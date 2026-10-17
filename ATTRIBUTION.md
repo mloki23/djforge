@@ -45,3 +45,11 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `assets/app-icon/soundcraft.ico` | SoundCraft contributors | original, rendered from `icon.svg` | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/` | SoundCraft contributors | original, rendered from `icon.svg` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft rendered from the synthesised demo session | MIT OR Apache-2.0 |
+
+## Vendored source code
+
+| Path | Author | Source | License |
+|---|---|---|---|
+| `crates/stretch/vendor/signalsmith-stretch/` | Geraint Luff / Signalsmith Audio Ltd. | https://github.com/Signalsmith-Audio/signalsmith-stretch | MIT (`LICENSE.txt` alongside) |
+| `crates/stretch/vendor/signalsmith-linear/` | Signalsmith Audio | https://github.com/Signalsmith-Audio/linear | MIT (`LICENSE.txt` alongside) |
+| `crates/stretch/vendor/wrapper/` | Colin Marc | https://github.com/colinmarc/signalsmith-stretch-rs (C wrapper) | MIT (`LICENSE.md` alongside) |

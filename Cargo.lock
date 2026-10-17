@@ -3733,6 +3733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-stretch"
+version = "0.8.0"
+dependencies = [
+ "cc",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-time"
 version = "0.8.0"
 dependencies = [

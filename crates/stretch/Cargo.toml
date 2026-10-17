@@ -1,0 +1,27 @@
+[package]
+name = "soundcraft-stretch"
+description = "Realtime pitch-preserving time stretch: a safe wrapper over the vendored Signalsmith Stretch C++ library (MIT)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+build = "build.rs"
+links = "signalsmith-stretch"
+
+[dependencies]
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+# The isolated unsafe helper crate (craftrules never-crash): unsafe is denied crate-wide and
+# allowed only in the FFI module (`src/ffi.rs`). The rest mirrors `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
