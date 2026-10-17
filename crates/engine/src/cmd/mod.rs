@@ -12,6 +12,7 @@ mod clap;
 mod clip;
 mod clip_list;
 mod clip_more;
+mod dj;
 mod edit;
 mod edit_more;
 mod event;
@@ -136,6 +137,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(sampler::specs());
         v.extend(video::specs());
         v.extend(zoom_toggle::specs());
+        v.extend(dj::specs());
         v
     })
 }

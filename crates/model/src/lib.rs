@@ -14,6 +14,7 @@ mod mixer;
 mod session;
 mod source;
 mod track;
+mod warp;
 
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
@@ -28,5 +29,6 @@ pub use session::{
 };
 pub use source::{Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};
+pub use warp::{MAX_WARP_BEATS, WarpMap};
 
 pub use soundcraft_time as time;

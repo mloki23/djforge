@@ -3700,6 +3700,7 @@ dependencies = [
  "soundcraft-dsp",
  "soundcraft-midi",
  "soundcraft-model",
+ "soundcraft-stretch",
  "soundcraft-time",
  "soundcraft-vst3-host",
 ]

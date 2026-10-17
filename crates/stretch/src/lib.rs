@@ -6,7 +6,7 @@
 //! between them is the playback rate for that block. Rate can change every block (tempo ramps)
 //! without clicks; pitch is preserved unless [`Stretcher::set_transpose`] says otherwise.
 //!
-//! Buffers are channel-major (`&[&[f32]]`, one slice per channel) like the rest of the engine.
+//! Buffers are channel-major (one slice or `Vec` per channel) like the rest of the engine.
 //! Interleaving scratch is allocated once in [`Stretcher::new`]; `process` and `seek` never
 //! allocate, block or panic, so they are safe on the audio thread.
 //!
@@ -131,7 +131,7 @@ impl Stretcher {
 
     /// Primes the stretcher after a jump: `input` is the source audio *leading up to* the new
     /// read position (ideally `input_latency() * 2` frames), at the coming playback `rate`.
-    pub fn seek(&mut self, input: &[&[f32]], frames: usize, rate: f64) -> Result<(), StretchError> {
+    pub fn seek<V: AsRef<[f32]>>(&mut self, input: &[V], frames: usize, rate: f64) -> Result<(), StretchError> {
         let frames = self.check(frames, self.max_in)?;
         let rate = if rate.is_finite() && rate > 0.0 { rate.min(MAX_RATE as f64) } else { 1.0 };
         self.interleave_input(input, frames);
@@ -143,7 +143,14 @@ impl Stretcher {
     /// Consumes `in_frames` from `input` (channel-major; short or missing channels read as
     /// silence, fewer source channels repeat cyclically) and *adds* `out_frames` of stretched
     /// audio into `output`, scaled by `gain`.
-    pub fn process(&mut self, input: &[&[f32]], in_frames: usize, output: &mut [Vec<f32>], out_frames: usize, gain: f32) -> Result<(), StretchError> {
+    pub fn process<V: AsRef<[f32]>>(
+        &mut self,
+        input: &[V],
+        in_frames: usize,
+        output: &mut [Vec<f32>],
+        out_frames: usize,
+        gain: f32,
+    ) -> Result<(), StretchError> {
         let in_frames = self.check(in_frames, self.max_in)?;
         let out_frames = self.check(out_frames, self.max_out)?;
         self.interleave_input(input, in_frames);
@@ -164,11 +171,11 @@ impl Stretcher {
         if frames > limit { Err(StretchError::TooLong { frames, limit }) } else { Ok(frames) }
     }
 
-    fn interleave_input(&mut self, input: &[&[f32]], frames: usize) {
+    fn interleave_input<V: AsRef<[f32]>>(&mut self, input: &[V], frames: usize) {
         let ch = self.channels;
         let n = input.len();
         for c in 0..ch {
-            let src: &[f32] = if n == 0 { &[] } else { input.get(c % n).copied().unwrap_or(&[]) };
+            let src: &[f32] = if n == 0 { &[] } else { input.get(c % n).map_or(&[], AsRef::as_ref) };
             for i in 0..frames {
                 if let Some(d) = self.inbuf.get_mut(i * ch + c) {
                     *d = src.get(i).copied().unwrap_or(0.0);
@@ -247,11 +254,12 @@ mod tests {
         assert!(Stretcher::new(2, SR, 0, Quality::Default).is_err());
         let mut s = Stretcher::new(2, SR, 64, Quality::Default).unwrap();
         let mut o = vec![vec![0.0; 64]; 2];
-        assert!(s.process(&[], 10_000, &mut o, 64, 1.0).is_err());
-        assert!(s.process(&[], 64, &mut o, 65, 1.0).is_err());
+        let none: &[&[f32]] = &[];
+        assert!(s.process(none, 10_000, &mut o, 64, 1.0).is_err());
+        assert!(s.process(none, 64, &mut o, 65, 1.0).is_err());
         // Missing input channels read as silence; more output channels than the stretcher wraps.
         let mut o3 = vec![vec![0.0; 64]; 3];
-        assert!(s.process(&[], 64, &mut o3, 64, f32::NAN).is_ok());
+        assert!(s.process(none, 64, &mut o3, 64, f32::NAN).is_ok());
         assert!(s.seek(&[&[0.0; 10]], 10, f64::INFINITY).is_ok());
     }
 }

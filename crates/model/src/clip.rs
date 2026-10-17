@@ -1,6 +1,6 @@
 //! Clips: windows onto audio sources or MIDI sequences, placed on a playlist.
 
-use crate::{ClipId, MAX_NAME_CHARS, SourceId, truncate_chars};
+use crate::{ClipId, MAX_NAME_CHARS, SourceId, WarpMap, truncate_chars};
 use soundcraft_midi::Sequence;
 use soundcraft_time::{MAX_POSITION, Range, Samples};
 
@@ -136,6 +136,10 @@ pub struct Clip {
     /// `clip.unloop` still recognises the loop after the source's content is edited.
     #[serde(default)]
     pub loop_id: Option<u64>,
+    /// Beat-locked playback: when set (audio clips only), the source follows the session tempo
+    /// map through this map, pitch-preserved in realtime, and `stretch` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<WarpMap>,
 }
 
 fn one() -> f64 {
@@ -163,6 +167,7 @@ impl Clip {
             stretch: 1.0,
             group: None,
             loop_id: None,
+            warp: None,
         }
     }
 
@@ -306,6 +311,12 @@ impl Clip {
         }
         if !self.stretch.is_finite() || self.stretch <= 0.0 {
             self.stretch = 1.0;
+        }
+        if let Some(w) = &mut self.warp {
+            w.sanitize();
+        }
+        if !self.is_audio() || !self.warp.as_ref().is_some_and(WarpMap::is_usable) {
+            self.warp = None;
         }
     }
 }

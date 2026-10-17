@@ -61,6 +61,9 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
+mod warp;
+use warp::WarpPlayers;
+
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
 
@@ -233,6 +236,8 @@ struct Strip {
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     clip_fx: HashMap<u64, ClipFx>,
     clipbuf: Vec<Vec<f32>>,
+    /// Realtime stretchers for beat-locked (warped) clips.
+    warps: WarpPlayers,
     /// Total latency of the active inserts (samples).
     latency: usize,
     /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
@@ -315,6 +320,7 @@ impl Strip {
             gr: 0.0,
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
+            warps: HashMap::new(),
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -935,7 +941,7 @@ fn process_strip(
                     continue;
                 }
                 match clip_fx_params(s, clip.id.0) {
-                    None => render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch),
+                    None => render_any_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch, &mut strip.warps),
                     Some(params) => {
                         let nch = strip.buf.len();
                         if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
@@ -944,7 +950,7 @@ fn process_strip(
                         for c in strip.clipbuf.iter_mut() {
                             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
                         }
-                        render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
+                        render_any_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch, &mut strip.warps);
                         let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -1404,6 +1410,15 @@ mod click {
     /// Click pitch for a MIDI note setting (clamped to the MIDI range).
     fn note_hz(note: f64) -> f64 {
         soundcraft_dsp::midi_to_hz(note.clamp(0.0, 127.0))
+    }
+}
+
+/// Plays a clip: beat-locked through its warp player when it has a warp map, else directly.
+fn render_any_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], scratch: &mut [f32], warps: &mut WarpPlayers) {
+    if clip.warp.is_some() {
+        warp::render_warped(s, clip, pos, frames, buf, warps);
+    } else {
+        render_clip(s, clip, pos, frames, buf, scratch);
     }
 }
 
@@ -2156,12 +2171,13 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / t.channels().max(1));
     let mut out = vec![vec![0.0f32; len]; t.channels().max(1)];
     let mut scratch = Vec::new();
+    let mut warps = WarpPlayers::new();
     for c in t.clips().iter().filter(|c| !c.muted && c.range().overlaps(&range)) {
         match clip_fx_params(s, c.id.0) {
-            None => render_clip(s, c, range.start, len, &mut out, &mut scratch),
+            None => render_any_clip(s, c, range.start, len, &mut out, &mut scratch, &mut warps),
             Some(params) => {
                 let mut tmp = vec![vec![0.0f32; len]; out.len()];
-                render_clip(s, c, range.start, len, &mut tmp, &mut scratch);
+                render_any_clip(s, c, range.start, len, &mut tmp, &mut scratch, &mut warps);
                 let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
                 fx.configure(params);
                 let mut done = 0;
@@ -2315,6 +2331,56 @@ mod tests {
         lane.set_point(0, -48.0);
         tr.automation.push(lane);
         assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
+    }
+
+    /// A warped clip's beats land on the session's beats (within 2 ms) at another tempo, through
+    /// a tempo ramp, and whatever the block size.
+    #[test]
+    fn warped_clip_follows_the_tempo_map() {
+        const SR: f64 = 48_000.0;
+        // 120 bpm source: a short 2 kHz burst on every beat from 0.25 s.
+        let mut src = vec![0.0f32; 48_000 * 12];
+        let beat_len = 0.5 * SR;
+        for k in 0..23 {
+            let at = (0.25 * SR + k as f64 * beat_len) as usize;
+            for i in 0..200 {
+                src[at + i] = (0.8 * (i as f32 * 2.0 * std::f32::consts::PI * 2000.0 / 48_000.0).sin()) * (-(i as f32) / 40.0).exp();
+            }
+        }
+        let beats: Vec<f64> = (0..23).map(|k| 0.25 * SR + k as f64 * beat_len).collect();
+        let build = |tempi: &[(i64, f64)]| {
+            let mut s = Session::default();
+            for &(beat, bpm) in tempi {
+                s.tempo.set_tempo(beat * TICKS_PER_QUARTER, bpm).unwrap();
+            }
+            s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![src.clone()] })));
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+            let id = s.new_clip_id();
+            let mut c = Clip::audio(id, "clicks", SourceId(900), 0, 0, 48_000 * 10);
+            c.warp = soundcraft_model::WarpMap::new(beats.clone(), -1.0);
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+            s
+        };
+        // Session time of session beat `b` under stepped tempi.
+        let time_of =
+            |tempi: &[(i64, f64)], b: i64| -> f64 { (0..b).map(|j| 60.0 / tempi.iter().rev().find(|(at, _)| *at <= j).map_or(120.0, |t| t.1)).sum() };
+        let constant = vec![(0, 128.0)];
+        let ramp: Vec<(i64, f64)> = std::iter::once((0, 120.0)).chain((4..12).map(|b| (b, 120.0 + 2.0 * (b - 3) as f64))).collect();
+        for (tempi, block) in [(&constant, 512), (&constant, 128), (&ramp, 1024)] {
+            let s = build(tempi);
+            let out = render_range(&s, Range::new(0, 48_000 * 8), block);
+            let ch = &out[0];
+            for b in 2..14 {
+                let expect = time_of(tempi, b) * SR;
+                let lo = (expect - 0.05 * SR) as usize;
+                let seg = &ch[lo..lo + (0.1 * SR) as usize];
+                let peak = seg.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                assert!(peak > 0.2, "beat {b}: no click (peak {peak})");
+                let onset = seg.iter().position(|x| x.abs() > 0.3 * peak).unwrap();
+                let err_ms = ((lo + onset) as f64 - expect) / SR * 1000.0;
+                assert!(err_ms.abs() < 2.0, "block {block}, beat {b}: click {err_ms:+.2} ms off the session beat");
+            }
+        }
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {
