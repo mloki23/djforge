@@ -16,13 +16,24 @@ pub struct WarpMap {
     pub beats: Vec<f64>,
     #[serde(default)]
     pub anchor: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<WarpLock>,
+}
+
+/// Where a warped clip sat after the last edit, so the next edit can keep its music in place:
+/// session beats of its edges and its source offset (which trims and splits move, moves don't).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WarpLock {
+    pub start_beat: f64,
+    pub end_beat: f64,
+    pub offset: i64,
 }
 
 impl WarpMap {
     /// A map from analysed beat times. `None` unless there are at least two strictly increasing,
     /// finite positions (at most [`MAX_WARP_BEATS`] are kept).
     pub fn new(beats: Vec<f64>, anchor: f64) -> Option<WarpMap> {
-        let mut w = WarpMap { beats, anchor };
+        let mut w = WarpMap { beats, anchor, lock: None };
         w.sanitize();
         (w.beats.len() >= 2).then_some(w)
     }
@@ -41,6 +52,9 @@ impl WarpMap {
         self.beats.truncate(keep);
         if !self.anchor.is_finite() {
             self.anchor = 0.0;
+        }
+        if self.lock.is_some_and(|l| !(l.start_beat.is_finite() && l.end_beat.is_finite())) {
+            self.lock = None;
         }
     }
 
@@ -162,5 +176,15 @@ mod tests {
         let at = 48_000;
         assert!((w.track_beat_at(&tempo, sr, at, at + 24_000) - 0.0).abs() < 1e-9);
         assert!((w.source_at_time(&tempo, sr, at, at + 36_000) - 12_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lock_is_optional_in_files_and_sanitized() {
+        let old: WarpMap = serde_json::from_str(r#"{"beats":[1.0,2.0],"anchor":0.0}"#).unwrap();
+        assert_eq!(old.lock, None);
+        let mut w = WarpMap::new(vec![1.0, 2.0], 0.0).unwrap();
+        w.lock = Some(WarpLock { start_beat: f64::NAN, end_beat: 4.0, offset: 0 });
+        w.sanitize();
+        assert_eq!(w.lock, None);
     }
 }
