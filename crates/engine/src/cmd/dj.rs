@@ -52,7 +52,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Nudge Beat-Locked Track",
             [],
             None,
-            "{clip, ms: -1000..=1000} — plays the clip's music `ms` later (negative: earlier), keeping it beat-locked",
+            "{clip, ms: -1000..=1000 | beats: -8..=8} — plays the clip's music `ms` (at the clip-start tempo) or `beats` later (negative: earlier), keeping it beat-locked",
             always,
             nudge
         ),
@@ -61,31 +61,33 @@ pub fn specs() -> Vec<CommandSpec> {
             "Suggest Transition Nudge",
             [],
             None,
-            "{out_clip, in_clip} — measures how far the incoming clip's beats sit from the outgoing clip's across their overlap (at least 8 beats), from low/mid/high onset profiles folded onto the session beat; returns {nudge_ms (apply with dj.nudge {clip: in_clip, ms}), score, agree (bands within 10 ms of it), bands, beats}. Changes nothing",
+            "{out_clip, in_clip} — measures how far the incoming clip's beats sit from the outgoing clip's across their overlap (at least 8 beats), from low/mid/high onset profiles folded onto the session beat; analyses the last 128 beats; returns {nudge_ms, nudge_beats (apply either with dj.nudge {clip: in_clip, ms | beats}), reliable, note (why not), ambiguity (second peak / best), score, agree (bands within 10 ms of it), bands (each band's own nudge_ms), overlap_beats, analysed_beats}. Changes nothing",
             always,
             align::suggest_nudge
         ),
     ]
 }
 
-/// Shifts a beat-locked clip's music by `ms` (positive: later) without moving the clip: the anchor
-/// moves by the session beats `ms` spans at the tempo of the clip start. Across a tempo ramp the
-/// shift in milliseconds therefore varies slightly along the clip; it stays constant in beats.
+/// Shifts a beat-locked clip's music later by `beats` session beats, or by `ms` (negative:
+/// earlier) without moving the clip: the anchor moves by those beats. `ms` converts at the tempo
+/// of the clip start, so across a tempo ramp the shift in milliseconds varies slightly along the
+/// clip; it stays constant in beats.
 fn nudge(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.nudge";
     let id = p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "`clip` required"))?;
-    let ms =
-        p.get("ms").and_then(Value::as_f64).filter(|m| m.is_finite() && m.abs() <= 1000.0).ok_or_else(|| bad(CMD, "`ms` must be -1000..=1000"))?;
+    let num = |key: &str, max: f64| p.get(key).map(|v| v.as_f64().filter(|x| x.is_finite() && x.abs() <= max));
     let s = e.session();
     let c = s.find_clip(id).map(|(_, c)| c).ok_or_else(|| bad(CMD, format!("no clip {}", id.0)))?;
-    if c.warp.is_none() || !c.is_audio() {
-        return Err(bad(CMD, "the clip is not beat-locked"));
-    }
-    let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(c.start, s.sample_rate));
-    let beats = ms / 1000.0 * bpm / 60.0;
-    let w = e.session_mut().find_clip_mut(id).and_then(|c| c.warp.as_mut()).ok_or_else(|| bad(CMD, "the clip is not beat-locked"))?;
+    align::beat_locked(c).ok_or_else(|| align::not_beat_locked(CMD, id))?;
+    let beat_ms = 60_000.0 / s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(c.start, s.sample_rate));
+    let beats = match (num("ms", 1000.0), num("beats", 8.0)) {
+        (Some(ms), None) => ms.ok_or_else(|| bad(CMD, "`ms` must be -1000..=1000"))? / beat_ms,
+        (None, Some(beats)) => beats.ok_or_else(|| bad(CMD, "`beats` must be -8..=8"))?,
+        _ => return Err(bad(CMD, "give one of `ms` or `beats`")),
+    };
+    let w = e.session_mut().find_clip_mut(id).and_then(|c| c.warp.as_mut()).ok_or_else(|| align::not_beat_locked(CMD, id))?;
     w.anchor -= beats;
-    Ok(json!({"clip": id, "anchor": w.anchor, "beats": -beats}))
+    Ok(json!({"clip": id, "anchor": w.anchor, "beats": beats, "ms": beats * beat_ms}))
 }
 
 fn crossfade(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -763,26 +765,47 @@ mod tests {
     #[test]
     fn nudge_moves_the_music_later_by_ms() {
         let (mut e, _, id) = warped();
-        let before = heard(&e, 5 * SR);
+        let (snapshot, before) = (e.session().clone(), heard(&e, 5 * SR));
         e.execute("dj.nudge", &json!({"clip": id.0, "ms": 10.0})).unwrap();
         // 10 ms later at 48 kHz: what played at 5 s now plays 480 samples later.
         assert!((heard(&e, 5 * SR + 480) - before).abs() < 1.0);
         // The relock pass leaves the nudge alone, and it undoes as one step.
         assert_eq!(clips(&e), vec![(SR, 20 * SR, 0)]);
-        e.execute("dj.nudge", &json!({"clip": id.0, "ms": -10.0})).unwrap();
-        assert!((heard(&e, 5 * SR) - before).abs() < 1.0);
+        assert!(e.undo());
+        assert!(*e.session() == snapshot);
+        // In beats: a quarter beat at 120 bpm is 125 ms, 6 000 samples.
+        e.execute("dj.nudge", &json!({"clip": id.0, "beats": 0.25})).unwrap();
+        assert!((heard(&e, 5 * SR + 6_000) - before).abs() < 1.0);
         let rev = e.session().clone();
-        assert!(e.execute("dj.nudge", &json!({"clip": id.0, "ms": f64::NAN})).is_err());
-        assert!(e.execute("dj.nudge", &json!({"clip": id.0, "ms": 1500.0})).is_err());
+        for bad in
+            [json!({"ms": f64::NAN}), json!({"ms": 1500.0}), json!({"beats": 9.0}), json!({"ms": 5.0, "beats": 0.1}), json!({}), json!({"ms": "5"})]
+        {
+            let mut p = bad.clone();
+            p["clip"] = json!(id.0);
+            assert!(e.execute("dj.nudge", &p).is_err(), "{p}");
+        }
         assert!(e.execute("dj.nudge", &json!({"clip": 9999, "ms": 5.0})).is_err());
         assert!(*e.session() == rev);
     }
 
+    /// The instruments of a [`drums`] source.
+    #[derive(Clone, Copy)]
+    struct Kit {
+        kick_hz: f64,
+        /// Kick decay time constant (seconds).
+        kick_decay: f64,
+        /// A continuous 55 Hz bassline under everything.
+        bass: bool,
+    }
+
+    const KIT: Kit = Kit { kick_hz: 60.0, kick_decay: 0.08, bass: false };
+
     /// A 30 s source with a 125 bpm beat list from 0.1 s whose sound comes `late` seconds after it:
-    /// a 60 Hz thump and a 1.5 kHz click on every beat, a noise hat on every off-beat.
-    fn drums(late: f64) -> AudioBuffer {
+    /// a kick and a 1.5 kHz click on every beat, a noise hat on every off-beat.
+    fn drums(late: f64, kit: Kit) -> AudioBuffer {
         let (n, sr) = (30 * SR as usize, SR as f64);
-        let mut x = vec![0.0f32; n];
+        let tau = std::f64::consts::TAU;
+        let mut x: Vec<f32> = (0..n).map(|i| if kit.bass { (0.3 * (tau * 55.0 * i as f64 / sr).sin()) as f32 } else { 0.0 }).collect();
         let mut seed: u32 = 1;
         let mut noise = || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -796,8 +819,7 @@ mod tests {
             for j in 0..(0.4 * sr) as usize {
                 let (t, Some(y)) = (j as f64 / sr, x.get_mut(at + j)) else { break };
                 let v = if k % 2 == 0 {
-                    0.5 * (std::f64::consts::TAU * 60.0 * t).sin() * (-t / 0.08).exp()
-                        + 0.3 * (std::f64::consts::TAU * 1_500.0 * t).sin() * (-t / 0.005).exp()
+                    0.5 * (tau * kit.kick_hz * t).sin() * (-t / kit.kick_decay).exp() + 0.3 * (tau * 1_500.0 * t).sin() * (-t / 0.005).exp()
                 } else {
                     0.3 * f64::from(noise()) * (-t / 0.007).exp()
                 };
@@ -807,19 +829,24 @@ mod tests {
         AudioBuffer { sample_rate: SR as u32, channels: vec![x] }
     }
 
-    /// A 128 bpm session with clip A (source `drums(0)`) on session beats 2..42 and clip B
-    /// (source `drums(late_b)`) on its own track from session beat `from_b` for 40 beats.
-    fn transition(late_b: f64, from_b: i64) -> (Engine, ClipId, ClipId) {
+    /// A transition in a session at 128 bpm (`step`: then this bpm from this session beat on):
+    /// clip A plays source `a` on session beats 2..42 and clip B source `b` from session beat
+    /// `from_b` for 40 beats, starting on track beat `anchor_b`. Both have the 125 bpm beat list
+    /// of [`drums`].
+    fn transition_of(a: AudioBuffer, b: AudioBuffer, from_b: i64, anchor_b: f64, step: Option<(i64, f64)>) -> (Engine, ClipId, ClipId) {
         let mut s = Session::default();
         s.tempo.set_tempo(0, 128.0).unwrap();
+        if let Some((beat, bpm)) = step {
+            s.tempo.set_tempo(beat * TICKS_PER_QUARTER, bpm).unwrap();
+        }
         let mut ids = Vec::new();
-        for (late, from) in [(0.0, 2), (late_b, from_b)] {
+        for (buf, from, anchor) in [(a, 2, 0.0), (b, from_b, anchor_b)] {
             let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-            let src = crate::io::add_source(&mut s, "drums", drums(late), None, FileFormat::Wav);
+            let src = crate::io::add_source(&mut s, "drums", buf, None, FileFormat::Wav);
             let id = s.new_clip_id();
             let start = at_beat(&s, from);
             let mut c = Clip::audio(id, "c", src, 0, start, at_beat(&s, from + 40) - start);
-            c.warp = WarpMap::new((0..62).map(|k| 4_800.0 + k as f64 * 23_040.0).collect(), 0.0);
+            c.warp = WarpMap::new((0..62).map(|k| 4_800.0 + k as f64 * 23_040.0).collect(), anchor);
             ops::place_clip(&mut s, t, c);
             ids.push(id);
         }
@@ -828,8 +855,19 @@ mod tests {
         (Engine::new(s), ids[0], ids[1])
     }
 
+    /// [`transition_of`] two [`KIT`] sources, B's sound `late_b` seconds late.
+    fn transition(late_b: f64, from_b: i64) -> (Engine, ClipId, ClipId) {
+        transition_of(drums(0.0, KIT), drums(late_b, KIT), from_b, 0.0, None)
+    }
+
     fn suggest(e: &mut Engine, a: ClipId, b: ClipId) -> Result<Value> {
         e.execute("dj.suggest_nudge", &json!({"out_clip": a.0, "in_clip": b.0}))
+    }
+
+    /// The suggestion's nudge_ms, asserting it is reliable.
+    fn reliable_ms(r: &Value) -> f64 {
+        assert_eq!(r["reliable"], true, "{r}");
+        r["nudge_ms"].as_f64().unwrap()
     }
 
     #[test]
@@ -840,12 +878,12 @@ mod tests {
         assert!(*e.session() == before, "the suggestion changed the session");
         // 30 ms of 125 bpm source is heard over 30 * 125 / 128 ms at 128 bpm.
         let want = -30.0 * 125.0 / 128.0;
-        let got = r["nudge_ms"].as_f64().unwrap();
+        let got = reliable_ms(&r);
         assert!((got - want).abs() < 2.0, "{r}");
         assert!(r["agree"].as_u64().unwrap() >= 2, "{r}");
-        assert!((r["beats"].as_f64().unwrap() - 24.0).abs() < 1e-6, "{r}");
+        assert!((r["overlap_beats"].as_f64().unwrap() - 24.0).abs() < 1e-6, "{r}");
         e.execute("dj.nudge", &json!({"clip": b.0, "ms": got})).unwrap();
-        let again = suggest(&mut e, a, b).unwrap()["nudge_ms"].as_f64().unwrap();
+        let again = reliable_ms(&suggest(&mut e, a, b).unwrap());
         assert!(again.abs() < 2.0, "after the nudge: {again}");
     }
 
@@ -855,20 +893,75 @@ mod tests {
         // the parabola through the peak gets within 1 ms.
         let (mut e, a, b) = transition(0.020, 18);
         let r = suggest(&mut e, a, b).unwrap();
-        let want = -20.0 * 125.0 / 128.0;
-        assert!((r["nudge_ms"].as_f64().unwrap() - want).abs() < 1.0, "{r}");
+        assert!((reliable_ms(&r) + 20.0 * 125.0 / 128.0).abs() < 1.0, "{r}");
         // An early incoming track asks for a later nudge.
         let (mut e, a, b) = transition(-0.012, 18);
         let r = suggest(&mut e, a, b).unwrap();
-        assert!((r["nudge_ms"].as_f64().unwrap() - 12.0 * 125.0 / 128.0).abs() < 1.0, "{r}");
+        assert!((reliable_ms(&r) - 12.0 * 125.0 / 128.0).abs() < 1.0, "{r}");
+    }
+
+    #[test]
+    fn suggest_nudge_is_right_or_unsure_far_off_the_beat() {
+        // Over a quarter and nearly half a beat late at 128 bpm (a beat is 469 ms).
+        for late in [0.130, 0.200] {
+            let (mut e, a, b) = transition(late, 18);
+            let r = suggest(&mut e, a, b).unwrap();
+            let want = -late * 1000.0 * 125.0 / 128.0;
+            let right = (r["nudge_ms"].as_f64().unwrap() - want).abs() < 2.0;
+            assert!(right || r["reliable"] == false, "a confident wrong answer for {late} s late: {r}");
+        }
+        // Exactly half a beat (of the 125 bpm source) late: early or late is a coin toss.
+        let (mut e, a, b) = transition(0.240, 18);
+        let r = suggest(&mut e, a, b).unwrap();
+        assert_eq!(r["reliable"], false, "{r}");
+        assert!(r["note"].as_str().unwrap().contains("half a beat"), "{r}");
     }
 
     #[test]
     fn suggest_nudge_finds_nothing_to_fix_between_identical_tracks() {
         let (mut e, a, b) = transition(0.0, 10);
         let r = suggest(&mut e, a, b).unwrap();
-        assert!(r["nudge_ms"].as_f64().unwrap().abs() < 2.0, "{r}");
+        assert!(reliable_ms(&r).abs() < 2.0, "{r}");
         assert_eq!(r["agree"], 3, "{r}");
+    }
+
+    #[test]
+    fn suggest_nudge_follows_kicks_not_bass_waveforms() {
+        // Different kicks over the same bassline: the low band must follow the kicks' envelopes.
+        let (kick_a, kick_b) = (Kit { bass: true, ..KIT }, Kit { kick_hz: 45.0, kick_decay: 0.15, bass: true });
+        let (mut e, a, b) = transition_of(drums(0.0, kick_a), drums(0.0, kick_b), 18, 0.0, None);
+        let r = suggest(&mut e, a, b).unwrap();
+        assert!(reliable_ms(&r).abs() < 2.0, "{r}");
+        let (mut e, a, b) = transition_of(drums(0.0, kick_a), drums(0.030, kick_b), 18, 0.0, None);
+        let r = suggest(&mut e, a, b).unwrap();
+        let want = -30.0 * 125.0 / 128.0;
+        assert!((reliable_ms(&r) - want).abs() < 2.0, "{r}");
+        assert!((r["bands"]["low"].as_f64().unwrap() - want).abs() < 5.0, "{r}");
+    }
+
+    #[test]
+    fn suggest_nudge_handles_a_lead_in_before_the_first_beat() {
+        // B starts a bar before its first beat.
+        let (mut e, a, b) = transition_of(drums(0.0, KIT), drums(0.030, KIT), 14, -4.0, None);
+        let r = suggest(&mut e, a, b).unwrap();
+        let got = reliable_ms(&r);
+        assert!((got + 30.0 * 125.0 / 128.0).abs() < 2.0, "{r}");
+        e.execute("dj.nudge", &json!({"clip": b.0, "ms": got})).unwrap();
+        assert!(reliable_ms(&suggest(&mut e, a, b).unwrap()).abs() < 2.0);
+    }
+
+    #[test]
+    fn suggest_nudge_round_trips_across_a_tempo_change_in_the_overlap() {
+        let (mut e, a, b) = transition_of(drums(0.0, KIT), drums(0.030, KIT), 18, 0.0, Some((26, 140.0)));
+        let r = suggest(&mut e, a, b).unwrap();
+        // Lateness is constant in beats: 30 ms of 125 bpm source is 0.0625 beats.
+        assert!((r["nudge_beats"].as_f64().unwrap() + 0.0625).abs() < 0.004, "{r}");
+        // Converted at the incoming clip's start tempo (128 bpm), as dj.nudge does.
+        let got = reliable_ms(&r);
+        assert!((got + 30.0 * 125.0 / 128.0).abs() < 2.0, "{r}");
+        e.execute("dj.nudge", &json!({"clip": b.0, "ms": got})).unwrap();
+        let again = reliable_ms(&suggest(&mut e, a, b).unwrap());
+        assert!(again.abs() < 0.5, "after the nudge: {again}");
     }
 
     #[test]
