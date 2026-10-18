@@ -334,7 +334,9 @@ impl Engine {
             Ok(v) => {
                 if !Arc::ptr_eq(&before, &self.doc) && cmd::dj::has_warped(&self.doc) {
                     let tempo_changed = before.tempo != self.doc.tempo;
-                    cmd::dj::relock(self.session_mut(), tempo_changed);
+                    if cmd::dj::relock_needed(&self.doc, tempo_changed) {
+                        cmd::dj::relock(self.session_mut(), tempo_changed);
+                    }
                 }
                 cmd::remember_selection(self, &before);
                 if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
