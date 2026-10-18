@@ -6,6 +6,9 @@ use serde_json::json;
 use soundcraft_model::{Clip, MAX_WARP_BEATS, Session, WarpLock, WarpMap};
 use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 
+#[path = "dj_align.rs"]
+mod align;
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
@@ -52,6 +55,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{clip, ms: -1000..=1000} — plays the clip's music `ms` later (negative: earlier), keeping it beat-locked",
             always,
             nudge
+        ),
+        cmd!(
+            query "dj.suggest_nudge",
+            "Suggest Transition Nudge",
+            [],
+            None,
+            "{out_clip, in_clip} — measures how far the incoming clip's beats sit from the outgoing clip's across their overlap (at least 8 beats), from low/mid/high onset profiles folded onto the session beat; returns {nudge_ms (apply with dj.nudge {clip: in_clip, ms}), score, agree (bands within 10 ms of it), bands, beats}. Changes nothing",
+            always,
+            align::suggest_nudge
         ),
     ]
 }
@@ -658,6 +670,110 @@ mod tests {
         assert!(e.execute("dj.nudge", &json!({"clip": id.0, "ms": 1500.0})).is_err());
         assert!(e.execute("dj.nudge", &json!({"clip": 9999, "ms": 5.0})).is_err());
         assert!(*e.session() == rev);
+    }
+
+    /// A 30 s source with a 125 bpm beat list from 0.1 s whose sound comes `late` seconds after it:
+    /// a 60 Hz thump and a 1.5 kHz click on every beat, a noise hat on every off-beat.
+    fn drums(late: f64) -> AudioBuffer {
+        let (n, sr) = (30 * SR as usize, SR as f64);
+        let mut x = vec![0.0f32; n];
+        let mut seed: u32 = 1;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        };
+        for k in 0.. {
+            let at = ((0.1 + k as f64 * 0.24 + late) * sr).round() as usize;
+            if at >= n {
+                break;
+            }
+            for j in 0..(0.4 * sr) as usize {
+                let (t, Some(y)) = (j as f64 / sr, x.get_mut(at + j)) else { break };
+                let v = if k % 2 == 0 {
+                    0.5 * (std::f64::consts::TAU * 60.0 * t).sin() * (-t / 0.08).exp()
+                        + 0.3 * (std::f64::consts::TAU * 1_500.0 * t).sin() * (-t / 0.005).exp()
+                } else {
+                    0.3 * f64::from(noise()) * (-t / 0.007).exp()
+                };
+                *y += v as f32;
+            }
+        }
+        AudioBuffer { sample_rate: SR as u32, channels: vec![x] }
+    }
+
+    /// A 128 bpm session with clip A (source `drums(0)`) on session beats 2..42 and clip B
+    /// (source `drums(late_b)`) on its own track from session beat `from_b` for 40 beats.
+    fn transition(late_b: f64, from_b: i64) -> (Engine, ClipId, ClipId) {
+        let mut s = Session::default();
+        s.tempo.set_tempo(0, 128.0).unwrap();
+        let mut ids = Vec::new();
+        for (late, from) in [(0.0, 2), (late_b, from_b)] {
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+            let src = crate::io::add_source(&mut s, "drums", drums(late), None, FileFormat::Wav);
+            let id = s.new_clip_id();
+            let start = at_beat(&s, from);
+            let mut c = Clip::audio(id, "c", src, 0, start, at_beat(&s, from + 40) - start);
+            c.warp = WarpMap::new((0..62).map(|k| 4_800.0 + k as f64 * 23_040.0).collect(), 0.0);
+            ops::place_clip(&mut s, t, c);
+            ids.push(id);
+        }
+        let old = s.tempo.clone();
+        relock(&mut s, &old);
+        (Engine::new(s), ids[0], ids[1])
+    }
+
+    fn suggest(e: &mut Engine, a: ClipId, b: ClipId) -> Result<Value> {
+        e.execute("dj.suggest_nudge", &json!({"out_clip": a.0, "in_clip": b.0}))
+    }
+
+    #[test]
+    fn suggest_nudge_measures_a_late_incoming_track_and_the_nudge_closes_the_loop() {
+        let (mut e, a, b) = transition(0.030, 18);
+        let before = e.session().clone();
+        let r = suggest(&mut e, a, b).unwrap();
+        assert!(*e.session() == before, "the suggestion changed the session");
+        // 30 ms of 125 bpm source is heard over 30 * 125 / 128 ms at 128 bpm.
+        let want = -30.0 * 125.0 / 128.0;
+        let got = r["nudge_ms"].as_f64().unwrap();
+        assert!((got - want).abs() < 2.0, "{r}");
+        assert!(r["agree"].as_u64().unwrap() >= 2, "{r}");
+        assert!((r["beats"].as_f64().unwrap() - 24.0).abs() < 1e-6, "{r}");
+        e.execute("dj.nudge", &json!({"clip": b.0, "ms": got})).unwrap();
+        let again = suggest(&mut e, a, b).unwrap()["nudge_ms"].as_f64().unwrap();
+        assert!(again.abs() < 2.0, "after the nudge: {again}");
+    }
+
+    #[test]
+    fn suggest_nudge_resolves_lags_between_bins() {
+        // 20 ms of source is 5.33 bins (3.66 ms each) at 128 bpm: the nearest bin alone is 1.2 ms off,
+        // the parabola through the peak gets within 1 ms.
+        let (mut e, a, b) = transition(0.020, 18);
+        let r = suggest(&mut e, a, b).unwrap();
+        let want = -20.0 * 125.0 / 128.0;
+        assert!((r["nudge_ms"].as_f64().unwrap() - want).abs() < 1.0, "{r}");
+        // An early incoming track asks for a later nudge.
+        let (mut e, a, b) = transition(-0.012, 18);
+        let r = suggest(&mut e, a, b).unwrap();
+        assert!((r["nudge_ms"].as_f64().unwrap() - 12.0 * 125.0 / 128.0).abs() < 1.0, "{r}");
+    }
+
+    #[test]
+    fn suggest_nudge_finds_nothing_to_fix_between_identical_tracks() {
+        let (mut e, a, b) = transition(0.0, 10);
+        let r = suggest(&mut e, a, b).unwrap();
+        assert!(r["nudge_ms"].as_f64().unwrap().abs() < 2.0, "{r}");
+        assert_eq!(r["agree"], 3, "{r}");
+    }
+
+    #[test]
+    fn suggest_nudge_needs_an_overlap_of_beat_locked_clips() {
+        let (mut e, a, b) = transition(0.0, 50);
+        assert!(suggest(&mut e, a, b).is_err());
+        // Four beats of overlap are too few.
+        let (mut e, a, b) = transition(0.0, 38);
+        assert!(suggest(&mut e, a, b).is_err());
+        assert!(e.execute("dj.suggest_nudge", &json!({"out_clip": a.0})).is_err());
+        assert!(e.execute("dj.suggest_nudge", &json!({"out_clip": a.0, "in_clip": 9999})).is_err());
     }
 
     #[test]
