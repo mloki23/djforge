@@ -156,22 +156,60 @@ pub(super) fn transition(e: &mut Engine, p: &Value) -> Result<Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(serde_json::from_value(v.clone()).map_err(|_| bad(CMD, "`style` must be \"blend\" or \"quick\""))?),
     };
-    let build = int_in(p, "build_bars", MIN_TRANSITION_BARS, MAX_TRANSITION_BARS, CMD)?;
-    let out = int_in(p, "out_bars", MIN_TRANSITION_BARS, MAX_TRANSITION_BARS, CMD)?;
+    let build_bars = int_in(p, "build_bars", MIN_TRANSITION_BARS, MAX_TRANSITION_BARS, CMD)?;
+    let out_bars = int_in(p, "out_bars", MIN_TRANSITION_BARS, MAX_TRANSITION_BARS, CMD)?;
     let entry = int_in(p, "entry_bar", 1, MAX_TRANSITION_BAR, CMD)?;
-    let force = bool_or(p, "force", false);
+    let changes = Changes { style, build_bars, out_bars, entry_bar: entry, force: bool_or(p, "force", false) };
+    let Built { transition: t, recipe: r, eq_inserted } = build(e, CMD, existing, out_id, in_id, &changes)?;
+    let points: Vec<Value> = r.points.iter().map(|(track, at, db)| json!({"track": track, "at": at, "value": db})).collect();
+    let transition = serde_json::to_value(&t).map_err(|err| bad(CMD, err.to_string()))?;
+    Ok(json!({
+        "transition": transition,
+        "hit_bar": t.hit_bar(),
+        "gone_bar": t.gone_bar(),
+        "recipe": {"entry": r.entry, "hit": r.hit, "gone": r.gone, "in_fade": r.in_fade, "out_fade": r.out_fade, "points": points},
+        "eq_inserted": eq_inserted,
+    }))
+}
+
+/// What to change on a transition before its recipe is (re)applied; `None` keeps the current
+/// value (a new transition's defaults).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Changes {
+    /// A style given without bars brings its own.
+    pub style: Option<TransitionStyle>,
+    pub build_bars: Option<i64>,
+    pub out_bars: Option<i64>,
+    pub entry_bar: Option<i64>,
+    /// Rebuild a transition edited by hand.
+    pub force: bool,
+}
+
+/// A transition [`build`] recorded, its recipe, and the decks it inserted the EQ on.
+pub(crate) struct Built {
+    pub transition: Transition,
+    pub recipe: Recipe,
+    pub eq_inserted: Vec<TrackId>,
+}
+
+/// Records transition `existing` (`None`: a new one) from `out_id` into `in_id` with `ch`
+/// applied, and writes its recipe into the session. Everything is checked before the session
+/// changes; errors name command `cmd`.
+pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out_id: ClipId, in_id: ClipId, ch: &Changes) -> Result<Built> {
+    let s = e.session();
+    let Changes { style, build_bars: build, out_bars: out, entry_bar: entry, force } = *ch;
     if let Some(t) = existing.as_ref().filter(|t| t.edited && !force) {
-        return Err(bad(CMD, format!("transition {} was edited by hand; pass force: true to rebuild it", t.id)));
+        return Err(bad(cmd, format!("transition {} was edited by hand; pass force: true to rebuild it", t.id)));
     }
     // The decks are wherever the clips live now.
-    let deck = |id: ClipId| track_of(s, id).ok_or_else(|| bad(CMD, format!("no clip {}", id.0)));
+    let deck = |id: ClipId| track_of(s, id).ok_or_else(|| bad(cmd, format!("no clip {}", id.0)));
     let (out_track, in_track) = (deck(out_id)?, deck(in_id)?);
     if out_track == in_track {
-        return Err(bad(CMD, "the two clips must be on different tracks"));
+        return Err(bad(cmd, "the two clips must be on different tracks"));
     }
     for (track, id) in [(out_track, out_id), (in_track, in_id)] {
         if !clip_on(s, track, id).is_some_and(Clip::is_audio) {
-            return Err(bad(CMD, format!("clip {} is not an audio clip", id.0)));
+            return Err(bad(cmd, format!("clip {} is not an audio clip", id.0)));
         }
     }
     let mut t = match existing.clone() {
@@ -210,15 +248,15 @@ pub(super) fn transition(e: &mut Engine, p: &Value) -> Result<Value> {
     t.out_bars = out.unwrap_or(t.out_bars);
     t.entry_bar = entry.unwrap_or(t.entry_bar);
     t.edited = false;
-    let r = recipe(s, &t).map_err(|m| bad(CMD, m))?;
+    let r = recipe(s, &t).map_err(|m| bad(cmd, m))?;
     // The previous recipe's span goes too, so a moved transition leaves nothing behind.
     let old = existing.as_ref().and_then(|o| recipe(s, o).ok());
     for track in [out_track, in_track] {
         let slot =
-            s.track(track).and_then(|tr| tr.mixer.inserts.get(EQ_SLOT)).ok_or_else(|| bad(CMD, format!("track {} has no insert slot a", track.0)))?;
+            s.track(track).and_then(|tr| tr.mixer.inserts.get(EQ_SLOT)).ok_or_else(|| bad(cmd, format!("track {} has no insert slot a", track.0)))?;
         if let Some(ins) = slot.as_ref().filter(|i| i.plugin != EQ_PLUGIN) {
             return Err(bad(
-                CMD,
+                cmd,
                 format!(
                     "insert slot a of track {} holds `{}`; the transition needs EQ 7-Band there, so move or remove it first",
                     track.0, ins.plugin
@@ -226,7 +264,7 @@ pub(super) fn transition(e: &mut Engine, p: &Value) -> Result<Value> {
             ));
         }
     }
-    let info = super::super::clap::plugin_info(EQ_PLUGIN).ok_or_else(|| bad(CMD, "the EQ 7-Band plugin is missing"))?;
+    let info = super::super::clap::plugin_info(EQ_PLUGIN).ok_or_else(|| bad(cmd, "the EQ 7-Band plugin is missing"))?;
 
     let s = e.session_mut();
     let mut inserted = Vec::new();
@@ -264,15 +302,7 @@ pub(super) fn transition(e: &mut Engine, p: &Value) -> Result<Value> {
         Some(slot) => *slot = t.clone(),
         None => s.dj.transitions.push(t.clone()),
     }
-    let points: Vec<Value> = r.points.iter().map(|(track, at, db)| json!({"track": track, "at": at, "value": db})).collect();
-    let transition = serde_json::to_value(&t).map_err(|err| bad(CMD, err.to_string()))?;
-    Ok(json!({
-        "transition": transition,
-        "hit_bar": t.hit_bar(),
-        "gone_bar": t.gone_bar(),
-        "recipe": {"entry": r.entry, "hit": r.hit, "gone": r.gone, "in_fade": r.in_fade, "out_fade": r.out_fade, "points": points},
-        "eq_inserted": inserted,
-    }))
+    Ok(Built { transition: t, recipe: r, eq_inserted: inserted })
 }
 
 /// `dj.transitions`: every transition, with its hit and gone bars.

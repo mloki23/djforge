@@ -8,6 +8,8 @@ use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 
 #[path = "dj_align.rs"]
 mod align;
+#[path = "dj_import.rs"]
+mod import;
 #[path = "dj_plan.rs"]
 pub(crate) mod plan;
 #[path = "dj_recipe.rs"]
@@ -77,6 +79,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{out_clip, in_clip} | {transition: id}, style?: blend|quick, build_bars?: 1..=256, out_bars?: 1..=256, entry_bar?, force?: bool — records the mix from `out_clip` into `in_clip` (entry_bar default: the first bar at or after the incoming clip's start; style default blend; bars default from the style, 16/8 blend, 8/4 quick, and a style given without bars brings its own) and writes its recipe: EQ 7-Band in insert slot a of both decks (inserted if the slot is empty), the incoming low shelf -24 dB at entry_bar to 0 at the hit (entry_bar + build_bars), the outgoing one 0 at the hit to -24 dB at the gone bar (hit + out_bars), an equal-power fade-in from the incoming clip's start to the hit and fade-out from the hit to the outgoing clip's end. Refuses a transition edited by hand unless `force`. Returns {transition, hit_bar, gone_bar, recipe: {entry, hit, gone, in_fade, out_fade, points}, eq_inserted}",
             always,
             recipe::transition
+        ),
+        cmd!(
+            "dj.import_set",
+            "Import mixforge Set",
+            [],
+            None,
+            "{plan: path of mixforge's plan.json, report?: path of a text report to write} — into a session without beat-locked clips: Deck A/B (alternating) with every track beat-locked, its first downbeat on the bar its transition enters on (the bar line nearest the previous track's out_start); the plan's tempo (a ramp over each transition's bars, or a step on its hit bar); clip gains; a Maximizer on the master fader; each transition with Marty's recipe (dj.transition; shortened when the clips are too short); each incoming track nudged by the plan's nudge_ms, else by a reliable dj.suggest_nudge. One undo step. Returns {tracks, track_list, sample_rate, decks, master, transitions: [{index, transition, out_title, in_title, out_camelot, in_camelot, style, mixforge_bars, entry_bar, entry_time, hit_bar, nudge_beats, nudge_ms, nudge_source, reliable, ambiguity, alt_ms, doubts}], warnings, ignored_fx}",
+            always,
+            import::import_set
         ),
         cmd!(
             query "dj.transitions",
@@ -159,11 +170,6 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     {
         return Err(bad(CMD, BAD_BEATS));
     }
-    /// Where the beat times come from.
-    enum Beats {
-        List(Vec<f64>),
-        Constant { bpm: f64, first: f64 },
-    }
     // mixforge runs before the import too, so a failed analysis leaves no clip behind.
     let mut analysis = None;
     let source = match (given, bpm) {
@@ -178,14 +184,60 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     };
     let at_bar = i64_or(p, "at_bar", 1).clamp(-10_000, 100_000);
     let target = track_param(e, CMD, p, "track")?;
+    let from_beat = p.get("from_beat").and_then(Value::as_f64);
+    let placed = place_warped(e, CMD, &path, source, at_bar, target, from_beat)?;
+    let mut out = json!({"track": placed.track, "clip": placed.clip, "start": placed.start, "length": placed.length, "beats": placed.beats, "anchor": placed.anchor, "downbeat_bar": placed.downbeat_bar});
+    if let (Some(a), Some(o)) = (analysis, out.as_object_mut()) {
+        for k in ["bpm", "key", "camelot", "lufs", "stale_cache"] {
+            o.insert(k.to_string(), a.get(k).cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(out)
+}
+
+/// Where a beat-locked track's beat times come from.
+pub(super) enum Beats {
+    /// Analysed beat times (seconds, the first a downbeat).
+    List(Vec<f64>),
+    /// A constant tempo from a first downbeat (seconds).
+    Constant { bpm: f64, first: f64 },
+}
+
+/// A beat-locked clip [`place_warped`] put on the timeline.
+pub(super) struct Placed {
+    /// The track it is on (as the import reported it).
+    pub track: Value,
+    pub clip: ClipId,
+    pub start: Samples,
+    pub length: Samples,
+    /// Session beats the clip lasts.
+    pub beats: f64,
+    pub anchor: f64,
+    /// Bar its first downbeat plays on.
+    pub downbeat_bar: i64,
+}
+
+/// Imports the audio file at `path` beat-locked on `at_bar` (on track `target`, else a new one),
+/// its beats from `source`; `from_beat` as for `dj.load_warped`. Errors name command `cmd`; a
+/// failure after the import is rolled back by `Engine::execute`.
+pub(super) fn place_warped(
+    e: &mut Engine,
+    cmd: &str,
+    path: &str,
+    source: Beats,
+    at_bar: i64,
+    target: Option<TrackId>,
+    from_beat: Option<f64>,
+) -> Result<Placed> {
+    const BAD_BEATS: &str = "`beats` must be at least two finite, non-negative, strictly increasing times";
     let sr = e.session().sample_rate;
     let start_tick = e.session().tempo.bar_start_tick(at_bar);
     let at = e.session().tempo.tick_to_samples(start_tick, sr);
 
-    let bytes = crate::io::read_file(&path)?;
-    let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
-    let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?;
-    let clip = r.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "import placed no clip"))?;
+    let bytes = crate::io::read_file(path)?;
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
+    let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path), target, at)?;
+    let clip = r.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(cmd, "import placed no clip"))?;
     let frames = r.get("frames").and_then(Value::as_i64).unwrap_or(0);
 
     // Beat times in seconds of the source-pool audio (the import resampled the file to the
@@ -200,24 +252,17 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     };
     let per_bar = i64::from(e.session().tempo.meter_at_tick(start_tick).numerator.max(1));
-    let from_beat = p.get("from_beat").and_then(Value::as_f64);
-    let (warp, track_beats) = grid(&secs, rate, frames, per_bar, from_beat).ok_or_else(|| bad(CMD, BAD_BEATS))?;
+    let (warp, track_beats) = grid(&secs, rate, frames, per_bar, from_beat).ok_or_else(|| bad(cmd, BAD_BEATS))?;
     let anchor = warp.anchor;
     // The clip lasts until the file's last sample, counted in session beats from its start.
     let end_tick = start_tick.saturating_add((track_beats * TICKS_PER_QUARTER as f64) as i64);
     let length = e.session().tempo.tick_to_samples(end_tick, sr).saturating_sub(at).max(1);
     let downbeat_bar = at_bar.saturating_add((-anchor / per_bar as f64).ceil().clamp(-1e9, 1e9) as i64);
     let s = e.session_mut();
-    let c = s.find_clip_mut(clip).ok_or_else(|| bad(CMD, "imported clip vanished"))?;
+    let c = s.find_clip_mut(clip).ok_or_else(|| bad(cmd, "imported clip vanished"))?;
     c.warp = Some(warp);
     c.length = length;
-    let mut out = json!({"track": r.get("track"), "clip": clip, "start": at, "length": length, "beats": track_beats, "anchor": anchor, "downbeat_bar": downbeat_bar});
-    if let (Some(a), Some(o)) = (analysis, out.as_object_mut()) {
-        for k in ["bpm", "key", "camelot", "lufs", "stale_cache"] {
-            o.insert(k.to_string(), a.get(k).cloned().unwrap_or(Value::Null));
-        }
-    }
-    Ok(out)
+    Ok(Placed { track: r.get("track").cloned().unwrap_or(Value::Null), clip, start: at, length, beats: track_beats, anchor, downbeat_bar })
 }
 
 /// The mixforge sidecar: prints one JSON object with a file's analysis, or `{error}`.

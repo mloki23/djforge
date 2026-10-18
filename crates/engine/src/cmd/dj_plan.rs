@@ -1,9 +1,6 @@
 //! mixforge's set plan (`plan.json`): the tracks of a set in play order, with their beat grids,
 //! cue points and the transition into the next one. [`parse_plan`] reads and validates it.
 
-// Read by the set import (`dj.import_set`), which comes next.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde_json::{Map, Value};
 use soundcraft_model::{MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, TransitionStyle};
 
