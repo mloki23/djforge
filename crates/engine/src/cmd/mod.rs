@@ -12,7 +12,7 @@ mod clap;
 mod clip;
 mod clip_list;
 mod clip_more;
-mod dj;
+pub(crate) mod dj;
 mod edit;
 mod edit_more;
 mod event;

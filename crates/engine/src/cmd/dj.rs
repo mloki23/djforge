@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{MAX_WARP_BEATS, WarpMap};
+use soundcraft_model::{MAX_WARP_BEATS, Session, WarpLock, WarpMap};
 use soundcraft_time::TICKS_PER_QUARTER;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -131,4 +131,133 @@ fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     s.tempo.set_tempo(end, b).map_err(|err| bad(CMD, err.to_string()))?;
     Ok(json!({"from_tick": start, "to_tick": end, "steps": steps}))
+}
+
+/// Keeps every beat-locked clip on its music after an edit.
+///
+/// A tempo change moves each clip so it starts and ends on the same session beats as before. A
+/// trim or split (the source offset changed) and any tempo change move the anchor by the beats
+/// the clip start moved, so the beat heard at every session beat stays the same. A plain move
+/// changes neither, so the music moves with the clip. Clips without a recorded lock just get one.
+pub(crate) fn relock(s: &mut Session, tempo_changed: bool) {
+    let sr = s.sample_rate;
+    let tempo = s.tempo.clone();
+    let tpq = TICKS_PER_QUARTER as f64;
+    let beat_at = |t: Samples| tempo.samples_to_ticks_f(t, sr) / tpq;
+    let at_beat = |b: f64| tempo.tick_to_samples((b * tpq).round() as i64, sr);
+    for tr in &mut s.tracks {
+        let Some(pl) = tr.playlist_mut() else { continue };
+        let mut moved = false;
+        for c in &mut pl.clips {
+            let Some(prev) = c.warp.as_ref().map(|w| w.lock) else { continue };
+            let offset = c.source_offset();
+            let mut shift = 0.0;
+            if let Some(lock) = prev {
+                if tempo_changed {
+                    let start = at_beat(lock.start_beat);
+                    moved |= start != c.start;
+                    c.length = at_beat(lock.end_beat).saturating_sub(start).max(1);
+                    c.start = start;
+                    c.clamp_fades();
+                }
+                if tempo_changed || offset != lock.offset {
+                    shift = beat_at(c.start) - lock.start_beat;
+                }
+            }
+            let lock = WarpLock { start_beat: beat_at(c.start), end_beat: beat_at(c.end()), offset };
+            if let Some(w) = c.warp.as_mut() {
+                w.anchor += shift;
+                w.lock = Some(lock);
+            }
+        }
+        if moved {
+            pl.sort();
+        }
+    }
+}
+
+/// True when any clip in the session is beat-locked.
+pub(crate) fn has_warped(s: &Session) -> bool {
+    s.tracks.iter().filter_map(|t| t.playlist()).any(|p| p.clips.iter().any(|c| c.warp.is_some()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::edit as ops;
+    use soundcraft_audio_io::{AudioBuffer, FileFormat};
+    use soundcraft_model::{ChannelFormat, Clip, TrackKind};
+
+    const SR: i64 = 48_000;
+
+    /// A 30 s source with a 125 bpm beat list (a beat every 0.48 s from 0.1 s), played from 1 s
+    /// for 20 s at the session's 120 bpm, with its lock recorded.
+    fn warped() -> (Engine, TrackId, ClipId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.1; 30 * SR as usize]] };
+        let src = crate::io::add_source(&mut s, "src", buf, None, FileFormat::Wav);
+        let id = s.new_clip_id();
+        let mut c = Clip::audio(id, "c", src, 0, SR, 20 * SR);
+        c.warp = WarpMap::new((0..60).map(|k| 4_800.0 + k as f64 * 23_040.0).collect(), -1.0);
+        ops::place_clip(&mut s, t, c);
+        relock(&mut s, false);
+        (Engine::new(s), t, id)
+    }
+
+    /// Source sample heard at timeline sample `t` from whichever clip holds `t` (after a split too).
+    fn heard(e: &Engine, t: Samples) -> f64 {
+        let s = e.session();
+        let c = s.tracks.iter().filter_map(|tr| tr.playlist()).flat_map(|p| p.clips.iter()).find(|c| c.range().contains(t)).unwrap();
+        c.warp.as_ref().unwrap().source_at_time(&s.tempo, s.sample_rate, c.start, t)
+    }
+
+    /// (start, length, source offset) of every clip on the session's tracks.
+    fn clips(e: &Engine) -> Vec<(Samples, Samples, Samples)> {
+        let s = e.session();
+        s.tracks.iter().filter_map(|tr| tr.playlist()).flat_map(|p| p.clips.iter()).map(|c| (c.start, c.length, c.source_offset())).collect()
+    }
+
+    #[test]
+    fn trimming_the_start_keeps_the_music() {
+        let (mut e, _, id) = warped();
+        let before = heard(&e, 5 * SR);
+        e.execute("edit.trim_clip", &json!({"clip": id.0, "start": 3 * SR})).unwrap();
+        assert_eq!(clips(&e), vec![(3 * SR, 18 * SR, 2 * SR)]);
+        assert!((heard(&e, 5 * SR) - before).abs() < 1.0);
+    }
+
+    #[test]
+    fn splitting_keeps_the_music() {
+        let (mut e, t, _) = warped();
+        let (first, before) = (heard(&e, 3 * SR), heard(&e, 8 * SR));
+        e.execute("edit.separate", &json!({"tracks": [t.0], "at": 6 * SR})).unwrap();
+        assert_eq!(clips(&e), vec![(SR, 5 * SR, 0), (6 * SR, 15 * SR, 5 * SR)]);
+        assert!((heard(&e, 3 * SR) - first).abs() < 1.0);
+        assert!((heard(&e, 8 * SR) - before).abs() < 1.0);
+    }
+
+    #[test]
+    fn moving_a_clip_moves_the_music() {
+        let (mut e, _, id) = warped();
+        let before = heard(&e, 5 * SR);
+        e.execute("edit.move_clips", &json!({"clips": [id.0], "by": SR / 2})).unwrap();
+        assert_eq!(clips(&e), vec![(SR + SR / 2, 20 * SR, 0)]);
+        assert!((heard(&e, 5 * SR + SR / 2) - before).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_tempo_change_keeps_clips_on_their_beats() {
+        let (mut e, _, id) = warped();
+        let at_beat = |e: &Engine, b: f64| e.session().tempo.tick_to_samples((b * TICKS_PER_QUARTER as f64) as i64, e.session().sample_rate);
+        let before = heard(&e, at_beat(&e, 10.0));
+        let end_before = e.session().tempo.samples_to_ticks_f(e.session().find_clip(id).unwrap().1.end(), e.session().sample_rate);
+        e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
+        assert_ne!(e.session().find_clip(id).unwrap().1.start, SR, "the tempo change did not move the clip");
+        assert!((heard(&e, at_beat(&e, 10.0)) - before).abs() < 2.0);
+        let s = e.session();
+        let end_after = s.tempo.samples_to_ticks_f(s.find_clip(id).unwrap().1.end(), s.sample_rate);
+        assert!((end_after - end_before).abs() < 2.0, "clip end moved from tick {end_before} to {end_after}");
+    }
 }
