@@ -7,11 +7,11 @@
 //!
 //! Latency: the stretcher delays its output by `input_latency` (source frames) plus
 //! `output_latency` (output frames). The player reads ahead by both, so the audio heard at
-//! timeline sample `t` is the source at `source_at(beat(t))`.
+//! timeline sample `t` is the source at [`soundcraft_model::WarpMap::source_at_time`].
 
-use soundcraft_model::{Clip, ClipContent, Session, WarpMap};
+use soundcraft_model::{Clip, ClipContent, Session};
 use soundcraft_stretch::{Quality, Stretcher};
-use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
+use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
 
 /// Per-clip playback state, kept across blocks by the strip that plays the clip.
@@ -43,16 +43,6 @@ impl WarpPlayer {
             next_src: 0.0,
         })
     }
-}
-
-/// Fractional session beat (quarter notes) at timeline sample `t`.
-fn beat_at(s: &Session, t: Samples) -> f64 {
-    s.tempo.samples_to_ticks_f(t, s.sample_rate) / TICKS_PER_QUARTER as f64
-}
-
-/// Source position that should be heard at timeline sample `t`.
-fn source_at(s: &Session, warp: &WarpMap, clip_beat0: f64, t: Samples) -> f64 {
-    warp.source_at(beat_at(s, t) - clip_beat0 + warp.anchor)
 }
 
 /// Copies source frames `[start, start + n)` of every channel into `dst`, silence outside the file.
@@ -88,10 +78,9 @@ pub(crate) fn render_warped(s: &Session, clip: &Clip, pos: Samples, frames: usiz
             None => return,
         },
     };
-    let clip_beat0 = beat_at(s, clip.start);
     let lat_in = player.st.input_latency() as f64;
     let lat_out = player.st.output_latency() as i64;
-    let feed = |t: Samples| source_at(s, warp, clip_beat0, t.saturating_add(lat_out)) + lat_in;
+    let feed = |t: Samples| warp.source_at_time(&s.tempo, s.sample_rate, clip.start, t.saturating_add(lat_out)) + lat_in;
 
     let mut t = isect.start;
     while t < isect.end {
