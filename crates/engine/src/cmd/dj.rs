@@ -44,7 +44,36 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             crossfade
         ),
+        cmd!(
+            "dj.nudge",
+            "Nudge Beat-Locked Track",
+            [],
+            None,
+            "{clip, ms: -1000..=1000} — plays the clip's music `ms` later (negative: earlier), keeping it beat-locked",
+            always,
+            nudge
+        ),
     ]
+}
+
+/// Shifts a beat-locked clip's music by `ms` (positive: later) without moving the clip: the anchor
+/// moves by the session beats `ms` spans at the tempo of the clip start. Across a tempo ramp the
+/// shift in milliseconds therefore varies slightly along the clip; it stays constant in beats.
+fn nudge(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "dj.nudge";
+    let id = p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "`clip` required"))?;
+    let ms =
+        p.get("ms").and_then(Value::as_f64).filter(|m| m.is_finite() && m.abs() <= 1000.0).ok_or_else(|| bad(CMD, "`ms` must be -1000..=1000"))?;
+    let s = e.session();
+    let c = s.find_clip(id).map(|(_, c)| c).ok_or_else(|| bad(CMD, format!("no clip {}", id.0)))?;
+    if c.warp.is_none() || !c.is_audio() {
+        return Err(bad(CMD, "the clip is not beat-locked"));
+    }
+    let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(c.start, s.sample_rate));
+    let beats = ms / 1000.0 * bpm / 60.0;
+    let w = e.session_mut().find_clip_mut(id).and_then(|c| c.warp.as_mut()).ok_or_else(|| bad(CMD, "the clip is not beat-locked"))?;
+    w.anchor -= beats;
+    Ok(json!({"clip": id, "anchor": w.anchor, "beats": -beats}))
 }
 
 fn crossfade(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -611,6 +640,24 @@ mod tests {
         assert!(e.redo());
         assert_eq!(clips(&e), at_140.0);
         assert!(*e.session() == at_140.1);
+    }
+
+    #[test]
+    fn nudge_moves_the_music_later_by_ms() {
+        let (mut e, _, id) = warped();
+        let before = heard(&e, 5 * SR);
+        e.execute("dj.nudge", &json!({"clip": id.0, "ms": 10.0})).unwrap();
+        // 10 ms later at 48 kHz: what played at 5 s now plays 480 samples later.
+        assert!((heard(&e, 5 * SR + 480) - before).abs() < 1.0);
+        // The relock pass leaves the nudge alone, and it undoes as one step.
+        assert_eq!(clips(&e), vec![(SR, 20 * SR, 0)]);
+        e.execute("dj.nudge", &json!({"clip": id.0, "ms": -10.0})).unwrap();
+        assert!((heard(&e, 5 * SR) - before).abs() < 1.0);
+        let rev = e.session().clone();
+        assert!(e.execute("dj.nudge", &json!({"clip": id.0, "ms": f64::NAN})).is_err());
+        assert!(e.execute("dj.nudge", &json!({"clip": id.0, "ms": 1500.0})).is_err());
+        assert!(e.execute("dj.nudge", &json!({"clip": 9999, "ms": 5.0})).is_err());
+        assert!(*e.session() == rev);
     }
 
     #[test]
