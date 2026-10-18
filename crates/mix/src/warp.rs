@@ -56,11 +56,6 @@ impl WarpPlayer {
     pub fn is_prepared(&self) -> bool {
         self.prepared
     }
-
-    /// Source channels the player was built for.
-    pub fn channels(&self) -> usize {
-        self.input.len()
-    }
 }
 
 /// A warp player built off the audio thread for a clip, handed over with the session snapshot.
@@ -74,6 +69,11 @@ impl PreparedWarp {
     /// Builds the stretcher now (allocates; call off the audio thread).
     pub fn new(track: TrackId, clip: ClipId, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
         Some(PreparedWarp { track, clip, player: WarpPlayer::build(channels, sample_rate, true)? })
+    }
+
+    /// The clip the player is for.
+    pub fn clip(&self) -> ClipId {
+        self.clip
     }
 }
 

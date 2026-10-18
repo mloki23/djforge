@@ -497,29 +497,45 @@ impl MixEngine {
         out
     }
 
-    /// Warp players built off the audio thread for the snapshot about to play; the next
-    /// `render` places them in their strips. Like [`MixEngine::adopt`], this runs when the
-    /// session snapshot changes, not per block.
-    pub fn adopt_warps(&mut self, warps: Vec<PreparedWarp>) {
-        if self.warp_inbox.is_empty() {
-            // Take the host's allocation instead of growing ours on the audio thread.
-            self.warp_inbox = warps;
-        } else {
-            self.warp_inbox.extend(warps);
+    /// Warp players built off the audio thread; the next `render` places them in their strips.
+    /// Like [`MixEngine::adopt`], this runs when the session snapshot changes, not per block.
+    ///
+    /// Neither allocates nor frees: it returns a `Vec` (empty, perhaps with capacity) for the
+    /// host to drop off the audio thread. The incoming batch becomes the inbox when the inbox is
+    /// empty; otherwise the two are merged into whichever has room. A host that sends batches
+    /// with spare capacity (see the playback crate) never hits the last resort, where the batch
+    /// is retired and its clips fall back to building a player when they play.
+    pub fn adopt_warps(&mut self, mut warps: Vec<PreparedWarp>) -> Vec<PreparedWarp> {
+        if warps.is_empty() {
+            return warps;
         }
+        if self.warp_inbox.is_empty() {
+            return std::mem::replace(&mut self.warp_inbox, warps);
+        }
+        if self.warp_inbox.capacity() - self.warp_inbox.len() >= warps.len() {
+            self.warp_inbox.append(&mut warps);
+            return warps;
+        }
+        if warps.capacity() - warps.len() >= self.warp_inbox.len() {
+            warps.append(&mut self.warp_inbox);
+            return std::mem::replace(&mut self.warp_inbox, warps);
+        }
+        self.retired_warps.extend(warps.drain(..).map(|w| w.player));
+        warps
     }
 
-    /// Takes the players of clips that are no longer on their strip's track (deleted, moved to
-    /// another track, or warp turned off), for dropping off the audio thread. Runs on snapshot
-    /// changes, like `sync`, not per block.
+    /// Takes the players of clips that no longer play on their strip's track (deleted, moved to
+    /// another track, muted, warp turned off, or the track made inactive or not an audio track:
+    /// see [`warp_clip_plays`]), for dropping off the audio thread. Runs on snapshot changes,
+    /// like `sync`, not per block.
     pub fn retire_stale_warps(&mut self, s: &Session) {
         for (id, st) in self.strips.iter_mut() {
             if st.warps.is_empty() {
                 continue;
             }
-            let clips = s.track(*id).and_then(Track::playlist).map_or(&[][..], |pl| pl.clips.as_slice());
-            let live = |cid: u64| clips.iter().any(|c| c.id.0 == cid && c.warp.is_some());
-            self.retired_warps.extend(st.warps.extract_if(|cid, _| !live(*cid)).map(|(_, p)| p));
+            let track = s.track(*id);
+            let plays = |cid: u64| track.is_some_and(|t| t.clips().iter().any(|c| c.id.0 == cid && warp_clip_plays(t, c)));
+            self.retired_warps.extend(st.warps.extract_if(|cid, _| !plays(*cid)).map(|(_, p)| p));
         }
     }
 
@@ -540,17 +556,23 @@ impl MixEngine {
         out
     }
 
+    /// The warp players in the strips, by track and clip id.
+    pub fn warp_players(&self) -> impl Iterator<Item = (TrackId, u64, &WarpPlayer)> {
+        self.strips.iter().flat_map(|(t, st)| st.warps.iter().map(move |(c, p)| (*t, *c, p)))
+    }
+
     /// Moves handed-over warp players into their strips. A player it replaces, or one whose
-    /// track is gone, is retired rather than dropped here (the audio thread).
-    fn place_warps(&mut self) {
+    /// clip no longer plays there, is retired rather than dropped here (the audio thread).
+    fn place_warps(&mut self, s: &Session) {
         for w in self.warp_inbox.drain(..) {
+            let plays = s.track(w.track).is_some_and(|t| t.clips().iter().any(|c| c.id == w.clip && warp_clip_plays(t, c)));
             match self.strips.get_mut(&w.track) {
-                Some(st) => {
+                Some(st) if plays => {
                     if let Some(old) = st.warps.insert(w.clip.0, w.player) {
                         self.retired_warps.push(old);
                     }
                 }
-                None => self.retired_warps.push(w.player),
+                _ => self.retired_warps.push(w.player),
             }
         }
     }
@@ -698,7 +720,7 @@ impl MixEngine {
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
         if !self.warp_inbox.is_empty() {
-            self.place_warps();
+            self.place_warps(s);
         }
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
@@ -1481,6 +1503,12 @@ mod click {
     fn note_hz(note: f64) -> f64 {
         soundcraft_dsp::midi_to_hz(note.clamp(0.0, 127.0))
     }
+}
+
+/// True when `render` would play clip `c` of track `t` through a warp player: an unmuted audio
+/// clip with a usable warp map, on an active audio track. Hosts build players only for these.
+pub fn warp_clip_plays(t: &Track, c: &Clip) -> bool {
+    t.kind == TrackKind::Audio && !t.inactive && !c.muted && c.is_audio() && c.warp.as_ref().is_some_and(|w| w.is_usable())
 }
 
 /// Plays a clip: beat-locked through its warp player when it has a warp map, else directly.
@@ -2471,6 +2499,37 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.clear();
         eng.retire_stale_warps(&s);
         assert_eq!(eng.take_retired_warps().len(), 1);
+    }
+
+    #[test]
+    fn a_replaced_or_unplayable_warp_player_is_retired_not_dropped() {
+        let mut s = Session::default();
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]] })));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        let mut c = Clip::audio(id, "c", SourceId(900), 0, 0, 48_000);
+        c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        let player = || PreparedWarp::new(t, id, 1, 48_000.0).unwrap();
+        // Two batches before a render merge into one inbox (the second has room for the first).
+        let mut batch = Vec::with_capacity(4);
+        batch.push(player());
+        assert_eq!(eng.adopt_warps(vec![player()]).len(), 0);
+        assert_eq!(eng.adopt_warps(batch).capacity(), 1, "the old inbox comes back to the host");
+        eng.render(&s, 0, 512, &mut out);
+        assert_eq!(eng.take_retired_warps().len(), 1, "the second player for the clip replaces the first");
+        assert!(eng.warp_players().all(|(_, _, p)| p.is_prepared()));
+        // A player for a muted clip is not placed.
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].muted = true;
+        eng.adopt_warps(vec![player()]);
+        eng.render(&s, 512, 512, &mut out);
+        assert_eq!(eng.take_retired_warps().len(), 1);
+        // Muting retires the clip's player too.
+        eng.retire_stale_warps(&s);
+        assert_eq!(eng.take_retired_warps().len(), 1);
+        assert_eq!(eng.warp_players().count(), 0);
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {
