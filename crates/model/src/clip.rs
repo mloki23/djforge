@@ -284,6 +284,21 @@ impl Clip {
         self.fade_out.len = self.fade_out.len.clamp(0, self.length);
     }
 
+    /// Resize to `length`, stretching what is pinned inside the clip with it: gain breakpoints,
+    /// fade lengths and the sync point (for a beat-locked clip whose beats grew or shrank).
+    pub fn rescale_to(&mut self, length: Samples) {
+        let length = length.clamp(1, MAX_POSITION);
+        let k = length as f64 / self.length.max(1) as f64;
+        let scale = |x: Samples| ((x as f64 * k).round() as Samples).clamp(-MAX_POSITION, MAX_POSITION);
+        self.gain_env.iter_mut().for_each(|(t, _)| *t = scale(*t));
+        self.fade_in.len = scale(self.fade_in.len);
+        self.fade_out.len = scale(self.fade_out.len);
+        self.sync_point = scale(self.sync_point);
+        self.length = length;
+        self.drop_stray_sync();
+        self.clamp_fades();
+    }
+
     /// A sync point (0 means none) that a trim left outside the clip no longer marks anything.
     fn drop_stray_sync(&mut self) {
         if !(0..self.length).contains(&self.sync_point) {
@@ -489,5 +504,17 @@ mod tests {
         c.fade_out = Fade { len: 800, shape: FadeShape::Linear, curvature: 0.0 };
         c.trim_start_to(900);
         assert!(c.fade_out.len <= c.length);
+    }
+
+    #[test]
+    fn rescaling_stretches_what_is_pinned_inside() {
+        let mut c = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, 1000);
+        c.gain_env = vec![(0, 0.0), (500, -6.0), (1000, 0.0)];
+        c.fade_in = Fade { len: 100, shape: FadeShape::Linear, curvature: 0.0 };
+        c.fade_out = Fade { len: 200, shape: FadeShape::Linear, curvature: 0.0 };
+        c.sync_point = 400;
+        c.rescale_to(500);
+        assert_eq!(c.gain_env, vec![(0, 0.0), (250, -6.0), (500, 0.0)]);
+        assert_eq!((c.length, c.fade_in.len, c.fade_out.len, c.sync_point), (500, 50, 100, 200));
     }
 }

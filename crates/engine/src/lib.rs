@@ -332,10 +332,11 @@ impl Engine {
         }
         match result {
             Ok(v) => {
-                if !Arc::ptr_eq(&before, &self.doc) && cmd::dj::has_warped(&self.doc) {
-                    let tempo_changed = before.tempo != self.doc.tempo;
-                    if cmd::dj::relock_needed(&self.doc, tempo_changed) {
-                        cmd::dj::relock(self.session_mut(), tempo_changed);
+                if !Arc::ptr_eq(&before, &self.doc) {
+                    // Beat-locked clips follow the edit; the document is touched only if one moves.
+                    let relocks = cmd::dj::relocks(&self.doc, &before.tempo);
+                    if !relocks.is_empty() {
+                        cmd::dj::apply_relocks(self.session_mut(), &relocks);
                     }
                 }
                 cmd::remember_selection(self, &before);

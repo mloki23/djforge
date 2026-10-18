@@ -1,6 +1,6 @@
 //! Beat-locked playback: a clip whose source follows the session tempo map beat for beat.
 
-use soundcraft_time::{SampleRate, Samples, TICKS_PER_QUARTER, TempoMap};
+use soundcraft_time::{MAX_POSITION, SampleRate, Samples, TICKS_PER_QUARTER, TempoMap};
 
 /// Most beats a warp map may hold (a 30-minute track at 200 bpm has 6 000).
 pub const MAX_WARP_BEATS: usize = 20_000;
@@ -20,13 +20,18 @@ pub struct WarpMap {
     pub lock: Option<WarpLock>,
 }
 
-/// Where a warped clip sat after the last edit, so the next edit can keep its music in place:
-/// session beats of its edges and its source offset (which trims and splits move, moves don't).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Where a warped clip sat after the last edit, so the next edit can keep its music in place: its
+/// start and length (timeline samples, under the tempo map of that moment) and its source offset
+/// (which trims, splits and copies of a part move, moves don't). A lock missing a field (from an
+/// older file) reads as empty and is dropped by [`WarpMap::sanitize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WarpLock {
-    pub start_beat: f64,
-    pub end_beat: f64,
-    pub offset: i64,
+    #[serde(default)]
+    pub start: Samples,
+    #[serde(default)]
+    pub length: Samples,
+    #[serde(default)]
+    pub offset: Samples,
 }
 
 impl WarpMap {
@@ -53,7 +58,7 @@ impl WarpMap {
         if !self.anchor.is_finite() {
             self.anchor = 0.0;
         }
-        if self.lock.is_some_and(|l| !(l.start_beat.is_finite() && l.end_beat.is_finite())) {
+        if self.lock.is_some_and(|l| l.length < 1 || l.length > MAX_POSITION || l.start.abs() > MAX_POSITION) {
             self.lock = None;
         }
     }
@@ -182,8 +187,11 @@ mod tests {
     fn lock_is_optional_in_files_and_sanitized() {
         let old: WarpMap = serde_json::from_str(r#"{"beats":[1.0,2.0],"anchor":0.0}"#).unwrap();
         assert_eq!(old.lock, None);
+        let mut older: WarpMap = serde_json::from_str(r#"{"beats":[1.0,2.0],"lock":{"start_beat":2.0,"end_beat":4.0,"offset":0}}"#).unwrap();
+        older.sanitize();
+        assert_eq!(older.lock, None);
         let mut w = WarpMap::new(vec![1.0, 2.0], 0.0).unwrap();
-        w.lock = Some(WarpLock { start_beat: f64::NAN, end_beat: 4.0, offset: 0 });
+        w.lock = Some(WarpLock { start: 0, length: 0, offset: 0 });
         w.sanitize();
         assert_eq!(w.lock, None);
     }
