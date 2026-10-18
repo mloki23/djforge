@@ -13,7 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track Beat-Locked",
             [],
             None,
-            "{path, bpm, first_beat: seconds of the first analysed beat, at_bar?: 1 (session bar the clip starts on), from_beat?: track beat playing at the clip start (default: the whole beat at or before the start of the file, negative when the file has audio before first_beat), track?} — imports an audio file whose beat grid follows the session tempo map in realtime, pitch preserved",
+            "{path, beats?: [seconds, first a downbeat] | bpm + first_beat (seconds of a downbeat), at_bar?: 1 (the clip starts on this bar; the first downbeat lands on the first bar line at or after the file start), from_beat?: track beat playing at the clip start, track?} — imports an audio file whose beat grid follows the session tempo map in realtime, pitch preserved",
             always,
             load_warped
         ),
@@ -63,14 +63,30 @@ fn crossfade(e: &mut Engine, p: &Value) -> Result<Value> {
 
 fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.load_warped";
+    const BAD_BEATS: &str = "`beats` must be at least two finite, non-negative, strictly increasing times";
     let path = str_param(p, "path").ok_or_else(|| bad(CMD, "`path` required"))?.to_string();
-    let bpm = f64_or(p, "bpm", f64::NAN);
-    if !(bpm.is_finite() && (20.0..=400.0).contains(&bpm)) {
+    let given: Option<Vec<f64>> = match p.get("beats") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_array().and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>()).ok_or_else(|| bad(CMD, BAD_BEATS))?),
+    };
+    let bpm = p.get("bpm").and_then(Value::as_f64);
+    if let Some(b) = bpm
+        && !(b.is_finite() && (20.0..=400.0).contains(&b))
+    {
         return Err(bad(CMD, "`bpm` must be 20..=400"));
     }
     let first_beat = f64_or(p, "first_beat", 0.0);
     if !(first_beat.is_finite() && (0.0..=600.0).contains(&first_beat)) {
         return Err(bad(CMD, "`first_beat` must be 0..=600 seconds"));
+    }
+    // Refuse a bad list before importing, so it leaves no clip behind.
+    if let Some(b) = &given
+        && grid(b, 48_000.0, i64::MAX / 4, 4, None).is_none()
+    {
+        return Err(bad(CMD, BAD_BEATS));
+    }
+    if given.is_none() && bpm.is_none() {
+        return Err(bad(CMD, "pass `beats` or `bpm`"));
     }
     let at_bar = i64_or(p, "at_bar", 1).clamp(-10_000, 100_000);
     let target = track_param(e, CMD, p, "track")?;
@@ -84,28 +100,59 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     let clip = r.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "import placed no clip"))?;
     let frames = r.get("frames").and_then(Value::as_i64).unwrap_or(0);
 
-    // Beat grid in source-pool samples (the import resampled the file to the session rate).
+    // Beat times in seconds of the source-pool audio (the import resampled the file to the
+    // session rate). A failure from here on is rolled back by `Engine::execute`.
     let rate = sr.as_f64();
-    let beat_len = 60.0 / bpm * rate;
-    let first = first_beat * rate;
-    let count = ((frames as f64 - first) / beat_len).ceil().max(2.0) as usize + 1;
-    let beats: Vec<f64> = (0..count.min(MAX_WARP_BEATS)).map(|i| first + i as f64 * beat_len).collect();
-    let anchor = match p.get("from_beat").and_then(Value::as_f64) {
-        Some(b) if b.is_finite() => b,
-        // Whole beats back from the first beat, so the track's beats land on session beats; the
-        // file's first sample then plays slightly after the clip start.
-        _ => -(first / beat_len).ceil(),
+    let secs: Vec<f64> = match (given, bpm) {
+        (Some(b), _) => b,
+        (None, Some(bpm)) => {
+            let beat = 60.0 / bpm;
+            let n = ((frames as f64 / rate - first_beat) / beat).ceil().max(1.0) as usize + 1;
+            (0..n.min(MAX_WARP_BEATS)).map(|i| first_beat + i as f64 * beat).collect()
+        }
+        (None, None) => return Err(bad(CMD, "pass `beats` or `bpm`")),
     };
-    let warp = WarpMap::new(beats, anchor).ok_or_else(|| bad(CMD, "could not build a beat grid"))?;
+    let per_bar = i64::from(e.session().tempo.meter_at_tick(start_tick).numerator.max(1));
+    let from_beat = p.get("from_beat").and_then(Value::as_f64);
+    let (warp, track_beats) = grid(&secs, rate, frames, per_bar, from_beat).ok_or_else(|| bad(CMD, BAD_BEATS))?;
+    let anchor = warp.anchor;
     // The clip lasts until the file's last sample, counted in session beats from its start.
-    let track_beats = (frames as f64 - first) / beat_len - anchor;
-    let end_tick = start_tick.saturating_add((track_beats.max(0.0) * TICKS_PER_QUARTER as f64) as i64);
+    let end_tick = start_tick.saturating_add((track_beats * TICKS_PER_QUARTER as f64) as i64);
     let length = e.session().tempo.tick_to_samples(end_tick, sr).saturating_sub(at).max(1);
+    let downbeat_bar = at_bar.saturating_add((-anchor / per_bar as f64).ceil().clamp(-1e9, 1e9) as i64);
     let s = e.session_mut();
     let c = s.find_clip_mut(clip).ok_or_else(|| bad(CMD, "imported clip vanished"))?;
     c.warp = Some(warp);
     c.length = length;
-    Ok(json!({"track": r.get("track"), "clip": clip, "start": at, "length": length, "beats": track_beats, "anchor": anchor}))
+    Ok(
+        json!({"track": r.get("track"), "clip": clip, "start": at, "length": length, "beats": track_beats, "anchor": anchor, "downbeat_bar": downbeat_bar}),
+    )
+}
+
+/// The warp map for analysed beat times `secs` (seconds, `secs[0]` a downbeat) of a file of
+/// `frames` samples at `rate`, and how many session beats the clip lasts. By default the clip
+/// starts on a bar line and the first downbeat falls on the first bar line at or after the file
+/// start; `from_beat` overrides that. `None` unless the beats are finite, non-negative, strictly
+/// increasing and at least two.
+fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Option<f64>) -> Option<(WarpMap, f64)> {
+    if secs.len() < 2 || secs.len() > MAX_WARP_BEATS || !(rate.is_finite() && rate > 0.0) {
+        return None;
+    }
+    // Checked in samples, so times that overflow or collapse when scaled are refused too.
+    let beats: Vec<f64> = secs.iter().map(|s| s * rate).collect();
+    if !beats.iter().all(|b| b.is_finite() && *b >= 0.0) || !beats.windows(2).all(|w| w.first() < w.get(1)) {
+        return None;
+    }
+    let (first, second) = (*beats.first()?, *beats.get(1)?);
+    let per_bar = beats_per_bar.max(1) as f64;
+    let bar = (second - first) * per_bar;
+    let anchor = match from_beat {
+        Some(b) if b.is_finite() => b,
+        _ => -(first / bar).ceil() * per_bar,
+    };
+    let w = WarpMap::new(beats, anchor)?;
+    let track_beats = w.beat_at_source(frames as f64) - w.anchor;
+    track_beats.is_finite().then_some((w, track_beats.max(0.0)))
 }
 
 fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -253,6 +300,32 @@ mod tests {
     fn clips(e: &Engine) -> Vec<(Samples, Samples, Samples)> {
         let s = e.session();
         s.tracks.iter().filter_map(|tr| tr.playlist()).flat_map(|p| p.clips.iter()).map(|c| (c.start, c.length, c.source_offset())).collect()
+    }
+
+    #[test]
+    fn grid_from_a_beat_list_puts_the_first_downbeat_on_a_bar_line() {
+        // 120 bpm, first downbeat 0.5 s in: one bar of lead-in (4 beats) before it.
+        let secs: Vec<f64> = (0..40).map(|k| 0.5 + k as f64 * 0.5).collect();
+        let (w, beats) = grid(&secs, 48_000.0, 48_000 * 21, 4, None).unwrap();
+        assert_eq!(w.anchor, -4.0);
+        assert_eq!(w.beats[0], 24_000.0);
+        // The file ends at 21 s: 41 beats after the 0.5 s downbeat, plus the 4 lead-in beats.
+        assert!((beats - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_with_a_downbeat_at_the_file_start_needs_no_lead_in() {
+        let secs: Vec<f64> = (0..8).map(|k| k as f64 * 0.5).collect();
+        assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, None).unwrap().0.anchor, 0.0);
+        assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, Some(0.25)).unwrap().0.anchor, 0.25);
+    }
+
+    #[test]
+    fn hostile_beat_lists_are_refused() {
+        assert!(grid(&[1.0], 48_000.0, 48_000, 4, None).is_none());
+        assert!(grid(&[1.0, 1.0, 2.0], 48_000.0, 48_000, 4, None).is_none());
+        assert!(grid(&[f64::NAN, 1.0], 48_000.0, 48_000, 4, None).is_none());
+        assert!(grid(&[-1.0, 1.0], 48_000.0, 48_000, 4, None).is_none());
     }
 
     #[test]
