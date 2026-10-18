@@ -8,6 +8,8 @@ use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 
 #[path = "dj_align.rs"]
 mod align;
+#[path = "dj_recipe.rs"]
+pub(crate) mod recipe;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -64,6 +66,24 @@ pub fn specs() -> Vec<CommandSpec> {
             "{out_clip, in_clip} — measures how far the incoming clip's beats sit from the outgoing clip's across their overlap (at least 8 beats), from low/mid/high onset profiles folded onto the session beat; analyses the last 128 beats; returns {nudge_ms, nudge_beats (apply either with dj.nudge {clip: in_clip, ms | beats}), reliable, note (why not), ambiguity (second peak / best), score, agree (bands within 10 ms of it), bands (each band's own nudge_ms), overlap_beats, analysed_beats}. Changes nothing",
             always,
             align::suggest_nudge
+        ),
+        cmd!(
+            "dj.transition",
+            "Build Transition",
+            [],
+            None,
+            "{out_clip, in_clip} | {transition: id}, style?: blend|quick, build_bars?: 1..=256, out_bars?: 1..=256, entry_bar?, force?: bool — records the mix from `out_clip` into `in_clip` (entry_bar default: the first bar at or after the incoming clip's start; style default blend; bars default from the style, 16/8 blend, 8/4 quick, and a style given without bars brings its own) and writes its recipe: EQ 7-Band in insert slot a of both decks (inserted if the slot is empty), the incoming low shelf -24 dB at entry_bar to 0 at the hit (entry_bar + build_bars), the outgoing one 0 at the hit to -24 dB at the gone bar (hit + out_bars), an equal-power fade-in from the incoming clip's start to the hit and fade-out from the hit to the outgoing clip's end. Refuses a transition edited by hand unless `force`. Returns {transition, hit_bar, gone_bar, recipe: {entry, hit, gone, in_fade, out_fade, points}, eq_inserted}",
+            always,
+            recipe::transition
+        ),
+        cmd!(
+            query "dj.transitions",
+            "List Transitions",
+            [],
+            None,
+            "{} — every transition with its hit_bar and gone_bar. Changes nothing",
+            always,
+            recipe::transitions
         ),
     ]
 }
