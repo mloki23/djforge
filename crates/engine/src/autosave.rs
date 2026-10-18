@@ -447,6 +447,29 @@ mod tests {
     }
 
     #[test]
+    fn audio_referenced_in_place_is_not_copied_and_recovers_from_its_file() {
+        let dir = folder("autosave-in-place");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("track.wav");
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 4_800]] };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
+        std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        let mut e = Engine::default();
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let mut a = Autosave::create(&dir.join("Autosave"), "Untitled").unwrap();
+        a.write(e.session(), None, None).unwrap();
+        assert!(!a.dir.join("Audio Files").exists());
+        drop(a);
+        let left = leftovers(&dir.join("Autosave"));
+        let mut r = Engine::default();
+        assert_eq!(recover(&mut r, &left[0]).unwrap(), Vec::<String>::new());
+        let src = &r.session().sources[0];
+        assert_eq!((Path::new(&src.path), src.unsaved), (wav.as_path(), false));
+        assert_eq!(levels(&r), [0.5]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn saved_audio_is_referenced_and_takes_are_copied_once() {
         let dir = folder("autosave-copies");
         let path = dir.join("Song/Song.scraft");

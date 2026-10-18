@@ -163,8 +163,15 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     let s = e.session_mut();
     let session_rate = s.sample_rate.hz();
     let src = add_source(s, name, buf, path, info.format);
-    if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
-        sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);
+    // A file that plays as decoded (no resampling), from an absolute path whose extension is the
+    // one it was decoded as, is referenced where it is: saving the session does not copy it.
+    let ext_of = |p: &str| Path::new(p).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
+    let in_place = file_rate == session_rate && path.is_some_and(|p| Path::new(p).is_absolute() && ext_of(p) == ext);
+    if let Some(sx) = s.sources.last_mut() {
+        sx.unsaved = !in_place;
+        if let Some(bwf) = info.bwf.as_ref() {
+            sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);
+        }
     }
     let frames = s.source(src).map_or(0, |x| i64::try_from(x.frames).unwrap_or(0));
     let track = match target {
@@ -964,6 +971,9 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
             src.path = format!("Audio Files/{f}");
             continue;
         }
+        if !src.unsaved && !shared && referenced_in_place(Path::new(&src.path)) {
+            continue;
+        }
         let Some(audio) = s.pool.get(src.id) else { continue };
         if let Some(path) = files.get(&Arc::as_ptr(audio)) {
             src.path.clone_from(path);
@@ -1008,6 +1018,13 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     }
     replace_file(&tmp, &p, text.as_bytes())?;
     Ok((s, written, p))
+}
+
+/// True for an existing file at an absolute path outside every `Audio Files` folder, such as an
+/// imported library file: the session references it where it is. Audio in an `Audio Files`
+/// folder belongs to the session (or recording folder) that wrote it, and is trusted only there.
+fn referenced_in_place(p: &Path) -> bool {
+    p.is_absolute() && p.parent().and_then(Path::file_name).is_none_or(|d| d != "Audio Files") && p.is_file()
 }
 
 /// Write `bytes` to `tmp`, flush it to disk and rename it over `file`, so `file` holds either the
@@ -2023,5 +2040,108 @@ mod bundle_tests {
         write_file(&p.to_string_lossy(), b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    /// A fresh temp folder for one test.
+    fn folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("soundcraft-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A one-second mono 32-bit float WAV at `rate` in `dir`: its absolute path and samples.
+    fn library_wav(dir: &Path, rate: u32) -> (String, Vec<f32>) {
+        let samples: Vec<f32> = (0..rate).map(|i| ((i % 100) as f32 / 100.0 - 0.5) * 0.5).collect();
+        let buf = AudioBuffer { sample_rate: rate, channels: vec![samples.clone()] };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("track.wav");
+        std::fs::write(&path, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        (path.to_string_lossy().into_owned(), samples)
+    }
+
+    fn session_at(rate: u32) -> Engine {
+        let mut e = Engine::default();
+        e.execute("session.new", &json!({"sample_rate": rate})).unwrap();
+        e
+    }
+
+    fn stored(session: &str) -> Session {
+        Session::from_json(&std::fs::read_to_string(session).unwrap()).unwrap()
+    }
+
+    fn reopen(path: &str) -> Engine {
+        let mut r = Engine::default();
+        assert_eq!(open_session(&mut r, path).unwrap(), Vec::<String>::new());
+        r
+    }
+
+    fn first_audio(e: &Engine) -> Vec<f32> {
+        let s = e.session();
+        s.pool.get(s.sources[0].id).unwrap().buffer.channels[0].clone()
+    }
+
+    #[test]
+    fn sessions_at_the_source_rate_keep_audio_referenced_in_place() {
+        let dir = folder("in-place");
+        let (wav, audio) = library_wav(&dir.join("Library"), 44_100);
+        let mut e = session_at(44_100);
+        e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 0);
+        assert!(!dir.join("Set/Audio Files").exists());
+        let saved = stored(&path);
+        assert_eq!((saved.sources[0].path.as_str(), saved.sources[0].unsaved), (wav.as_str(), false));
+        assert!(Path::new(&saved.sources[0].path).is_absolute());
+        let mut r = reopen(&path);
+        assert_eq!(first_audio(&r), audio);
+        // The absolute path still finds the audio from another folder, and is not copied there.
+        let moved = dir.join("Moved/Moved.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut r, &moved).unwrap(), 0);
+        assert!(!dir.join("Moved/Audio Files").exists());
+        assert_eq!(first_audio(&reopen(&moved)), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resampled_imports_are_copied_into_the_session() {
+        let dir = folder("in-place-48k");
+        let (wav, _) = library_wav(&dir.join("Library"), 44_100);
+        let mut e = session_at(48_000);
+        e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        assert_eq!(std::fs::read_dir(dir.join("Set/Audio Files")).unwrap().count(), 1);
+        assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
+        assert_eq!(first_audio(&reopen(&path)).len(), 48_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_of_referenced_audio_is_saved_into_the_session_and_leaves_the_file_alone() {
+        let dir = folder("in-place-edit");
+        let (wav, audio) = library_wav(&dir.join("Library"), 44_100);
+        let original = std::fs::read(&wav).unwrap();
+        let mut e = session_at(44_100);
+        let r = e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let clip = r["imported"][0]["clip"].as_u64().unwrap();
+        e.execute("audiosuite.process", &json!({"process": "invert", "clips": [clip]})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        assert_eq!(std::fs::read_dir(dir.join("Set/Audio Files")).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&wav).unwrap(), original);
+        let r = reopen(&path);
+        let s = r.session();
+        let src = s.tracks.iter().flat_map(|t| t.clips()).find_map(|c| c.source()).unwrap();
+        assert!(s.source(src).unwrap().path.starts_with("Audio Files/"));
+        let edited = &s.pool.get(src).unwrap().buffer.channels[0];
+        assert_eq!(edited.len(), audio.len());
+        assert!(edited.iter().zip(&audio).all(|(x, y)| (x + y).abs() < 1e-6));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
