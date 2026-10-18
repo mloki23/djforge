@@ -8,6 +8,7 @@
 mod automation;
 pub mod b64;
 mod clip;
+mod dj;
 mod ids;
 mod markers;
 mod mixer;
@@ -18,6 +19,9 @@ mod warp;
 
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
+pub use dj::{
+    DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource, NudgeSuggestion, Transition, TransitionStyle,
+};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use mixer::{

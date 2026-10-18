@@ -2,7 +2,7 @@
 
 use crate::clip::{bound, bound_sequence};
 use crate::{
-    Bus, BusId, ChannelFormat, Clip, ClipId, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
+    Bus, BusId, ChannelFormat, Clip, ClipId, DjState, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
     TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
 };
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
@@ -321,6 +321,9 @@ pub struct Session {
     pub next_id: u64,
     #[serde(default)]
     pub comments: String,
+    /// DJ arrangement data: transitions between beat-locked tracks of an imported set.
+    #[serde(default, skip_serializing_if = "DjState::is_empty")]
+    pub dj: DjState,
     /// Original MIDI performances keyed by clip id (Event › MIDI Operations › Restore/Flatten
     /// Performance). Independent of undo so a restore survives later edits.
     #[serde(default)]
@@ -361,6 +364,7 @@ impl Session {
             edit: EditState::default(),
             next_id: 1,
             comments: String::new(),
+            dj: DjState::default(),
             midi_originals: std::collections::BTreeMap::new(),
             pool: SourcePool::default(),
             folder: None,
@@ -625,6 +629,7 @@ impl Session {
         let clip_ids: std::collections::BTreeSet<u64> =
             self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))).collect();
         self.midi_originals.retain(|id, _| clip_ids.contains(id));
+        self.dj.sanitize(&self.tracks);
         if !self.edit.zoom.samples_per_px.is_finite() || self.edit.zoom.samples_per_px <= 0.0 {
             self.edit.zoom.samples_per_px = 1024.0;
         }
