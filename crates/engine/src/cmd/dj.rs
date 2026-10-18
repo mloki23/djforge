@@ -13,9 +13,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track Beat-Locked",
             [],
             None,
-            "{path, beats?: [seconds, first a downbeat] | bpm + first_beat (seconds of a downbeat), at_bar?: 1 (the clip starts on this bar; the first downbeat lands on the first bar line at or after the file start), from_beat?: track beat playing at the clip start, track?} — imports an audio file whose beat grid follows the session tempo map in realtime, pitch preserved",
+            "{path, beats?: [seconds, first a downbeat] | bpm + first_beat (seconds of a downbeat) (default: mixforge's analysis of the file, needs DJFORGE_PYTHON and DJFORGE_MIXFORGE), at_bar?: 1 (the clip starts on this bar; the first downbeat lands on the first bar line at or after the file start), from_beat?: track beat playing at the clip start, track?} — imports an audio file whose beat grid follows the session tempo map in realtime, pitch preserved",
             always,
             load_warped
+        ),
+        cmd!(
+            query "dj.analyze",
+            "Analyse Track (mixforge)",
+            [],
+            None,
+            "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder)",
+            always,
+            |_, p| analyze_file(str_param(p, "path").ok_or_else(|| bad("dj.analyze", "`path` required"))?)
         ),
         cmd!(
             "dj.tempo_ramp",
@@ -85,9 +94,23 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     {
         return Err(bad(CMD, BAD_BEATS));
     }
-    if given.is_none() && bpm.is_none() {
-        return Err(bad(CMD, "pass `beats` or `bpm`"));
+    /// Where the beat times come from.
+    enum Beats {
+        List(Vec<f64>),
+        Constant { bpm: f64, first: f64 },
     }
+    // mixforge runs before the import too, so a failed analysis leaves no clip behind.
+    let mut analysis = None;
+    let source = match (given, bpm) {
+        (Some(b), _) => Beats::List(b),
+        (None, Some(bpm)) => Beats::Constant { bpm, first: first_beat },
+        (None, None) => {
+            let a = analyze_file(&path)?;
+            let (bpm, first) = grid_of(&a).ok_or_else(|| bad(CMD, "mixforge's analysis has no usable bpm/first_downbeat"))?;
+            analysis = Some(a);
+            Beats::Constant { bpm, first }
+        }
+    };
     let at_bar = i64_or(p, "at_bar", 1).clamp(-10_000, 100_000);
     let target = track_param(e, CMD, p, "track")?;
     let sr = e.session().sample_rate;
@@ -103,14 +126,13 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     // Beat times in seconds of the source-pool audio (the import resampled the file to the
     // session rate). A failure from here on is rolled back by `Engine::execute`.
     let rate = sr.as_f64();
-    let secs: Vec<f64> = match (given, bpm) {
-        (Some(b), _) => b,
-        (None, Some(bpm)) => {
+    let secs: Vec<f64> = match source {
+        Beats::List(b) => b,
+        Beats::Constant { bpm, first } => {
             let beat = 60.0 / bpm;
-            let n = ((frames as f64 / rate - first_beat) / beat).ceil().max(1.0) as usize + 1;
-            (0..n.min(MAX_WARP_BEATS)).map(|i| first_beat + i as f64 * beat).collect()
+            let n = ((frames as f64 / rate - first) / beat).ceil().max(1.0) as usize + 1;
+            (0..n.min(MAX_WARP_BEATS)).map(|i| first + i as f64 * beat).collect()
         }
-        (None, None) => return Err(bad(CMD, "pass `beats` or `bpm`")),
     };
     let per_bar = i64::from(e.session().tempo.meter_at_tick(start_tick).numerator.max(1));
     let from_beat = p.get("from_beat").and_then(Value::as_f64);
@@ -124,9 +146,66 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     let c = s.find_clip_mut(clip).ok_or_else(|| bad(CMD, "imported clip vanished"))?;
     c.warp = Some(warp);
     c.length = length;
-    Ok(
-        json!({"track": r.get("track"), "clip": clip, "start": at, "length": length, "beats": track_beats, "anchor": anchor, "downbeat_bar": downbeat_bar}),
-    )
+    let mut out = json!({"track": r.get("track"), "clip": clip, "start": at, "length": length, "beats": track_beats, "anchor": anchor, "downbeat_bar": downbeat_bar});
+    if let (Some(a), Some(o)) = (analysis, out.as_object_mut()) {
+        for k in ["bpm", "key", "camelot", "lufs", "stale_cache"] {
+            o.insert(k.to_string(), a.get(k).cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(out)
+}
+
+/// The mixforge sidecar: prints one JSON object with a file's analysis, or `{error}`.
+const MIXFORGE_BEATS: &str = include_str!("mixforge_beats.py");
+
+/// mixforge's analysis of the audio file at `path`, through the sidecar run with the python in
+/// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`.
+fn analyze_file(path: &str) -> Result<Value> {
+    const CMD: &str = "dj.analyze";
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    let var =
+        |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| bad(CMD, format!("set {name} to {what}")));
+    let python = var("DJFORGE_PYTHON", "the python.exe of mixforge's environment")?;
+    let mixforge = var("DJFORGE_MIXFORGE", "the mixforge folder (the one holding the `mixforge` package)")?;
+    let mut command = std::process::Command::new(&python);
+    command.args(["-I", "-c", MIXFORGE_BEATS, &mixforge, path]).stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the GUI must not flash a console.
+        command.creation_flags(0x0800_0000);
+    }
+    let out = command.output().map_err(|err| bad(CMD, format!("could not run DJFORGE_PYTHON ({python}): {err}")))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines.get(lines.len().saturating_sub(5)..).unwrap_or_default().join("\n");
+        return Err(bad(CMD, format!("mixforge printed nothing ({}): {tail}", out.status)));
+    }
+    parse_analysis(&stdout)
+}
+
+/// The sidecar's output as a JSON object; its `{error}` becomes the error.
+fn parse_analysis(out: &str) -> Result<Value> {
+    const CMD: &str = "dj.analyze";
+    let text = out.trim();
+    let head = || text.chars().take(300).collect::<String>();
+    let v: Value = serde_json::from_str(text).map_err(|_| bad(CMD, format!("mixforge printed something that is not JSON: {}", head())))?;
+    if let Some(msg) = v.get("error") {
+        return Err(bad(CMD, msg.as_str().map_or_else(|| msg.to_string(), str::to_string)));
+    }
+    if !v.is_object() {
+        return Err(bad(CMD, format!("mixforge printed something that is not an object: {}", head())));
+    }
+    Ok(v)
+}
+
+/// (bpm, first downbeat in seconds) of an analysis, when both are usable.
+fn grid_of(a: &Value) -> Option<(f64, f64)> {
+    let bpm = a.get("bpm")?.as_f64().filter(|b| b.is_finite() && (20.0..=400.0).contains(b))?;
+    let first = a.get("first_downbeat")?.as_f64().filter(|f| f.is_finite() && (0.0..=600.0).contains(f))?;
+    Some((bpm, first))
 }
 
 /// The warp map for analysed beat times `secs` (seconds, `secs[0]` a downbeat) of a file of
@@ -318,6 +397,46 @@ mod tests {
         let secs: Vec<f64> = (0..8).map(|k| k as f64 * 0.5).collect();
         assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, None).unwrap().0.anchor, 0.0);
         assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, Some(0.25)).unwrap().0.anchor, 0.25);
+    }
+
+    #[test]
+    fn mixforge_output_is_parsed_and_its_errors_kept() {
+        let a = parse_analysis("{\"bpm\": 145.0, \"first_downbeat\": 0.2, \"camelot\": \"4B\"}\n").unwrap();
+        assert_eq!(a["camelot"], "4B");
+        let e = parse_analysis(r#"{"error":"not analysed by mixforge"}"#).unwrap_err();
+        assert!(matches!(&e, EngineError::BadParams(_, m) if m == "not analysed by mixforge"), "{e}");
+        assert!(parse_analysis("Traceback (most recent call last):\n  File ...").is_err());
+        assert!(parse_analysis("[1, 2]").is_err());
+    }
+
+    #[test]
+    fn grid_of_wants_a_usable_bpm_and_downbeat() {
+        assert_eq!(grid_of(&json!({"bpm": 145.0, "first_downbeat": 0.2})), Some((145.0, 0.2)));
+        assert_eq!(grid_of(&json!({"first_downbeat": 0.2})), None);
+        assert_eq!(grid_of(&json!({"bpm": 500.0, "first_downbeat": 0.2})), None);
+        assert_eq!(grid_of(&json!({"bpm": null, "first_downbeat": 0.2})), None);
+        assert_eq!(grid_of(&json!({"bpm": 145.0, "first_downbeat": -0.1})), None);
+    }
+
+    #[test]
+    fn load_warped_puts_the_first_downbeat_on_bar_two() {
+        let dir = std::env::temp_dir().join(format!("sc-dj-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 10 * SR as usize]] };
+        let path = dir.join("track.wav");
+        std::fs::write(&path, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut e = Engine::default();
+        let r = e.execute("dj.load_warped", &json!({"path": path, "bpm": 120, "first_beat": 0.5})).unwrap();
+        assert_eq!(r["anchor"], -4.0);
+        assert_eq!(r["downbeat_bar"], 2);
+        // A bad beat list is refused before anything is imported.
+        let tracks = e.session().tracks.len();
+        assert!(e.execute("dj.load_warped", &json!({"path": path, "beats": [1.0, "x"]})).is_err());
+        assert!(e.execute("dj.load_warped", &json!({"path": path, "beats": [2.0, 1.0]})).is_err());
+        assert_eq!(e.session().tracks.len(), tracks);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
