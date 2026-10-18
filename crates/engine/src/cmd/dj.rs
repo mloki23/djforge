@@ -24,7 +24,7 @@ pub fn specs() -> Vec<CommandSpec> {
             None,
             "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder)",
             always,
-            |_, p| analyze_file(str_param(p, "path").ok_or_else(|| bad("dj.analyze", "`path` required"))?)
+            |_, p| analyze_file("dj.analyze", str_param(p, "path").ok_or_else(|| bad("dj.analyze", "`path` required"))?)
         ),
         cmd!(
             "dj.tempo_ramp",
@@ -105,7 +105,7 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
         (Some(b), _) => Beats::List(b),
         (None, Some(bpm)) => Beats::Constant { bpm, first: first_beat },
         (None, None) => {
-            let a = analyze_file(&path)?;
+            let a = analyze_file(CMD, &path)?;
             let (bpm, first) = grid_of(&a).ok_or_else(|| bad(CMD, "mixforge's analysis has no usable bpm/first_downbeat"))?;
             analysis = Some(a);
             Beats::Constant { bpm, first }
@@ -159,12 +159,11 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
 const MIXFORGE_BEATS: &str = include_str!("mixforge_beats.py");
 
 /// mixforge's analysis of the audio file at `path`, through the sidecar run with the python in
-/// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`.
-fn analyze_file(path: &str) -> Result<Value> {
-    const CMD: &str = "dj.analyze";
+/// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`. Errors name command `cmd`.
+fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
     crate::file_access::check_read(path).map_err(EngineError::Io)?;
     let var =
-        |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| bad(CMD, format!("set {name} to {what}")));
+        |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| bad(cmd, format!("set {name} to {what}")));
     let python = var("DJFORGE_PYTHON", "the python.exe of mixforge's environment")?;
     let mixforge = var("DJFORGE_MIXFORGE", "the mixforge folder (the one holding the `mixforge` package)")?;
     let mut command = std::process::Command::new(&python);
@@ -175,28 +174,27 @@ fn analyze_file(path: &str) -> Result<Value> {
         // CREATE_NO_WINDOW: the GUI must not flash a console.
         command.creation_flags(0x0800_0000);
     }
-    let out = command.output().map_err(|err| bad(CMD, format!("could not run DJFORGE_PYTHON ({python}): {err}")))?;
+    let out = command.output().map_err(|err| bad(cmd, format!("could not run DJFORGE_PYTHON ({python}): {err}")))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let lines: Vec<&str> = stderr.lines().collect();
         let tail = lines.get(lines.len().saturating_sub(5)..).unwrap_or_default().join("\n");
-        return Err(bad(CMD, format!("mixforge printed nothing ({}): {tail}", out.status)));
+        return Err(bad(cmd, format!("mixforge printed nothing ({}): {tail}", out.status)));
     }
-    parse_analysis(&stdout)
+    parse_analysis(cmd, &stdout)
 }
 
-/// The sidecar's output as a JSON object; its `{error}` becomes the error.
-fn parse_analysis(out: &str) -> Result<Value> {
-    const CMD: &str = "dj.analyze";
+/// The sidecar's output as a JSON object; its `{error}` becomes command `cmd`'s error.
+fn parse_analysis(cmd: &str, out: &str) -> Result<Value> {
     let text = out.trim();
     let head = || text.chars().take(300).collect::<String>();
-    let v: Value = serde_json::from_str(text).map_err(|_| bad(CMD, format!("mixforge printed something that is not JSON: {}", head())))?;
+    let v: Value = serde_json::from_str(text).map_err(|_| bad(cmd, format!("mixforge printed something that is not JSON: {}", head())))?;
     if let Some(msg) = v.get("error") {
-        return Err(bad(CMD, msg.as_str().map_or_else(|| msg.to_string(), str::to_string)));
+        return Err(bad(cmd, msg.as_str().map_or_else(|| msg.to_string(), str::to_string)));
     }
     if !v.is_object() {
-        return Err(bad(CMD, format!("mixforge printed something that is not an object: {}", head())));
+        return Err(bad(cmd, format!("mixforge printed something that is not an object: {}", head())));
     }
     Ok(v)
 }
@@ -207,6 +205,9 @@ fn grid_of(a: &Value) -> Option<(f64, f64)> {
     let first = a.get("first_downbeat")?.as_f64().filter(|f| f.is_finite() && (0.0..=600.0).contains(f))?;
     Some((bpm, first))
 }
+
+/// Lead-in (seconds) before a first downbeat that is dropped rather than given a bar of its own.
+const PRE_ROLL_SECS: f64 = 0.060;
 
 /// The warp map for analysed beat times `secs` (seconds, `secs[0]` a downbeat) of a file of
 /// `frames` samples at `rate`, and how many session beats the clip lasts. By default the clip
@@ -227,6 +228,9 @@ fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Opt
     let bar = (second - first) * per_bar;
     let anchor = match from_beat {
         Some(b) if b.is_finite() => b,
+        // A downbeat this close to the file start goes on the clip-start bar line, dropping those
+        // few milliseconds rather than adding a silent bar.
+        _ if first <= PRE_ROLL_SECS * rate => 0.0,
         _ => -(first / bar).ceil() * per_bar,
     };
     let w = WarpMap::new(beats, anchor)?;
@@ -433,6 +437,15 @@ mod tests {
     }
 
     #[test]
+    fn a_downbeat_a_few_milliseconds_in_lands_on_the_clip_start() {
+        let secs: Vec<f64> = (0..8).map(|k| 0.0045 + k as f64 * 0.5).collect();
+        assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, None).unwrap().0.anchor, 0.0);
+        // Past the pre-roll it gets a bar of lead-in.
+        let secs: Vec<f64> = (0..8).map(|k| 0.07 + k as f64 * 0.5).collect();
+        assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, None).unwrap().0.anchor, -4.0);
+    }
+
+    #[test]
     fn grid_with_a_downbeat_at_the_file_start_needs_no_lead_in() {
         let secs: Vec<f64> = (0..8).map(|k| k as f64 * 0.5).collect();
         assert_eq!(grid(&secs, 48_000.0, 48_000 * 4, 4, None).unwrap().0.anchor, 0.0);
@@ -441,12 +454,12 @@ mod tests {
 
     #[test]
     fn mixforge_output_is_parsed_and_its_errors_kept() {
-        let a = parse_analysis("{\"bpm\": 145.0, \"first_downbeat\": 0.2, \"camelot\": \"4B\"}\n").unwrap();
+        let a = parse_analysis("dj.analyze", "{\"bpm\": 145.0, \"first_downbeat\": 0.2, \"camelot\": \"4B\"}\n").unwrap();
         assert_eq!(a["camelot"], "4B");
-        let e = parse_analysis(r#"{"error":"not analysed by mixforge"}"#).unwrap_err();
-        assert!(matches!(&e, EngineError::BadParams(_, m) if m == "not analysed by mixforge"), "{e}");
-        assert!(parse_analysis("Traceback (most recent call last):\n  File ...").is_err());
-        assert!(parse_analysis("[1, 2]").is_err());
+        let e = parse_analysis("dj.load_warped", r#"{"error":"not analysed by mixforge"}"#).unwrap_err();
+        assert!(matches!(&e, EngineError::BadParams(c, m) if c == "dj.load_warped" && m == "not analysed by mixforge"), "{e}");
+        assert!(parse_analysis("dj.analyze", "Traceback (most recent call last):\n  File ...").is_err());
+        assert!(parse_analysis("dj.analyze", "[1, 2]").is_err());
     }
 
     #[test]
