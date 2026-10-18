@@ -15,9 +15,10 @@
 //! Plugins and threads: hosted third-party plugins (CLAP/VST3) are created, given their stored
 //! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
 //! travel to the audio thread together with the session snapshot that needs them; the mix
-//! engine adopts them (see `soundcraft_mix`'s crate docs). Instances the engine retires, and the
-//! session snapshots the callback replaces, come back on return channels and are dropped on the UI
-//! thread ([`Player::idle`]). Plugin editors are driven, and plugin states for saving read
+//! engine adopts them (see `soundcraft_mix`'s crate docs). The stretchers of beat-locked clips
+//! are built the same way. Instances and stretchers the engine retires, and the session snapshots
+//! the callback replaces, come back on return channels and are dropped on the UI thread
+//! ([`Player::idle`]). Plugin editors are driven, and plugin states for saving read
 //! ([`Player::capture_states`]), on the UI thread
 //! through handles taken from each instance before it leaves ([`Player::open_editor`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -28,8 +29,8 @@ pub mod record;
 pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
-use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
-use soundcraft_model::{Session, TrackId};
+use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, itu_stereo_fold, main_channels};
+use soundcraft_model::{ClipContent, Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -59,8 +60,9 @@ pub type PluginStates = Vec<(TrackId, usize, Vec<u8>)>;
 pub type EditorEdit = (TrackId, usize, String, f32);
 
 enum Cmd {
-    /// A new snapshot plus the third-party instances it needs (created on the UI thread).
-    Session(Arc<Session>, Vec<PreparedInstance>),
+    /// A new snapshot plus the third-party instances and warp players it needs (created on the
+    /// UI thread).
+    Session(Arc<Session>, Vec<PreparedInstance>, Vec<PreparedWarp>),
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
@@ -168,9 +170,27 @@ struct AudioState {
     device_rate: f64,
     input: Option<Arc<record::InputRing>>,
     recording: bool,
-    /// Retired plugin instances go back to the UI thread to be dropped there.
-    garbage: Sender<Vec<Box<dyn Plugin>>>,
+    /// Retired plugin instances and warp players go back to the UI thread to be dropped there.
+    garbage: Bin,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+}
+
+/// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
+struct Bin {
+    plugins: Sender<Vec<Box<dyn Plugin>>>,
+    warps: Sender<Vec<WarpPlayer>>,
+}
+
+/// The UI-thread ends of a [`Bin`].
+struct BinRx {
+    plugins: Receiver<Vec<Box<dyn Plugin>>>,
+    warps: Receiver<Vec<WarpPlayer>>,
+}
+
+fn bin() -> (Bin, BinRx) {
+    let (ptx, prx) = channel();
+    let (wtx, wrx) = channel();
+    (Bin { plugins: ptx, warps: wtx }, BinRx { plugins: prx, warps: wrx })
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -181,7 +201,7 @@ fn new_engine(sr: f32) -> MixEngine {
 }
 
 impl AudioState {
-    fn new(rx: Receiver<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64, garbage: Sender<Vec<Box<dyn Plugin>>>) -> Self {
+    fn new(rx: Receiver<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64, garbage: Bin) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
         AudioState {
@@ -211,13 +231,15 @@ impl AudioState {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
                 Cmd::Recording(r) => self.recording = r,
-                Cmd::Session(s, instances) => {
+                Cmd::Session(s, instances, warps) => {
                     changed = true;
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
-                        let _ = self.garbage.send(old.drain_plugins());
+                        let _ = self.garbage.plugins.send(old.drain_plugins());
+                        let _ = self.garbage.warps.send(old.drain_warps());
                     }
                     self.mix.adopt(instances);
+                    self.mix.adopt_warps(warps);
                     // The main format changed (a document edit, not steady state): resize.
                     let nch = main_channels(&s);
                     if self.pending.len() != nch {
@@ -259,6 +281,7 @@ impl AudioState {
             // Place adopted instances now (not only once playback starts), so editors see them;
             // `sync` creates no third-party plugins here.
             self.mix.ensure_synced(&self.session);
+            self.mix.retire_stale_warps(&self.session);
         }
         self.send_garbage();
         self.shared.playing.store(self.playing, Ordering::Relaxed);
@@ -267,7 +290,11 @@ impl AudioState {
     fn send_garbage(&mut self) {
         let g = self.mix.take_retired();
         if !g.is_empty() {
-            let _ = self.garbage.send(g);
+            let _ = self.garbage.plugins.send(g);
+        }
+        let w = self.mix.take_retired_warps();
+        if !w.is_empty() {
+            let _ = self.garbage.warps.send(w);
         }
     }
 
@@ -406,24 +433,36 @@ struct Side {
     /// Instances that refused their stored state: saves keep that state until the plugin's editor
     /// is opened.
     refused: HashSet<(TrackId, usize)>,
-    garbage: Receiver<Vec<Box<dyn Plugin>>>,
+    garbage: BinRx,
     old_sessions: Option<Receiver<Arc<Session>>>,
+    /// Beat-locked clips whose warp player was sent: (track, clip id) -> (channels, sample rate).
+    prepared_warps: HashMap<(TrackId, u64), (usize, u32)>,
 }
 
 impl Side {
-    fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
-        Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
+    fn new(rate: f32, garbage: BinRx) -> Side {
+        Side {
+            shadow: HashMap::new(),
+            rate,
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+            refused: HashSet::new(),
+            garbage,
+            old_sessions: None,
+            prepared_warps: HashMap::new(),
+        }
     }
 
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
     /// replaced session snapshots.
     fn collect_garbage(&mut self) {
-        while let Ok(g) = self.garbage.try_recv() {
+        while let Ok(g) = self.garbage.plugins.try_recv() {
             for p in g {
                 log::debug!("plugin instance released: {}", p.info().name);
                 drop(p);
             }
         }
+        self.garbage.warps.try_iter().for_each(drop);
         if let Some(rx) = &self.old_sessions {
             rx.try_iter().for_each(drop);
         }
@@ -511,7 +550,7 @@ impl Player {
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
-        let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
+        let new_side = |garbage: BinRx| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
             Ok((device, config, format, name)) => {
                 // The chosen buffer size first; if the device refuses it, its default.
@@ -523,7 +562,7 @@ impl Player {
                     let rate = config.sample_rate.0;
                     let channels = usize::from(config.channels);
                     let (tx, rx) = channel();
-                    let (gtx, grx) = channel();
+                    let (gtx, grx) = bin();
                     let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
                     let fault = Arc::new(Fault::default());
                     use cpal::traits::StreamTrait;
@@ -565,39 +604,25 @@ impl Player {
                 }
                 log::warn!("no usable audio stream; using a silent clock");
                 let (tx, rx) = channel();
-                let (gtx, grx) = channel();
+                let (gtx, grx) = bin();
                 Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
                 let (tx, rx) = channel();
-                let (gtx, grx) = channel();
+                let (gtx, grx) = bin();
                 Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
             }
         }
     }
 
-    fn silent_clock(
-        shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        rx: Receiver<Cmd>,
-        rate: u32,
-        side: Mutex<Side>,
-        gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
+    fn silent_clock(shared: Arc<Shared>, tx: Sender<Cmd>, rx: Receiver<Cmd>, rate: u32, side: Mutex<Side>, gtx: Bin) -> Player {
         let s = Arc::new(Session::new("Untitled", soundcraft_time::SampleRate::new(rate).unwrap_or_default()));
         Player::silent_clock_with(shared, tx, rx, s, side, gtx)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn silent_clock_with(
-        shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        rx: Receiver<Cmd>,
-        session: Arc<Session>,
-        side: Mutex<Side>,
-        gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
+    fn silent_clock_with(shared: Arc<Shared>, tx: Sender<Cmd>, rx: Receiver<Cmd>, session: Arc<Session>, side: Mutex<Side>, gtx: Bin) -> Player {
         let rate = session.sample_rate.hz();
         let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
         let fault = Arc::new(Fault::default());
@@ -639,14 +664,7 @@ impl Player {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn silent_clock_with(
-        shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        _rx: Receiver<Cmd>,
-        session: Arc<Session>,
-        side: Mutex<Side>,
-        _gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
+    fn silent_clock_with(shared: Arc<Shared>, tx: Sender<Cmd>, _rx: Receiver<Cmd>, session: Arc<Session>, side: Mutex<Side>, _gtx: Bin) -> Player {
         Player {
             shared,
             fault: Arc::default(),
@@ -664,8 +682,11 @@ impl Player {
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
     pub fn update_session(&self, s: Arc<Session>) {
-        let instances = self.side().prepare(&s);
-        let _ = self.tx.send(Cmd::Session(s, instances));
+        let mut side = self.side();
+        let instances = side.prepare(&s);
+        let warps = side.prepare_warps(&s);
+        drop(side);
+        let _ = self.tx.send(Cmd::Session(s, instances, warps));
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.
@@ -842,6 +863,36 @@ impl Side {
                 out.push(PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, plugin });
             }
         }
+        out
+    }
+
+    /// Builds warp players for beat-locked clips the audio thread has no player for yet, so it
+    /// never builds a stretcher mid-mix. Players are kept per track, so a clip moved to another
+    /// track gets a new one; a change of source channels or sample rate replaces it.
+    fn prepare_warps(&mut self, s: &Session) -> Vec<PreparedWarp> {
+        let sr = s.sample_rate.hz();
+        let mut out = Vec::new();
+        let mut live = HashSet::new();
+        for t in &s.tracks {
+            let Some(pl) = t.playlist() else { continue };
+            for c in pl.clips.iter().filter(|c| c.warp.is_some()) {
+                let ClipContent::Audio { source, .. } = &c.content else { continue };
+                let ch = s.pool.get(*source).map_or(0, |a| a.buffer.channels.len());
+                if ch == 0 {
+                    continue;
+                }
+                let key = (t.id, c.id.0);
+                live.insert(key);
+                if self.prepared_warps.get(&key) == Some(&(ch, sr)) {
+                    continue;
+                }
+                if let Some(w) = PreparedWarp::new(t.id, c.id, ch, s.sample_rate.as_f64() as f32) {
+                    self.prepared_warps.insert(key, (ch, sr));
+                    out.push(w);
+                }
+            }
+        }
+        self.prepared_warps.retain(|k, _| live.contains(k));
         out
     }
 }
@@ -1032,7 +1083,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
         tx.send(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
         let mut out = vec![0.0f32; 4096];
         st.fill(&mut out, 2);
@@ -1050,7 +1101,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         let mut out = vec![0.0f32; 2 * 64];
         st.fill(&mut out, 2);
@@ -1075,7 +1126,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, bin().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         // An 8-channel device: channels in order, the rest silent.
         let mut out = vec![0.0f32; 8 * 256];
@@ -1108,34 +1159,76 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let (gtx, grx) = channel();
+        let (gtx, grx) = bin();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
         let plugin = soundcraft_dsp::create("gain").unwrap();
-        tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
+        tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }], Vec::new()))
+            .unwrap();
         let mut out = vec![0.0f32; 256];
         st.fill(&mut out, 2);
-        assert!(grx.try_recv().is_err(), "nothing retired yet");
+        assert!(grx.plugins.try_recv().is_err(), "nothing retired yet");
         // A session without the insert retires the instance to the return channel.
-        tx.send(Cmd::Session(Arc::new(soundcraft_model::Session::default()), Vec::new())).unwrap();
+        tx.send(Cmd::Session(Arc::new(soundcraft_model::Session::default()), Vec::new(), Vec::new())).unwrap();
         st.fill(&mut out, 2);
-        assert_eq!(grx.try_recv().unwrap().len(), 1);
+        assert_eq!(grx.plugins.try_recv().unwrap().len(), 1);
         // A sample-rate change rebuilds the engine without dropping plugins on this thread.
         tx.send(Cmd::Session(
             Arc::clone(&s),
             vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin: soundcraft_dsp::create("gain").unwrap() }],
+            Vec::new(),
         ))
         .unwrap();
         st.fill(&mut out, 2);
         let mut s44 = (*s).clone();
         s44.sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
-        tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
+        tx.send(Cmd::Session(Arc::new(s44), Vec::new(), Vec::new())).unwrap();
         st.fill(&mut out, 2);
-        assert_eq!(grx.try_recv().unwrap().len(), 1);
+        assert_eq!(grx.plugins.try_recv().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn warp_players_are_built_and_dropped_off_the_audio_thread() {
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]; 2] };
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(buf)));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let id = s.new_clip_id();
+        let mut c = Clip::audio(id, "c", SourceId(900), 0, 0, 48_000);
+        c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+        let mut side = Side::new(48_000.0, bin().1);
+        let warps = side.prepare_warps(&s);
+        assert_eq!(warps.len(), 1);
+        assert!(side.prepare_warps(&s).is_empty(), "built once per clip");
+        tx.send(Cmd::Session(Arc::new(s.clone()), Vec::new(), warps)).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 512];
+        st.fill(&mut out, 2);
+        assert!(grx.warps.try_recv().is_err(), "the clip's player is in use");
+        // The clip moves to another track: a new player there, the old one comes back.
+        let t2 = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let moved = s.track_mut(t).unwrap().playlist_mut().unwrap().clips.remove(0);
+        s.track_mut(t2).unwrap().playlist_mut().unwrap().clips.push(moved);
+        let warps = side.prepare_warps(&s);
+        assert_eq!(warps.len(), 1);
+        tx.send(Cmd::Session(Arc::new(s), Vec::new(), warps)).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(grx.warps.try_recv().map(|w| w.len()).unwrap_or(0), 1);
     }
 
     #[test]
     fn plugin_states_are_read_without_the_audio_thread() {
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, bin().1);
         let (a, b) = (TrackId(1), TrackId(2));
         side.states.insert((b, 0), Box::new(|| Some(b"b0".to_vec())));
         side.states.insert((a, soundcraft_mix::INSTRUMENT_SLOT), Box::new(|| Some(b"synth".to_vec())));
@@ -1164,7 +1257,7 @@ mod tests {
 
     #[test]
     fn a_refused_state_is_kept_until_the_editor_opens() {
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, bin().1);
         let k = (TrackId(1), 0);
         side.states.insert(k, Box::new(|| Some(b"defaults".to_vec())));
         side.editors.insert(k, Box::new(Window));
@@ -1177,7 +1270,7 @@ mod tests {
     #[test]
     fn side_creates_each_missing_instance_once() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
-        let mut side = Side::new(48_000.0, channel().1);
+        let mut side = Side::new(48_000.0, bin().1);
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
@@ -1200,7 +1293,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let (gtx, grx) = channel();
+        let (gtx, grx) = bin();
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
         let mut side = Side::new(48_000.0, grx);
         side.return_old_sessions(&tx);
@@ -1210,7 +1303,7 @@ mod tests {
             let s = Arc::new(soundcraft_model::Session::default());
             watched.push(Arc::downgrade(&s));
             side.collect_garbage();
-            tx.send(Cmd::Session(s, Vec::new())).unwrap();
+            tx.send(Cmd::Session(s, Vec::new(), Vec::new())).unwrap();
             st.fill(&mut out, 2);
             let replaced = watched.len().checked_sub(2).and_then(|i| watched.get(i));
             assert!(replaced.is_none_or(|w| w.strong_count() == 1), "freed on the audio thread");
@@ -1229,7 +1322,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
         tx.send(Cmd::Play { from: 0, end: None, looped: Some(Range::new(0, 1000)) }).unwrap();
         let mut out = vec![0.0f32; 20_000];
         st.fill(&mut out, 2);
@@ -1264,7 +1357,7 @@ mod tests {
                 meters: Mutex::new(MeterSnapshot::default()),
             });
             let (tx, rx) = channel();
-            let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+            let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
             tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
             let mut out = vec![0.0f32; 2 * 512];
             let mut before = 0.0f32;
@@ -1294,7 +1387,7 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
         let ring = record::InputRing::new(1, 48_000);
         tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
         tx.send(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();

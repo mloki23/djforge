@@ -63,6 +63,7 @@ use std::sync::Arc;
 
 mod warp;
 use warp::WarpPlayers;
+pub use warp::{PreparedWarp, WarpPlayer};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -320,7 +321,7 @@ impl Strip {
             gr: 0.0,
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
-            warps: HashMap::new(),
+            warps: HashMap::with_capacity(16),
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -374,6 +375,10 @@ pub struct MixEngine {
     adopt: HashMap<(TrackId, usize), PreparedInstance>,
     /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
     retired: Vec<Box<dyn Plugin>>,
+    /// Warp players handed over by the host, placed into their strips by the next `render`.
+    warp_inbox: Vec<PreparedWarp>,
+    /// Warp players taken out of service, for the host to drop (see [`MixEngine::take_retired_warps`]).
+    retired_warps: Vec<WarpPlayer>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
 }
@@ -448,6 +453,8 @@ impl MixEngine {
             external: false,
             adopt: HashMap::new(),
             retired: Vec::new(),
+            warp_inbox: Vec::new(),
+            retired_warps: Vec::new(),
             work: Vec::new(),
         }
     }
@@ -488,6 +495,64 @@ impl MixEngine {
         out.extend(self.adopt.drain().map(|(_, p)| p.plugin));
         self.synced = (usize::MAX, usize::MAX, usize::MAX);
         out
+    }
+
+    /// Warp players built off the audio thread for the snapshot about to play; the next
+    /// `render` places them in their strips. Like [`MixEngine::adopt`], this runs when the
+    /// session snapshot changes, not per block.
+    pub fn adopt_warps(&mut self, warps: Vec<PreparedWarp>) {
+        if self.warp_inbox.is_empty() {
+            // Take the host's allocation instead of growing ours on the audio thread.
+            self.warp_inbox = warps;
+        } else {
+            self.warp_inbox.extend(warps);
+        }
+    }
+
+    /// Takes the players of clips that are no longer on their strip's track (deleted, moved to
+    /// another track, or warp turned off), for dropping off the audio thread. Runs on snapshot
+    /// changes, like `sync`, not per block.
+    pub fn retire_stale_warps(&mut self, s: &Session) {
+        for (id, st) in self.strips.iter_mut() {
+            if st.warps.is_empty() {
+                continue;
+            }
+            let clips = s.track(*id).and_then(Track::playlist).map_or(&[][..], |pl| pl.clips.as_slice());
+            let live = |cid: u64| clips.iter().any(|c| c.id.0 == cid && c.warp.is_some());
+            self.retired_warps.extend(st.warps.extract_if(|cid, _| !live(*cid)).map(|(_, p)| p));
+        }
+    }
+
+    /// Warp players taken out of service since the last call (drop them off the audio thread).
+    /// Does not allocate.
+    pub fn take_retired_warps(&mut self) -> Vec<WarpPlayer> {
+        std::mem::take(&mut self.retired_warps)
+    }
+
+    /// Every warp player this engine holds (strips, waiting and retired), leaving the engine
+    /// without any: hand them to another thread to drop before replacing the engine.
+    pub fn drain_warps(&mut self) -> Vec<WarpPlayer> {
+        let mut out = std::mem::take(&mut self.retired_warps);
+        for st in self.strips.values_mut() {
+            out.extend(st.warps.drain().map(|(_, p)| p));
+        }
+        out.extend(self.warp_inbox.drain(..).map(|w| w.player));
+        out
+    }
+
+    /// Moves handed-over warp players into their strips. A player it replaces, or one whose
+    /// track is gone, is retired rather than dropped here (the audio thread).
+    fn place_warps(&mut self) {
+        for w in self.warp_inbox.drain(..) {
+            match self.strips.get_mut(&w.track) {
+                Some(st) => {
+                    if let Some(old) = st.warps.insert(w.clip.0, w.player) {
+                        self.retired_warps.push(old);
+                    }
+                }
+                None => self.retired_warps.push(w.player),
+            }
+        }
     }
 
     pub fn max_block(&self) -> usize {
@@ -543,6 +608,7 @@ impl MixEngine {
                     cx.retire(p);
                 }
                 cx.retire(st.instrument.take());
+                self.retired_warps.extend(st.warps.drain().map(|(_, p)| p));
             }
         }
         for t in &s.tracks {
@@ -591,6 +657,7 @@ impl MixEngine {
         }
         if !self.external {
             self.retired.clear();
+            self.retired_warps.clear();
         }
         for b in &s.busses {
             let n = b.format.channels().clamp(1, MAX_CHANNELS);
@@ -630,6 +697,9 @@ impl MixEngine {
         }
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
+        if !self.warp_inbox.is_empty() {
+            self.place_warps();
+        }
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -2381,6 +2451,26 @@ mod tests {
                 assert!(err_ms.abs() < 2.0, "block {block}, beat {b}: click {err_ms:+.2} ms off the session beat");
             }
         }
+    }
+
+    #[test]
+    fn adopted_warp_players_are_used_and_stale_ones_retired() {
+        let mut s = Session::default();
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]] })));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        let mut c = Clip::audio(id, "c", SourceId(900), 0, 0, 48_000);
+        c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.adopt_warps(vec![PreparedWarp::new(t, id, 1, 48_000.0).unwrap()]);
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.render(&s, 0, 512, &mut out);
+        assert!(eng.strips.get(&t).and_then(|st| st.warps.get(&id.0)).is_some_and(|p| p.prepared));
+        // The clip goes away: its player comes back for dropping off the audio thread.
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.clear();
+        eng.retire_stale_warps(&s);
+        assert_eq!(eng.take_retired_warps().len(), 1);
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {

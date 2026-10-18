@@ -9,14 +9,20 @@
 //! `output_latency` (output frames). The player reads ahead by both, so the audio heard at
 //! timeline sample `t` is the source at [`soundcraft_model::WarpMap::source_at_time`].
 
-use soundcraft_model::{Clip, ClipContent, Session};
+use soundcraft_model::{Clip, ClipContent, ClipId, Session, TrackId};
 use soundcraft_stretch::{Quality, Stretcher};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
 
 /// Per-clip playback state, kept across blocks by the strip that plays the clip.
-pub(crate) struct WarpPlayer {
+///
+/// Building one allocates (the stretcher's FFT plans and buffers) and dropping one frees, so a
+/// realtime host builds them with [`PreparedWarp::new`] and drops retired ones off the audio
+/// thread (see [`crate::MixEngine::adopt_warps`]).
+pub struct WarpPlayer {
     st: Stretcher,
+    /// Built off the audio thread and handed over, rather than created lazily while rendering.
+    pub(crate) prepared: bool,
     /// Timeline sample the next block is expected to start at (continuity check).
     next_pos: Samples,
     /// Source position fed next (fractional).
@@ -32,16 +38,42 @@ pub(crate) type WarpPlayers = HashMap<u64, WarpPlayer>;
 const PLAYER_BLOCK: usize = 4096;
 
 impl WarpPlayer {
-    fn new(channels: usize, sample_rate: f32) -> Option<WarpPlayer> {
+    /// Builds a player for `channels` source channels (allocates).
+    pub(crate) fn build(channels: usize, sample_rate: f32, prepared: bool) -> Option<WarpPlayer> {
         let st = Stretcher::new(channels.max(1), sample_rate, PLAYER_BLOCK, Quality::Default).ok()?;
         let max_in = st.max_input();
         Some(WarpPlayer {
             input: vec![vec![0.0; max_in]; channels.max(1)],
             out: vec![vec![0.0; PLAYER_BLOCK]; channels.max(1)],
             st,
+            prepared,
             next_pos: Samples::MIN,
             next_src: 0.0,
         })
+    }
+
+    /// True when the player was built off the audio thread and handed over.
+    pub fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    /// Source channels the player was built for.
+    pub fn channels(&self) -> usize {
+        self.input.len()
+    }
+}
+
+/// A warp player built off the audio thread for a clip, handed over with the session snapshot.
+pub struct PreparedWarp {
+    pub(crate) track: TrackId,
+    pub(crate) clip: ClipId,
+    pub(crate) player: WarpPlayer,
+}
+
+impl PreparedWarp {
+    /// Builds the stretcher now (allocates; call off the audio thread).
+    pub fn new(track: TrackId, clip: ClipId, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
+        Some(PreparedWarp { track, clip, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 }
 
@@ -73,7 +105,7 @@ pub(crate) fn render_warped(s: &Session, clip: &Clip, pos: Samples, frames: usiz
     let sr = s.sample_rate.as_f64() as f32;
     let player = match players.entry(clip.id.0) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => match WarpPlayer::new(src.len(), sr) {
+        std::collections::hash_map::Entry::Vacant(e) => match WarpPlayer::build(src.len(), sr, false) {
             Some(p) => e.insert(p),
             None => return,
         },
