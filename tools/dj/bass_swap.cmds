@@ -1,15 +1,16 @@
 # 16-bar bass swap for the stage 1 transition (append to transition.cmds; clips 3 = Mental
 # Atmosphere on track 2, 6 = I Feel Love on track 5):
-# bars 254-270: I Feel Love fades in with its bass cut, Mental Atmosphere plays in full;
-# bar 270: the basses swap on the downbeat (a 26 ms ramp so it doesn't click);
-# after bar 270: Mental Atmosphere fades out to its end.
-dj.nudge {"clip": 6, "beats": -0.16451522627150178}
+# bars 238-254: I Feel Love fades in with its bass cut, Mental Atmosphere plays in full;
+# bar 254: the basses swap on the first beat of Mental Atmosphere's outro (a 26 ms ramp so it
+# doesn't click); after bar 254: Mental Atmosphere fades out through its outro to its end.
+# Fade lengths are samples: bar 238 = 19786212, bar 254 = 21105300, Mental Atmosphere ends 23171039.
+dj.nudge {"clip": 6, "beats": -0.16564117734652098}
 mix.insert {"track": 2, "slot": "a", "plugin": "eq_7band", "params": {"low_shelf_freq": 200}}
 mix.insert {"track": 5, "slot": "a", "plugin": "eq_7band", "params": {"low_shelf_freq": 200}}
-automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:254|1|000", "value": -24}
-automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:269|4|900", "value": -24}
-automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:270|1|000", "value": 0}
-automation.set_point {"track": 2, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:269|4|900", "value": 0}
-automation.set_point {"track": 2, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:270|1|000", "value": -24}
+automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:238|1|000", "value": -24}
+automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:253|4|900", "value": -24}
+automation.set_point {"track": 5, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:254|1|000", "value": 0}
+automation.set_point {"track": 2, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:253|4|900", "value": 0}
+automation.set_point {"track": 2, "param": "plugin:a:low_shelf_gain", "at": "bars_beats:254|1|000", "value": -24}
 edit.fades_create {"clip": 6, "side": "in", "length": 1319088, "shape": "equal power"}
-edit.fades_create {"clip": 3, "side": "out", "length": 792247, "shape": "equal power"}
+edit.fades_create {"clip": 3, "side": "out", "length": 2065739, "shape": "equal power"}

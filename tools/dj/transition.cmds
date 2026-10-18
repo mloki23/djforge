@@ -2,8 +2,9 @@
 # Run from the repo root (DJFORGE_PYTHON and DJFORGE_MIXFORGE must be set):
 #   soundcraft-cli script tools/dj/transition.cmds --save OUT.scraft --bounce OUT.wav --start 400 --end 520
 # Mental Atmosphere's first downbeat lands on bar 2, so its bar k plays at session bar k + 2;
-# I Feel Love comes in on bar 254 (40 s into the 400 s excerpt), the mix point Marty picked by ear.
+# I Feel Love comes in on bar 238 (12 s into the 400 s excerpt), 16 bars before the outro of
+# Mental Atmosphere at bar 254 (39.7 s), where the bass swap lands (Marty, by ear).
 event.tempo {"bpm": 137.987}
-dj.tempo_ramp {"from_bar": 254, "bars": 32, "from_bpm": 137.987, "to_bpm": 145}
+dj.tempo_ramp {"from_bar": 238, "bars": 32, "from_bpm": 137.987, "to_bpm": 145}
 dj.load_warped {"path": "C:/Users/marty/Music/Youtube Loki Playlist/150 - Mental Atmosphere (Midnight Mix).mp3", "at_bar": 1}
-dj.load_warped {"path": "C:/Users/marty/Music/Youtube Loki Playlist/069 - I Feel Love (Mixed).mp3", "at_bar": 254}
+dj.load_warped {"path": "C:/Users/marty/Music/Youtube Loki Playlist/069 - I Feel Love (Mixed).mp3", "at_bar": 238}
