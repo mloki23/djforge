@@ -334,11 +334,14 @@ impl Engine {
             Ok(v) => {
                 if !Arc::ptr_eq(&before, &self.doc) {
                     // Beat-locked clips follow the edit; the document is touched only if one moves.
-                    let relocks = cmd::dj::relocks(&self.doc, &before.tempo);
+                    let relocks = cmd::dj::relocks(&self.doc, &before.tempo, before.sample_rate);
                     if !relocks.is_empty() {
                         cmd::dj::apply_relocks(self.session_mut(), &relocks);
                     }
                 }
+                // Copied parts of beat-locked clips remember which part they are before any later
+                // tempo change.
+                cmd::dj::settle_clipboard(&mut self.clipboard, &self.doc);
                 cmd::remember_selection(self, &before);
                 if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
                     self.push_undo(spec.label, before);

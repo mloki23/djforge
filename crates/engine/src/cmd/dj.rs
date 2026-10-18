@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{Clip, MAX_WARP_BEATS, Session, WarpLock, WarpMap};
+use soundcraft_model::{Clip, MAX_WARP_BEATS, Session, WarpLock, WarpMap, tempo_fingerprint};
 use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 
 #[path = "dj_align.rs"]
@@ -319,6 +319,35 @@ fn beat_at(tempo: &TempoMap, sr: SampleRate, t: Samples) -> f64 {
     tempo.samples_to_ticks_f(t, sr) / TICKS_PER_QUARTER as f64
 }
 
+/// The tempo map and sample rate an edit's timeline positions are measured under.
+#[derive(Clone, Copy)]
+pub(crate) struct Timebase<'a> {
+    tempo: &'a TempoMap,
+    sr: SampleRate,
+    fp: u64,
+}
+
+impl<'a> Timebase<'a> {
+    pub(crate) fn new(tempo: &'a TempoMap, sr: SampleRate) -> Self {
+        Timebase { tempo, sr, fp: tempo_fingerprint(tempo, sr) }
+    }
+
+    /// Session beat (fractional) at timeline sample `t`.
+    fn beat(&self, t: Samples) -> f64 {
+        beat_at(self.tempo, self.sr, t)
+    }
+
+    /// Timeline sample of fractional session beat `b`.
+    fn sample(&self, b: f64) -> Samples {
+        sample_at_beat(self.tempo, self.sr, b)
+    }
+
+    /// Track beats that `d` source-offset samples from timeline sample `at` span.
+    fn span(&self, at: Samples, d: Samples) -> f64 {
+        self.beat(at.saturating_add(d).clamp(-MAX_POSITION, MAX_POSITION)) - self.beat(at)
+    }
+}
+
 /// A beat-locked clip's new placement after an edit: clip `clip` of track `track`'s playlist.
 pub(crate) struct Relock {
     track: usize,
@@ -329,58 +358,63 @@ pub(crate) struct Relock {
     lock: WarpLock,
 }
 
-/// Where beat-locked clip `c` belongs after an edit that turned tempo map `old` into `new`
-/// (`tempo_changed` when they differ), as (start, length, anchor, lock); `None` when it is
-/// already there or isn't a beat-locked audio clip.
+/// Where beat-locked clip `c` belongs after an edit that turned timebase `old` into `new`, as
+/// (start, length, anchor, lock); `None` when it is already there or isn't a beat-locked audio clip.
 ///
-/// The clip's music was anchored where its lock records it. When the source offset moved by `d`
-/// since (a trim, a split, a copied part), the clip now starts with what played `d` after that old
-/// start, wherever the clip sits now: the anchor moves by the beats `d` spanned there under `old`.
-/// A plain move keeps the offset, so the music moves with the clip. A tempo change then puts the
-/// clip's edges on the same session beats they had under `old`.
-fn relocked(c: &Clip, old: &TempoMap, new: &TempoMap, sr: SampleRate, tempo_changed: bool) -> Option<(Samples, Samples, f64, WarpLock)> {
+/// The clip's music was anchored where its lock records it, under the tempo map the lock names.
+/// When the source offset moved by `d` since (a trim, a split, a copied part, or a slip edit, which
+/// keeps the start and so slides the music), the clip now starts with what played `d` after that
+/// old start, wherever the clip sits now: the anchor moves by the beats `d` spanned there. A plain
+/// move keeps the offset, so the music moves with the clip. A clip locked under `old` when the
+/// tempo changed is put on the same session beats under `new`. A lock taken under `new` already
+/// matches (an undo, redo or opened session swapped in a consistent document); one taken under
+/// neither map (or none) is only re-recorded.
+fn relocked(c: &Clip, old: Timebase, new: Timebase) -> Option<(Samples, Samples, f64, WarpLock)> {
     const EPS: f64 = 1e-9;
     let w = c.warp.as_ref().filter(|_| c.is_audio())?;
     let offset = c.source_offset();
-    let unmoved = WarpLock { start: c.start, length: c.length, offset };
-    if !tempo_changed && w.lock == Some(unmoved) {
+    if w.lock == Some(WarpLock { start: c.start, length: c.length, offset, tempo: new.fp }) {
         return None;
     }
-    let mut anchor = w.anchor;
-    if let Some(l) = w.lock
-        && l.offset != offset
-    {
-        let moved_to = l.start.saturating_add(offset.saturating_sub(l.offset)).clamp(-MAX_POSITION, MAX_POSITION);
-        anchor += beat_at(old, sr, moved_to) - beat_at(old, sr, l.start);
+    let under = match w.lock {
+        Some(l) if l.tempo == new.fp => Some((l, new)),
+        Some(l) if l.tempo == old.fp => Some((l, old)),
+        _ => None,
+    };
+    let (mut start, mut length, mut anchor) = (c.start, c.length, w.anchor);
+    if let Some((l, tb)) = under {
+        if l.offset != offset {
+            anchor += tb.span(l.start, offset.saturating_sub(l.offset));
+        }
+        if tb.fp != new.fp {
+            let (from, to) = (tb.beat(c.start), tb.beat(c.end()));
+            start = new.sample(from).clamp(-MAX_POSITION, MAX_POSITION);
+            length = new.sample(to).saturating_sub(start).clamp(1, MAX_POSITION);
+            // The start rounds to a sample: keep the beat heard at every session beat exact.
+            anchor += new.beat(start) - from;
+        }
     }
-    let (mut start, mut length) = (c.start, c.length);
-    if tempo_changed {
-        let (from, to) = (beat_at(old, sr, c.start), beat_at(old, sr, c.end()));
-        start = sample_at_beat(new, sr, from).clamp(-MAX_POSITION, MAX_POSITION);
-        length = sample_at_beat(new, sr, to).saturating_sub(start).clamp(1, MAX_POSITION);
-        // The start rounds to a sample: keep the beat heard at every session beat exact.
-        anchor += beat_at(new, sr, start) - from;
-    }
-    let lock = WarpLock { start, length, offset };
+    let lock = WarpLock { start, length, offset, tempo: new.fp };
     let unchanged = start == c.start && length == c.length && (anchor - w.anchor).abs() <= EPS && w.lock == Some(lock);
     (!unchanged).then_some((start, length, anchor, lock))
 }
 
 /// What [`apply_relocks`] must change so every beat-locked clip stays on its music after an edit
-/// that turned tempo map `old` into the session's (see [`relocked`]); empty when nothing moves.
-/// Clips without a recorded lock just get one.
+/// that turned tempo map `old` at rate `old_sr` into the session's (see [`relocked`]); empty when
+/// nothing moves. Clips without a recorded lock just get one.
 ///
 /// Not handled yet: a clip that grows with a tempo change may overlap a neighbour that isn't
-/// beat-locked; a take placed straight by recording is relocked only by the next command; a part
-/// copied before a tempo change and pasted after it keeps the old map's beat measure.
-pub(crate) fn relocks(s: &Session, old: &TempoMap) -> Vec<Relock> {
-    let (new, sr) = (&s.tempo, s.sample_rate);
-    let tempo_changed = old != new;
+/// beat-locked; a take placed straight by recording is relocked only by the next command;
+/// `event.move_song_start` moves clips on tick-timebase tracks itself and shifts the tempo events,
+/// so a beat-locked clip on such a track is moved twice (clips on sample-timebase tracks follow
+/// their beats, as with any tempo change).
+pub(crate) fn relocks(s: &Session, old: &TempoMap, old_sr: SampleRate) -> Vec<Relock> {
+    let (old, new) = (Timebase::new(old, old_sr), Timebase::new(&s.tempo, s.sample_rate));
     let mut out = Vec::new();
     for (track, tr) in s.tracks.iter().enumerate() {
         let Some(pl) = tr.playlist() else { continue };
         for (clip, c) in pl.clips.iter().enumerate() {
-            if let Some((start, length, anchor, lock)) = relocked(c, old, new, sr, tempo_changed) {
+            if let Some((start, length, anchor, lock)) = relocked(c, old, new) {
                 out.push(Relock { track, clip, start, length, anchor, lock });
             }
         }
@@ -391,6 +425,8 @@ pub(crate) fn relocks(s: &Session, old: &TempoMap) -> Vec<Relock> {
 /// Applies [`relocks`]' result to the session it was computed from. A tempo change's resize
 /// stretches the clip's envelope, fades and sync point with its beats.
 pub(crate) fn apply_relocks(s: &mut Session, relocks: &[Relock]) {
+    // `relocks` lists clips track by track, so a track's entries are adjacent and comparing with
+    // the last one recorded is enough to list each moved track once.
     let mut moved: Vec<usize> = Vec::new();
     for r in relocks {
         let Some(c) = s.tracks.get_mut(r.track).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.get_mut(r.clip)) else { continue };
@@ -410,6 +446,26 @@ pub(crate) fn apply_relocks(s: &mut Session, relocks: &[Relock]) {
         if let Some(pl) = s.tracks.get_mut(t).and_then(|t| t.playlist_mut()) {
             pl.sort();
         }
+    }
+}
+
+/// Settles copied parts of beat-locked clips on the clipboard under the current timebase `now`:
+/// each part's anchor takes the beats its offset change spanned, and its lock records where that
+/// part played. Pasting it later, after a tempo change too, then plays the part that was copied.
+pub(crate) fn settle_clipboard(cb: &mut crate::Clipboard, s: &Session) {
+    let mut now = None;
+    for c in cb.tracks.iter_mut().flatten() {
+        let offset = c.source_offset();
+        let audio = c.is_audio();
+        let Some(w) = c.warp.as_mut().filter(|_| audio) else { continue };
+        let Some(l) = w.lock.filter(|l| l.offset != offset) else { continue };
+        let tb = *now.get_or_insert_with(|| Timebase::new(&s.tempo, s.sample_rate));
+        if l.tempo != tb.fp {
+            continue;
+        }
+        let d = offset.saturating_sub(l.offset);
+        w.anchor += tb.span(l.start, d);
+        w.lock = Some(WarpLock { start: l.start.saturating_add(d).clamp(-MAX_POSITION, MAX_POSITION), offset, ..l });
     }
 }
 
@@ -441,7 +497,7 @@ mod tests {
 
     /// Relocks `s` after an edit that turned tempo map `old` into its own.
     fn relock(s: &mut Session, old: &TempoMap) {
-        let r = relocks(s, old);
+        let r = relocks(s, old, s.sample_rate);
         apply_relocks(s, &r);
     }
 
@@ -646,12 +702,62 @@ mod tests {
         e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
         let at_140 = (clips(&e), e.session().clone());
         assert_ne!(at_120.0, at_140.0);
-        assert!(e.undo());
-        assert_eq!(clips(&e), at_120.0);
-        assert!(*e.session() == at_120.1);
-        assert!(e.redo());
-        assert_eq!(clips(&e), at_140.0);
-        assert!(*e.session() == at_140.1);
+        // Through the commands, which swap whole documents inside `Engine::execute`.
+        for _ in 0..2 {
+            e.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(clips(&e), at_120.0);
+            assert!(*e.session() == at_120.1, "undo moved beat-locked clips");
+            e.execute("edit.redo", &json!({})).unwrap();
+            assert_eq!(clips(&e), at_140.0);
+            assert!(*e.session() == at_140.1, "redo moved beat-locked clips");
+        }
+    }
+
+    #[test]
+    fn opening_a_session_saved_at_another_tempo_keeps_its_clips() {
+        let (mut e, _, _) = warped();
+        e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
+        let saved = clips(&e);
+        let anchors = |e: &Engine| -> Vec<f64> {
+            e.session()
+                .tracks
+                .iter()
+                .filter_map(|t| t.playlist())
+                .flat_map(|p| p.clips.iter())
+                .filter_map(|c| c.warp.as_ref().map(|w| w.anchor))
+                .collect()
+        };
+        let saved_anchors = anchors(&e);
+        let dir = std::env::temp_dir().join(format!("sc-dj-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Warped.scraft").to_string_lossy().into_owned();
+        e.execute("session.save_as", &json!({"path": path})).unwrap();
+        // An engine at 120 bpm, holding beat-locked clips of its own.
+        let (mut other, _, _) = warped();
+        other.execute("session.open", &json!({"path": path})).unwrap();
+        assert_eq!(clips(&other), saved);
+        assert_eq!(anchors(&other), saved_anchors);
+        assert!(!other.is_dirty(), "opening marked the session modified");
+        other.execute("session.revert", &json!({})).unwrap();
+        assert_eq!(clips(&other), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_part_copied_before_a_tempo_change_and_pasted_after_plays_that_part() {
+        let (mut e, t, _) = warped();
+        let beat_heard = |e: &Engine, at: Samples| {
+            let s = e.session();
+            let c = s.tracks.iter().filter_map(|tr| tr.playlist()).flat_map(|p| p.clips.iter()).find(|c| c.range().contains(at)).unwrap();
+            c.warp.as_ref().unwrap().track_beat_at(&s.tempo, s.sample_rate, c.start, at)
+        };
+        let copied = beat_heard(&e, 5 * SR);
+        e.execute("edit.copy", &json!({"tracks": [t.0], "start": 5 * SR, "end": 6 * SR})).unwrap();
+        e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
+        e.execute("edit.paste", &json!({"tracks": [t.0], "at": 25 * SR})).unwrap();
+        assert!(clips(&e).iter().any(|&(start, _, offset)| start == 25 * SR && offset == 4 * SR), "{:?}", clips(&e));
+        assert!((beat_heard(&e, 25 * SR) - copied).abs() < 1e-6, "pasted part starts on track beat {} instead of {copied}", beat_heard(&e, 25 * SR));
     }
 
     #[test]
@@ -782,7 +888,7 @@ mod tests {
         // Off the tick grid (a tick is 25 samples here), so rounding to ticks would show.
         e.execute("edit.move_clips", &json!({"clips": [id.0], "by": 7})).unwrap();
         let tempo = e.session().tempo.clone();
-        assert!(relocks(e.session(), &tempo).is_empty());
+        assert!(relocks(e.session(), &tempo, e.session().sample_rate).is_empty());
         // A no-op edit leaves the document alone.
         let before = e.session().clone();
         let mut s = before.clone();

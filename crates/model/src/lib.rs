@@ -29,6 +29,6 @@ pub use session::{
 };
 pub use source::{Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};
-pub use warp::{MAX_WARP_BEATS, WarpLock, WarpMap};
+pub use warp::{MAX_WARP_BEATS, WarpLock, WarpMap, tempo_fingerprint};
 
 pub use soundcraft_time as time;

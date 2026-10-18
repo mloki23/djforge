@@ -21,9 +21,10 @@ pub struct WarpMap {
 }
 
 /// Where a warped clip sat after the last edit, so the next edit can keep its music in place: its
-/// start and length (timeline samples, under the tempo map of that moment) and its source offset
-/// (which trims, splits and copies of a part move, moves don't). A lock missing a field (from an
-/// older file) reads as empty and is dropped by [`WarpMap::sanitize`].
+/// start and length (timeline samples), its source offset (which trims, splits and copies of a
+/// part move, moves don't) and the [`tempo_fingerprint`] of the tempo map and sample rate those
+/// samples were measured under (0: unknown). A lock missing its position (from an older file)
+/// reads as empty and is dropped by [`WarpMap::sanitize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WarpLock {
     #[serde(default)]
@@ -32,6 +33,23 @@ pub struct WarpLock {
     pub length: Samples,
     #[serde(default)]
     pub offset: Samples,
+    #[serde(default)]
+    pub tempo: u64,
+}
+
+/// A fingerprint of what timeline sample positions mean: the tempo events and the sample rate.
+/// Stable across builds and runs (FNV-1a), so saved locks keep matching; never 0, which a
+/// [`WarpLock`] uses for "unknown". Meters don't move samples, so they are left out.
+pub fn tempo_fingerprint(tempo: &TempoMap, sr: SampleRate) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let words = std::iter::once(u64::from(sr.hz())).chain(tempo.tempos().iter().flat_map(|t| [t.tick as u64, t.bpm.to_bits()]));
+    for w in words {
+        for b in w.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h.max(1)
 }
 
 impl WarpMap {
@@ -191,8 +209,21 @@ mod tests {
         older.sanitize();
         assert_eq!(older.lock, None);
         let mut w = WarpMap::new(vec![1.0, 2.0], 0.0).unwrap();
-        w.lock = Some(WarpLock { start: 0, length: 0, offset: 0 });
+        w.lock = Some(WarpLock { start: 0, length: 0, offset: 0, tempo: 0 });
         w.sanitize();
         assert_eq!(w.lock, None);
+    }
+
+    #[test]
+    fn the_tempo_fingerprint_follows_tempo_and_rate_only() {
+        use soundcraft_time::{SampleRate, TempoMap};
+        let sr = SampleRate::default();
+        let a = TempoMap::new(120.0, 4, 4).unwrap();
+        let mut b = a.clone();
+        b.set_meter(960 * 8, 3, 4).unwrap();
+        assert_eq!(tempo_fingerprint(&a, sr), tempo_fingerprint(&b, sr));
+        b.set_tempo(960 * 8, 140.0).unwrap();
+        assert_ne!(tempo_fingerprint(&a, sr), tempo_fingerprint(&b, sr));
+        assert_ne!(tempo_fingerprint(&a, sr), tempo_fingerprint(&a, SampleRate::new(44_100).unwrap()));
     }
 }
