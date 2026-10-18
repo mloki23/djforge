@@ -411,7 +411,8 @@ fn relocked(c: &Clip, old: Timebase, new: Timebase) -> Option<(Samples, Samples,
 /// so a beat-locked clip on such a track is moved twice (clips on sample-timebase tracks follow
 /// their beats, as with any tempo change).
 pub(crate) fn relocks(s: &Session, old: &TempoMap, old_sr: SampleRate) -> Vec<Relock> {
-    let (old, new) = (Timebase::new(old, old_sr), Timebase::new(&s.tempo, s.sample_rate));
+    let new = Timebase::new(&s.tempo, s.sample_rate);
+    let old = if old_sr == s.sample_rate && *old == s.tempo { new } else { Timebase::new(old, old_sr) };
     let mut out = Vec::new();
     for (track, tr) in s.tracks.iter().enumerate() {
         let Some(pl) = tr.playlist() else { continue };
@@ -451,14 +452,23 @@ pub(crate) fn apply_relocks(s: &mut Session, relocks: &[Relock]) {
     }
 }
 
+/// Records a lock, under the session's own tempo map, for every beat-locked clip of a session
+/// entering the engine outside a command (a new engine, an opened or recovered file), so the
+/// first tempo change moves it with its beats. Locks already taken under that map are kept.
+pub(crate) fn record_locks(s: &mut Session) {
+    let r = relocks(s, &s.tempo, s.sample_rate);
+    if !r.is_empty() {
+        apply_relocks(s, &r);
+    }
+}
+
 /// Settles copied parts of beat-locked clips on the clipboard under the current timebase `now`:
 /// each part's anchor takes the beats its offset change spanned, and its lock records where that
 /// part played. Pasting it later, after a tempo change too, then plays the part that was copied.
 pub(crate) fn settle_clipboard(cb: &mut crate::Clipboard, s: &Session) {
     let mut now = None;
     for c in cb.tracks.iter_mut().flatten() {
-        let offset = c.source_offset();
-        let audio = c.is_audio();
+        let (offset, length, audio) = (c.source_offset(), c.length, c.is_audio());
         let Some(w) = c.warp.as_mut().filter(|_| audio) else { continue };
         let Some(l) = w.lock.filter(|l| l.offset != offset) else { continue };
         let tb = *now.get_or_insert_with(|| Timebase::new(&s.tempo, s.sample_rate));
@@ -467,7 +477,7 @@ pub(crate) fn settle_clipboard(cb: &mut crate::Clipboard, s: &Session) {
         }
         let d = offset.saturating_sub(l.offset);
         w.anchor += tb.span(l.start, d);
-        w.lock = Some(WarpLock { start: l.start.saturating_add(d).clamp(-MAX_POSITION, MAX_POSITION), offset, ..l });
+        w.lock = Some(WarpLock { start: l.start.saturating_add(d).clamp(-MAX_POSITION, MAX_POSITION), length, offset, tempo: l.tempo });
     }
 }
 
@@ -987,5 +997,47 @@ mod tests {
         let mut s = before.clone();
         relock(&mut s, &tempo);
         assert!(s == before, "relock changed a consistent session");
+    }
+
+    /// Every beat-locked clip's lock (None when it has none).
+    fn locks(e: &Engine) -> Vec<Option<WarpLock>> {
+        e.session().tracks.iter().filter_map(|t| t.playlist()).flat_map(|p| p.clips.iter()).filter_map(|c| c.warp.as_ref().map(|w| w.lock)).collect()
+    }
+
+    /// After loading, the clip spanning beats 2..42 follows its beats through a tempo change.
+    fn follows_a_tempo_change(mut e: Engine, id: ClipId) {
+        e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
+        let s = e.session();
+        let c = s.find_clip(id).unwrap().1;
+        assert_eq!((c.start, c.end()), (at_beat(s, 2), at_beat(s, 42)));
+    }
+
+    #[test]
+    fn a_new_engine_records_locks_without_marking_itself_modified() {
+        let (e, _, id) = warped();
+        let mut s = e.session().clone();
+        s.find_clip_mut(id).unwrap().warp.as_mut().unwrap().lock = None;
+        let e = Engine::new(s);
+        assert!(locks(&e).iter().all(Option::is_some));
+        assert!(!e.is_dirty());
+        follows_a_tempo_change(e, id);
+    }
+
+    #[test]
+    fn opening_a_file_without_locks_records_them() {
+        let (mut e, _, id) = warped();
+        e.session_mut().find_clip_mut(id).unwrap().warp.as_mut().unwrap().lock = None;
+        let dir = std::env::temp_dir().join(format!("sc-dj-unlocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Unlocked.scraft").to_string_lossy().into_owned();
+        crate::io::save_session(&mut e, &path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"lock\""), "the saved file still has a lock");
+        let mut opened = Engine::default();
+        crate::io::open_session(&mut opened, &path).unwrap();
+        assert!(locks(&opened).iter().all(Option::is_some));
+        assert!(!opened.is_dirty());
+        follows_a_tempo_change(opened, id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

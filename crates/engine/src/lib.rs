@@ -148,8 +148,10 @@ impl Default for Engine {
 }
 
 impl Engine {
-    pub fn new(session: Session) -> Self {
+    pub fn new(mut session: Session) -> Self {
         install_panic_hook();
+        // Recorded as part of what was loaded, so the engine starts clean.
+        cmd::dj::record_locks(&mut session);
         let doc = Arc::new(session);
         Engine {
             saved: Arc::clone(&doc),
@@ -194,7 +196,9 @@ impl Engine {
     }
 
     /// Replace the whole document (open / new); clears history.
-    pub fn replace_session(&mut self, s: Session) {
+    pub fn replace_session(&mut self, mut s: Session) {
+        // Recorded as part of what was loaded, so the document starts clean.
+        cmd::dj::record_locks(&mut s);
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
         self.transport_requests.clear();
         self.transport_requests.push(TransportRequest::ResetSession);
