@@ -52,6 +52,12 @@ impl WarpPlayer {
         })
     }
 
+    /// Source channels the player was built for.
+    #[cfg(test)]
+    pub(crate) fn channels(&self) -> usize {
+        self.input.len()
+    }
+
     /// True when the player was built off the audio thread and handed over.
     pub fn is_prepared(&self) -> bool {
         self.prepared

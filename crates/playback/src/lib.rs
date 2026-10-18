@@ -199,13 +199,12 @@ fn bin() -> (Bin, BinRx) {
     (Bin { plugins: ptx, warps: wtx, batches: btx }, BinRx { plugins: prx, warps: wrx, batches: brx })
 }
 
-/// Most warp players built per [`Player::update_session`] or [`Player::idle`] call, so loading
-/// a big set doesn't stall the UI; the rest follow from later `idle` calls.
+/// Most warp players built per [`Player::update_session`] call (nearest the playhead first), so
+/// loading a big set doesn't stall the UI; the rest follow from [`Player::idle`].
 const WARP_BATCH: usize = 8;
 
-/// Capacity of every batch of warp players sent: room for the engine to merge several batches
-/// that arrive between two renders without allocating (see `MixEngine::adopt_warps`).
-const WARP_BATCH_CAP: usize = 8 * WARP_BATCH;
+/// Most warp players built per [`Player::idle`] call (a UI frame).
+const WARP_IDLE_BATCH: usize = 2;
 
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
@@ -252,6 +251,9 @@ impl AudioState {
                         let _ = self.garbage.plugins.send(old.drain_plugins());
                         let _ = self.garbage.warps.send(old.drain_warps());
                     }
+                    // Place the previous batch first, so the engine's inbox is empty to adopt into
+                    // (see `MixEngine::adopt_warps`).
+                    self.place_warps();
                     self.mix.adopt(instances);
                     self.adopt_warps(warps);
                     // The main format changed (a document edit, not steady state): resize.
@@ -267,7 +269,12 @@ impl AudioState {
                         let _ = tx.try_send(old);
                     }
                 }
-                Cmd::Warps(warps) => self.adopt_warps(warps),
+                Cmd::Warps(warps) => {
+                    // Placed right away: while stopped, `render` (which also places) doesn't run.
+                    self.place_warps();
+                    self.adopt_warps(warps);
+                    self.place_warps();
+                }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
                     self.pos = from;
@@ -296,10 +303,19 @@ impl AudioState {
             // Place adopted instances now (not only once playback starts), so editors see them;
             // `sync` creates no third-party plugins here.
             self.mix.ensure_synced(&self.session);
+            self.mix.place_pending_warps(&self.session);
             self.mix.retire_stale_warps(&self.session);
         }
         self.send_garbage();
         self.shared.playing.store(self.playing, Ordering::Relaxed);
+    }
+
+    /// Places warp players waiting in the engine into the strips of the current snapshot.
+    fn place_warps(&mut self) {
+        if self.mix.has_pending_warps() {
+            self.mix.ensure_synced(&self.session);
+            self.mix.place_pending_warps(&self.session);
+        }
     }
 
     /// Hands warp players to the engine; the emptied batch goes back to be freed off this thread.
@@ -460,7 +476,8 @@ struct Side {
     old_sessions: Option<Receiver<Arc<Session>>>,
     /// Beat-locked clips whose warp player was sent: (track, clip id) -> (channels, sample rate).
     prepared_warps: HashMap<(TrackId, u64), (usize, u32)>,
-    /// The snapshot last sent, while some of its warp players are still to be built.
+    /// The snapshot last sent (an extra reference, released here on the UI thread), while some
+    /// of its warp players are still to be built.
     warps_for: Option<Arc<Session>>,
 }
 
@@ -713,8 +730,9 @@ impl Player {
         let instances = side.prepare(&s);
         side.warps_for = Some(Arc::clone(&s));
         let warps = side.prepare_warps(&s, self.position(), WARP_BATCH);
-        drop(side);
+        // Sent under the lock, so a batch from `idle` can't overtake the snapshot it belongs to.
         let _ = self.tx.send(Cmd::Session(s, instances, warps));
+        drop(side);
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.
@@ -728,7 +746,7 @@ impl Player {
         let mut side = self.side();
         side.collect_garbage();
         if let Some(s) = side.warps_for.clone() {
-            let warps = side.prepare_warps(&s, self.position(), WARP_BATCH);
+            let warps = side.prepare_warps(&s, self.position(), WARP_IDLE_BATCH);
             if !warps.is_empty() {
                 let _ = self.tx.send(Cmd::Warps(warps));
             }
@@ -935,7 +953,10 @@ impl Side {
         if todo.len() <= budget {
             self.warps_for = None;
         }
-        let mut out = Vec::with_capacity(WARP_BATCH_CAP);
+        if todo.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(todo.len().min(budget));
         for (_, track, clip, ch) in todo.into_iter().take(budget) {
             // Remembered even when the build fails: retrying every frame would not help.
             self.prepared_warps.insert((track, clip.0), (ch, sr));
@@ -1274,6 +1295,44 @@ mod tests {
         // retired player is already on the channel when it returns.
         st.fill(&mut out, 2);
         assert_eq!(grx.warps.try_recv().map(|w| w.len()).unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn warp_players_sent_while_stopped_are_all_placed() {
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind, WarpMap};
+        let mut s = soundcraft_model::Session::default();
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]] };
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(buf)));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let n = 70;
+        for k in 0..n {
+            let id = s.new_clip_id();
+            let mut c = Clip::audio(id, "c", SourceId(900), 0, k * 48_000, 48_000);
+            c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        }
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, bin().0);
+        let mut side = Side::new(48_000.0, bin().1);
+        let s = Arc::new(s);
+        side.warps_for = Some(Arc::clone(&s));
+        tx.send(Cmd::Session(Arc::clone(&s), Vec::new(), side.prepare_warps(&s, 0, WARP_BATCH))).unwrap();
+        let mut out = vec![0.0f32; 256];
+        // Stopped: every UI frame sends a batch, and the callback only drains commands.
+        while side.warps_for.is_some() {
+            tx.send(Cmd::Warps(side.prepare_warps(&s, 0, WARP_IDLE_BATCH))).unwrap();
+            st.fill(&mut out, 2);
+        }
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(st.mix.warp_players().count(), n as usize);
+        assert!(st.mix.warp_players().all(|(_, _, p)| p.is_prepared()));
     }
 
     #[test]

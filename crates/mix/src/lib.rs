@@ -502,9 +502,10 @@ impl MixEngine {
     ///
     /// Neither allocates nor frees: it returns a `Vec` (empty, perhaps with capacity) for the
     /// host to drop off the audio thread. The incoming batch becomes the inbox when the inbox is
-    /// empty; otherwise the two are merged into whichever has room. A host that sends batches
-    /// with spare capacity (see the playback crate) never hits the last resort, where the batch
-    /// is retired and its clips fall back to building a player when they play.
+    /// empty; otherwise the two are merged, oldest first, into whichever has room. If neither
+    /// has, the batch is retired and its clips fall back to building a player when they play. A
+    /// host avoids that by calling [`MixEngine::place_pending_warps`] before each `adopt_warps`,
+    /// which leaves the inbox empty (the playback crate does, so it never reaches that case).
     pub fn adopt_warps(&mut self, mut warps: Vec<PreparedWarp>) -> Vec<PreparedWarp> {
         if warps.is_empty() {
             return warps;
@@ -517,7 +518,10 @@ impl MixEngine {
             return warps;
         }
         if warps.capacity() - warps.len() >= self.warp_inbox.len() {
+            // Older batch first, so a newer player for the same clip wins in placement.
+            let k = warps.len();
             warps.append(&mut self.warp_inbox);
+            warps.rotate_left(k);
             return std::mem::replace(&mut self.warp_inbox, warps);
         }
         self.retired_warps.extend(warps.drain(..).map(|w| w.player));
@@ -561,9 +565,16 @@ impl MixEngine {
         self.strips.iter().flat_map(|(t, st)| st.warps.iter().map(move |(c, p)| (*t, *c, p)))
     }
 
-    /// Moves handed-over warp players into their strips. A player it replaces, or one whose
-    /// clip no longer plays there, is retired rather than dropped here (the audio thread).
-    fn place_warps(&mut self, s: &Session) {
+    /// True when handed-over warp players wait to be placed.
+    pub fn has_pending_warps(&self) -> bool {
+        !self.warp_inbox.is_empty()
+    }
+
+    /// Moves handed-over warp players into the strips of `s` (call `ensure_synced(s)` first so
+    /// they exist; `render` does this itself). A player it replaces, or one whose clip no longer
+    /// plays there, is retired rather than dropped here. Neither allocates nor frees, apart from
+    /// growing the retired list.
+    pub fn place_pending_warps(&mut self, s: &Session) {
         for w in self.warp_inbox.drain(..) {
             let plays = s.track(w.track).is_some_and(|t| t.clips().iter().any(|c| c.id == w.clip && warp_clip_plays(t, c)));
             match self.strips.get_mut(&w.track) {
@@ -720,7 +731,7 @@ impl MixEngine {
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
         if !self.warp_inbox.is_empty() {
-            self.place_warps(s);
+            self.place_pending_warps(s);
         }
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
@@ -2514,12 +2525,15 @@ mod tests {
         let mut out = vec![vec![0.0; 512]; 2];
         let player = || PreparedWarp::new(t, id, 1, 48_000.0).unwrap();
         // Two batches before a render merge into one inbox (the second has room for the first).
+        // The newer player is told apart by its channel count.
         let mut batch = Vec::with_capacity(4);
-        batch.push(player());
+        batch.push(PreparedWarp::new(t, id, 2, 48_000.0).unwrap());
         assert_eq!(eng.adopt_warps(vec![player()]).len(), 0);
         assert_eq!(eng.adopt_warps(batch).capacity(), 1, "the old inbox comes back to the host");
         eng.render(&s, 0, 512, &mut out);
-        assert_eq!(eng.take_retired_warps().len(), 1, "the second player for the clip replaces the first");
+        let retired = eng.take_retired_warps();
+        assert_eq!(retired.iter().map(WarpPlayer::channels).collect::<Vec<_>>(), [1], "the older player is replaced");
+        assert_eq!(eng.warp_players().map(|(_, _, p)| p.channels()).collect::<Vec<_>>(), [2], "the newer one plays");
         assert!(eng.warp_players().all(|(_, _, p)| p.is_prepared()));
         // A player for a muted clip is not placed.
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].muted = true;
