@@ -1,0 +1,175 @@
+{
+  "format": "mixforge-plan/2",
+  "master_bpm": 140.0,
+  "tempo_mode": "ramp",
+  "bar_seconds": 1.714286,
+  "sample_rate": 44100,
+  "target_lufs": -10.0,
+  "master_fx": [],
+  "tracks": [
+    {
+      "path": "C:\\Users\\marty\\Music\\Youtube Loki Playlist\\193 - Quest - Accelerator (Sunnyside Dub) (Acid Trance 2000).mp3",
+      "title": "Quest - Accelerator (Sunnyside Dub) (Acid Trance 2000)",
+      "artist": "GERMSGEMS",
+      "bpm": 132.006,
+      "tempo_multiplier": 1.0,
+      "play_bpm": 132.006,
+      "stretch": 1.0,
+      "key": "D#",
+      "camelot": "5B",
+      "gain_db": 6.0,
+      "first_downbeat": 1.5957,
+      "audio_end": 512.464,
+      "start": 0.0,
+      "cue_in": 1.5957,
+      "out_start": 496.1187,
+      "transition_bars": 8,
+      "transition": {
+        "style": "quick",
+        "bars": 8,
+        "ramp": true,
+        "reason": "keys clash (5B -> 7A): keep the overlap short"
+      },
+      "sections": [
+        {
+          "bar": 7,
+          "label": "intro",
+          "bars": 8,
+          "time": 14.3224
+        },
+        {
+          "bar": 15,
+          "label": "intro",
+          "bars": 8,
+          "time": 28.8672
+        },
+        {
+          "bar": 23,
+          "label": "intro",
+          "bars": 24,
+          "time": 43.412
+        }
+      ],
+      "fx": [],
+      "nudge_ms": 0.0
+    },
+    {
+      "path": "C:\\Users\\marty\\Music\\Youtube Loki Playlist\\154 - Meet Her at the Love Parade 97 09 (Nalin & Kane Remix).mp3",
+      "title": "Meet Her at the Love Parade 97 09 (Nalin & Kane Remix)",
+      "artist": "Da Hool, Nalin & Kane",
+      "bpm": 133.0,
+      "tempo_multiplier": 1.0,
+      "play_bpm": 133.0,
+      "stretch": 1.0,
+      "key": "Dm",
+      "camelot": "7A",
+      "gain_db": 4.83,
+      "first_downbeat": 1.3157,
+      "audio_end": 590.809,
+      "start": 1.3157,
+      "cue_in": 1.3157,
+      "out_start": 549.8871,
+      "transition_bars": 16,
+      "transition": {
+        "style": "blend",
+        "bars": 16,
+        "ramp": true,
+        "reason": "beat-matched blend with bass swap"
+      },
+      "sections": [
+        {
+          "bar": 17,
+          "label": "intro",
+          "bars": 15,
+          "time": 31.9924
+        },
+        {
+          "bar": 31,
+          "label": "inst",
+          "bars": 8,
+          "time": 57.2555
+        },
+        {
+          "bar": 39,
+          "label": "inst",
+          "bars": 9,
+          "time": 71.6916
+        }
+      ],
+      "fx": [],
+      "nudge_ms": 0
+    },
+    {
+      "path": "C:\\Users\\marty\\Music\\Youtube Loki Playlist\\140 - Da Hool Vrs R.H.C - The Fever Called Love Parade (Creative Thieves Mash-Up) 1998.mp3",
+      "title": "Da Hool Vrs R.H.C - The Fever Called Love Parade (Creative Thieves Mash-Up) 1998",
+      "artist": "Pete Neeson",
+      "bpm": 134.661,
+      "tempo_multiplier": 1.0,
+      "play_bpm": 134.661,
+      "stretch": 1.0,
+      "key": "Dm",
+      "camelot": "7A",
+      "gain_db": 4.92,
+      "first_downbeat": 0.9357,
+      "audio_end": 464.596,
+      "start": 0.9357,
+      "cue_in": 0.9357,
+      "out_start": 435.8055,
+      "transition_bars": 8,
+      "transition": {
+        "style": "quick",
+        "bars": 8,
+        "ramp": true,
+        "reason": "keys clash (7A -> 5B): keep the overlap short"
+      },
+      "sections": [
+        {
+          "bar": 0,
+          "label": "intro",
+          "bars": 12,
+          "time": 0.9357
+        },
+        {
+          "bar": 11,
+          "label": "inst",
+          "bars": 8,
+          "time": 20.5405
+        },
+        {
+          "bar": 19,
+          "label": "inst",
+          "bars": 8,
+          "time": 34.7985
+        }
+      ],
+      "fx": [],
+      "nudge_ms": 0
+    }
+  ],
+  "warnings": [
+    "Key clash: Quest - Accelerator (Sunnyside Dub) (Acid Trance 2000) (5B) -> Meet Her at the Love Parade 97 09 (Nalin & Kane Remix) (7A): quick 8-bar mix.",
+    "Key clash: Da Hool Vrs R.H.C - The Fever Called Love Parade (Creative Thieves Mash-Up) 1998 (7A) -> Why Don't You Dance with Me? (5B): quick 8-bar mix.",
+    "Key clash: Marc Dawn - Expander (Flutlicht Remix) Classic Hard Trance (4A) -> Envio - Touched By The Sun (Original Mix) (2003) (12A): quick 8-bar mix.",
+    "Key clash: TranceVault - Citizen Caned - The Journey (Surge Remix) (9B) -> Rocco - One,Two, Three (2003) (5A): quick 8-bar mix.",
+    "Key clash: Parker & Clind - Generator (Remastered Power Club Mix) (5A) -> Dizmaster Meets Wavetraxx - Patriot (Locanda & Kuznetsow Remix) (2B): quick 8-bar mix.",
+    "Key clash: Dizmaster Meets Wavetraxx - Patriot (Locanda & Kuznetsow Remix) (2B) -> Nomad - Distorted Harmony (extended mix) (9A): quick 8-bar mix.",
+    "Key clash: Awaken Your Soul (ASOT 1247) (10B) -> Ripped Out (Mix Cut) (7A): quick 8-bar mix.",
+    "Key clash: Ripped Out (Mix Cut) (7A) -> Creeds - Push Up (SIMOX Bootleg) (10B): quick 8-bar mix.",
+    "Key clash: Creeds - Push Up (SIMOX Bootleg) (10B) -> ANTONYM - Bass Go (3A): quick 8-bar mix.",
+    "Key clash: ANTONYM - Bass Go (3A) -> Move It (12A): quick 8-bar mix.",
+    "Why Don't You Dance with Me?: intro is off its beatgrid, mixing in at bar 25.",
+    "Why Don't You Dance with Me?: outro is off its beatgrid, mixing out at bar 113 of 178.",
+    "Dj Sequenza - Black Rain (Club Mix) 2002: intro is off its beatgrid, mixing in at bar 25.",
+    "Transa - Enervate (1997): outro is off its beatgrid, mixing out at bar 112 of 271.",
+    "TranceVault - Citizen Caned - The Journey (Surge Remix): outro is off its beatgrid, mixing out at bar 169 of 218.",
+    "Rocco - One,Two, Three (2003): intro is off its beatgrid, mixing in at bar 25.",
+    "Parker & Clind - Generator (Remastered Power Club Mix): outro is off its beatgrid, mixing out at bar 265 of 290.",
+    "Dizmaster Meets Wavetraxx - Patriot (Locanda & Kuznetsow Remix): no clean phrase to mix in on; using the first downbeat.",
+    "Nomad - Distorted Harmony (extended mix): intro is off its beatgrid, mixing in at bar 33.",
+    "Awaken Your Soul (ASOT 1247): intro is off its beatgrid, mixing in at bar 17.",
+    "Ripped Out (Mix Cut): outro is off its beatgrid, mixing out at bar 201 of 231.",
+    "ANTONYM - Bass Go: intro is off its beatgrid, mixing in at bar 65.",
+    "ANTONYM - Bass Go: outro is off its beatgrid; transition may not be tight.",
+    "Move It: intro is off its beatgrid, mixing in at bar 25."
+  ]
+}

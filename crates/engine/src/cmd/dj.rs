@@ -8,6 +8,8 @@ use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 
 #[path = "dj_align.rs"]
 mod align;
+#[path = "dj_plan.rs"]
+pub(crate) mod plan;
 #[path = "dj_recipe.rs"]
 pub(crate) mod recipe;
 
