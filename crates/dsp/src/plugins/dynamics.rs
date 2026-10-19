@@ -476,10 +476,11 @@ impl Plugin for DeEsser {
 
 // ---------------------------------------------------------------------------------------------
 
-static MAX_PARAMS: [ParamInfo; 3] = [
+static MAX_PARAMS: [ParamInfo; 4] = [
     lin("threshold", "Threshold", -30.0, 0.0, 0.0, Unit::Db),
     lin("ceiling", "Ceiling", -30.0, 0.0, -0.3, Unit::Db),
     log("release", "Release", 1.0, 1000.0, 50.0, Unit::Ms),
+    toggle("true_peak", "True Peak", false),
 ];
 
 pub static MAX_INFO: PluginInfo = PluginInfo {
@@ -494,14 +495,24 @@ pub static MAX_INFO: PluginInfo = PluginInfo {
 
 const MAX_LOOKAHEAD_MS: f32 = 1.5;
 
+/// How many samples late the true-peak detector sees an inter-sample peak (its interpolation
+/// filter's group delay, rounded up): the audio is delayed that much more in true-peak mode.
+const TP_DELAY: usize = crate::meter::TP_TAPS / 2;
+
 /// Lookahead brickwall limiter: the input is driven by `-threshold` dB and never exceeds the
 /// ceiling. Gain is a min-hold over the lookahead window followed by an equal-length moving
 /// average, which ramps the gain down before each peak reaches the output.
+///
+/// With `true_peak` on, peaks are detected on a 4× oversampled signal (the loudness meter's
+/// true-peak filter), so inter-sample peaks stay under the ceiling too; the audio is delayed by
+/// the detector's [`TP_DELAY`] more samples, which [`Plugin::latency`] reports.
 pub struct Maximizer {
     p: Params,
     sr: f32,
     la: usize,
     delay: Vec<DelayLine>,
+    tp_coefs: [[f32; crate::meter::TP_TAPS]; crate::meter::TP_PHASES],
+    tp_hist: Vec<[f32; crate::meter::TP_TAPS]>,
     req: Vec<f32>,
     smooth: Vec<f32>,
     idx: usize,
@@ -526,6 +537,8 @@ impl Maximizer {
             sr: 48_000.0,
             la: 1,
             delay: Vec::new(),
+            tp_coefs: crate::meter::true_peak_coefs(),
+            tp_hist: Vec::new(),
             req: vec![1.0],
             smooth: vec![1.0],
             idx: 0,
@@ -547,6 +560,10 @@ impl Maximizer {
         self.ceiling.snap();
         self.rel = time_coef(self.p.v(2), self.sr);
     }
+
+    fn true_peak(&self) -> bool {
+        self.p.on(3)
+    }
 }
 
 impl Plugin for Maximizer {
@@ -558,10 +575,11 @@ impl Plugin for Maximizer {
         self.delay = (0..sane_channels(channels))
             .map(|_| {
                 let mut d = DelayLine::default();
-                d.allocate(self.la + 2);
+                d.allocate(self.la + TP_DELAY + 2);
                 d
             })
             .collect();
+        self.tp_hist = vec![[0.0; crate::meter::TP_TAPS]; self.delay.len()];
         self.req = vec![1.0; self.la];
         self.smooth = vec![1.0; self.la];
         self.drive.set_time(20.0, self.sr);
@@ -572,6 +590,7 @@ impl Plugin for Maximizer {
 
     fn reset(&mut self) {
         self.delay.iter_mut().for_each(DelayLine::clear);
+        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; crate::meter::TP_TAPS]);
         self.req.iter_mut().for_each(|v| *v = 1.0);
         self.smooth.iter_mut().for_each(|v| *v = 1.0);
         self.sum = self.la as f64;
@@ -586,6 +605,8 @@ impl Plugin for Maximizer {
         let ch = self.delay.len().min(io.len());
         let frames = frames_in(io, frames, ch);
         let la = self.la.max(1);
+        let true_peak = self.true_peak();
+        let out_tap = if true_peak { la + TP_DELAY } else { la };
         let mut min_gain = 1.0f32;
         for n in 0..frames {
             let drive = self.drive.next();
@@ -595,7 +616,16 @@ impl Plugin for Maximizer {
                 let (Some(buf), Some(d)) = (io.get(c), self.delay.get_mut(c)) else { continue };
                 let x = buf.get(n).copied().filter(|v| v.is_finite()).unwrap_or(0.0) * drive;
                 d.push(x);
-                peak = peak.max(x.abs());
+                // The history is kept in both modes, so switching mode starts from real audio.
+                let p = match self.tp_hist.get_mut(c) {
+                    Some(h) => {
+                        h.copy_within(0..crate::meter::TP_TAPS - 1, 1);
+                        h[0] = x;
+                        if true_peak { crate::meter::true_peak_of(&self.tp_coefs, h, x) } else { x.abs() }
+                    }
+                    None => x.abs(),
+                };
+                peak = peak.max(p);
             }
             let req = if peak > ceil { ceil / peak } else { 1.0 };
             if let Some(r) = self.req.get_mut(self.idx) {
@@ -617,7 +647,7 @@ impl Plugin for Maximizer {
             for c in 0..ch {
                 let (Some(buf), Some(d)) = (io.get_mut(c), self.delay.get(c)) else { continue };
                 if let Some(x) = buf.get_mut(n) {
-                    *x = (d.tap(la) * g).clamp(-ceil, ceil);
+                    *x = (d.tap(out_tap) * g).clamp(-ceil, ceil);
                 }
             }
         }
@@ -625,7 +655,7 @@ impl Plugin for Maximizer {
     }
 
     fn latency(&self) -> usize {
-        self.la - 1
+        self.la - 1 + if self.true_peak() { TP_DELAY } else { 0 }
     }
 
     fn gain_reduction_db(&self) -> f32 {

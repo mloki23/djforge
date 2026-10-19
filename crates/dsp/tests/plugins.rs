@@ -294,6 +294,64 @@ fn maximizer_respects_ceiling_and_reports_latency() {
     assert!(p.gain_reduction_db() > 5.0);
 }
 
+/// True peak (dBTP) of `out` after its first `skip` frames, by the loudness meter.
+fn true_peak_db(out: &[Vec<f32>], skip: usize) -> f32 {
+    let tail: Vec<Vec<f32>> = out.iter().map(|c| c[skip..].to_vec()).collect();
+    let mut m = soundcraft_dsp::meter::LoudnessMeter::new(SR, tail.len());
+    m.process(&tail, tail[0].len());
+    m.true_peak_db()
+}
+
+#[test]
+fn maximizer_true_peak_mode_keeps_inter_sample_peaks_under_the_ceiling() {
+    // A full-scale sine at fs/4, 45° off: every sample is ±0.707 (-3 dBFS) but the wave peaks at
+    // 0 dBTP between them.
+    let overs: Vec<f32> = (0..48_000).map(|i| (TAU * (i % 4) as f32 / 4.0 + TAU / 8.0).sin()).collect();
+    // Loud broadband material driven into the limiter.
+    let mut seed = 1u32;
+    let noise: Vec<f32> = (0..48_000)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        })
+        .collect();
+    // Faded in, so the meter's interpolation filter is not measuring an abrupt start.
+    let fade_in = |x: Vec<f32>| -> Vec<f32> { x.iter().enumerate().map(|(i, v)| v * (i as f32 / 480.0).min(1.0)).collect() };
+    let (overs, noise) = (fade_in(overs), fade_in(noise));
+    for (what, x, threshold) in [("fs/4 sine", &overs, 0.0), ("noise", &noise, -6.0)] {
+        let mut off = prepared("maximizer");
+        off.set_param("threshold", threshold);
+        off.set_param("ceiling", -1.0);
+        let base = off.latency();
+        let out = run(off.as_mut(), &[x.clone(), x.clone()]);
+        let sample_mode = true_peak_db(&out, 0);
+        let mut on = prepared("maximizer");
+        on.set_param("threshold", threshold);
+        on.set_param("ceiling", -1.0);
+        on.set_param("true_peak", 1.0);
+        assert!(on.latency() > base, "{what}: true-peak mode adds the detector's delay");
+        let out = run(on.as_mut(), &[x.clone(), x.clone()]);
+        let tp = true_peak_db(&out, 0);
+        assert!(peak(&out[0]) <= db_to_gain(-1.0) + 1e-5, "{what}");
+        assert!(tp <= -0.9, "{what}: {tp} dBTP with true_peak on ({sample_mode} dBTP off)");
+        if what == "fs/4 sine" {
+            assert!(sample_mode > -0.5, "{what}: the sample-peak mode lets it over: {sample_mode}");
+        }
+    }
+}
+
+#[test]
+fn maximizer_true_peak_latency_matches_its_delay() {
+    let mut p = prepared("maximizer");
+    p.set_param("true_peak", 1.0);
+    let lat = p.latency();
+    let mut x = vec![0.0f32; 8000];
+    x[1000] = 0.25;
+    let out = run(p.as_mut(), &[x]);
+    let pos = out[0].iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+    assert_eq!(pos, 1000 + lat);
+}
+
 #[test]
 fn de_esser_reduces_sibilance_only() {
     let mut p = prepared("de_esser");

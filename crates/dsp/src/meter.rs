@@ -133,8 +133,46 @@ const SUB_BLOCKS: usize = 30; // 3 s of 100 ms sub-blocks
 const HIST_MIN: f32 = -70.0;
 const HIST_STEP: f32 = 0.05;
 const HIST_BINS: usize = 1800; // -70 .. +20 LUFS
-const TP_PHASES: usize = 4;
-const TP_TAPS: usize = 12;
+/// True peak: 4× oversampling with a 48-tap interpolation filter, 12 taps per phase.
+pub(crate) const TP_PHASES: usize = 4;
+pub(crate) const TP_TAPS: usize = 12;
+
+/// The true-peak interpolation filter (a windowed sinc at the original Nyquist, split into
+/// [`TP_PHASES`] phases, each normalised to unity gain). Phase `k` applied to the newest
+/// [`TP_TAPS`] samples (newest first) estimates the signal between samples, about
+/// `TP_TAPS / 2` samples back.
+pub(crate) fn true_peak_coefs() -> [[f32; TP_TAPS]; TP_PHASES] {
+    let mut tp_coefs = [[0.0f32; TP_TAPS]; TP_PHASES];
+    let total = TP_TAPS * TP_PHASES;
+    let center = (total as f64 - 1.0) / 2.0;
+    for i in 0..total {
+        let t = (i as f64 - center) / TP_PHASES as f64;
+        let sinc = if t.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) };
+        let x = i as f64 / (total as f64 - 1.0);
+        let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * x).cos() + 0.08 * (4.0 * std::f64::consts::PI * x).cos();
+        if let Some(slot) = tp_coefs.get_mut(i % TP_PHASES).and_then(|ph| ph.get_mut(i / TP_PHASES)) {
+            *slot = (sinc * w) as f32;
+        }
+    }
+    for ph in &mut tp_coefs {
+        let s: f32 = ph.iter().sum();
+        if s.abs() > 1e-6 {
+            ph.iter_mut().for_each(|c| *c /= s);
+        }
+    }
+    tp_coefs
+}
+
+/// The largest absolute value among `x` and the inter-sample estimates from the history `h`
+/// (newest first, `x` already pushed into it).
+pub(crate) fn true_peak_of(coefs: &[[f32; TP_TAPS]; TP_PHASES], h: &[f32; TP_TAPS], x: f32) -> f32 {
+    let mut peak = x.abs();
+    for ph in coefs {
+        let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
+        peak = peak.max(y.abs());
+    }
+    peak
+}
 
 /// ITU-R BS.1770 / EBU R128 loudness meter.
 #[derive(Debug, Clone)]
@@ -196,25 +234,7 @@ impl LoudnessMeter {
         let channels = channels.clamp(1, crate::util::MAX_CHANNELS);
         let weights = if channels == 6 { vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41] } else { vec![1.0; channels] };
         let [c1, c2] = k_weighting(sr);
-        // Interpolation filter: windowed sinc at the original Nyquist, split into 4 phases.
-        let mut tp_coefs = [[0.0f32; TP_TAPS]; TP_PHASES];
-        let total = TP_TAPS * TP_PHASES;
-        let center = (total as f64 - 1.0) / 2.0;
-        for i in 0..total {
-            let t = (i as f64 - center) / TP_PHASES as f64;
-            let sinc = if t.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) };
-            let x = i as f64 / (total as f64 - 1.0);
-            let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * x).cos() + 0.08 * (4.0 * std::f64::consts::PI * x).cos();
-            if let Some(slot) = tp_coefs.get_mut(i % TP_PHASES).and_then(|ph| ph.get_mut(i / TP_PHASES)) {
-                *slot = (sinc * w) as f32;
-            }
-        }
-        for ph in &mut tp_coefs {
-            let s: f32 = ph.iter().sum();
-            if s.abs() > 1e-6 {
-                ph.iter_mut().for_each(|c| *c /= s);
-            }
-        }
+        let tp_coefs = true_peak_coefs();
         Self {
             sr,
             weights,
@@ -288,11 +308,7 @@ impl LoudnessMeter {
         let Some(h) = self.tp_hist.get_mut(c) else { return };
         h.copy_within(0..TP_TAPS - 1, 1);
         h[0] = x;
-        let mut peak = x.abs();
-        for ph in &self.tp_coefs {
-            let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
-            peak = peak.max(y.abs());
-        }
+        let peak = true_peak_of(&self.tp_coefs, h, x);
         if peak > self.true_peak {
             self.true_peak = peak;
         }
