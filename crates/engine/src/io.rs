@@ -105,11 +105,29 @@ fn saved_stamp(p: &Path) -> (u64, u64) {
 }
 
 /// Where decoded audio came from: keyed by the audio's address, checked against the live `Arc`.
-type DecodedFrom = std::collections::BTreeMap<usize, (std::sync::Weak<SourceAudio>, PathBuf, FileStamp)>;
+/// What is known about the file some decoded audio came from.
+struct DecodedEntry {
+    audio: std::sync::Weak<SourceAudio>,
+    key: PathBuf,
+    /// The file's stamp when the audio was decoded from it (or last found to decode to it).
+    stamp: FileStamp,
+    /// A later stamp of the file at which it was found to decode to other audio, so that is
+    /// not decoded again until the file changes once more.
+    differs: Option<FileStamp>,
+}
+
+/// Where decoded audio came from: keyed by the audio's address, checked against the live `Arc`.
+type DecodedFrom = std::collections::BTreeMap<usize, DecodedEntry>;
 static DECODED_FROM: std::sync::Mutex<DecodedFrom> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn decoded_from() -> std::sync::MutexGuard<'static, DecodedFrom> {
     DECODED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Files [`decodes_unchanged`] decoded again on this thread.
+    pub(crate) static REDECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Remember that `audio` was decoded from the file at `p` as it is now.
@@ -117,36 +135,52 @@ pub(crate) fn remember_decoded(audio: &Arc<SourceAudio>, p: &Path) {
     let Some(stamp) = file_stamp(p) else { return };
     let key = file_key(p);
     let mut map = decoded_from();
-    map.retain(|_, (weak, _, _)| weak.strong_count() > 0);
-    map.insert(Arc::as_ptr(audio) as usize, (Arc::downgrade(audio), key, stamp));
+    map.retain(|_, e| e.audio.strong_count() > 0);
+    map.insert(Arc::as_ptr(audio) as usize, DecodedEntry { audio: Arc::downgrade(audio), key, stamp, differs: None });
 }
 
-/// The file `audio` was decoded from and its stamp then, if it is known.
-fn decoded_source(audio: &Arc<SourceAudio>) -> Option<(PathBuf, FileStamp)> {
+/// Remember that the file `audio` was decoded from decodes to other audio at `stamp`.
+fn remember_differs(audio: &Arc<SourceAudio>, stamp: FileStamp) {
+    let mut map = decoded_from();
+    if let Some(e) = map.get_mut(&(Arc::as_ptr(audio) as usize)) {
+        e.differs = Some(stamp);
+    }
+}
+
+/// The file `audio` was decoded from, its stamp then, and the stamp at which it was last found
+/// to decode to other audio, if it is known.
+fn decoded_source(audio: &Arc<SourceAudio>) -> Option<(PathBuf, FileStamp, Option<FileStamp>)> {
     let map = decoded_from();
     map.get(&(Arc::as_ptr(audio) as usize))
-        .filter(|(weak, _, _)| weak.upgrade().is_some_and(|a| Arc::ptr_eq(&a, audio)))
-        .map(|(_, key, stamp)| (key.clone(), *stamp))
+        .filter(|e| e.audio.upgrade().is_some_and(|a| Arc::ptr_eq(&a, audio)))
+        .map(|e| (e.key.clone(), e.stamp, e.differs))
 }
 
 /// True when `audio` was decoded from the file at `p` and the file has not changed since.
 pub(crate) fn decoded_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
     let (key, stamp) = (file_key(p), file_stamp(p));
-    decoded_source(audio).is_some_and(|(k, s)| k == key && Some(s) == stamp)
+    decoded_source(audio).is_some_and(|(k, s, _)| k == key && Some(s) == stamp)
 }
 
 /// [`decoded_unchanged`], or else, when `audio` was decoded from `p` but the file's size or
 /// time changed (a retag, a copy back), true when `p` still decodes to exactly `audio`: the
-/// stamp is then renewed.
+/// stamp is then renewed. A file found to hold other audio is not decoded again until its stamp
+/// changes once more (autosave asks every second).
 fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
     let (key, stamp) = (file_key(p), file_stamp(p));
-    let Some((k, s)) = decoded_source(audio) else { return false };
+    let Some((k, s, differs)) = decoded_source(audio) else { return false };
     if k != key {
         return false;
     }
-    if Some(s) == stamp {
+    let Some(now) = stamp else { return false };
+    if s == now {
         return true;
     }
+    if differs == Some(now) {
+        return false;
+    }
+    #[cfg(test)]
+    REDECODES.with(|n| n.set(n.get() + 1));
     let ext = p.extension().and_then(|x| x.to_str());
     let again = read_file(p).ok().and_then(|bytes| decode_source(&bytes, ext, audio.buffer.sample_rate).ok());
     let same = again.is_some_and(|a| {
@@ -155,6 +189,8 @@ fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
     });
     if same {
         remember_decoded(audio, p);
+    } else {
+        remember_differs(audio, now);
     }
     same
 }
@@ -2624,6 +2660,33 @@ mod in_place_tests {
         assert_eq!(report.modified.len(), 1, "{report:?}");
         assert!(report.modified[0].contains("modified since the session was saved"));
         assert_eq!(first_audio(&r), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_whose_audio_changed_is_decoded_again_only_once() {
+        let dir = folder("in-place-redecode");
+        let (wav, _) = library_wav(&dir.join("Lib"), 44_100);
+        let (e, _) = saved_with(&dir, &wav);
+        // Same length, other audio: only decoding tells.
+        let buf = AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.25; 44_100]] };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+        std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        let src = e.session().sources[0].clone();
+        let audio = e.session().pool.get(src.id).unwrap().clone();
+        let session = dir.join("Set/Set.scraft");
+        let before = REDECODES.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            assert_eq!(kept_reference(&src.path, &session, &audio), None);
+        }
+        assert_eq!(REDECODES.with(std::cell::Cell::get) - before, 1);
+        // Changed once more: decoded again (and now the same audio as before, so kept).
+        let (_, _) = library_wav(&dir.join("Lib"), 44_100);
+        let renewed = file_stamp(Path::new(&wav)).unwrap();
+        if decoded_source(&audio).and_then(|(_, _, d)| d) != Some(renewed) {
+            assert!(kept_reference(&src.path, &session, &audio).is_some());
+            assert_eq!(REDECODES.with(std::cell::Cell::get) - before, 2);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

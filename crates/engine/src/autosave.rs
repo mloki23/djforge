@@ -460,6 +460,32 @@ mod tests {
     }
 
     #[test]
+    fn a_referenced_file_whose_audio_changed_is_decoded_once_across_autosaves() {
+        let dir = folder("autosave-changed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("track.wav");
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
+        let write = |level: f32| {
+            let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; 4_800]] };
+            std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        };
+        write(0.5);
+        let mut e = Engine::default();
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        // Same length, other audio.
+        write(0.25);
+        let mut a = Autosave::create(&dir.join("Autosave"), "Untitled").unwrap();
+        let before = crate::io::REDECODES.with(std::cell::Cell::get);
+        a.write(e.session(), None, None).unwrap();
+        a.write(e.session(), None, None).unwrap();
+        assert_eq!(crate::io::REDECODES.with(std::cell::Cell::get) - before, 1);
+        // The audio in memory was copied, not the changed file referenced.
+        assert_eq!(std::fs::read_dir(a.dir.join("Audio Files")).unwrap().count(), 1);
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn audio_referenced_in_place_is_not_copied_and_recovers_from_its_file() {
         let dir = folder("autosave-in-place");
         std::fs::create_dir_all(&dir).unwrap();
