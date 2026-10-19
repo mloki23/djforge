@@ -242,6 +242,8 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     max.params.insert("ceiling".to_string(), -1.0);
     max.params.insert("threshold".to_string(), 0.0);
+    // Inter-sample peaks too: the ceiling holds on players that reconstruct between samples.
+    max.params.insert("true_peak".to_string(), 1.0);
     match s.track_mut(master).and_then(|m| m.mixer.inserts.iter_mut().find(|i| i.as_ref().is_none_or(|i| i.plugin == MAXIMIZER))) {
         Some(slot) => *slot = Some(max),
         None => warnings.push("the master fader has no free insert slot; no Maximizer was added".to_string()),
@@ -685,7 +687,7 @@ mod tests {
             assert_eq!(s.track(*d).unwrap().mixer.inserts[0].as_ref().unwrap().plugin, "eq_7band");
         }
         let max = s.master().unwrap().mixer.inserts.iter().flatten().find(|i| i.plugin == MAXIMIZER).unwrap();
-        assert_eq!((max.params.get("ceiling"), max.params.get("threshold")), (Some(&-1.0), Some(&0.0)));
+        assert_eq!((max.params.get("ceiling"), max.params.get("threshold"), max.params.get("true_peak")), (Some(&-1.0), Some(&0.0), Some(&1.0)));
 
         // The plan's nudge (10 ms at B's start tempo, 120 bpm: 0.02 beats) and a reliable suggestion.
         assert_eq!(t[0].nudge_source, NudgeSource::Plan);
