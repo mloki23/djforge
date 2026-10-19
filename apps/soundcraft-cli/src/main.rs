@@ -99,8 +99,8 @@ fn info(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else { return fail("info FILE") };
     if path.ends_with(".scraft") {
         let mut e = Engine::default();
-        match soundcraft_engine::io::open_session(&mut e, path) {
-            Ok(missing) => warn_missing(&missing),
+        match soundcraft_engine::io::open_session_checked(&mut e, path) {
+            Ok(report) => warn_media(&report),
             Err(err) => return fail(err),
         }
         outln!("{}", soundcraft_engine::inspect::session_text(&e));
@@ -184,17 +184,25 @@ fn missing_warnings(missing: &[String]) -> Vec<String> {
     missing.iter().map(|m| format!("warning: missing media: {m}")).collect()
 }
 
-fn warn_missing(missing: &[String]) {
-    for line in missing_warnings(missing) {
+/// Print what opening a session found wrong with its media: missing files, files changed on
+/// disk since they were imported, and (as information) files modified since the save.
+fn warn_media(report: &soundcraft_engine::io::OpenReport) {
+    for line in missing_warnings(&report.missing) {
         eprintln!("{line}");
+    }
+    for m in &report.changed {
+        eprintln!("warning: {m}");
+    }
+    for m in &report.modified {
+        eprintln!("note: {m}");
     }
 }
 
 fn load_engine(args: &[String]) -> Result<Engine, String> {
     if let Some(p) = arg_value(args, "--in") {
         let mut e = Engine::default();
-        let missing = soundcraft_engine::io::open_session(&mut e, &p).map_err(|e| e.to_string())?;
-        warn_missing(&missing);
+        let report = soundcraft_engine::io::open_session_checked(&mut e, &p).map_err(|e| e.to_string())?;
+        warn_media(&report);
         Ok(e)
     } else if args.iter().any(|a| a == "--demo" || a == "--sample") {
         Ok(soundcraft_engine::demo::demo_engine())

@@ -298,12 +298,17 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
 /// with the takes of a recording that never finished placed as Stop would have. Returns the
 /// media that couldn't be loaded.
 pub fn recover(e: &mut Engine, left: &Leftover) -> Result<Vec<String>> {
+    recover_checked(e, left).map(|r| r.missing)
+}
+
+/// [`recover`], also reporting audio files that changed or were modified on disk since.
+pub fn recover_checked(e: &mut Engine, left: &Leftover) -> Result<crate::io::OpenReport> {
     let mut r = Engine::default();
     let session = left.dir.join(SESSION);
     let links = left.origin.as_deref().map_or(session.as_path(), Path::new);
-    let mut missing = open_session_linked(&mut r, &session.to_string_lossy(), links)?;
+    let mut report = open_session_linked(&mut r, &session.to_string_lossy(), links)?;
     let mut s = r.session().clone();
-    let unfinished = unfinished_takes(left, &s, &mut missing);
+    let unfinished = unfinished_takes(left, &s, &mut report.missing);
     if let Some(home) = left.origin.as_deref().and_then(|o| Path::new(o).parent()) {
         for src in s.sources.iter_mut().filter(|src| !src.unsaved) {
             if let Ok(rel) = Path::new(&src.path).strip_prefix(home) {
@@ -317,7 +322,7 @@ pub fn recover(e: &mut Engine, left: &Leftover) -> Result<Vec<String>> {
     if let Some((plan, takes)) = unfinished {
         crate::io::place_recording(e, &plan, takes);
     }
-    Ok(missing)
+    Ok(report)
 }
 
 /// The takes of the recording `left` holds the plan of, repaired, minus those already in `s`.

@@ -51,6 +51,49 @@ pub enum MainWindow {
     Mix,
 }
 
+/// One line on what opening media found: missing files, files changed on disk since they were
+/// imported (other length), and files modified since the save (same length). `None` when all
+/// is well.
+pub fn media_problems(missing: &[String], changed: &[String], modified: &[String]) -> Option<String> {
+    let part = |list: &[String], what: &str| {
+        list.first().map(|first| match list.len() {
+            1 => format!("{what}: {first}"),
+            n => format!("{n} {what}, first: {first}"),
+        })
+    };
+    let parts: Vec<String> = [
+        part(missing, "audio file(s) missing"),
+        part(changed, "changed on disk since import"),
+        part(modified, "modified since the save (same length)"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The status line after `id` succeeded with `v`, for commands that open or relink media.
+fn media_status(id: &str, v: &Value) -> Option<String> {
+    let strings = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    match id {
+        "session.open" | "session.revert" => media_problems(&strings("missing"), &strings("changed"), &strings("modified")),
+        "file.relink_audio" => {
+            let n = |k: &str| v.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+            let mut line = format!("Relinked {} audio file(s); {} still missing", n("relinked"), n("missing"));
+            if n("ambiguous") > 0 {
+                line.push_str(&format!("; {} with several matching files — relink each with a chosen file", n("ambiguous")));
+            }
+            Some(line)
+        }
+        _ => None,
+    }
+}
+
 /// UI state (serde, so agents can read and set it).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -86,6 +129,8 @@ pub struct UiState {
     pub send_window: Option<(TrackId, usize)>,
     pub audiosuite: Option<String>,
     pub status: String,
+    /// Save Session Copy In also copies every source's audio into the copy.
+    pub save_copy_audio: bool,
     pub show_automation: bool,
     pub show_color_palette: bool,
     pub show_disk_usage: bool,
@@ -153,6 +198,7 @@ impl Default for UiState {
             send_window: None,
             audiosuite: None,
             status: String::new(),
+            save_copy_audio: false,
             show_automation: false,
             show_color_palette: false,
             show_disk_usage: false,
@@ -437,6 +483,9 @@ impl SoundApp {
                 }
                 if id == "track.clear_clip_indicators" {
                     self.meters.values_mut().chain([&mut self.main_meter]).for_each(|m| m.clip = false);
+                }
+                if let Some(status) = media_status(id, &v) {
+                    self.ui.status = status;
                 }
                 Ok(v)
             }
@@ -730,14 +779,15 @@ impl SoundApp {
             return;
         }
         self.close_autosave();
-        match soundcraft_engine::autosave::recover(&mut self.engine, left) {
-            Ok(missing) => {
+        match soundcraft_engine::autosave::recover_checked(&mut self.engine, left) {
+            Ok(report) => {
                 if self.write_autosave() {
                     soundcraft_engine::autosave::discard(left);
                 }
-                self.ui.status = match missing.len() {
-                    0 => format!("Recovered “{}”. Save it to keep the changes.", left.name),
-                    n => format!("Recovered “{}”, but {n} audio file(s) are missing. Save it to keep the changes.", left.name),
+                let media = media_problems(&report.missing, &report.changed, &report.modified);
+                self.ui.status = match media {
+                    None => format!("Recovered “{}”. Save it to keep the changes.", left.name),
+                    Some(m) => format!("Recovered “{}”. Save it to keep the changes. {m}", left.name),
                 };
             }
             Err(e) => self.ui.status = format!("Couldn't recover “{}”: {e}", left.name),
@@ -1566,5 +1616,16 @@ mod tests {
         app.handle_transport(1.0 / 60.0);
         assert!(!app.is_playing());
         assert!((speed(&app) - 1.0).abs() < 1e-3, "a half-speed pass that ends on its own restores full speed");
+    }
+
+    #[test]
+    fn opening_and_relinking_say_what_happened_to_the_media() {
+        let v = serde_json::json!({"missing": ["a.wav"], "changed": [], "modified": ["b.mp3: modified", "c.mp3: modified"]});
+        let line = crate::media_status("session.open", &v).unwrap();
+        assert!(line.contains("missing: a.wav") && line.contains("2 modified since the save"), "{line}");
+        assert_eq!(crate::media_status("session.open", &serde_json::json!({"missing": [], "changed": [], "modified": []})), None);
+        let v = serde_json::json!({"relinked": [1], "missing": [], "ambiguous": [2]});
+        let line = crate::media_status("file.relink_audio", &v).unwrap();
+        assert!(line.starts_with("Relinked 1") && line.contains("several matching files"), "{line}");
     }
 }

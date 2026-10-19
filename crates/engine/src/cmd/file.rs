@@ -69,8 +69,8 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(noundo "session.revert", "Revert Session to Saved...", ["File"], None, "{}", |e| if e.path.is_some() { Ok(()) } else { Err("the session has not been saved".into()) }, |e, _| {
             let path = e.path.clone().ok_or_else(|| bad("session.revert", "the session has not been saved"))?;
-            crate::io::open_session(e, &path)?;
-            Ok(json!({}))
+            let report = crate::io::open_session_checked(e, &path)?;
+            Ok(json!({"missing": report.missing, "changed": report.changed, "modified": report.modified}))
         }),
         cmd!(
             "file.import_audio",

@@ -452,9 +452,15 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     if replaces {
                         ui.label(format!("“{}” already exists. Do you want to replace it?", file.file_name().unwrap_or_default().to_string_lossy()));
                     }
+                    if cmd == "session.save_copy" {
+                        crate::widgets::checkbox(ui, &mut app.ui.save_copy_audio, "Copy all audio into the copy (files referenced in place too)");
+                    }
                     if buttons(ui, if replaces { "Replace" } else { "OK" }, enter && !replaces) {
                         let mut v = json!({});
                         v[key.as_str()] = json!(path);
+                        if cmd == "session.save_copy" {
+                            v["copy_audio"] = json!(app.ui.save_copy_audio);
+                        }
                         if replaces {
                             v["replace"] = json!(true);
                         }

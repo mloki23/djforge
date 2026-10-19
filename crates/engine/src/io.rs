@@ -1280,13 +1280,13 @@ fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
 
 /// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
 pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
-    open_session_linked(e, path, Path::new(path))
+    open_session_linked(e, path, Path::new(path)).map(|r| r.missing)
 }
 
 /// [`open_session`], following the media paths in it as if they were stored in the session file
 /// `links` (crash recovery: the session written beside the autosave, its paths from the original).
-pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<Vec<String>> {
-    open_session_report(e, path, links).map(|r| r.missing)
+pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<OpenReport> {
+    open_session_report(e, path, links)
 }
 
 /// What opening a session found wrong with its media.
