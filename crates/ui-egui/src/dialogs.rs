@@ -127,6 +127,18 @@ impl Dialogs {
                 Dialog::Number { cmd: id.into(), title: "Quantize strength".into(), key: "strength".into(), value: 100.0, suffix: "%".into() }
             }
             "edit.fades_create" => Dialog::Fades { shape: "equal power".into() },
+            "dj.import_set" => Dialog::PathPrompt { cmd: id.into(), title: "Import mixforge Set (plan.json)".into(), path: home, key: "plan".into() },
+            "dj.tempo_ramp" => {
+                let s = e.session();
+                let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(s.edit.selection.start, s.sample_rate));
+                Dialog::Number {
+                    cmd: id.into(),
+                    title: "Tempo Ramp over the Selection to".into(),
+                    key: "to_bpm".into(),
+                    value: bpm,
+                    suffix: "bpm".into(),
+                }
+            }
             "edit.strip_silence" => Dialog::StripSilence { threshold: -48.0, min_ms: 50.0, pre_ms: 5.0, post_ms: 20.0 },
             "track.group" => {
                 let s = e.session();

@@ -81,8 +81,23 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
     v.extend(mix_view_aliases().iter().copied());
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
     v.extend(MENU_WINDOWS.iter().copied());
+    v.extend(DJ_MENU.iter().copied());
     v
 }
+
+/// The DJ menu: djforge's beat-locked set tools. Items without a prompt act on the selection (the
+/// two selected clips, the selected clip, or the timeline selection).
+const DJ_MENU: &[(&str, &str)] = &[
+    ("DJ > Import mixforge Set...", "dj.import_set"),
+    ("DJ > Load Track Beat-Locked...", "dj.load_warped"),
+    ("DJ > Build Transition from Selected Clips", "dj.transition"),
+    ("DJ > Move Transition 4 Bars Later", "dj.move_transition"),
+    ("DJ > Move Transition 4 Bars Earlier", "dj.move_transition"),
+    ("DJ > Nudge Selected Clip Later (5 ms)", "dj.nudge"),
+    ("DJ > Nudge Selected Clip Earlier (5 ms)", "dj.nudge"),
+    ("DJ > Crossfade Selected Clips", "dj.crossfade"),
+    ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
+];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
 fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
@@ -166,6 +181,8 @@ const DIALOG_COMMANDS: &[&str] = &[
     "event.transpose",
     "edit.strip_silence",
     "clip.rename",
+    "dj.import_set",
+    "dj.tempo_ramp",
 ];
 
 /// Shared menu hierarchy for egui and native desktop hosts.
@@ -208,7 +225,7 @@ pub fn tree() -> Vec<MenuNode> {
     if let Some(clip) = roots.iter_mut().find(|n| n.label == "Clip") {
         clip.children.rotate_right(1);
     }
-    for (path, _) in MENU_WINDOWS {
+    for (path, _) in MENU_WINDOWS.iter().chain(DJ_MENU) {
         insert_path(&mut roots, path);
     }
     roots
@@ -401,6 +418,8 @@ fn params_for(path: &str, id: &str) -> Value {
         "track.change_width" => json!({"format": leaf}),
         "view.mix_section" => json!({"section": mix_section_id(leaf)}),
         "audiosuite.process" => json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == path).map_or("", |(_, x)| *x)}),
+        "dj.move_transition" => json!({"bars": if leaf.contains("Earlier") { -4 } else { 4 }}),
+        "dj.nudge" => json!({"ms": if leaf.contains("Earlier") { -5.0 } else { 5.0 }}),
         _ => json!({}),
     }
 }
