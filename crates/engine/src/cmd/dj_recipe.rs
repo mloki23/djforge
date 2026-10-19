@@ -158,7 +158,7 @@ pub(crate) enum Mark {
 
 /// Whether what `a` recorded is still in the session: every point at its sample with its value,
 /// no other point strictly inside an owned span, and every fade at its length on its clip.
-fn intact(s: &Session, a: &Applied) -> bool {
+pub(crate) fn intact(s: &Session, a: &Applied) -> bool {
     let lane = bass_lane();
     let points = |track: TrackId| s.track(track).and_then(|t| t.lane(&lane)).map_or(&[][..], |l| l.points.as_slice());
     let kept = a.points.iter().all(|p| points(p.track).iter().any(|q| q.at == p.at && (q.value - p.value).abs() <= 1e-4));

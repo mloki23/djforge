@@ -438,6 +438,7 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         "ignored_fx": ignored_fx,
     });
     if let Some(path) = report_path {
+        crate::io::refuse_source_file(e.session(), std::path::Path::new(&path))?;
         crate::io::write_path(&path, text_report(&report))?;
     }
     Ok(report)

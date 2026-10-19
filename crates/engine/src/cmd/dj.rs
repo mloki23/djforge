@@ -10,6 +10,8 @@ use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 mod align;
 #[path = "dj_import.rs"]
 mod import;
+#[path = "dj_move.rs"]
+mod moving;
 #[path = "dj_plan.rs"]
 pub(crate) mod plan;
 #[path = "dj_recipe.rs"]
@@ -88,6 +90,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{plan: path of mixforge's plan.json, report?: path of a text report to write} — into a session without beat-locked clips: Deck A/B (alternating) with every track beat-locked, its first downbeat on the bar its transition enters on (the bar line nearest the previous track's out_start); the plan's tempo (a ramp over each transition's bars, or a step on its hit bar); clip gains; a Maximizer on the master fader; each transition with Marty's recipe (dj.transition; shortened when the clips are too short); each incoming track nudged by the plan's nudge_ms, else by a reliable dj.suggest_nudge. One undo step. Returns {tracks, track_list, sample_rate, decks, master, transitions: [{index, transition, out_title, in_title, out_camelot, in_camelot, style, mixforge_bars, entry_bar, entry_time, hit_bar, nudge_beats, nudge_ms, nudge_source, reliable, ambiguity, alt_ms, doubts}], warnings, ignored_fx}",
             always,
             import::import_set
+        ),
+        cmd!(
+            "dj.move_transition",
+            "Move Transition",
+            [],
+            None,
+            "{transition: id, bars: non-zero whole bars, later if positive} — moves the mix point: the incoming track and every later one in the chain, and the tempo from the old entry on, go `bars` later (earlier), each keeping its beats; the tempo before the old entry stays (moving later, the outgoing track's tempo fills the gap; moving earlier, the overlapped tempo events go). Outgoing clips end 16 bars after their new gone bar (within their audio) and the moved recipes are rebuilt, skipping (and listing) transitions edited by hand. Refuses an entry before the outgoing track starts or before the previous transition's bass is gone. Returns {transition, bars, entry_bar, moved_clips, rebuilt, skipped: [{transition, reason}]}",
+            always,
+            moving::move_transition
         ),
         cmd!(
             query "dj.transitions",
