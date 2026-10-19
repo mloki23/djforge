@@ -4,7 +4,7 @@
 //! is nudged by the plan or by a reliable suggestion.
 
 use super::plan::{Plan, PlanTrack, parse_plan};
-use super::recipe::{Changes, build};
+use super::recipe::{Changes, bar_sample, build};
 use super::*;
 use soundcraft_model::{ChannelFormat, Insert, NudgeSource, NudgeSuggestion, TrackKind, Transition, TransitionStyle};
 
@@ -20,9 +20,15 @@ struct Layout {
     at_bar: Vec<i64>,
     /// Bar each track's first downbeat lands on.
     downbeat_bar: Vec<i64>,
+    /// Recipe bars (build, out) of each transition: the style's, halved until the hit comes
+    /// before the outgoing track's `audio_end`.
+    bars: Vec<(i64, i64)>,
     /// Tempo events (tick, bpm), in order, the first at tick 0.
     tempo: Vec<(i64, f64)>,
 }
+
+/// Bars a trimmed outgoing clip plays on after its transition's gone bar.
+const TAIL_BARS: i64 = 16;
 
 /// Whole bars of lead-in before a track's first downbeat, as [`grid`] gives a clip starting on a
 /// bar line (none when the downbeat is within the pre-roll of the file start).
@@ -41,9 +47,15 @@ fn nearest_bar(tempo: &TempoMap, tick: i64) -> i64 {
     if (tempo.bar_start_tick(next) - tick).abs() < (tick - tempo.bar_start_tick(bar)).abs() { next } else { bar }
 }
 
-/// Recipe bars (build, out) of a transition in `style`.
-fn recipe_bars(style: TransitionStyle) -> (i64, i64) {
-    style.default_bars()
+/// Recipe bars (build, out) of a transition in `style` entering on bar `entry`: the style's,
+/// halved (both, down to 1) until the hit bar starts before session beat `end` (where the
+/// outgoing track's audio ends).
+fn recipe_bars(style: TransitionStyle, tempo: &TempoMap, entry: i64, end: f64) -> (i64, i64) {
+    let (mut b, mut o) = style.default_bars();
+    while (b, o) != (1, 1) && tempo.bar_start_tick(entry.saturating_add(b)) as f64 >= end * TICKS_PER_QUARTER as f64 {
+        (b, o) = ((b / 2).max(1), (o / 2).max(1));
+    }
+    (b, o)
 }
 
 /// The [`Layout`] of `plan` under the meter of `tempo` (4/4 by default: a session beat is a quarter).
@@ -51,12 +63,12 @@ fn recipe_bars(style: TransitionStyle) -> (i64, i64) {
 /// Track 0 starts on bar 1. Track i+1's first downbeat goes on the bar line nearest where track i
 /// reaches its `out_start`: that track beat, counted from track i's clip start, in session beats.
 /// The tempo starts at track 0's `play_bpm`; each transition ramps to the next `play_bpm` one step
-/// per beat over its recipe's bars from the entry bar (`ramp`), or steps to it on the hit bar,
+/// per beat over its recipe's bars (shortened to fit, see [`recipe_bars`]) from the entry bar (`ramp`), or steps to it on the hit bar,
 /// and holds it after. A later transition entering before an earlier ramp ends takes over there.
 fn layout(plan: &Plan, tempo: &TempoMap) -> std::result::Result<Layout, String> {
     let per_bar = i64::from(tempo.meter_at_tick(0).numerator.max(1));
     let beat_ticks = tempo.meter_at_tick(0).ticks_per_beat().max(1);
-    let (mut at_bar, mut downbeat_bar) = (Vec::new(), Vec::new());
+    let (mut at_bar, mut downbeat_bar, mut bars) = (Vec::new(), Vec::new(), Vec::new());
     let first = plan.tracks.first().ok_or("the plan has no tracks")?;
     let mut events: Vec<(i64, f64)> = vec![(0, first.play_bpm)];
     let lead = lead_in_bars(first, per_bar);
@@ -81,7 +93,9 @@ fn layout(plan: &Plan, tempo: &TempoMap) -> std::result::Result<Layout, String> 
         at_bar.push(entry - lead);
         downbeat_bar.push(entry);
         let style = out.transition.map_or(TransitionStyle::Blend, |t| t.style);
-        let (build_bars, out_bars) = recipe_bars(style);
+        let end = downbeat_beat + (out.audio_end - out.first_downbeat) * out.bpm / 60.0;
+        let (build_bars, out_bars) = recipe_bars(style, tempo, entry, end);
+        bars.push((build_bars, out_bars));
         let ramp = out.transition.is_some_and(|t| t.ramp);
         let (from, to) = (out.play_bpm, inc.play_bpm);
         let hit = tempo.bar_start_tick(entry.saturating_add(build_bars));
@@ -100,7 +114,7 @@ fn layout(plan: &Plan, tempo: &TempoMap) -> std::result::Result<Layout, String> 
             events.push((hit, to));
         }
     }
-    Ok(Layout { at_bar, downbeat_bar, tempo: events })
+    Ok(Layout { at_bar, downbeat_bar, bars, tempo: events })
 }
 
 /// Camelot wheel distance between keys like `5B` and `7A` (`None` when either isn't one): steps
@@ -235,6 +249,30 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         track_doubts.push(doubts);
     }
 
+    // The plan's `start`: mixforge starts a track this far into its file (past silence or a
+    // pre-roll). The clip start is trimmed there when that falls after it and before the track's
+    // bass hit; the locks recorded first keep its music on its beats through the trim.
+    super::record_locks(e.session_mut());
+    for (i, t) in plan.tracks.iter().enumerate() {
+        let (Some(&clip), true) = (clips.get(i), t.start > 0.0) else { continue };
+        let s = e.session();
+        let Some((_, c)) = s.find_clip(clip) else { continue };
+        let Some(w) = c.warp.as_ref() else { continue };
+        let limit = match (i.checked_sub(1).and_then(|k| lay.bars.get(k)), lay.downbeat_bar.get(i)) {
+            (Some(&(build_bars, _)), Some(&entry)) => bar_sample(s, entry.saturating_add(build_bars)),
+            _ => c.end(),
+        };
+        let track_beat = w.beat_at_source(t.start * s.sample_rate.as_f64());
+        let at = sample_at_beat(&s.tempo, s.sample_rate, beat_at(&s.tempo, s.sample_rate, c.start) + track_beat - w.anchor);
+        if at > c.start
+            && at < limit
+            && let Some(c) = e.session_mut().find_clip_mut(clip)
+        {
+            c.trim_start_to(at);
+        }
+    }
+    super::record_locks(e.session_mut());
+
     // The transitions, in play order: each nudge moves the clip the next one is measured against.
     let mut rows = Vec::new();
     for (i, pair) in plan.tracks.windows(2).enumerate() {
@@ -246,7 +284,16 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         doubts.extend(track_doubts.get(i + 1).cloned().unwrap_or_default());
         let style = out.transition.map_or(TransitionStyle::Blend, |t| t.style);
-        let (b, o) = recipe_bars(style);
+        let (b, o) = lay.bars.get(i).copied().unwrap_or_else(|| style.default_bars());
+        // The outgoing clip ends TAIL_BARS after the gone bar (or at its own end), so its fade-out
+        // doesn't run on long past the mix.
+        let tail = bar_sample(e.session(), entry_bar.saturating_add(b + o + TAIL_BARS));
+        if let Some(c) = e.session_mut().find_clip_mut(out_clip)
+            && tail > c.start
+            && tail < c.end()
+        {
+            c.trim_end_to(tail);
+        }
         if let Some(d) = camelot_distance(&out.camelot, &inc.camelot).filter(|d| *d > 1) {
             doubts.push(format!("key clash: {} -> {} ({d} steps on the wheel)", out.camelot, inc.camelot));
         }
@@ -270,7 +317,7 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         let mut t = match built {
             Some(t) => {
-                if (t.build_bars, t.out_bars) != (b, o) {
+                if (t.build_bars, t.out_bars) != style.default_bars() {
                     doubts.push(format!("recipe shortened to {}/{} bars to fit the clips", t.build_bars, t.out_bars));
                 }
                 t
@@ -651,5 +698,60 @@ mod tests {
         assert_eq!(camelot_distance("8a", "3b"), Some(6));
         assert_eq!(camelot_distance("", "5A"), None);
         assert_eq!(camelot_distance("13A", "5A"), None);
+    }
+
+    /// A two-track plan: A (120 bpm, downbeat at 0, `a_end` s long) mixes from 32 s (bar 17) into
+    /// B (124 bpm, downbeat 0.5 s in, 90 s long), a blend that ramps when `ramp`.
+    fn pair(a: &str, b: &str, a_end: f64, b_start: f64, ramp: bool) -> Value {
+        json!({
+            "format": "mixforge-plan/2", "master_bpm": 124.0,
+            "tracks": [
+                {"path": a, "bpm": 120.0, "first_downbeat": 0.0, "audio_end": a_end, "out_start": 32.0,
+                 "transition": {"style": "blend", "bars": 16, "ramp": ramp}},
+                {"path": b, "bpm": 124.0, "first_downbeat": 0.5, "audio_end": 90.0, "start": b_start},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_short_outgoing_track_shortens_the_recipe_and_its_ramp() {
+        let tempo = Session::default().tempo;
+        // A ends on beat 140 (bar 36): a 16-bar build would hit on bar 33 (beat 128), in time.
+        let lay = layout(&parse_plan(&pair("a", "b", 70.0, 0.0, true).to_string()).unwrap(), &tempo).unwrap();
+        assert_eq!(lay.bars, vec![(16, 8)]);
+        // A ends on beat 120 (bar 31): halved to 8/4 (hit on bar 25), and the ramp to bar 29.
+        let lay = layout(&parse_plan(&pair("a", "b", 60.0, 0.0, true).to_string()).unwrap(), &tempo).unwrap();
+        assert_eq!(lay.bars, vec![(8, 4)]);
+        let (start, end) = (tempo.bar_start_tick(17), tempo.bar_start_tick(29));
+        assert_eq!(lay.tempo.iter().filter(|(t, _)| *t >= start && *t < end).count(), 48);
+        assert_eq!(lay.tempo.last(), Some(&(end, 124.0)));
+    }
+
+    #[test]
+    fn imported_tracks_are_trimmed_to_their_mix_and_their_plan_start() {
+        let dir = folder("trim");
+        let a = write_wav(&dir, "a.wav", &drums(120.0, 0.0, 0.0, 150));
+        let b = write_wav(&dir, "b.wav", &drums(124.0, 0.5, 0.0, 90));
+        let plan = dir.join("plan.json");
+        std::fs::write(&plan, pair(&a, &b, 150.0, 1.0, false).to_string()).unwrap();
+        let mut e = Engine::default();
+        let r = e.execute("dj.import_set", &json!({"plan": plan.to_string_lossy()})).unwrap();
+        let s = e.session();
+        let clip = |i: usize| s.find_clip(ClipId(r["track_list"][i]["clip"].as_u64().unwrap())).unwrap().1;
+        // A (75 bars long) ends 16 bars after the gone bar (41), its fade-out from the hit (33).
+        assert_eq!(clip(0).end(), bar(&e, 57));
+        assert_eq!(clip(0).fade_out.len, bar(&e, 57) - bar(&e, 33));
+        // B starts 1 s into its file, after its downbeat, which stays on bar 17.
+        let c = clip(1);
+        let w = c.warp.as_ref().unwrap();
+        let heard = w.source_at_time(&s.tempo, s.sample_rate, c.start, c.start);
+        assert!(c.start > bar(&e, 17) && (heard - SR as f64).abs() < 8.0, "starts at {} playing source sample {heard}", c.start);
+        let downbeat = beat_at(&s.tempo, s.sample_rate, c.start) - w.anchor;
+        // Less the (tiny) nudge the suggestion applied.
+        let nudge = s.dj.transitions.first().unwrap().nudge_beats;
+        assert!((downbeat - nudge - 64.0).abs() < 1e-6, "B's downbeat on session beat {downbeat}, nudged {nudge}");
+        assert_eq!(c.fade_in.len, bar(&e, 33) - c.start);
+        assert!(r["transitions"][0]["doubts"].as_array().unwrap().is_empty(), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
