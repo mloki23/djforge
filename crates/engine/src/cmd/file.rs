@@ -19,15 +19,16 @@ pub fn specs() -> Vec<CommandSpec> {
             "Relink Audio...",
             ["File"],
             None,
-            "{folder, source?: id (default: every missing source)} — finds missing audio files in `folder` and its subfolders by name, also ignoring Mixed In Key key/energy/tempo tags, and relinks those that decode to the length the session recorded",
+            "{dir | file, source?: id (default: every missing source; required with `file`)} — finds missing audio files in `dir` and its subfolders by name, then by name without Mixed In Key key/energy/tempo tags, and relinks a source when exactly one file decodes to the length the session recorded; several are returned as `ambiguous` candidates, to relink one with `{source, file}`",
             always,
             |e, p| {
-                let folder = str_param(p, "folder").ok_or_else(|| bad("file.relink_audio", "`folder` required"))?.to_string();
+                let dir = str_param(p, "dir").map(std::path::PathBuf::from);
+                let file = str_param(p, "file").map(std::path::PathBuf::from);
                 let only = match p.get("source") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(soundcraft_model::SourceId(v.as_u64().ok_or_else(|| bad("file.relink_audio", "`source` must be a source id"))?)),
                 };
-                crate::io::relink_audio(e, only, std::path::Path::new(&folder))
+                crate::io::relink_audio(e, only, dir.as_deref(), file.as_deref())
             }
         ),
         cmd!(noundo "session.close", "Close Session", ["File"], Some("Cmd+Shift+W"), "{}", always, |e, _| { e.replace_session(Session::default()); e.path = None; Ok(json!({})) }),

@@ -107,17 +107,48 @@ fn decoded_from() -> std::sync::MutexGuard<'static, DecodedFrom> {
 /// Remember that `audio` was decoded from the file at `p` as it is now.
 pub(crate) fn remember_decoded(audio: &Arc<SourceAudio>, p: &Path) {
     let Some(stamp) = file_stamp(p) else { return };
+    let key = file_key(p);
     let mut map = decoded_from();
     map.retain(|_, (weak, _, _)| weak.strong_count() > 0);
-    map.insert(Arc::as_ptr(audio) as usize, (Arc::downgrade(audio), file_key(p), stamp));
+    map.insert(Arc::as_ptr(audio) as usize, (Arc::downgrade(audio), key, stamp));
+}
+
+/// The file `audio` was decoded from and its stamp then, if it is known.
+fn decoded_source(audio: &Arc<SourceAudio>) -> Option<(PathBuf, FileStamp)> {
+    let map = decoded_from();
+    map.get(&(Arc::as_ptr(audio) as usize))
+        .filter(|(weak, _, _)| weak.upgrade().is_some_and(|a| Arc::ptr_eq(&a, audio)))
+        .map(|(_, key, stamp)| (key.clone(), *stamp))
 }
 
 /// True when `audio` was decoded from the file at `p` and the file has not changed since.
 pub(crate) fn decoded_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
-    let map = decoded_from();
-    map.get(&(Arc::as_ptr(audio) as usize)).is_some_and(|(weak, key, stamp)| {
-        weak.upgrade().is_some_and(|a| Arc::ptr_eq(&a, audio)) && *key == file_key(p) && file_stamp(p) == Some(*stamp)
-    })
+    let (key, stamp) = (file_key(p), file_stamp(p));
+    decoded_source(audio).is_some_and(|(k, s)| k == key && Some(s) == stamp)
+}
+
+/// [`decoded_unchanged`], or else, when `audio` was decoded from `p` but the file's size or
+/// time changed (a retag, a copy back), true when `p` still decodes to exactly `audio`: the
+/// stamp is then renewed.
+fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
+    let (key, stamp) = (file_key(p), file_stamp(p));
+    let Some((k, s)) = decoded_source(audio) else { return false };
+    if k != key {
+        return false;
+    }
+    if Some(s) == stamp {
+        return true;
+    }
+    let ext = p.extension().and_then(|x| x.to_str());
+    let again = read_file(p).ok().and_then(|bytes| decode_source(&bytes, ext, audio.buffer.sample_rate).ok());
+    let same = again.is_some_and(|a| {
+        let (x, y) = (&a.buffer.channels, &audio.buffer.channels);
+        x.len() == y.len() && x.iter().zip(y).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.to_bits() == b.to_bits()))
+    });
+    if same {
+        remember_decoded(audio, p);
+    }
+    same
 }
 
 /// Refuse to write `out` when it is the file of one of `s`'s sources: a bounce or export must
@@ -149,7 +180,7 @@ pub(crate) fn kept_reference(stored: &str, session: &Path, audio: &Arc<SourceAud
         return None;
     }
     let file = stored_path(stored, session).ok()?;
-    (file_found(&file) && !in_audio_files(&file) && decoded_unchanged(audio, &file)).then_some(file)
+    (file_found(&file) && !in_audio_files(&file) && decodes_unchanged(audio, &file)).then_some(file)
 }
 
 /// Create `dir` and its parents, inside the automation write root when there is one.
@@ -1334,28 +1365,44 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
 const RELINK_MAX_DEPTH: usize = 16;
 const RELINK_MAX_FILES: usize = 200_000;
 
-/// True for a tag Mixed In Key may add to a file name: a Camelot key (`8A`), an energy level
-/// (`Energy 6`) or a tempo (`128`, `128 BPM`).
-fn is_name_tag(seg: &str) -> bool {
+/// A Camelot key tag (`8A`, `12B`).
+fn is_camelot(seg: &str) -> bool {
     let t = seg.trim().to_ascii_lowercase();
-    let digits = |x: &str| !x.is_empty() && x.len() <= 3 && x.bytes().all(|b| b.is_ascii_digit());
-    let camelot = t.strip_suffix(['a', 'b']).and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n)) && t.len() <= 3;
-    let energy = t.strip_prefix("energy").is_some_and(|n| digits(n.trim()));
-    let bpm = digits(t.strip_suffix("bpm").map_or(t.as_str(), str::trim));
-    camelot || energy || bpm
+    t.len() <= 3 && t.strip_suffix(['a', 'b']).and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n))
+}
+
+fn is_number(seg: &str) -> bool {
+    let t = seg.trim();
+    !t.is_empty() && t.len() <= 3 && t.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// True when part `i` of `parts` is a tag Mixed In Key adds to a file name: a Camelot key, an
+/// energy level (`Energy 6`), a tempo with its unit (`128 BPM`), or a bare number right next to a
+/// Camelot key (`1A - 128 - Title`). A bare number on its own (a track number, `03 - Title`) is
+/// part of the name.
+fn is_name_tag(parts: &[&str], i: usize) -> bool {
+    let Some(seg) = parts.get(i) else { return false };
+    let t = seg.trim().to_ascii_lowercase();
+    let energy = t.strip_prefix("energy ").is_some_and(is_number);
+    let bpm = t.strip_suffix("bpm").is_some_and(is_number);
+    let near_key = |j: Option<usize>| j.and_then(|j| parts.get(j)).is_some_and(|x| is_camelot(x));
+    let tempo = is_number(&t) && (near_key(i.checked_sub(1)) || near_key(i.checked_add(1)));
+    is_camelot(&t) || energy || bpm || tempo
 }
 
 /// `stem` without the key/energy/tempo tags Mixed In Key adds at its start or end
 /// (`1A - 128 - Title`, `Title - 1A`), lowercased. At least one part of the name is kept.
 fn untagged_stem(stem: &str) -> String {
-    let mut parts: Vec<&str> = stem.split(" - ").collect();
-    while parts.len() > 1 && parts.first().is_some_and(|p| is_name_tag(p)) {
-        parts.remove(0);
+    let parts: Vec<&str> = stem.split(" - ").collect();
+    let mut first = 0;
+    while first + 1 < parts.len() && is_name_tag(&parts, first) {
+        first += 1;
     }
-    while parts.len() > 1 && parts.last().is_some_and(|p| is_name_tag(p)) {
-        parts.pop();
+    let mut last = parts.len();
+    while last > first + 1 && is_name_tag(&parts, last - 1) {
+        last -= 1;
     }
-    parts.join(" - ").trim().to_lowercase()
+    parts.get(first..last).unwrap_or_default().join(" - ").trim().to_lowercase()
 }
 
 fn lower_ext(p: &Path) -> String {
@@ -1384,21 +1431,59 @@ fn files_under(folder: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Look in `folder` for the audio files of missing sources (only `only` when given): first by
-/// file name, then by the name without the key/energy/tempo tags Mixed In Key adds. A file is
-/// relinked only when it decodes to the length and width the source had. Returns what was
-/// relinked and what is still missing.
-pub fn relink_audio(e: &mut Engine, only: Option<SourceId>, folder: &Path) -> Result<Value> {
-    crate::file_access::check_read(folder).map_err(EngineError::Io)?;
-    if !folder.is_dir() {
-        return Err(EngineError::Io(format!("{}: not a folder", folder.display())));
+/// The audio of `file` when it decodes at `rate` to the length and width `src` recorded.
+fn matching_audio(file: &Path, src: &Source, rate: u32) -> Option<Arc<SourceAudio>> {
+    // A map per file: a candidate that doesn't match is dropped at once.
+    let audio = decode_file(&mut DecodedFiles::new(), file, rate).ok()?;
+    (audio.buffer.frames() as u64 == src.frames && audio.buffer.num_channels() == usize::from(src.channels)).then_some(audio)
+}
+
+/// Point source `src` at `file`, whose decoded audio is `audio`.
+fn relink_to(e: &mut Engine, src: SourceId, file: &Path, audio: Arc<SourceAudio>) {
+    let s = e.session_mut();
+    s.pool.insert(src, audio);
+    if let Some(x) = s.sources.iter_mut().find(|x| x.id == src) {
+        x.path = file.to_string_lossy().into_owned();
+        x.unsaved = false;
     }
-    if let Some(id) = only
-        && e.session().source(id).is_none()
-    {
-        return Err(EngineError::BadParams("file.relink_audio".into(), format!("no source {}", id.0)));
+}
+
+/// Relink missing audio. With `file`, source `only` is relinked to that file when it decodes to
+/// the length and width the source recorded. Otherwise `dir` and its subfolders are searched for
+/// the missing sources (only `only` when given): exact file-name matches first; when none
+/// matches, names compared without the key/energy/tempo tags Mixed In Key adds. A source is
+/// relinked only when exactly one candidate decodes to its recorded length and width; when
+/// several do, it is reported as ambiguous with their paths and left alone (relink it with
+/// `file`).
+pub fn relink_audio(e: &mut Engine, only: Option<SourceId>, dir: Option<&Path>, file: Option<&Path>) -> Result<Value> {
+    const CMD: &str = "file.relink_audio";
+    if let Some(id) = only {
+        let s = e.session();
+        if s.source(id).is_none() {
+            return Err(EngineError::BadParams(CMD.into(), format!("no source {}", id.0)));
+        }
+        if s.pool.get(id).is_some() {
+            return Err(EngineError::BadParams(CMD.into(), format!("source {} is not missing", id.0)));
+        }
     }
-    let files: Vec<PathBuf> = files_under(folder).into_iter().filter(|f| crate::file_access::check_read(f).is_ok()).collect();
+    let rate = e.session().sample_rate.hz();
+    if let Some(file) = file {
+        let id = only.ok_or_else(|| EngineError::BadParams(CMD.into(), "`file` needs `source`".into()))?;
+        crate::file_access::check_read(file).map_err(EngineError::Io)?;
+        let src = e.session().source(id).cloned().ok_or_else(|| EngineError::BadParams(CMD.into(), format!("no source {}", id.0)))?;
+        let audio = matching_audio(file, &src, rate).ok_or_else(|| {
+            EngineError::Io(format!("{}: does not decode to the {} frames, {} channels of `{}`", file.display(), src.frames, src.channels, src.name))
+        })?;
+        relink_to(e, id, file, audio);
+        let done = json!({"source": id.0, "name": src.name, "from": src.path, "to": file});
+        return Ok(json!({"relinked": [done], "missing": [], "ambiguous": []}));
+    }
+    let dir = dir.ok_or_else(|| EngineError::BadParams(CMD.into(), "`dir` or `file` required".into()))?;
+    crate::file_access::check_read(dir).map_err(EngineError::Io)?;
+    if !dir.is_dir() {
+        return Err(EngineError::Io(format!("{}: not a folder", dir.display())));
+    }
+    let files: Vec<PathBuf> = files_under(dir).into_iter().filter(|f| crate::file_access::check_read(f).is_ok()).collect();
     let mut by_name: std::collections::HashMap<String, Vec<&PathBuf>> = std::collections::HashMap::new();
     let mut by_untagged: std::collections::HashMap<(String, String), Vec<&PathBuf>> = std::collections::HashMap::new();
     for f in &files {
@@ -1409,36 +1494,48 @@ pub fn relink_audio(e: &mut Engine, only: Option<SourceId>, folder: &Path) -> Re
             by_untagged.entry((untagged_stem(stem), lower_ext(f))).or_default().push(f);
         }
     }
-    let rate = e.session().sample_rate.hz();
     let wanted: Vec<Source> =
         e.session().sources.iter().filter(|x| only.is_none_or(|id| x.id == id) && e.session().pool.get(x.id).is_none()).cloned().collect();
-    let mut decoded = DecodedFiles::new();
-    let (mut relinked, mut missing) = (Vec::new(), Vec::new());
+    let (mut relinked, mut missing, mut ambiguous) = (Vec::new(), Vec::new(), Vec::new());
     for src in wanted {
         // The stored path may use either separator, whatever this computer uses.
         let stored = src.path.replace('\\', "/");
         let name = stored.rsplit('/').next().unwrap_or_default().to_string();
-        let exact = by_name.get(&name.to_lowercase()).cloned().unwrap_or_default();
         let stem = Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or_default();
-        let tagged = by_untagged.get(&(untagged_stem(stem), lower_ext(Path::new(&name)))).cloned().unwrap_or_default();
-        let found = exact.into_iter().chain(tagged).find_map(|cand| {
-            let audio = decode_file(&mut decoded, cand, rate).ok()?;
-            (audio.buffer.frames() as u64 == src.frames && audio.buffer.num_channels() == usize::from(src.channels)).then(|| (cand.clone(), audio))
-        });
-        match found {
-            Some((file, audio)) => {
-                let s = e.session_mut();
-                s.pool.insert(src.id, audio);
-                if let Some(x) = s.sources.iter_mut().find(|x| x.id == src.id) {
-                    x.path = file.to_string_lossy().into_owned();
-                    x.unsaved = false;
+        let exact = by_name.get(&name.to_lowercase()).cloned().unwrap_or_default();
+        let tagged: Vec<&PathBuf> = by_untagged
+            .get(&(untagged_stem(stem), lower_ext(Path::new(&name))))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|f| !exact.contains(f))
+            .collect();
+        // The candidates of one tier that match; only the first one's audio is kept.
+        let matches = |cands: &[&PathBuf]| {
+            let mut first = None;
+            let mut paths = Vec::new();
+            for c in cands {
+                if let Some(audio) = matching_audio(c, &src, rate) {
+                    first.get_or_insert(audio);
+                    paths.push((*c).clone());
                 }
+            }
+            (first, paths)
+        };
+        let (mut audio, mut paths) = matches(&exact);
+        if paths.is_empty() {
+            (audio, paths) = matches(&tagged);
+        }
+        match (audio, paths.as_slice()) {
+            (Some(audio), [file]) => {
+                relink_to(e, src.id, file, audio);
                 relinked.push(json!({"source": src.id.0, "name": src.name, "from": src.path, "to": file}));
             }
-            None => missing.push(json!({"source": src.id.0, "name": src.name, "path": src.path})),
+            (_, []) => missing.push(json!({"source": src.id.0, "name": src.name, "path": src.path})),
+            _ => ambiguous.push(json!({"source": src.id.0, "name": src.name, "path": src.path, "candidates": paths})),
         }
     }
-    Ok(json!({"relinked": relinked, "missing": missing, "files_searched": files.len()}))
+    Ok(json!({"relinked": relinked, "missing": missing, "ambiguous": ambiguous, "files_searched": files.len()}))
 }
 
 // ─── Hosts without a filesystem (the browser) ─────────────────────────────────────────────────
@@ -2421,6 +2518,7 @@ mod in_place_tests {
         let Some(rest) = wav.strip_prefix("C:\\").or_else(|| wav.strip_prefix("c:\\")) else { return };
         let unc = format!("\\\\localhost\\C$\\{rest}");
         if !Path::new(&unc).is_file() {
+            eprintln!("skipped: {unc} is not reachable (no administrative share)");
             return;
         }
         let mut e = session_at(44_100);
@@ -2452,6 +2550,28 @@ mod in_place_tests {
         assert!(report.missing.is_empty());
         assert_eq!(report.changed.len(), 1);
         assert!(report.changed[0].contains("changed on disk") && report.changed[0].contains("22050 frames"), "{:?}", report.changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_or_retag_that_keeps_the_audio_keeps_the_reference() {
+        let dir = folder("in-place-retag");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        let (mut e, path) = saved_with(&dir, &wav);
+        // The same bytes written again (a copy back from a backup).
+        let bytes = std::fs::read(&wav).unwrap();
+        std::fs::write(&wav, &bytes).unwrap();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 0);
+        // A tag added in a trailing chunk: the file grows, the audio is the same.
+        let mut tagged = bytes.clone();
+        tagged.extend_from_slice(b"JUNK\x04\x00\x00\x00tag!");
+        let riff = u32::from_le_bytes([tagged[4], tagged[5], tagged[6], tagged[7]]) + 12;
+        tagged[4..8].copy_from_slice(&riff.to_le_bytes());
+        std::fs::write(&wav, &tagged).unwrap();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 0);
+        assert!(!dir.join("Set/Audio Files").exists());
+        assert_eq!(stored(&path).sources[0].path, wav);
+        assert_eq!(first_audio(&reopen(&path)), audio);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2514,7 +2634,7 @@ mod in_place_tests {
         wav_named(&dir.join("New"), "track - 5B.wav", 44_100, 1_000);
         let mut r = Engine::default();
         assert_eq!(open_session(&mut r, &path).unwrap().len(), 1);
-        let out = r.execute("file.relink_audio", &json!({"folder": dir.join("New")})).unwrap();
+        let out = r.execute("file.relink_audio", &json!({"dir": dir.join("New")})).unwrap();
         assert_eq!(out["relinked"].as_array().unwrap().len(), 1, "{out}");
         assert!(out["missing"].as_array().unwrap().is_empty());
         assert_eq!(Path::new(&r.session().sources[0].path), moved.join("1A - 128 - track.wav"));
@@ -2527,7 +2647,7 @@ mod in_place_tests {
         std::fs::remove_dir_all(dir.join("New")).unwrap();
         let mut gone = Engine::default();
         open_session(&mut gone, &path).unwrap();
-        let out = gone.execute("file.relink_audio", &json!({"folder": dir.join("Set")})).unwrap();
+        let out = gone.execute("file.relink_audio", &json!({"dir": dir.join("Set")})).unwrap();
         assert_eq!(out["missing"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2539,5 +2659,57 @@ mod in_place_tests {
         assert_eq!(untagged_stem("8A - Energy 6 - Song"), "song");
         assert_eq!(untagged_stem("128"), "128");
         assert_eq!(untagged_stem("Song - Part 2"), "song - part 2");
+        assert_eq!(untagged_stem("Song - 1A - 128"), "song");
+        assert_eq!(untagged_stem("Song - 126 BPM"), "song");
+        // A bare number is a tempo only next to a key: a track number stays part of the name.
+        assert_eq!(untagged_stem("03 - Song"), "03 - song");
+        assert_eq!(untagged_stem("Song - 03"), "song - 03");
+    }
+
+    #[test]
+    fn several_matching_files_are_never_guessed_between() {
+        let dir = folder("in-place-ambiguous");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        let (_, path) = saved_with(&dir, &wav);
+        std::fs::remove_file(&wav).unwrap();
+        // Two edits of the same length under the same name.
+        let (clean, _) = wav_named(&dir.join("New/Clean"), "track.wav", 44_100, 44_100);
+        wav_named(&dir.join("New/Dirty"), "track.wav", 44_100, 44_100);
+        let mut r = Engine::default();
+        open_session(&mut r, &path).unwrap();
+        let out = r.execute("file.relink_audio", &json!({"dir": dir.join("New")})).unwrap();
+        assert!(out["relinked"].as_array().unwrap().is_empty(), "{out}");
+        let amb = out["ambiguous"].as_array().unwrap();
+        assert_eq!((amb.len(), amb[0]["candidates"].as_array().unwrap().len()), (1, 2), "{out}");
+        assert!(r.session().pool.get(r.session().sources[0].id).is_none());
+        // The person picks one.
+        let src = r.session().sources[0].id.0;
+        let out = r.execute("file.relink_audio", &json!({"source": src, "file": clean})).unwrap();
+        assert_eq!(out["relinked"].as_array().unwrap().len(), 1);
+        assert_eq!(r.session().sources[0].path, clean);
+        assert_eq!(first_audio(&r), audio);
+        // Now it is not missing.
+        let err = r.execute("file.relink_audio", &json!({"source": src, "dir": dir.join("New")})).unwrap_err().to_string();
+        assert!(err.contains("not missing"), "{err}");
+        // A file of another length is refused.
+        let (short, _) = wav_named(&dir.join("Short"), "track.wav", 44_100, 100);
+        let mut again = Engine::default();
+        open_session(&mut again, &path).unwrap();
+        assert!(again.execute("file.relink_audio", &json!({"source": src, "file": short})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_track_number_is_not_a_key_tag() {
+        let dir = folder("in-place-track-number");
+        let (wav, _) = wav_named(&dir.join("Lib"), "Song.wav", 44_100, 44_100);
+        let (_, path) = saved_with(&dir, &wav);
+        std::fs::remove_file(&wav).unwrap();
+        wav_named(&dir.join("New"), "03 - Song.wav", 44_100, 44_100);
+        let mut r = Engine::default();
+        open_session(&mut r, &path).unwrap();
+        let out = r.execute("file.relink_audio", &json!({"dir": dir.join("New")})).unwrap();
+        assert_eq!(out["missing"].as_array().unwrap().len(), 1, "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
