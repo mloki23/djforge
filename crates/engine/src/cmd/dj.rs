@@ -42,7 +42,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tempo Ramp",
             [],
             None,
-            "{from_bar, bars, from_bpm, to_bpm} — glides the session tempo from `from_bpm` to `to_bpm` over `bars`, one tempo step per beat, holding `to_bpm` afterwards",
+            "{to_bpm, from_bar?, bars? (default: the whole bars of the timeline selection), from_bpm? (default: the tempo at from_bar)} — glides the session tempo from `from_bpm` to `to_bpm` over `bars`, one tempo step per beat, holding `to_bpm` afterwards",
             always,
             tempo_ramp
         ),
@@ -51,7 +51,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Crossfade Transition",
             [],
             None,
-            "{out_clip, in_clip, shape?: equal power} — fades `out_clip` out and `in_clip` in across the span where they overlap",
+            "{out_clip, in_clip (default: the two selected clips), shape?: equal power} — fades `out_clip` out and `in_clip` in across the span where they overlap",
             always,
             crossfade
         ),
@@ -60,7 +60,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Nudge Beat-Locked Track",
             [],
             None,
-            "{clip, ms: -1000..=1000 | beats: -8..=8} — plays the clip's music `ms` (at the clip-start tempo) or `beats` later (negative: earlier), keeping it beat-locked",
+            "{clip (default: the selected clip), ms: -1000..=1000 | beats: -8..=8} — plays the clip's music `ms` (at the clip-start tempo) or `beats` later (negative: earlier), keeping it beat-locked",
             always,
             nudge
         ),
@@ -78,7 +78,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Build Transition",
             [],
             None,
-            "{out_clip, in_clip} | {transition: id}, style?: blend|quick, build_bars?: 1..=256, out_bars?: 1..=256, entry_bar?, force?: bool — records the mix from `out_clip` into `in_clip` (entry_bar default: the first bar at or after the incoming clip's start; style default blend; bars default from the style, 16/8 blend, 8/4 quick, and a style given without bars brings its own) and writes its recipe: EQ 7-Band in insert slot a of both decks (inserted if the slot is empty), the incoming low shelf -24 dB at entry_bar to 0 at the hit (entry_bar + build_bars), the outgoing one 0 at the hit to -24 dB at the gone bar (hit + out_bars), an equal-power fade-in from the incoming clip's start to the hit and fade-out from the hit to the outgoing clip's end. Refuses a transition edited by hand unless `force`. Returns {transition, hit_bar, gone_bar, recipe: {entry, hit, gone, in_fade, out_fade, points}, eq_inserted}",
+            "{out_clip, in_clip} | {transition: id} (default: the two selected clips), style?: blend|quick, build_bars?: 1..=256, out_bars?: 1..=256, entry_bar?, force?: bool — records the mix from `out_clip` into `in_clip` (entry_bar default: the first bar at or after the incoming clip's start; style default blend; bars default from the style, 16/8 blend, 8/4 quick, and a style given without bars brings its own) and writes its recipe: EQ 7-Band in insert slot a of both decks (inserted if the slot is empty), the incoming low shelf -24 dB at entry_bar to 0 at the hit (entry_bar + build_bars), the outgoing one 0 at the hit to -24 dB at the gone bar (hit + out_bars), an equal-power fade-in from the incoming clip's start to the hit and fade-out from the hit to the outgoing clip's end. Refuses a transition edited by hand unless `force`. Returns {transition, hit_bar, gone_bar, recipe: {entry, hit, gone, in_fade, out_fade, points}, eq_inserted}",
             always,
             recipe::transition
         ),
@@ -96,7 +96,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Transition",
             [],
             None,
-            "{transition: id, bars: non-zero whole bars, later if positive} — moves the mix point: the incoming track and every later one in the chain, and the tempo from the old entry on, go `bars` later (earlier), each keeping its beats; the tempo before the old entry stays (moving later, the outgoing track's tempo fills the gap; moving earlier, the overlapped tempo events go). Outgoing clips end 16 bars after their new gone bar (within their audio) and the moved recipes are rebuilt, skipping (and listing) transitions edited by hand. Refuses an entry before the outgoing track starts or before the previous transition's bass is gone. Returns {transition, bars, entry_bar, moved_clips, rebuilt, skipped: [{transition, reason}]}",
+            "{transition: id (default: the one into the selected clip), bars: non-zero whole bars, later if positive} — moves the mix point: the incoming track and every later one in the chain, and the tempo from the old entry on, go `bars` later (earlier), each keeping its beats; the tempo before the old entry stays (moving later, the outgoing track's tempo fills the gap; moving earlier, the overlapped tempo events go). Outgoing clips end 16 bars after their new gone bar (within their audio) and the moved recipes are rebuilt, skipping (and listing) transitions edited by hand. Refuses an entry before the outgoing track starts or before the previous transition's bass is gone. Returns {transition, bars, entry_bar, moved_clips, rebuilt, skipped: [{transition, reason}]}",
             always,
             moving::move_transition
         ),
@@ -112,13 +112,34 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// The one selected clip.
+pub(super) fn selected_one(s: &Session) -> Option<ClipId> {
+    match s.edit.selected_clips.as_slice() {
+        [c] => Some(*c),
+        _ => None,
+    }
+}
+
+/// The two selected clips, the one starting earlier first (out, in).
+pub(super) fn selected_pair(s: &Session) -> Option<(ClipId, ClipId)> {
+    let mut v: Vec<(Samples, ClipId)> = s.edit.selected_clips.iter().filter_map(|c| s.find_clip(*c).map(|(_, x)| (x.start, *c))).collect();
+    v.sort();
+    match v.as_slice() {
+        [a, b] if s.edit.selected_clips.len() == 2 => Some((a.1, b.1)),
+        _ => None,
+    }
+}
+
 /// Shifts a beat-locked clip's music later by `beats` session beats, or by `ms` (negative:
 /// earlier) without moving the clip: the anchor moves by those beats. `ms` converts at the tempo
 /// of the clip start, so across a tempo ramp the shift in milliseconds varies slightly along the
 /// clip; it stays constant in beats.
 fn nudge(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.nudge";
-    let id = p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, "`clip` required"))?;
+    let id = match p.get("clip") {
+        Some(v) => v.as_u64().map(ClipId).ok_or_else(|| bad(CMD, "`clip` must be a clip id"))?,
+        None => selected_one(e.session()).ok_or_else(|| bad(CMD, "`clip` required (or select one clip)"))?,
+    };
     let num = |key: &str, max: f64| p.get(key).map(|v| v.as_f64().filter(|x| x.is_finite() && x.abs() <= max));
     let s = e.session();
     let c = s.find_clip(id).map(|(_, c)| c).ok_or_else(|| bad(CMD, format!("no clip {}", id.0)))?;
@@ -137,7 +158,10 @@ fn nudge(e: &mut Engine, p: &Value) -> Result<Value> {
 fn crossfade(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.crossfade";
     let id = |key: &str| p.get(key).and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(CMD, format!("`{key}` required")));
-    let (out_id, in_id) = (id("out_clip")?, id("in_clip")?);
+    let (out_id, in_id) = match (p.get("out_clip"), p.get("in_clip")) {
+        (None, None) => selected_pair(e.session()).ok_or_else(|| bad(CMD, "`out_clip` and `in_clip` required (or select two clips)"))?,
+        _ => (id("out_clip")?, id("in_clip")?),
+    };
     let shape = str_param(p, "shape").and_then(soundcraft_model::FadeShape::from_id).unwrap_or_default();
     let s = e.session_mut();
     let range = |s: &soundcraft_model::Session, c: ClipId| s.find_clip(c).map(|(_, c)| c.range()).ok_or_else(|| bad(CMD, format!("no clip {}", c.0)));
@@ -361,12 +385,21 @@ fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Opt
 
 fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.tempo_ramp";
-    let from_bar = i64_or(p, "from_bar", 1).clamp(1, 100_000);
-    let bars = i64_or(p, "bars", 0);
+    // Without bars, over the timeline selection: from the first bar line in it, for its whole bars.
+    let s = e.session();
+    let sel = s.edit.selection;
+    let bar_of = |at: Samples| {
+        let bb = s.tempo.bar_beat_at(at, s.sample_rate);
+        if s.tempo.tick_to_samples(s.tempo.bar_start_tick(bb.bar), s.sample_rate) < at { bb.bar.saturating_add(1) } else { bb.bar }
+    };
+    let (sel_from, sel_to) = (bar_of(sel.start), s.tempo.bar_beat_at(sel.end, s.sample_rate).bar);
+    let from_bar = i64_or(p, "from_bar", sel_from).clamp(1, 100_000);
+    let bars = i64_or(p, "bars", if sel.is_empty() { 0 } else { sel_to - from_bar });
     if !(1..=256).contains(&bars) {
-        return Err(bad(CMD, "`bars` must be 1..=256"));
+        return Err(bad(CMD, "`bars` must be 1..=256 (or select at least a whole bar)"));
     }
-    let (a, b) = (f64_or(p, "from_bpm", f64::NAN), f64_or(p, "to_bpm", f64::NAN));
+    let start_bpm = s.tempo.tempo_at_tick(s.tempo.bar_start_tick(from_bar));
+    let (a, b) = (f64_or(p, "from_bpm", start_bpm), f64_or(p, "to_bpm", f64::NAN));
     if ![a, b].iter().all(|v| v.is_finite() && (20.0..=400.0).contains(v)) {
         return Err(bad(CMD, "`from_bpm` and `to_bpm` must be 20..=400"));
     }

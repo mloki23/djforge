@@ -2,7 +2,7 @@
 //! set (every later track and the tempo from the old entry on) so each track keeps its own
 //! beats, then rebuilds the moved transitions' recipes.
 
-use super::recipe::{Changes, bar_sample, build, intact};
+use super::recipe::{Changes, bar_sample, build, clips_in_place, intact};
 use super::*;
 use soundcraft_model::{MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, Transition};
 
@@ -38,7 +38,12 @@ fn audio_end(s: &Session, c: &Clip) -> Samples {
 
 /// `dj.move_transition {transition, bars}`.
 pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
-    let id = p.get("transition").and_then(Value::as_u64).ok_or_else(|| bad(CMD, "`transition` required"))?;
+    let id = match p.get("transition") {
+        Some(v) => v.as_u64().ok_or_else(|| bad(CMD, "`transition` must be a transition id"))?,
+        None => super::selected_one(e.session())
+            .and_then(|c| e.session().dj.transitions.iter().find(|t| t.in_clip == c).map(|t| t.id))
+            .ok_or_else(|| bad(CMD, "`transition` required (or select the clip a transition mixes into)"))?,
+    };
     let bars = p
         .get("bars")
         .and_then(Value::as_i64)
@@ -151,7 +156,8 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
         m.entry_bar = m.entry_bar.saturating_add(bars).clamp(1, MAX_TRANSITION_BAR);
         let tail = bar_sample(s, m.gone_bar().saturating_add(TAIL_BARS));
         if let Some(c) = s.find_clip(m.out_clip).map(|(_, c)| c) {
-            let end = tail.min(audio_end(s, c));
+            // Cut back to the tail, or extended towards it no further than the audio goes.
+            let end = if tail < c.end() { tail } else { tail.min(audio_end(s, c).max(c.end())) };
             if end > c.start
                 && end != c.end()
                 && let Some(c) = s.find_clip_mut(m.out_clip)
@@ -213,7 +219,7 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             .iter()
             .enumerate()
             .filter(|(_, o)| !moved_ids.contains(&o.id) && !o.edited && !o.stale)
-            .filter_map(|(i, o)| o.applied.as_ref().filter(|a| a.tempo != fp).map(|a| (i, intact(s, a))))
+            .filter_map(|(i, o)| o.applied.as_ref().map(|a| (i, intact(s, a, true) && clips_in_place(s, a))))
             .collect();
     for (i, ok) in untouched {
         if let Some(o) = s.dj.transitions.get_mut(i) {

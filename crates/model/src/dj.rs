@@ -141,6 +141,12 @@ pub struct AppliedFade {
     /// The fade-in (else the fade-out).
     pub fade_in: bool,
     pub len: Samples,
+    /// Where the clip was when the fade was written: a clip moved in time since makes the
+    /// transition stale rather than edited.
+    #[serde(default)]
+    pub start: Samples,
+    #[serde(default)]
+    pub end: Samples,
 }
 
 /// A value of type `T`, or its default when missing, null or malformed.
@@ -279,7 +285,7 @@ mod tests {
                 tempo: 7,
                 points: vec![AppliedPoint { track: b, at: 10, value: -24.0 }],
                 spans: vec![OwnedSpan { track: b, start: 10, end: 20 }],
-                fades: vec![AppliedFade { clip: cb, track: b, fade_in: true, len: 10 }],
+                fades: vec![AppliedFade { clip: cb, track: b, fade_in: true, len: 10, start: 500_000, end: 1_500_000 }],
             }),
         };
         (s, t)

@@ -140,11 +140,55 @@ fn applied(s: &Session, t: &Transition, r: &Recipe) -> Applied {
         tempo: soundcraft_model::tempo_fingerprint(&s.tempo, s.sample_rate),
         points: r.points.iter().map(|&(track, at, value)| AppliedPoint { track, at, value }).collect(),
         spans: r.spans.to_vec(),
-        fades: vec![
-            AppliedFade { clip: t.in_clip, track: t.in_track, fade_in: true, len: r.in_fade },
-            AppliedFade { clip: t.out_clip, track: t.out_track, fade_in: false, len: r.out_fade },
-        ],
+        fades: [(t.in_clip, t.in_track, true, r.in_fade), (t.out_clip, t.out_track, false, r.out_fade)]
+            .into_iter()
+            .map(|(clip, track, fade_in, len)| {
+                let (start, end) = clip_on(s, track, clip).map_or((0, 0), |c| (c.start, c.end()));
+                AppliedFade { clip, track, fade_in, len, start, end }
+            })
+            .collect(),
     }
+}
+
+/// Transition `t`'s owned spans in bars (track, first, last): the incoming deck from the entry to
+/// the hit, the outgoing deck from the hit to the gone bar. Bars hold under any tempo map.
+fn bar_spans(t: &Transition) -> [(TrackId, i64, i64); 2] {
+    [(t.in_track, t.entry_bar, t.hit_bar()), (t.out_track, t.hit_bar(), t.gone_bar())]
+}
+
+/// Transition `t`'s bass points in bars (track, bar, dB).
+fn bar_points(t: &Transition) -> [(TrackId, i64, f32); 4] {
+    [
+        (t.in_track, t.entry_bar, BASS_OUT_DB),
+        (t.in_track, t.hit_bar(), BASS_IN_DB),
+        (t.out_track, t.hit_bar(), BASS_IN_DB),
+        (t.out_track, t.gone_bar(), BASS_OUT_DB),
+    ]
+}
+
+/// Why `t` can't share its decks with the transitions `others` that have recipes applied, compared
+/// in bars (so a tempo change, or another transition gone stale, doesn't skew it): an owned span
+/// overlapping another's on the same deck, or an end point both write with different values.
+fn conflict(t: &Transition, others: &[&Transition]) -> Option<String> {
+    for o in others.iter().filter(|o| o.applied.is_some()) {
+        for (track, a, b) in bar_spans(t) {
+            if bar_spans(o).iter().any(|&(ot, oa, ob)| ot == track && a < ob && oa < b) {
+                return Some(format!(
+                    "conflict: transition {}'s bass span on track {} (bars {a}..{b}) overlaps transition {}'s; move or shorten one of them",
+                    t.id, track.0, o.id
+                ));
+            }
+        }
+        for (track, bar, v) in bar_points(t) {
+            if bar_points(o).iter().any(|&(ot, ob, ov)| ot == track && ob == bar && (ov - v).abs() > 1e-4) {
+                return Some(format!(
+                    "conflict: transition {} and transition {} both set the bass on track {} at bar {bar}, to different values",
+                    t.id, o.id, track.0
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// A flag the session's state calls for on a transition.
@@ -156,29 +200,42 @@ pub(crate) enum Mark {
     Edited,
 }
 
+/// Whether the clips are where the recipe wrote its fades: each fade-in's clip starts, and each
+/// fade-out's clip ends, where it did. A clip moved in time (or to another deck) since makes the
+/// transition stale, not edited.
+pub(crate) fn clips_in_place(s: &Session, a: &Applied) -> bool {
+    a.fades.iter().all(|f| clip_on(s, f.track, f.clip).is_some_and(|c| if f.fade_in { c.start == f.start } else { c.end() == f.end }))
+}
+
 /// Whether what `a` recorded is still in the session: every point at its sample with its value,
-/// no other point strictly inside an owned span, and every fade at its length on its clip.
-pub(crate) fn intact(s: &Session, a: &Applied) -> bool {
+/// no other point strictly inside an owned span, and (with `fades`) every fade at its length.
+/// Points stay valid in samples through a tempo change (relock moves clips, not automation).
+pub(crate) fn intact(s: &Session, a: &Applied, fades: bool) -> bool {
     let lane = bass_lane();
     let points = |track: TrackId| s.track(track).and_then(|t| t.lane(&lane)).map_or(&[][..], |l| l.points.as_slice());
     let kept = a.points.iter().all(|p| points(p.track).iter().any(|q| q.at == p.at && (q.value - p.value).abs() <= 1e-4));
     let clean = a.spans.iter().all(|sp| !points(sp.track).iter().any(|q| q.at > sp.start && q.at < sp.end));
-    let fades = a.fades.iter().all(|f| clip_on(s, f.track, f.clip).is_some_and(|c| (if f.fade_in { c.fade_in } else { c.fade_out }).len == f.len));
-    kept && clean && fades
+    let faded =
+        !fades || a.fades.iter().all(|f| clip_on(s, f.track, f.clip).is_some_and(|c| (if f.fade_in { c.fade_in } else { c.fade_out }).len == f.len));
+    kept && clean && faded
 }
 
-/// The flags session `s` calls for (transition index, flag), without changing it: a transition
-/// whose recipe was applied under another tempo map is stale (a tempo change moves clips and
-/// rescales fades, which is not a hand edit); one that isn't, whose recorded writes are no longer
-/// all there, was edited by hand. A consistent session (after an undo, say) calls for none.
+/// The flags session `s` calls for (transition index, flag), without changing it. A transition
+/// whose recipe was applied under another tempo map, or whose clips have moved, is stale (a tempo
+/// change moves clips and rescales fades, which is not a hand edit). One whose recorded points
+/// are gone or changed, or with another point inside a span it owns, was edited by hand, stale or
+/// not; its fades are compared only while it isn't stale. A consistent session (after an undo,
+/// say) calls for none.
 pub(crate) fn marks(s: &Session) -> Vec<(usize, Mark)> {
     let fp = soundcraft_model::tempo_fingerprint(&s.tempo, s.sample_rate);
     let mut out = Vec::new();
     for (i, t) in s.dj.transitions.iter().enumerate() {
-        let Some(a) = t.applied.as_ref().filter(|_| !t.stale) else { continue };
-        if a.tempo != fp {
+        let Some(a) = t.applied.as_ref() else { continue };
+        let moved = a.tempo != fp || !clips_in_place(s, a);
+        if moved && !t.stale {
             out.push((i, Mark::Stale));
-        } else if !t.edited && !intact(s, a) {
+        }
+        if !t.edited && !intact(s, a, !(moved || t.stale)) {
             out.push((i, Mark::Edited));
         }
     }
@@ -216,6 +273,10 @@ fn target(s: &Session, p: &Value, cmd: &str) -> Result<(Option<Transition>, Clip
             if o == i {
                 return Err(bad(cmd, "`out_clip` and `in_clip` must be different clips"));
             }
+            Ok((s.dj.transitions.iter().find(|t| t.out_clip == o && t.in_clip == i).cloned(), o, i))
+        }
+        (None, None, None) => {
+            let (o, i) = super::selected_pair(s).ok_or_else(|| bad(cmd, "give `transition`, or `out_clip` and `in_clip` (or select two clips)"))?;
             Ok((s.dj.transitions.iter().find(|t| t.out_clip == o && t.in_clip == i).cloned(), o, i))
         }
         _ => Err(bad(cmd, "give `transition`, or `out_clip` and `in_clip`")),
@@ -345,17 +406,8 @@ pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out
     t.entry_bar = entry.unwrap_or(t.entry_bar);
     let r = recipe(s, &t).map_err(|m| bad(cmd, m))?;
     let others: Vec<&Transition> = s.dj.transitions.iter().filter(|o| o.id != t.id).collect();
-    for span in &r.spans {
-        let clash = others.iter().find_map(|o| o.applied.as_ref()?.spans.iter().any(|x| x.overlaps(span)).then_some(o.id));
-        if let Some(other) = clash {
-            return Err(bad(
-                cmd,
-                format!(
-                    "conflict: transition {}'s bass span on track {} overlaps transition {other}'s; move or shorten one of them",
-                    t.id, span.track.0
-                ),
-            ));
-        }
+    if let Some(why) = conflict(&t, &others) {
+        return Err(bad(cmd, why));
     }
     for track in [out_track, in_track] {
         let slot =
@@ -376,6 +428,14 @@ pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out
         |p: &AppliedPoint| others.iter().any(|o| o.applied.as_ref().is_some_and(|a| a.points.iter().any(|q| q.track == p.track && q.at == p.at)));
     let stale_points: Vec<AppliedPoint> =
         existing.as_ref().and_then(|o| o.applied.as_ref()).map_or_else(Vec::new, |a| a.points.iter().filter(|p| !shared(p)).copied().collect());
+    // A transition without a record of what it wrote (an older or damaged one) clears what its
+    // old bars owned, both ends included, keeping any point another transition wrote.
+    let old_spans: Vec<(TrackId, Samples, Samples)> = match existing.as_ref().filter(|o| o.applied.is_none()) {
+        Some(o) => bar_spans(o).iter().map(|&(track, a, b)| (track, bar_sample(s, a), bar_sample(s, b))).collect(),
+        None => Vec::new(),
+    };
+    let others_points: Vec<(TrackId, Samples)> =
+        others.iter().filter_map(|o| o.applied.as_ref()).flat_map(|a| a.points.iter().map(|p| (p.track, p.at))).collect();
     t.applied = Some(applied(s, &t, &r));
     t.edited = false;
     t.stale = false;
@@ -401,6 +461,11 @@ pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out
             tr.lane_mut(&lane).points.retain(|q| q.at != p.at);
         }
     }
+    for &(track, a, b) in &old_spans {
+        if let Some(tr) = s.track_mut(track) {
+            tr.lane_mut(&lane).points.retain(|q| q.at < a || q.at > b || others_points.contains(&(track, q.at)));
+        }
+    }
     for span in &r.spans {
         if let Some(tr) = s.track_mut(span.track) {
             tr.lane_mut(&lane).clear_range(span.start.saturating_add(1), span.end);
@@ -424,13 +489,25 @@ pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out
     Ok(Built { transition: t, recipe: r, eq_inserted: inserted })
 }
 
-/// `dj.transitions`: every transition, with its hit and gone bars.
+/// `dj.transitions`: every transition, with its hit and gone bars, and whether it is `usable` as
+/// its recipe wrote it (else the `reason`: a clip off its deck's active playlist, a recipe that
+/// no longer fits, edited by hand, stale, or no recipe applied).
 pub(super) fn transitions(e: &mut Engine, _: &Value) -> Result<Value> {
-    let list = e.session().dj.transitions.iter().map(|t| {
+    let s = e.session();
+    let list = s.dj.transitions.iter().map(|t| {
         let mut v = serde_json::to_value(t).map_err(|err| bad("dj.transitions", err.to_string()))?;
+        let reason = match recipe(s, t) {
+            Err(why) => Some(why),
+            Ok(_) if t.edited => Some("edited by hand; rebuild it with dj.transition {transition, force: true}".to_string()),
+            Ok(_) if t.stale => Some("stale: the tempo or its clips moved since its recipe was applied; apply it again".to_string()),
+            Ok(_) if t.applied.is_none() => Some("no recipe applied".to_string()),
+            Ok(_) => None,
+        };
         if let Some(o) = v.as_object_mut() {
             o.insert("hit_bar".to_string(), json!(t.hit_bar()));
             o.insert("gone_bar".to_string(), json!(t.gone_bar()));
+            o.insert("usable".to_string(), json!(reason.is_none()));
+            o.insert("reason".to_string(), json!(reason));
         }
         Ok(v)
     });
@@ -654,7 +731,7 @@ mod tests {
         assert_eq!(c.fade_in.len, bar(&e, 41) - c.start);
     }
 
-    /// Clips (deck, from bar, to bar) on `decks` mono decks at 128 bpm.
+    /// Beat-locked clips (deck, from bar, to bar) on `decks` mono decks at 128 bpm.
     fn arranged(decks: usize, clips: &[(usize, i64, i64)]) -> (Engine, Vec<TrackId>, Vec<ClipId>) {
         let mut s = Session::default();
         s.tempo.set_tempo(0, 128.0).unwrap();
@@ -665,7 +742,9 @@ mod tests {
         for &(deck, from, to) in clips {
             let id = s.new_clip_id();
             let start = bar_sample(&s, from);
-            let clip = Clip::audio(id, "c", src, 0, start, bar_sample(&s, to) - start);
+            let mut clip = Clip::audio(id, "c", src, 0, start, bar_sample(&s, to) - start);
+            // Beat-locked, so a tempo change keeps it on its bars.
+            clip.warp = WarpMap::new((0..1_000).map(|k| k as f64 * 22_500.0).collect(), 0.0);
             ops::place_clip(&mut s, tracks[deck], clip);
             ids.push(id);
         }
@@ -718,5 +797,109 @@ mod tests {
         tr.active_playlist = 1;
         let err = apply(&mut e, json!({"transition": 1})).unwrap_err().to_string();
         assert!(err.contains("inactive playlist"), "{err}");
+        let list = e.execute("dj.transitions", &json!({})).unwrap();
+        assert_eq!(list[0]["usable"], false);
+        assert!(list[0]["reason"].as_str().unwrap().contains("inactive playlist"), "{list}");
+    }
+
+    #[test]
+    fn a_hand_edit_of_a_stale_transition_still_marks_it_edited() {
+        let (mut e, (_, a), (tb, b)) = decks();
+        apply(&mut e, json!({"out_clip": a.0, "in_clip": b.0})).unwrap();
+        e.execute("event.tempo", &json!({"bpm": 140.0})).unwrap();
+        assert_eq!(flags(&e, 1), (false, true));
+        let list = e.execute("dj.transitions", &json!({})).unwrap();
+        assert!(list[0]["usable"] == false && list[0]["reason"].as_str().unwrap().starts_with("stale"), "{list}");
+        // The recipe's points haven't moved in samples: one added inside its build is an edit.
+        let inside = points(&e, tb)[0].0 + SR;
+        set_bass(&mut e, tb, inside, -6.0);
+        assert_eq!(flags(&e, 1), (true, true));
+        let err = apply(&mut e, json!({"transition": 1})).unwrap_err().to_string();
+        assert!(err.contains("edited by hand"), "{err}");
+        apply(&mut e, json!({"transition": 1, "force": true})).unwrap();
+        assert_eq!(flags(&e, 1), (false, false));
+    }
+
+    #[test]
+    fn moving_a_clip_makes_its_transition_stale_not_edited() {
+        let (mut e, (ta, a), (tb, b)) = decks();
+        apply(&mut e, json!({"out_clip": a.0, "in_clip": b.0})).unwrap();
+        e.execute("edit.move_clips", &json!({"clips": [b.0], "by": SR})).unwrap();
+        assert_eq!(flags(&e, 1), (false, true));
+        apply(&mut e, json!({"transition": 1})).unwrap();
+        assert_eq!(flags(&e, 1), (false, false));
+        // Onto another deck: stale too, and re-applying follows it there.
+        let s = e.session_mut();
+        let clip = s.find_clip(b).unwrap().1.clone();
+        let deck = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.track_mut(tb).unwrap().playlist_mut().unwrap().clips.retain(|c| c.id != b);
+        s.track_mut(deck).unwrap().playlist_mut().unwrap().clips.push(clip);
+        let far = bar(&e, 100);
+        set_bass(&mut e, ta, far, 0.0);
+        assert_eq!(flags(&e, 1), (false, true));
+        apply(&mut e, json!({"transition": 1})).unwrap();
+        assert_eq!(e.session().dj.transition(1).unwrap().in_track, deck);
+    }
+
+    #[test]
+    fn spans_are_compared_in_bars_across_tempo_changes() {
+        let (mut e, _, c) = arranged(2, &[(0, 1, 45), (1, 25, 69), (0, 49, 90)]);
+        apply(&mut e, json!({"out_clip": c[0].0, "in_clip": c[1].0})).unwrap();
+        // Slower: transition 1's stored samples now fall before its bars; bars still clash.
+        e.execute("event.tempo", &json!({"bpm": 100.0})).unwrap();
+        let err = apply(&mut e, json!({"out_clip": c[1].0, "in_clip": c[2].0, "entry_bar": 45})).unwrap_err().to_string();
+        assert!(err.contains("conflict") && err.contains("bars 45..61"), "{err}");
+        // Faster: its stored samples reach past its bars; bars don't clash.
+        e.execute("event.tempo", &json!({"bpm": 160.0})).unwrap();
+        apply(&mut e, json!({"out_clip": c[1].0, "in_clip": c[2].0, "entry_bar": 49})).unwrap();
+        // The stale transition 1 still re-applies beside transition 2.
+        assert_eq!(flags(&e, 1), (false, true));
+        apply(&mut e, json!({"transition": 1})).unwrap();
+        assert_eq!(flags(&e, 1), (false, false));
+    }
+
+    #[test]
+    fn a_shared_end_point_with_another_value_is_a_conflict() {
+        let (mut e, (_, a), (_, b)) = decks();
+        apply(&mut e, json!({"out_clip": a.0, "in_clip": b.0})).unwrap();
+        let t1 = e.session().dj.transition(1).unwrap().clone();
+        // Another build into the same deck starting where transition 1's hits: 0 dB vs -24 dB.
+        let mut t2 = t1.clone();
+        t2.id = 2;
+        t2.entry_bar = t1.hit_bar();
+        let why = conflict(&t2, &[&t1]).unwrap();
+        assert!(why.contains("different values") && why.contains("bar 41"), "{why}");
+        // Where both write -24 dB (one's gone bar, the other's entry), they may share it.
+        let mut t3 = t1.clone();
+        t3.id = 3;
+        (t3.in_track, t3.out_track) = (t1.out_track, t1.in_track);
+        t3.entry_bar = t1.gone_bar();
+        assert_eq!(conflict(&t3, &[&t1]), None);
+    }
+
+    #[test]
+    fn re_applying_without_a_record_clears_the_old_bars() {
+        let (mut e, (ta, a), (tb, b)) = decks();
+        apply(&mut e, json!({"out_clip": a.0, "in_clip": b.0, "build_bars": 8})).unwrap();
+        e.session_mut().dj.transition_mut(1).unwrap().applied = None;
+        apply(&mut e, json!({"transition": 1, "entry_bar": 29})).unwrap();
+        assert_eq!(points(&e, tb), vec![(bar(&e, 29), -24.0), (bar(&e, 37), 0.0)]);
+        assert_eq!(points(&e, ta), vec![(bar(&e, 37), 0.0), (bar(&e, 45), -24.0)]);
+    }
+
+    #[test]
+    fn the_menu_commands_act_on_the_selection() {
+        let (mut e, _, c) = arranged(2, &[(0, 1, 61), (1, 25, 69)]);
+        let (a, b) = (c[0], c[1]);
+        // The later clip selected first: the earlier one is still the outgoing one.
+        e.session_mut().edit.selected_clips = vec![b, a];
+        let r = apply(&mut e, json!({})).unwrap();
+        assert_eq!((r["transition"]["out_clip"].as_u64(), r["transition"]["in_clip"].as_u64()), (Some(a.0), Some(b.0)));
+        e.session_mut().edit.selected_clips = vec![b];
+        e.execute("dj.move_transition", &json!({"bars": 4})).unwrap();
+        assert_eq!(e.session().dj.transition(1).unwrap().entry_bar, 29);
+        e.execute("dj.nudge", &json!({"ms": 5.0})).unwrap();
+        e.session_mut().edit.selected_clips = vec![];
+        assert!(apply(&mut e, json!({})).unwrap_err().to_string().contains("select two clips"));
     }
 }

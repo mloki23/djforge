@@ -222,6 +222,30 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         let at_bar = lay.at_bar.get(i).copied().unwrap_or(1);
         let placed = place_warped(e, CMD, &t.path, Beats::Constant { bpm: t.bpm, first: t.first_downbeat }, at_bar, deck, None)?;
         let mut doubts = Vec::new();
+        // A track that mixes out ends TAIL_BARS after its transition's gone bar (or at its own
+        // end), so its fade-out doesn't run on long past the mix. Trimmed now, before the track
+        // after next goes on the same deck: placing that one clears what it overlaps, and could
+        // otherwise split this one and leave a stray piece after it.
+        if let (Some(&entry), Some(&(b, o))) = (lay.downbeat_bar.get(i + 1), lay.bars.get(i)) {
+            let tail_bar = entry.saturating_add(b + o + TAIL_BARS);
+            let tail = bar_sample(e.session(), tail_bar);
+            if let Some(c) = e.session_mut().find_clip_mut(placed.clip)
+                && tail > c.start
+                && tail < c.end()
+            {
+                c.trim_end_to(tail);
+            }
+            let end = e.session().find_clip(placed.clip).map_or(0, |(_, c)| c.end());
+            if let Some(&next) = lay.at_bar.get(i + 2)
+                && bar_sample(e.session(), next) < end
+            {
+                doubts.push(format!(
+                    "{}: track {} starts on the same deck on bar {next}, before this track's planned end (bar {tail_bar}), and cuts it there",
+                    title(t),
+                    i + 3
+                ));
+            }
+        }
         if Some(&placed.downbeat_bar) != lay.downbeat_bar.get(i) {
             doubts.push(format!(
                 "{}: its first downbeat landed on bar {} instead of {}",
@@ -285,15 +309,6 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         doubts.extend(track_doubts.get(i + 1).cloned().unwrap_or_default());
         let style = out.transition.map_or(TransitionStyle::Blend, |t| t.style);
         let (b, o) = lay.bars.get(i).copied().unwrap_or_else(|| style.default_bars());
-        // The outgoing clip ends TAIL_BARS after the gone bar (or at its own end), so its fade-out
-        // doesn't run on long past the mix.
-        let tail = bar_sample(e.session(), entry_bar.saturating_add(b + o + TAIL_BARS));
-        if let Some(c) = e.session_mut().find_clip_mut(out_clip)
-            && tail > c.start
-            && tail < c.end()
-        {
-            c.trim_end_to(tail);
-        }
         if let Some(d) = camelot_distance(&out.camelot, &inc.camelot).filter(|d| *d > 1) {
             doubts.push(format!("key clash: {} -> {} ({d} steps on the wheel)", out.camelot, inc.camelot));
         }
@@ -323,7 +338,7 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
                 t
             }
             None => {
-                doubts.push(format!("no recipe applied: {last_err}"));
+                doubts.push(format!("needs manual attention: no recipe applied ({last_err})"));
                 let s = e.session();
                 let deck_of = |c: ClipId| s.find_clip(c).map_or(TrackId(0), |(t, _)| t);
                 let t = Transition {
@@ -753,6 +768,41 @@ mod tests {
         assert!((downbeat - nudge - 64.0).abs() < 1e-6, "B's downbeat on session beat {downbeat}, nudged {nudge}");
         assert_eq!(c.fade_in.len, bar(&e, 33) - c.start);
         assert!(r["transitions"][0]["doubts"].as_array().unwrap().is_empty(), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_track_is_trimmed_before_the_track_after_next_lands_on_its_deck() {
+        // A (150 s, to bar 76) into a short B on bar 17; B into C on bar 61, back on A's deck,
+        // inside A's file but after A's planned end (bar 57). C is 10 s: it ends inside A's file.
+        let dir = folder("deck");
+        let a = write_wav(&dir, "a.wav", &drums(120.0, 0.0, 0.0, 150));
+        let b = write_wav(&dir, "b.wav", &drums(124.0, 0.5, 0.0, 100));
+        let c = write_wav(&dir, "c.wav", &drums(128.0, 0.0, 0.0, 10));
+        let plan = json!({
+            "format": "mixforge-plan/2", "master_bpm": 124.0,
+            "tracks": [
+                {"path": a, "bpm": 120.0, "first_downbeat": 0.0, "audio_end": 150.0, "out_start": 32.0,
+                 "transition": {"style": "blend", "bars": 16, "ramp": false}},
+                {"path": b, "bpm": 124.0, "first_downbeat": 0.5, "audio_end": 100.0, "out_start": 0.5 + 176.0 * 60.0 / 124.0,
+                 "transition": {"style": "quick", "bars": 8, "ramp": false}},
+                {"path": c, "bpm": 128.0, "first_downbeat": 0.0, "audio_end": 10.0},
+            ],
+        });
+        let path = dir.join("plan.json");
+        std::fs::write(&path, plan.to_string()).unwrap();
+        let mut e = Engine::default();
+        let r = e.execute("dj.import_set", &json!({"plan": path.to_string_lossy()})).unwrap();
+        assert_eq!(r["track_list"][2]["at_bar"], 61, "{r}");
+        let deck: TrackId = serde_json::from_value(r["decks"][0].clone()).unwrap();
+        let s = e.session();
+        let on_deck: Vec<(Samples, Samples)> = s.track(deck).unwrap().clips().iter().map(|c| (c.start, c.end())).collect();
+        assert_eq!(on_deck.len(), 2, "a stray piece of A is left: {on_deck:?}");
+        assert_eq!(on_deck[0], (bar(&e, 1), bar(&e, 57)));
+        // Nothing reads as edited or stale once another command has run.
+        e.execute("automation.set_point", &json!({"track": deck.0, "param": "volume", "at": bar(&e, 200), "value": 0.0})).unwrap();
+        let t = &e.session().dj.transitions;
+        assert!(t.iter().all(|t| !t.edited && !t.stale && t.applied.is_some()), "{t:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
