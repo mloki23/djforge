@@ -12,7 +12,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "session.open", "Open Session...", ["File"], Some("Cmd+O"), "{path}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.open", "`path` required"))?.to_string();
             let report = crate::io::open_session_checked(e, &path)?;
-            Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": report.missing, "changed": report.changed}))
+            Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": report.missing, "changed": report.changed, "modified": report.modified}))
         }),
         cmd!(
             "file.relink_audio",

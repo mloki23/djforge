@@ -96,6 +96,14 @@ fn file_stamp(p: &Path) -> Option<FileStamp> {
     Some(FileStamp { len: m.len(), modified: m.modified().ok() })
 }
 
+/// The size and modification time (ms since 1970) a session records for the file at `p`; zeros
+/// when they are unknown.
+fn saved_stamp(p: &Path) -> (u64, u64) {
+    let Some(st) = file_stamp(p) else { return (0, 0) };
+    let ms = st.modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    (st.len, ms)
+}
+
 /// Where decoded audio came from: keyed by the audio's address, checked against the live `Arc`.
 type DecodedFrom = std::collections::BTreeMap<usize, (std::sync::Weak<SourceAudio>, PathBuf, FileStamp)>;
 static DECODED_FROM: std::sync::Mutex<DecodedFrom> = std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -241,6 +249,8 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         format,
         time_reference: 0,
         unsaved: true,
+        file_len: 0,
+        file_modified_ms: 0,
     });
     s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
     id
@@ -1132,6 +1142,11 @@ fn write_session(session: &Session, path: &str, overwrite: bool, copy_audio: boo
     if written > 0 {
         sync_dir(&audio_dir);
     }
+    // What each file was like when saved, so opening can tell when one changed since.
+    for src in &mut s.sources {
+        let file = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
+        (src.file_len, src.file_modified_ms) = saved_stamp(&file);
+    }
     s.folder = Some(dir.clone());
     if !overwrite && let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
         s.name = stem.to_string();
@@ -1281,6 +1296,10 @@ pub struct OpenReport {
     /// Audio files that loaded with a different length or width than the session recorded:
     /// the file changed on disk since it was imported or saved.
     pub changed: Vec<String>,
+    /// Information: audio files whose size or modification time differ from when the session
+    /// was saved, though they decode to the recorded length (a retag, or an edit of the same
+    /// length).
+    pub modified: Vec<String>,
 }
 
 /// [`open_session`], reporting audio files that changed on disk as well as missing media.
@@ -1294,6 +1313,7 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
     let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
     let mut changed = Vec::new();
+    let mut modified = Vec::new();
     let mut files = DecodedFiles::new();
     for src in &s.sources {
         let decoded = stored_path(&src.path, links)
@@ -1309,6 +1329,8 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
                         src.frames,
                         src.channels
                     ));
+                } else if src.file_len != 0 && saved_stamp(&p) != (src.file_len, src.file_modified_ms) {
+                    modified.push(format!("{}: modified since the session was saved (same length; tags or audio may differ)", p.display()));
                 }
                 s.pool.insert(src.id, audio);
             }
@@ -1322,10 +1344,10 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
-    for m in &changed {
+    for m in changed.iter().chain(&modified) {
         e.message(m.clone());
     }
-    Ok(OpenReport { missing, changed })
+    Ok(OpenReport { missing, changed, modified })
 }
 
 /// Decode one source's audio file at the session rate.
@@ -2572,6 +2594,28 @@ mod in_place_tests {
         assert!(!dir.join("Set/Audio Files").exists());
         assert_eq!(stored(&path).sources[0].path, wav);
         assert_eq!(first_audio(&reopen(&path)), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_retagged_since_the_save_is_reported_on_open() {
+        let dir = folder("in-place-retag-open");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        let (_, path) = saved_with(&dir, &wav);
+        let mut r = Engine::default();
+        let report = open_session_checked(&mut r, &path).unwrap();
+        assert!(report.missing.is_empty() && report.changed.is_empty() && report.modified.is_empty(), "{report:?}");
+        let mut tagged = std::fs::read(&wav).unwrap();
+        tagged.extend_from_slice(b"JUNK\x04\x00\x00\x00tag!");
+        let riff = u32::from_le_bytes([tagged[4], tagged[5], tagged[6], tagged[7]]) + 12;
+        tagged[4..8].copy_from_slice(&riff.to_le_bytes());
+        std::fs::write(&wav, &tagged).unwrap();
+        let mut r = Engine::default();
+        let report = open_session_checked(&mut r, &path).unwrap();
+        assert!(report.changed.is_empty(), "{report:?}");
+        assert_eq!(report.modified.len(), 1, "{report:?}");
+        assert!(report.modified[0].contains("modified since the session was saved"));
+        assert_eq!(first_audio(&r), audio);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

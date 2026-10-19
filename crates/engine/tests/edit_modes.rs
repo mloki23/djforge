@@ -14,6 +14,8 @@ fn source(id: u64, frames: u64) -> Source {
         format: soundcraft_audio_io::FileFormat::Wav,
         time_reference: 0,
         unsaved: false,
+        file_len: 0,
+        file_modified_ms: 0,
     }
 }
 

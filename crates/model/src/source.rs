@@ -23,6 +23,16 @@ pub struct Source {
     /// True when the file has not been written to disk yet (recorded/rendered this session).
     #[serde(default)]
     pub unsaved: bool,
+    /// Size in bytes of the file when the session was last saved (0 = unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub file_len: u64,
+    /// The file's modification time then, in milliseconds since 1970 (0 = unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub file_modified_ms: u64,
+}
+
+fn is_zero(x: &u64) -> bool {
+    *x == 0
 }
 
 /// A movie used by Video track clips (serialised). The pictures themselves are never stored in
