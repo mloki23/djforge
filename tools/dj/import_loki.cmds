@@ -1,0 +1,4 @@
+# Stage 2 gate: rebuild Marty's "loki journey" set from mixforge's plan.json.
+#   soundcraft-cli script tools/dj/import_loki.cmds --save "C:/Users/marty/Music/djforge-tests/loki journey/loki journey.scraft"
+session.new {"name": "loki journey", "sample_rate": 48000}
+dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json", "report": "C:/Users/marty/Music/djforge-tests/loki journey/loki journey.import.txt"}
