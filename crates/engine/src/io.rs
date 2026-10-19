@@ -130,6 +130,14 @@ thread_local! {
     pub(crate) static REDECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Give the file at `p` a modification time an hour ahead, so a rewrite of the same size made
+/// within the file system's time resolution still counts as a change.
+#[cfg(test)]
+pub(crate) fn touch_later(p: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(later)).unwrap();
+}
+
 /// Remember that `audio` was decoded from the file at `p` as it is now.
 pub(crate) fn remember_decoded(audio: &Arc<SourceAudio>, p: &Path) {
     let Some(stamp) = file_stamp(p) else { return };
@@ -2672,6 +2680,7 @@ mod in_place_tests {
         let buf = AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.25; 44_100]] };
         let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
         std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        touch_later(Path::new(&wav));
         let src = e.session().sources[0].clone();
         let audio = e.session().pool.get(src.id).unwrap().clone();
         let session = dir.join("Set/Set.scraft");
@@ -2682,11 +2691,10 @@ mod in_place_tests {
         assert_eq!(REDECODES.with(std::cell::Cell::get) - before, 1);
         // Changed once more: decoded again (and now the same audio as before, so kept).
         let (_, _) = library_wav(&dir.join("Lib"), 44_100);
-        let renewed = file_stamp(Path::new(&wav)).unwrap();
-        if decoded_source(&audio).and_then(|(_, _, d)| d) != Some(renewed) {
-            assert!(kept_reference(&src.path, &session, &audio).is_some());
-            assert_eq!(REDECODES.with(std::cell::Cell::get) - before, 2);
-        }
+        let much_later = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        std::fs::File::options().write(true).open(&wav).and_then(|f| f.set_modified(much_later)).unwrap();
+        assert!(kept_reference(&src.path, &session, &audio).is_some());
+        assert_eq!(REDECODES.with(std::cell::Cell::get) - before, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

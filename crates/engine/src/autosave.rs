@@ -474,6 +474,7 @@ mod tests {
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
         // Same length, other audio.
         write(0.25);
+        crate::io::touch_later(&wav);
         let mut a = Autosave::create(&dir.join("Autosave"), "Untitled").unwrap();
         let before = crate::io::REDECODES.with(std::cell::Cell::get);
         a.write(e.session(), None, None).unwrap();
