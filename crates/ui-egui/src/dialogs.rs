@@ -129,8 +129,9 @@ impl Dialogs {
             "edit.fades_create" => Dialog::Fades { shape: "equal power".into() },
             "dj.import_set" => Dialog::PathPrompt { cmd: id.into(), title: "Import mixforge Set (plan.json)".into(), path: home, key: "plan".into() },
             "dj.tempo_ramp" => {
+                // The tempo the selection ends in (the next track's, when it reaches into it).
                 let s = e.session();
-                let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(s.edit.selection.start, s.sample_rate));
+                let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(s.edit.selection.end, s.sample_rate));
                 Dialog::Number {
                     cmd: id.into(),
                     title: "Tempo Ramp over the Selection to".into(),

@@ -1,6 +1,6 @@
 //! `dj.move_transition`: moves a transition's mix point by whole bars, rippling the rest of the
-//! set (every later track and the tempo from the old entry on) so each track keeps its own
-//! beats, then rebuilds the moved transitions' recipes.
+//! set (the later tracks, every clip, automation point, marker and tempo event from the old entry
+//! on) so each track keeps its own beats, then rebuilds the moved transitions' recipes.
 
 use super::recipe::{Changes, bar_sample, build, clips_in_place, intact};
 use super::*;
@@ -10,8 +10,9 @@ const CMD: &str = "dj.move_transition";
 /// Bars an outgoing clip plays on after its transition's gone bar (as the set import trims it).
 const TAIL_BARS: i64 = 16;
 
-/// The transitions after `first` in play order: each one's outgoing clip is the previous one's
-/// incoming clip. Indices into `s.dj.transitions`, `first` included.
+/// The transitions from `first` on in play order, followed as a linear chain: each one's
+/// outgoing clip is the previous one's incoming clip (the first such, if several; a loop ends
+/// it). Indices into `s.dj.transitions`, `first` included.
 fn chain(s: &Session, first: usize) -> Vec<usize> {
     let mut out = vec![first];
     let mut seen = std::collections::BTreeSet::from([first]);
@@ -70,6 +71,11 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             format!("transition {id} would enter on bar {new_entry}, before transition {}'s bass is gone (bar {})", prev.id, prev.gone_bar()),
         ));
     }
+    // What moves: the chain's incoming clips, and every clip starting at or after the old entry.
+    // Clips straddling it (the outgoing track) stay.
+    let (old_tempo, sr) = (s.tempo.clone(), s.sample_rate);
+    let from = old_tempo.bar_start_tick(t.entry_bar);
+    let from_sample = old_tempo.tick_to_samples(from, sr);
     let mut clips: Vec<ClipId> = Vec::new();
     for &i in &moved {
         if let Some(m) = s.dj.transitions.get(i)
@@ -83,12 +89,15 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             return Err(bad(CMD, format!("clip {} is not on an active playlist", c.0)));
         }
     }
+    for c in s.tracks.iter().flat_map(|t| t.clips()) {
+        if c.start >= from_sample && !clips.contains(&c.id) {
+            clips.push(c.id);
+        }
+    }
 
     // The new tempo map: unchanged before the old entry, shifted by the move after it. Moving
     // later, the gap keeps the tempo playing before the entry (the outgoing track's); moving
     // earlier, the events the move overlaps go.
-    let (old_tempo, sr) = (s.tempo.clone(), s.sample_rate);
-    let from = old_tempo.bar_start_tick(t.entry_bar);
     let delta = old_tempo.bar_start_tick(new_entry) - from;
     let keep_before = from.min(from + delta);
     let events: Vec<(i64, f64)> = old_tempo
@@ -107,23 +116,82 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
         tempo.set_tempo(tick, bpm).map_err(|err| bad(CMD, err.to_string()))?;
     }
     let shift = delta as f64 / TICKS_PER_QUARTER as f64;
+    // A timeline position at or after the old entry, rippled: through ticks of the old map, moved
+    // by the delta, back to samples under the new one.
+    let ripple = |tempo: &TempoMap, at: Samples| -> Samples {
+        let tick = old_tempo.samples_to_ticks_f(at, sr) + delta as f64;
+        sample_at_beat(tempo, sr, tick / TICKS_PER_QUARTER as f64)
+    };
 
-    // Moved clips go `shift` session beats later under the new map, locked there so the relock
-    // pass leaves them; the others then follow their beats from the old map to the new one.
+    let moved_ids: Vec<u64> = moved.iter().filter_map(|&i| s.dj.transitions.get(i)).map(|m| m.id).collect();
+    let lane = super::recipe::bass_lane();
+    // Points unmoved transitions wrote stay, wherever they are.
+    let keep: Vec<(TrackId, Samples)> =
+        s.dj.transitions
+            .iter()
+            .filter(|o| !moved_ids.contains(&o.id))
+            .filter_map(|o| o.applied.as_ref())
+            .flat_map(|a| a.points.iter().map(|p| (p.track, p.at)))
+            .collect();
+    let rebuilt_points: Vec<(TrackId, Samples)> =
+        s.dj.transitions
+            .iter()
+            .filter(|o| moved_ids.contains(&o.id) && !o.edited)
+            .filter_map(|o| o.applied.as_ref())
+            .flat_map(|a| a.points.iter().map(|p| (p.track, p.at)))
+            .filter(|p| !keep.contains(p))
+            .collect();
+
     let s = e.session_mut();
     s.tempo = tempo;
     let (old, new) = (Timebase::new(&old_tempo, sr), Timebase::new(&s.tempo, sr));
     let new_fp = new.fp;
+    // Automation and markers from the old entry on ripple with the set; the recipes about to be
+    // rebuilt lose their old points first.
+    for tr in &mut s.tracks {
+        let id = tr.id;
+        for l in &mut tr.automation {
+            let is_bass = l.param == lane;
+            let mut moved_points = Vec::new();
+            l.points.retain(|p| {
+                if is_bass && rebuilt_points.contains(&(id, p.at)) {
+                    return false;
+                }
+                if p.at >= from_sample && !(is_bass && keep.contains(&(id, p.at))) {
+                    moved_points.push(*p);
+                    return false;
+                }
+                true
+            });
+            for p in moved_points {
+                l.set_point(ripple(&s.tempo, p.at), p.value);
+            }
+        }
+    }
+    for m in &mut s.markers {
+        if m.start >= from_sample {
+            let len = m.end.saturating_sub(m.start);
+            m.start = ripple(&s.tempo, m.start);
+            m.end = m.start.saturating_add(len);
+        }
+    }
+    // Beat-locked clips go `shift` session beats later under the new map, locked there so the
+    // relock pass leaves them; others move by ticks, keeping their length in samples. The clips
+    // that stay then follow their beats from the old map to the new one.
     let mut placed = Vec::new();
     for c in &clips {
         let Some(clip) = s.find_clip(*c).map(|(_, c)| c) else { continue };
-        let (b0, b1) = (old.beat(clip.start) + shift, old.beat(clip.end()) + shift);
-        let start = new.sample(b0).clamp(-MAX_POSITION, MAX_POSITION);
-        let length = new.sample(b1).saturating_sub(start).clamp(1, MAX_POSITION);
-        placed.push((*c, start, length, new.beat(start) - b0));
+        if clip.warp.is_some() {
+            let (b0, b1) = (old.beat(clip.start) + shift, old.beat(clip.end()) + shift);
+            let start = new.sample(b0).clamp(-MAX_POSITION, MAX_POSITION);
+            let length = new.sample(b1).saturating_sub(start).clamp(1, MAX_POSITION);
+            placed.push((*c, start, length, new.beat(start) - b0));
+        } else {
+            placed.push((*c, ripple(&s.tempo, clip.start).clamp(-MAX_POSITION, MAX_POSITION), clip.length, 0.0));
+        }
     }
     let mut tracks = Vec::new();
-    for (c, start, length, drift) in placed {
+    for &(c, start, length, drift) in &placed {
         let Some(track) = s.find_clip(c).map(|(t, _)| t) else { continue };
         if let Some(clip) = s.find_clip_mut(c) {
             if clip.length != length {
@@ -140,7 +208,7 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             tracks.push(track);
         }
     }
-    for t in tracks {
+    for &t in &tracks {
         if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
             pl.sort();
         }
@@ -148,57 +216,96 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
     let r = relocks(s, &old_tempo, sr);
     apply_relocks(s, &r);
 
-    // Each moved transition's outgoing clip ends TAIL_BARS after its new gone bar, within its audio.
-    let mut skipped = Vec::new();
-    let mut rebuilt = Vec::new();
+    // The moved transitions' new bars.
     let mut moved_ts: Vec<Transition> = moved.iter().filter_map(|&i| s.dj.transitions.get(i).cloned()).collect();
     for m in &mut moved_ts {
         m.entry_bar = m.entry_bar.saturating_add(bars).clamp(1, MAX_TRANSITION_BAR);
-        let tail = bar_sample(s, m.gone_bar().saturating_add(TAIL_BARS));
-        if let Some(c) = s.find_clip(m.out_clip).map(|(_, c)| c) {
-            // Cut back to the tail, or extended towards it no further than the audio goes.
-            let end = if tail < c.end() { tail } else { tail.min(audio_end(s, c).max(c.end())) };
-            if end > c.start
-                && end != c.end()
-                && let Some(c) = s.find_clip_mut(m.out_clip)
+    }
+    let gone_of = |s: &Session, clip: ClipId| -> Option<(u64, i64)> {
+        let o = moved_ts.iter().find(|m| m.out_clip == clip).or_else(|| s.dj.transitions.iter().find(|o| o.out_clip == clip))?;
+        Some((o.id, o.gone_bar()))
+    };
+    // A moved clip that now overlaps one staying on its deck (moving earlier) cuts that one where
+    // it starts, when that is after the staying clip's own transition's bass is gone.
+    let (mut cut, mut cut_clips) = (Vec::new(), Vec::new());
+    for &(c, start, _, _) in &placed {
+        let Some(track) = s.find_clip(c).map(|(t, _)| t) else { continue };
+        let staying: Vec<ClipId> = s
+            .track(track)
+            .map(|t| t.clips().iter().filter(|o| !clips.contains(&o.id) && o.start < start && o.end() > start).map(|o| o.id).collect())
+            .unwrap_or_default();
+        for other in staying {
+            if let Some((tid, gone)) = gone_of(s, other)
+                && bar_sample(s, gone) > start
             {
-                c.trim_end_to(end);
+                return Err(bad(
+                    CMD,
+                    format!("clip {} would start before transition {tid}'s bass is gone (bar {gone}) on the same deck; move it less", c.0),
+                ));
             }
+            if let Some(o) = s.find_clip_mut(other) {
+                o.trim_end_to(start);
+                cut.push(json!({"clip": other, "ends": start}));
+                cut_clips.push(other);
+            }
+        }
+    }
+    // Each moved transition's outgoing clip ends TAIL_BARS after its new gone bar: cut back, or
+    // extended no further than its audio or the next clip on its deck.
+    for m in &moved_ts {
+        let tail = bar_sample(s, m.gone_bar().saturating_add(TAIL_BARS));
+        let Some((track, c)) = s.find_clip(m.out_clip) else { continue };
+        let next = s.track(track).and_then(|t| t.clips().iter().filter(|o| o.id != c.id && o.start >= c.start).map(|o| o.start).min());
+        let end = if tail < c.end() { tail } else { tail.min(audio_end(s, c).max(c.end())).min(next.unwrap_or(MAX_POSITION).max(c.end())) };
+        if end > c.start
+            && end != c.end()
+            && let Some(c) = s.find_clip_mut(m.out_clip)
+        {
+            c.trim_end_to(end);
         }
     }
     let r = relocks(s, &s.tempo.clone(), sr);
     apply_relocks(s, &r);
-    // The moved recipes' old points go first (but not one an unmoved transition also wrote), so
-    // the rebuilt ones don't meet them.
-    let moved_ids: Vec<u64> = moved_ts.iter().map(|m| m.id).collect();
-    let lane = super::recipe::bass_lane();
-    let keep: Vec<(TrackId, Samples)> =
-        s.dj.transitions
-            .iter()
-            .filter(|o| !moved_ids.contains(&o.id) || o.edited)
-            .filter_map(|o| o.applied.as_ref())
-            .flat_map(|a| a.points.iter().map(|p| (p.track, p.at)))
-            .collect();
-    for m in moved_ts.iter().filter(|m| !m.edited) {
-        for p in m.applied.iter().flat_map(|a| a.points.iter()) {
-            if !keep.contains(&(p.track, p.at))
-                && let Some(tr) = s.track_mut(p.track)
-            {
-                tr.lane_mut(&lane).points.retain(|q| q.at != p.at);
-            }
-        }
-    }
+
+    // Edited transitions keep their (rippled) points and stay edited; their record follows. The
+    // others are rebuilt on their new bars.
+    let fp = soundcraft_model::tempo_fingerprint(&s.tempo, s.sample_rate);
     for m in &moved_ts {
-        if let Some(slot) = s.dj.transition_mut(m.id) {
-            slot.entry_bar = m.entry_bar;
-            if !m.edited {
-                slot.applied = None;
+        let (s_tempo, edited) = (s.tempo.clone(), m.edited);
+        let clip_edges: Vec<(ClipId, Samples, Samples)> =
+            m.applied.iter().flat_map(|a| a.fades.iter()).filter_map(|f| s.find_clip(f.clip).map(|(_, c)| (f.clip, c.start, c.end()))).collect();
+        let Some(slot) = s.dj.transition_mut(m.id) else { continue };
+        slot.entry_bar = m.entry_bar;
+        if !edited {
+            slot.applied = None;
+            continue;
+        }
+        if let Some(a) = slot.applied.as_mut() {
+            for p in &mut a.points {
+                if p.at >= from_sample {
+                    p.at = ripple(&s_tempo, p.at);
+                }
             }
+            for sp in &mut a.spans {
+                if sp.start >= from_sample {
+                    sp.start = ripple(&s_tempo, sp.start);
+                }
+                if sp.end >= from_sample {
+                    sp.end = ripple(&s_tempo, sp.end);
+                }
+            }
+            for f in &mut a.fades {
+                if let Some(&(_, start, end)) = clip_edges.iter().find(|x| x.0 == f.clip) {
+                    (f.start, f.end) = (start, end);
+                }
+            }
+            a.tempo = fp;
         }
     }
+    let (mut rebuilt, mut skipped) = (Vec::new(), Vec::new());
     for m in moved_ts {
         if m.edited {
-            skipped.push(json!({"transition": m.id, "reason": "edited by hand; rebuild it with dj.transition {transition, force: true}"}));
+            skipped.push(json!({"transition": m.id, "reason": "edited by hand: moved with the set but not rebuilt; rebuild it with dj.transition {transition, force: true}"}));
             continue;
         }
         let ch = Changes { entry_bar: Some(m.entry_bar), ..Changes::default() };
@@ -207,13 +314,31 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
         match build(e, CMD, Some(current), m.out_clip, m.in_clip, &ch) {
             Ok(b) => rebuilt.push(b.transition.id),
             Err(err) if m.id == id => return Err(err),
-            Err(err) => skipped.push(json!({"transition": m.id, "reason": err.to_string()})),
+            Err(err) => {
+                if let Some(slot) = e.session_mut().dj.transition_mut(m.id) {
+                    slot.stale = true;
+                }
+                skipped.push(json!({"transition": m.id, "reason": format!("rebuild failed: {err}")}));
+            }
+        }
+    }
+    // A transition whose outgoing clip the move cut gets its fade-out to the new end.
+    let recut: Vec<Transition> =
+        e.session().dj.transitions.iter().filter(|o| !moved_ids.contains(&o.id) && !o.edited && cut_clips.contains(&o.out_clip)).cloned().collect();
+    for o in recut {
+        match build(e, CMD, Some(o.clone()), o.out_clip, o.in_clip, &Changes::default()) {
+            Ok(b) => rebuilt.push(b.transition.id),
+            Err(err) => {
+                if let Some(slot) = e.session_mut().dj.transition_mut(o.id) {
+                    slot.stale = true;
+                }
+                skipped.push(json!({"transition": o.id, "reason": format!("rebuild failed: {err}")}));
+            }
         }
     }
     // Transitions the move didn't touch are where they were: their recipes hold under the new map
     // when what they wrote is still there; otherwise they are stale.
     let s = e.session_mut();
-    let fp = soundcraft_model::tempo_fingerprint(&s.tempo, s.sample_rate);
     let untouched: Vec<(usize, bool)> =
         s.dj.transitions
             .iter()
@@ -229,7 +354,7 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             }
         }
     }
-    Ok(json!({"transition": id, "bars": bars, "entry_bar": new_entry, "moved_clips": clips, "rebuilt": rebuilt, "skipped": skipped}))
+    Ok(json!({"transition": id, "bars": bars, "entry_bar": new_entry, "moved_clips": clips, "cut": cut, "rebuilt": rebuilt, "skipped": skipped}))
 }
 
 #[cfg(test)]
@@ -354,6 +479,73 @@ mod tests {
             let err = mv(&mut e, id, bars).unwrap_err().to_string();
             assert!(err.contains(want), "{id} by {bars}: {err}");
             assert!(*e.session() == before);
+        }
+    }
+
+    /// Clip `c`'s deck.
+    fn deck(e: &Engine, c: ClipId) -> TrackId {
+        e.session().find_clip(c).unwrap().0
+    }
+
+    #[test]
+    fn moving_ripples_automation_markers_and_other_clips_after_the_entry() {
+        let (mut e, c) = set();
+        let b_deck = deck(&e, c[1]);
+        let (at20, at90, at100) = (bar_sample(e.session(), 20), bar_sample(e.session(), 90), bar_sample(e.session(), 100));
+        for at in [at20, at90] {
+            e.execute("automation.set_point", &json!({"track": b_deck.0, "param": "volume", "at": at, "value": -6.0})).unwrap();
+        }
+        e.execute("markers.add", &json!({"name": "drop", "at": at100})).unwrap();
+        // A clip on another track, not part of any transition, on bar 95.
+        let s = e.session_mut();
+        let src = s.find_clip(c[0]).unwrap().1.source().unwrap();
+        let other = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        let start = bar_sample(s, 95);
+        ops::place_clip(s, other, Clip::audio(id, "fx", src, 0, start, SR));
+        mv(&mut e, 1, 4).unwrap();
+        let s = e.session();
+        let near = |a: Samples, bar: i64| (a - bar_sample(s, bar)).abs() <= 1;
+        let vol: Vec<Samples> = s.track(b_deck).unwrap().lane(&soundcraft_model::AutoParam::Volume).unwrap().points.iter().map(|p| p.at).collect();
+        assert!(vol.len() == 2 && vol[0] == at20 && near(vol[1], 94), "{vol:?}");
+        assert!(near(s.markers[0].start, 104), "marker at {}", s.markers[0].start);
+        assert!(near(s.find_clip(id).unwrap().1.start, 99));
+        assert_eq!(s.find_clip(id).unwrap().1.length, SR, "a clip that isn't beat-locked keeps its length");
+    }
+
+    #[test]
+    fn moving_earlier_cuts_the_clip_it_now_overlaps_after_its_mix() {
+        let (mut e, c) = set();
+        // C goes from bar 73 to bar 49 on deck 0, where A plays until bar 61; A's mix is gone by 49.
+        let r = mv(&mut e, 2, -24).unwrap();
+        let s = e.session();
+        assert_eq!(s.find_clip(c[2]).unwrap().1.start, bar_sample(s, 49));
+        assert_eq!(s.find_clip(c[0]).unwrap().1.end(), bar_sample(s, 49));
+        assert_eq!(r["cut"][0]["clip"], c[0].0, "{r}");
+        assert!(s.dj.transitions.iter().all(|t| !t.edited && !t.stale), "{:?}", s.dj.transitions);
+    }
+
+    #[test]
+    fn an_edited_transition_keeps_its_points_in_step_with_its_music() {
+        let (mut e, c) = set();
+        let c_deck = deck(&e, c[2]);
+        let at80 = bar_sample(e.session(), 80);
+        e.execute("automation.set_point", &json!({"track": c_deck.0, "param": "plugin:a:low_shelf_gain", "at": at80, "value": -6.0})).unwrap();
+        assert!(e.session().dj.transition(2).unwrap().edited);
+        mv(&mut e, 1, 4).unwrap();
+        // Another command: transition 2 is still edited, not stale, and its record matches.
+        e.execute("automation.set_point", &json!({"track": c_deck.0, "param": "volume", "at": 0, "value": 0.0})).unwrap();
+        let s = e.session();
+        let t = s.dj.transition(2).unwrap();
+        assert!(t.edited && !t.stale && t.entry_bar == 77, "{t:?}");
+        let lane = super::super::recipe::bass_lane();
+        let deck_points: Vec<Samples> = s.track(c_deck).unwrap().lane(&lane).unwrap().points.iter().map(|p| p.at).collect();
+        let near = |a: Samples, bar: i64| (a - bar_sample(s, bar)).abs() <= 1;
+        // Transition 1's out points (bars 45, 53 after the move), then 2's build with the hand point.
+        assert!(deck_points.iter().any(|&a| near(a, 84)), "the hand point moved with the music: {deck_points:?}");
+        let applied: Vec<Samples> = t.applied.as_ref().unwrap().points.iter().map(|p| p.at).collect();
+        for (a, bar) in applied.iter().zip([77, 93, 93, 101]) {
+            assert!(near(*a, bar), "{applied:?}");
         }
     }
 }

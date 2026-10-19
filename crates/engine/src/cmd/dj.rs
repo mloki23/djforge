@@ -385,7 +385,8 @@ fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Opt
 
 fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.tempo_ramp";
-    // Without bars, over the timeline selection: from the first bar line in it, for its whole bars.
+    // Without a start bar, over the timeline selection: from the first bar line in it, for its
+    // whole bars (a start bar given without bars takes nothing from the selection).
     let s = e.session();
     let sel = s.edit.selection;
     let bar_of = |at: Samples| {
@@ -394,7 +395,7 @@ fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
     };
     let (sel_from, sel_to) = (bar_of(sel.start), s.tempo.bar_beat_at(sel.end, s.sample_rate).bar);
     let from_bar = i64_or(p, "from_bar", sel_from).clamp(1, 100_000);
-    let bars = i64_or(p, "bars", if sel.is_empty() { 0 } else { sel_to - from_bar });
+    let bars = i64_or(p, "bars", if sel.is_empty() || p.get("from_bar").is_some() { 0 } else { sel_to - from_bar });
     if !(1..=256).contains(&bars) {
         return Err(bad(CMD, "`bars` must be 1..=256 (or select at least a whole bar)"));
     }
@@ -402,6 +403,9 @@ fn tempo_ramp(e: &mut Engine, p: &Value) -> Result<Value> {
     let (a, b) = (f64_or(p, "from_bpm", start_bpm), f64_or(p, "to_bpm", f64::NAN));
     if ![a, b].iter().all(|v| v.is_finite() && (20.0..=400.0).contains(v)) {
         return Err(bad(CMD, "`from_bpm` and `to_bpm` must be 20..=400"));
+    }
+    if (a - b).abs() < 1e-9 {
+        return Err(bad(CMD, format!("the tempo is already {b} bpm at bar {from_bar}; give the tempo to ramp to as `to_bpm`")));
     }
     let s = e.session_mut();
     let start = s.tempo.bar_start_tick(from_bar);
@@ -710,6 +714,20 @@ mod tests {
         assert!(e.execute("dj.load_warped", &json!({"path": path, "beats": [2.0, 1.0]})).is_err());
         assert_eq!(e.session().tracks.len(), tracks);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tempo_ramp_needs_bars_and_a_new_tempo() {
+        let mut e = Engine::default();
+        e.session_mut().edit.selection = soundcraft_time::Range::new(0, 20 * SR);
+        // A start bar without bars doesn't borrow the selection's.
+        let err = e.execute("dj.tempo_ramp", &json!({"from_bar": 5, "to_bpm": 130.0})).unwrap_err().to_string();
+        assert!(err.contains("`bars`"), "{err}");
+        let err = e.execute("dj.tempo_ramp", &json!({"from_bar": 5, "bars": 4, "to_bpm": 120.0})).unwrap_err().to_string();
+        assert!(err.contains("already 120 bpm"), "{err}");
+        // Over the selection (bars 1..11 at 120 bpm): ten bars.
+        let r = e.execute("dj.tempo_ramp", &json!({"to_bpm": 130.0})).unwrap();
+        assert_eq!(r["steps"], 40, "{r}");
     }
 
     #[test]

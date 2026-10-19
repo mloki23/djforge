@@ -409,6 +409,17 @@ pub(crate) fn build(e: &mut Engine, cmd: &str, existing: Option<Transition>, out
     if let Some(why) = conflict(&t, &others) {
         return Err(bad(cmd, why));
     }
+    // A stale neighbour's points are still where the old tempo put them; clearing the new spans
+    // could delete them.
+    for o in others.iter().filter(|o| o.stale) {
+        let inside = o
+            .applied
+            .as_ref()
+            .is_some_and(|a| r.spans.iter().any(|sp| a.points.iter().any(|p| p.track == sp.track && p.at > sp.start && p.at < sp.end)));
+        if inside {
+            return Err(bad(cmd, format!("transition {} on this deck is stale; apply it again first", o.id)));
+        }
+    }
     for track in [out_track, in_track] {
         let slot =
             s.track(track).and_then(|tr| tr.mixer.inserts.get(EQ_SLOT)).ok_or_else(|| bad(cmd, format!("track {} has no insert slot a", track.0)))?;
@@ -849,13 +860,21 @@ mod tests {
         e.execute("event.tempo", &json!({"bpm": 100.0})).unwrap();
         let err = apply(&mut e, json!({"out_clip": c[1].0, "in_clip": c[2].0, "entry_bar": 45})).unwrap_err().to_string();
         assert!(err.contains("conflict") && err.contains("bars 45..61"), "{err}");
-        // Faster: its stored samples reach past its bars; bars don't clash.
+        // Faster: its stored samples reach past its bars; bars don't clash, but its stale points
+        // sit inside transition 2's span, so it must be applied again first.
         e.execute("event.tempo", &json!({"bpm": 160.0})).unwrap();
-        apply(&mut e, json!({"out_clip": c[1].0, "in_clip": c[2].0, "entry_bar": 49})).unwrap();
-        // The stale transition 1 still re-applies beside transition 2.
+        let t2 = json!({"out_clip": c[1].0, "in_clip": c[2].0, "entry_bar": 49});
+        let err = apply(&mut e, t2.clone()).unwrap_err().to_string();
+        assert!(err.contains("transition 1 on this deck is stale; apply it again first"), "{err}");
         assert_eq!(flags(&e, 1), (false, true));
         apply(&mut e, json!({"transition": 1})).unwrap();
-        assert_eq!(flags(&e, 1), (false, false));
+        apply(&mut e, t2).unwrap();
+        assert_eq!((flags(&e, 1), flags(&e, 2)), ((false, false), (false, false)));
+        // A stale transition re-applies beside a neighbour.
+        e.execute("event.tempo", &json!({"bpm": 150.0})).unwrap();
+        apply(&mut e, json!({"transition": 2})).unwrap();
+        apply(&mut e, json!({"transition": 1})).unwrap();
+        assert_eq!((flags(&e, 1), flags(&e, 2)), ((false, false), (false, false)));
     }
 
     #[test]
