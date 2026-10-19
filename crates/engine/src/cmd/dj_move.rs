@@ -1,6 +1,8 @@
 //! `dj.move_transition`: moves a transition's mix point by whole bars, rippling the rest of the
-//! set (the later tracks, every clip, automation point, marker and tempo event from the old entry
-//! on) so each track keeps its own beats, then rebuilds the moved transitions' recipes.
+//! set (the later tracks, every clip, automation point, marker, key signature and tempo or meter
+//! event from the old entry on) so each track keeps its own beats, then rebuilds the moved
+//! transitions' recipes. Automation over a clip that stays keeps its beat instead; markers and key
+//! signatures, being the session's, always ripple. Clips on inactive playlists don't move.
 
 use super::recipe::{Changes, bar_sample, build, clips_in_place, intact};
 use super::*;
@@ -95,25 +97,32 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
 
-    // The new tempo map: unchanged before the old entry, shifted by the move after it. Moving
-    // later, the gap keeps the tempo playing before the entry (the outgoing track's); moving
-    // earlier, the events the move overlaps go.
+    // The new tempo map, meters included: unchanged before the old entry, shifted by the move
+    // after it. Moving later, the gap keeps the tempo playing before the entry (the outgoing
+    // track's); moving earlier, the events the move overlaps go.
     let delta = old_tempo.bar_start_tick(new_entry) - from;
     let keep_before = from.min(from + delta);
-    let events: Vec<(i64, f64)> = old_tempo
-        .tempos()
-        .iter()
-        .filter(|ev| ev.tick < keep_before)
-        .map(|ev| (ev.tick, ev.bpm))
-        .chain(old_tempo.tempos().iter().filter(|ev| ev.tick >= from).map(|ev| (ev.tick + delta, ev.bpm)))
-        .collect();
-    let mut tempo = old_tempo.clone();
-    let ticks: Vec<i64> = tempo.tempos().iter().map(|ev| ev.tick).filter(|&k| k != 0).collect();
-    for k in ticks {
-        tempo.remove_tempo(k);
+    let moved_tick = |tick: i64| {
+        if tick >= from {
+            Some(tick + delta)
+        } else if tick < keep_before || tick == 0 {
+            Some(tick)
+        } else {
+            None
+        }
+    };
+    let first_meter = old_tempo.meter_at_tick(0);
+    let time_err = |err: soundcraft_time::TimeError| bad(CMD, err.to_string());
+    let mut tempo = TempoMap::new(old_tempo.tempo_at_tick(0), first_meter.numerator, first_meter.denominator).map_err(time_err)?;
+    for m in old_tempo.meters().iter().filter(|m| m.tick != 0) {
+        if let Some(tick) = moved_tick(m.tick) {
+            tempo.set_meter(tick, m.numerator, m.denominator).map_err(time_err)?;
+        }
     }
-    for (tick, bpm) in events {
-        tempo.set_tempo(tick, bpm).map_err(|err| bad(CMD, err.to_string()))?;
+    for ev in old_tempo.tempos() {
+        if let Some(tick) = moved_tick(ev.tick) {
+            tempo.set_tempo(tick, ev.bpm).map_err(time_err)?;
+        }
     }
     let shift = delta as f64 / TICKS_PER_QUARTER as f64;
     // A timeline position at or after the old entry, rippled: through ticks of the old map, moved
@@ -133,6 +142,18 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
             .filter_map(|o| o.applied.as_ref())
             .flat_map(|a| a.points.iter().map(|p| (p.track, p.at)))
             .collect();
+    // Clips that stay keep their automation with their music: a point over one stays on its
+    // beat (unless it is in a moved transition edited by hand, whose points go with it).
+    let staying: Vec<(TrackId, Samples, Samples)> =
+        s.tracks.iter().flat_map(|t| t.clips().iter().filter(|c| !clips.contains(&c.id)).map(move |c| (t.id, c.start, c.end()))).collect();
+    let edited_spans: Vec<(TrackId, Samples, Samples)> =
+        s.dj.transitions
+            .iter()
+            .filter(|o| moved_ids.contains(&o.id) && o.edited)
+            .filter_map(|o| o.applied.as_ref())
+            .flat_map(|a| a.spans.iter().map(|sp| (sp.track, sp.start, sp.end)))
+            .collect();
+    let keep_before_sample = old_tempo.tick_to_samples(keep_before, sr);
     let rebuilt_points: Vec<(TrackId, Samples)> =
         s.dj.transitions
             .iter()
@@ -146,10 +167,15 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
     s.tempo = tempo;
     let (old, new) = (Timebase::new(&old_tempo, sr), Timebase::new(&s.tempo, sr));
     let new_fp = new.fp;
-    // Automation and markers from the old entry on ripple with the set; the recipes about to be
-    // rebuilt lose their old points first.
+    // Automation from the old entry on ripples with the set, except over a clip that stays, where
+    // it keeps its beat under the new map (as the clip does). The recipes about to be rebuilt
+    // lose their old points first; unmoved transitions' points stay where they are.
+    let same_beat = |tempo: &TempoMap, at: Samples| sample_at_beat(tempo, sr, old_tempo.samples_to_ticks_f(at, sr) / TICKS_PER_QUARTER as f64);
     for tr in &mut s.tracks {
         let id = tr.id;
+        let over = |spans: &[(TrackId, Samples, Samples)], at: Samples, closed: bool| {
+            spans.iter().any(|&(t, a, b)| t == id && at >= a && (at < b || (closed && at == b)))
+        };
         for l in &mut tr.automation {
             let is_bass = l.param == lane;
             let mut moved_points = Vec::new();
@@ -157,15 +183,23 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
                 if is_bass && rebuilt_points.contains(&(id, p.at)) {
                     return false;
                 }
-                if p.at >= from_sample && !(is_bass && keep.contains(&(id, p.at))) {
-                    moved_points.push(*p);
-                    return false;
+                if (is_bass && keep.contains(&(id, p.at))) || p.at < keep_before_sample {
+                    return true;
                 }
-                true
+                moved_points.push(*p);
+                false
             });
             for p in moved_points {
-                l.set_point(ripple(&s.tempo, p.at), p.value);
+                let rippled = p.at >= from_sample && (over(&edited_spans, p.at, true) || !over(&staying, p.at, false));
+                let at = if rippled { ripple(&s.tempo, p.at) } else { same_beat(&s.tempo, p.at) };
+                l.set_point(at, p.value);
             }
+        }
+    }
+    // Markers and key signatures are the session's, not a track's: they ripple from the entry on.
+    for k in &mut s.key_signatures {
+        if k.0 >= from_sample {
+            k.0 = ripple(&s.tempo, k.0);
         }
     }
     for m in &mut s.markers {
@@ -226,15 +260,23 @@ pub(super) fn move_transition(e: &mut Engine, p: &Value) -> Result<Value> {
         Some((o.id, o.gone_bar()))
     };
     // A moved clip that now overlaps one staying on its deck (moving earlier) cuts that one where
-    // it starts, when that is after the staying clip's own transition's bass is gone.
+    // it starts, when that is after the staying clip's own transition's bass is gone; a staying
+    // clip that starts inside the moved one is refused.
     let (mut cut, mut cut_clips) = (Vec::new(), Vec::new());
-    for &(c, start, _, _) in &placed {
+    for &(c, start, length, _) in &placed {
         let Some(track) = s.find_clip(c).map(|(t, _)| t) else { continue };
-        let staying: Vec<ClipId> = s
+        let end = start.saturating_add(length);
+        let overlapped: Vec<(ClipId, Samples)> = s
             .track(track)
-            .map(|t| t.clips().iter().filter(|o| !clips.contains(&o.id) && o.start < start && o.end() > start).map(|o| o.id).collect())
+            .map(|t| t.clips().iter().filter(|o| !clips.contains(&o.id) && o.start < end && o.end() > start).map(|o| (o.id, o.start)).collect())
             .unwrap_or_default();
-        for other in staying {
+        if let Some(&(other, _)) = overlapped.iter().find(|&&(_, at)| at >= start) {
+            return Err(bad(
+                CMD,
+                format!("clip {} would play over clip {} on track {}; move that clip, or move the transition less", c.0, other.0, track.0),
+            ));
+        }
+        for (other, _) in overlapped {
             if let Some((tid, gone)) = gone_of(s, other)
                 && bar_sample(s, gone) > start
             {
@@ -547,5 +589,42 @@ mod tests {
         for (a, bar) in applied.iter().zip([77, 93, 93, 101]) {
             assert!(near(*a, bar), "{applied:?}");
         }
+    }
+
+    #[test]
+    fn automation_over_a_staying_track_stays_with_its_music() {
+        let (mut e, c) = set();
+        let (a_deck, b_deck) = (deck(&e, c[0]), deck(&e, c[1]));
+        let (at50, at60) = (bar_sample(e.session(), 50), bar_sample(e.session(), 60));
+        // On A's tail (A stays, playing to bar 61) and on B (which moves).
+        e.execute("automation.set_point", &json!({"track": a_deck.0, "param": "volume", "at": at50, "value": -3.0})).unwrap();
+        e.execute("automation.set_point", &json!({"track": b_deck.0, "param": "volume", "at": at60, "value": -3.0})).unwrap();
+        let meter_tick = e.session().tempo.bar_start_tick(150);
+        e.execute("event.meter", &json!({"numerator": 3, "denominator": 4, "at": bar_sample(e.session(), 150)})).unwrap();
+        mv(&mut e, 1, 4).unwrap();
+        let s = e.session();
+        let vol = |t: TrackId| s.track(t).unwrap().lane(&soundcraft_model::AutoParam::Volume).unwrap().points[0].at;
+        let near = |a: Samples, bar: i64| (a - bar_sample(s, bar)).abs() <= 1;
+        assert!(near(vol(a_deck), 50), "A's point left its bar: {} vs {}", vol(a_deck), bar_sample(s, 50));
+        assert!(near(vol(b_deck), 64), "B's point didn't move with B");
+        // The meter change after the entry ripples by the move's ticks.
+        let delta = s.tempo.bar_start_tick(29) - s.tempo.bar_start_tick(25);
+        assert!(s.tempo.meters().iter().any(|m| m.tick == meter_tick + delta && m.numerator == 3), "{:?}", s.tempo.meters());
+    }
+
+    #[test]
+    fn a_staying_clip_inside_the_moved_region_is_refused() {
+        let (mut e, c) = set();
+        // A clip on C's deck on bars 66..70; moving C 8 bars earlier (to 65) would play over it.
+        let a_deck = deck(&e, c[0]);
+        let s = e.session_mut();
+        let src = s.find_clip(c[0]).unwrap().1.source().unwrap();
+        let (start, end) = (bar_sample(s, 66), bar_sample(s, 70));
+        let id = s.new_clip_id();
+        ops::place_clip(s, a_deck, Clip::audio(id, "fx", src, 0, start, end - start));
+        let before = e.session().clone();
+        let err = mv(&mut e, 2, -8).unwrap_err().to_string();
+        assert!(err.contains(&format!("would play over clip {}", id.0)), "{err}");
+        assert!(*e.session() == before);
     }
 }
