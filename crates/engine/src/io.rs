@@ -77,6 +77,81 @@ pub fn stored_path(stored: &str, session: &Path) -> std::result::Result<PathBuf,
     Ok(path)
 }
 
+// ─── Audio referenced in place ────────────────────────────────────────────────────────────────
+//
+// An imported file that plays as decoded is referenced where it is rather than copied into the
+// session. The session may keep such a reference only while (a) the session file can reopen it
+// (`stored_path`), (b) it is not audio another session or a recording owns (an `Audio Files`
+// folder), and (c) the file is still the one the audio in memory was decoded from.
+
+/// A file's size and modification time when its audio was decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(p: &Path) -> Option<FileStamp> {
+    let m = std::fs::metadata(p).ok()?;
+    Some(FileStamp { len: m.len(), modified: m.modified().ok() })
+}
+
+/// Where decoded audio came from: keyed by the audio's address, checked against the live `Arc`.
+type DecodedFrom = std::collections::BTreeMap<usize, (std::sync::Weak<SourceAudio>, PathBuf, FileStamp)>;
+static DECODED_FROM: std::sync::Mutex<DecodedFrom> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn decoded_from() -> std::sync::MutexGuard<'static, DecodedFrom> {
+    DECODED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Remember that `audio` was decoded from the file at `p` as it is now.
+pub(crate) fn remember_decoded(audio: &Arc<SourceAudio>, p: &Path) {
+    let Some(stamp) = file_stamp(p) else { return };
+    let mut map = decoded_from();
+    map.retain(|_, (weak, _, _)| weak.strong_count() > 0);
+    map.insert(Arc::as_ptr(audio) as usize, (Arc::downgrade(audio), file_key(p), stamp));
+}
+
+/// True when `audio` was decoded from the file at `p` and the file has not changed since.
+pub(crate) fn decoded_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
+    let map = decoded_from();
+    map.get(&(Arc::as_ptr(audio) as usize)).is_some_and(|(weak, key, stamp)| {
+        weak.upgrade().is_some_and(|a| Arc::ptr_eq(&a, audio)) && *key == file_key(p) && file_stamp(p) == Some(*stamp)
+    })
+}
+
+/// Refuse to write `out` when it is the file of one of `s`'s sources: a bounce or export must
+/// never replace audio the session plays, least of all a library file referenced in place.
+pub fn refuse_source_file(s: &Session, out: &Path) -> Result<()> {
+    let out_key = file_key(out);
+    let hit = s.sources.iter().find(|src| {
+        let p = Path::new(&src.path);
+        let file = if p.is_absolute() { p.to_path_buf() } else { s.folder.as_deref().map_or_else(|| p.to_path_buf(), |f| f.join(p)) };
+        file_key(&file) == out_key
+    });
+    match hit {
+        Some(src) => {
+            Err(EngineError::Io(format!("{}: is the audio file of source `{}` in this session; choose another file", out.display(), src.name)))
+        }
+        None => Ok(()),
+    }
+}
+
+/// True when `p` is inside a folder named `Audio Files` (any depth, any case).
+pub(crate) fn in_audio_files(p: &Path) -> bool {
+    p.ancestors().skip(1).any(|a| a.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("Audio Files")))
+}
+
+/// The file the session file `session` may keep referencing for the stored absolute path
+/// `stored`, holding `audio`: see the section comment. `None` means the audio must be copied.
+pub(crate) fn kept_reference(stored: &str, session: &Path, audio: &Arc<SourceAudio>) -> Option<PathBuf> {
+    if !Path::new(stored).is_absolute() || in_audio_files(Path::new(stored)) {
+        return None;
+    }
+    let file = stored_path(stored, session).ok()?;
+    (file_found(&file) && !in_audio_files(&file) && decoded_unchanged(audio, &file)).then_some(file)
+}
+
 /// Create `dir` and its parents, inside the automation write root when there is one.
 pub(crate) fn make_dir(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
@@ -167,6 +242,24 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     // one it was decoded as, is referenced where it is: saving the session does not copy it.
     let ext_of = |p: &str| Path::new(p).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let in_place = file_rate == session_rate && path.is_some_and(|p| Path::new(p).is_absolute() && ext_of(p) == ext);
+    if let (true, Some(p)) = (in_place, path.map(Path::new)) {
+        // The same file imported again shares the audio already decoded from it, so the two
+        // sources stay one reference instead of differing audio under one path.
+        let key = file_key(p);
+        let earlier = s
+            .sources
+            .iter()
+            .filter(|x| x.id != src && !x.unsaved && file_key(Path::new(&x.path)) == key)
+            .find_map(|x| s.pool.get(x.id).filter(|a| decoded_unchanged(a, p)).cloned());
+        match earlier {
+            Some(audio) => s.pool.insert(src, audio),
+            None => {
+                if let Some(audio) = s.pool.get(src) {
+                    remember_decoded(audio, p);
+                }
+            }
+        }
+    }
     if let Some(sx) = s.sources.last_mut() {
         sx.unsaved = !in_place;
         if let Some(bwf) = info.bwf.as_ref() {
@@ -424,6 +517,7 @@ impl Bounce {
         if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
             return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
         }
+        refuse_source_file(&s, path)?;
         let (fmt, channels, fold) = bounce_layout(&s, bus, fold_stereo);
         let name = path.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
         let part = path.with_file_name(format!("{name}.part"));
@@ -910,7 +1004,7 @@ pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
     if cfg!(target_arch = "wasm32") {
         return save_session_bundle(e, path);
     }
-    let (fresh, written, p) = write_session(e.session(), path, false)?;
+    let (fresh, written, p) = write_session(e.session(), path, false, false)?;
     // Keep the in-memory document in sync (paths, unsaved flags) without an undo step.
     *e.session_mut() = fresh;
     e.path = Some(p.to_string_lossy().into_owned());
@@ -921,18 +1015,20 @@ pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
 /// Write a copy of the session (and any audio it needs) without touching the open document —
 /// used for autosave / crash recovery. Audio already written for a source is reused.
 pub fn save_copy(e: &Engine, path: &str) -> Result<usize> {
-    write_session(e.session(), path, true).map(|(_, n, _)| n)
+    write_session(e.session(), path, true, false).map(|(_, n, _)| n)
 }
 
 /// File › Save Session Copy In: a normal session folder that does not rename, retarget or
-/// clean the session that stays open.
-pub fn save_session_copy(e: &Engine, path: &str) -> Result<usize> {
-    write_session(e.session(), path, false).map(|(_, n, _)| n)
+/// clean the session that stays open. With `copy_audio` the copy is self-contained: every
+/// source with audio is written into its `Audio Files`, files referenced in place included.
+pub fn save_session_copy(e: &Engine, path: &str, copy_audio: bool) -> Result<usize> {
+    write_session(e.session(), path, false, copy_audio).map(|(_, n, _)| n)
 }
 
 /// Write `session` to `path`; returns the session with updated media paths, the number of audio
-/// files written and the final path.
-fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Session, usize, PathBuf)> {
+/// files written and the final path. `copy_audio` copies every source with audio that is not
+/// already in the new session's own folder.
+fn write_session(session: &Session, path: &str, overwrite: bool, copy_audio: bool) -> Result<(Session, usize, PathBuf)> {
     use std::collections::{HashMap, HashSet};
     let p = session_file(path);
     // Before any audio is written: a session saved outside the write root changes nothing.
@@ -963,7 +1059,7 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
         }
         let exists_rel = same_dir && !Path::new(&src.path).is_absolute() && dir.join(&src.path).exists();
         let shared = shared_paths.get(i).copied().unwrap_or(false);
-        if exists_rel && !src.unsaved && !shared {
+        if exists_rel && !src.unsaved && !shared && (!copy_audio || src.path.starts_with("Audio Files/")) {
             continue;
         }
         let in_folder = Path::new(&src.path).strip_prefix(&audio_dir).ok().and_then(Path::to_str).map(str::to_string);
@@ -971,10 +1067,10 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
             src.path = format!("Audio Files/{f}");
             continue;
         }
-        if !src.unsaved && !shared && referenced_in_place(Path::new(&src.path)) {
+        let Some(audio) = s.pool.get(src.id) else { continue };
+        if !src.unsaved && !shared && !copy_audio && kept_reference(&src.path, &p, audio).is_some() {
             continue;
         }
-        let Some(audio) = s.pool.get(src.id) else { continue };
         if let Some(path) = files.get(&Arc::as_ptr(audio)) {
             src.path.clone_from(path);
             src.unsaved = false;
@@ -1018,13 +1114,6 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     }
     replace_file(&tmp, &p, text.as_bytes())?;
     Ok((s, written, p))
-}
-
-/// True for an existing file at an absolute path outside every `Audio Files` folder, such as an
-/// imported library file: the session references it where it is. Audio in an `Audio Files`
-/// folder belongs to the session (or recording folder) that wrote it, and is trusted only there.
-fn referenced_in_place(p: &Path) -> bool {
-    p.is_absolute() && p.parent().and_then(Path::file_name).is_none_or(|d| d != "Audio Files") && p.is_file()
 }
 
 /// Write `bytes` to `tmp`, flush it to disk and rename it over `file`, so `file` holds either the
@@ -1150,16 +1239,48 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
 /// [`open_session`], following the media paths in it as if they were stored in the session file
 /// `links` (crash recovery: the session written beside the autosave, its paths from the original).
 pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<Vec<String>> {
+    open_session_report(e, path, links).map(|r| r.missing)
+}
+
+/// What opening a session found wrong with its media.
+#[derive(Debug, Default)]
+pub struct OpenReport {
+    /// Media that could not be loaded.
+    pub missing: Vec<String>,
+    /// Audio files that loaded with a different length or width than the session recorded:
+    /// the file changed on disk since it was imported or saved.
+    pub changed: Vec<String>,
+}
+
+/// [`open_session`], reporting audio files that changed on disk as well as missing media.
+pub fn open_session_checked(e: &mut Engine, path: &str) -> Result<OpenReport> {
+    open_session_report(e, path, Path::new(path))
+}
+
+fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenReport> {
     let text = read_text(path)?;
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
     let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
+    let mut changed = Vec::new();
     let mut files = DecodedFiles::new();
     for src in &s.sources {
-        let decoded =
-            stored_path(&src.path, links).map_err(|why| format!("{}: {why}", src.path)).and_then(|p| decode_file(&mut files, &p, s.sample_rate.hz()));
+        let decoded = stored_path(&src.path, links)
+            .map_err(|why| format!("{}: {why}", src.path))
+            .and_then(|p| decode_file(&mut files, &p, s.sample_rate.hz()).map(|a| (p, a)));
         match decoded {
-            Ok(audio) => s.pool.insert(src.id, audio),
+            Ok((p, audio)) => {
+                let (frames, channels) = (audio.buffer.frames() as u64, audio.buffer.num_channels());
+                if frames != src.frames || channels != usize::from(src.channels) {
+                    changed.push(format!(
+                        "{}: changed on disk since it was imported: {frames} frames, {channels} channels vs {} frames, {} channels",
+                        p.display(),
+                        src.frames,
+                        src.channels
+                    ));
+                }
+                s.pool.insert(src.id, audio);
+            }
             Err(err) => missing.push(err),
         }
     }
@@ -1170,7 +1291,10 @@ pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> R
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
-    Ok(missing)
+    for m in &changed {
+        e.message(m.clone());
+    }
+    Ok(OpenReport { missing, changed })
 }
 
 /// Decode one source's audio file at the session rate.
@@ -1197,9 +1321,124 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
         .entry(file_key(p))
         .or_insert_with(|| {
             let bytes = read_file(p).map_err(|_| p.display().to_string())?;
-            decode_source(&bytes, p.extension().and_then(|x| x.to_str()), rate).map_err(|err| format!("{}: {err}", p.display()))
+            let audio = decode_source(&bytes, p.extension().and_then(|x| x.to_str()), rate).map_err(|err| format!("{}: {err}", p.display()))?;
+            remember_decoded(&audio, p);
+            Ok(audio)
         })
         .clone()
+}
+
+// ─── Relinking moved audio ────────────────────────────────────────────────────────────────────
+
+/// How deep [`relink_audio`] looks into the folder it is given, and how many files it looks at.
+const RELINK_MAX_DEPTH: usize = 16;
+const RELINK_MAX_FILES: usize = 200_000;
+
+/// True for a tag Mixed In Key may add to a file name: a Camelot key (`8A`), an energy level
+/// (`Energy 6`) or a tempo (`128`, `128 BPM`).
+fn is_name_tag(seg: &str) -> bool {
+    let t = seg.trim().to_ascii_lowercase();
+    let digits = |x: &str| !x.is_empty() && x.len() <= 3 && x.bytes().all(|b| b.is_ascii_digit());
+    let camelot = t.strip_suffix(['a', 'b']).and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n)) && t.len() <= 3;
+    let energy = t.strip_prefix("energy").is_some_and(|n| digits(n.trim()));
+    let bpm = digits(t.strip_suffix("bpm").map_or(t.as_str(), str::trim));
+    camelot || energy || bpm
+}
+
+/// `stem` without the key/energy/tempo tags Mixed In Key adds at its start or end
+/// (`1A - 128 - Title`, `Title - 1A`), lowercased. At least one part of the name is kept.
+fn untagged_stem(stem: &str) -> String {
+    let mut parts: Vec<&str> = stem.split(" - ").collect();
+    while parts.len() > 1 && parts.first().is_some_and(|p| is_name_tag(p)) {
+        parts.remove(0);
+    }
+    while parts.len() > 1 && parts.last().is_some_and(|p| is_name_tag(p)) {
+        parts.pop();
+    }
+    parts.join(" - ").trim().to_lowercase()
+}
+
+fn lower_ext(p: &Path) -> String {
+    p.extension().and_then(|x| x.to_str()).unwrap_or_default().to_ascii_lowercase()
+}
+
+/// The files under `folder` (subfolders included, links not followed), at most
+/// [`RELINK_MAX_FILES`] of them, [`RELINK_MAX_DEPTH`] folders deep.
+fn files_under(folder: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![(folder.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() && depth < RELINK_MAX_DEPTH {
+                todo.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                out.push(entry.path());
+                if out.len() >= RELINK_MAX_FILES {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Look in `folder` for the audio files of missing sources (only `only` when given): first by
+/// file name, then by the name without the key/energy/tempo tags Mixed In Key adds. A file is
+/// relinked only when it decodes to the length and width the source had. Returns what was
+/// relinked and what is still missing.
+pub fn relink_audio(e: &mut Engine, only: Option<SourceId>, folder: &Path) -> Result<Value> {
+    crate::file_access::check_read(folder).map_err(EngineError::Io)?;
+    if !folder.is_dir() {
+        return Err(EngineError::Io(format!("{}: not a folder", folder.display())));
+    }
+    if let Some(id) = only
+        && e.session().source(id).is_none()
+    {
+        return Err(EngineError::BadParams("file.relink_audio".into(), format!("no source {}", id.0)));
+    }
+    let files: Vec<PathBuf> = files_under(folder).into_iter().filter(|f| crate::file_access::check_read(f).is_ok()).collect();
+    let mut by_name: std::collections::HashMap<String, Vec<&PathBuf>> = std::collections::HashMap::new();
+    let mut by_untagged: std::collections::HashMap<(String, String), Vec<&PathBuf>> = std::collections::HashMap::new();
+    for f in &files {
+        if let Some(n) = f.file_name().and_then(|n| n.to_str()) {
+            by_name.entry(n.to_lowercase()).or_default().push(f);
+        }
+        if let Some(stem) = f.file_stem().and_then(|n| n.to_str()) {
+            by_untagged.entry((untagged_stem(stem), lower_ext(f))).or_default().push(f);
+        }
+    }
+    let rate = e.session().sample_rate.hz();
+    let wanted: Vec<Source> =
+        e.session().sources.iter().filter(|x| only.is_none_or(|id| x.id == id) && e.session().pool.get(x.id).is_none()).cloned().collect();
+    let mut decoded = DecodedFiles::new();
+    let (mut relinked, mut missing) = (Vec::new(), Vec::new());
+    for src in wanted {
+        // The stored path may use either separator, whatever this computer uses.
+        let stored = src.path.replace('\\', "/");
+        let name = stored.rsplit('/').next().unwrap_or_default().to_string();
+        let exact = by_name.get(&name.to_lowercase()).cloned().unwrap_or_default();
+        let stem = Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+        let tagged = by_untagged.get(&(untagged_stem(stem), lower_ext(Path::new(&name)))).cloned().unwrap_or_default();
+        let found = exact.into_iter().chain(tagged).find_map(|cand| {
+            let audio = decode_file(&mut decoded, cand, rate).ok()?;
+            (audio.buffer.frames() as u64 == src.frames && audio.buffer.num_channels() == usize::from(src.channels)).then(|| (cand.clone(), audio))
+        });
+        match found {
+            Some((file, audio)) => {
+                let s = e.session_mut();
+                s.pool.insert(src.id, audio);
+                if let Some(x) = s.sources.iter_mut().find(|x| x.id == src.id) {
+                    x.path = file.to_string_lossy().into_owned();
+                    x.unsaved = false;
+                }
+                relinked.push(json!({"source": src.id.0, "name": src.name, "from": src.path, "to": file}));
+            }
+            None => missing.push(json!({"source": src.id.0, "name": src.name, "path": src.path})),
+        }
+    }
+    Ok(json!({"relinked": relinked, "missing": missing, "files_searched": files.len()}))
 }
 
 // ─── Hosts without a filesystem (the browser) ─────────────────────────────────────────────────
@@ -2056,13 +2295,27 @@ mod in_place_tests {
 
     /// A one-second mono 32-bit float WAV at `rate` in `dir`: its absolute path and samples.
     fn library_wav(dir: &Path, rate: u32) -> (String, Vec<f32>) {
-        let samples: Vec<f32> = (0..rate).map(|i| ((i % 100) as f32 / 100.0 - 0.5) * 0.5).collect();
+        wav_named(dir, "track.wav", rate, rate as usize)
+    }
+
+    /// A mono 32-bit float WAV of `frames` frames at `rate` named `name` in `dir`.
+    fn wav_named(dir: &Path, name: &str, rate: u32, frames: usize) -> (String, Vec<f32>) {
+        let samples: Vec<f32> = (0..frames).map(|i| ((i % 100) as f32 / 100.0 - 0.5) * 0.5).collect();
         let buf = AudioBuffer { sample_rate: rate, channels: vec![samples.clone()] };
         let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
         std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join("track.wav");
+        let path = dir.join(name);
         std::fs::write(&path, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
         (path.to_string_lossy().into_owned(), samples)
+    }
+
+    /// A 44.1 kHz session with one referenced import of `wav`, saved to `dir/Set/Set.scraft`.
+    fn saved_with(dir: &Path, wav: &str) -> (Engine, String) {
+        let mut e = session_at(44_100);
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 0);
+        (e, path)
     }
 
     fn session_at(rate: u32) -> Engine {
@@ -2143,5 +2396,148 @@ mod in_place_tests {
         assert_eq!(edited.len(), audio.len());
         assert!(edited.iter().zip(&audio).all(|(x, y)| (x + y).abs() < 1e-6));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reference_the_session_could_not_reopen_is_copied() {
+        let dir = folder("in-place-refused");
+        // A lookalike separator: the file opens on import, but a stored path naming it is refused.
+        let (wav, audio) = wav_named(&dir.join("Lib"), "AC\u{FF0F}DC.wav", 44_100, 44_100);
+        let mut e = session_at(44_100);
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
+        assert_eq!(first_audio(&reopen(&path)), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_off_the_sessions_share_is_copied() {
+        let dir = folder("in-place-unc");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        // The same file through the administrative share: a network path for a local session.
+        let Some(rest) = wav.strip_prefix("C:\\").or_else(|| wav.strip_prefix("c:\\")) else { return };
+        let unc = format!("\\\\localhost\\C$\\{rest}");
+        if !Path::new(&unc).is_file() {
+            return;
+        }
+        let mut e = session_at(44_100);
+        e.execute("file.import_audio", &json!({"path": unc})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
+        assert_eq!(first_audio(&reopen(&path)), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_referenced_file_that_changed_on_disk_is_not_trusted() {
+        let dir = folder("in-place-changed");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        // Changed before the save: the session keeps the audio it was edited with.
+        let mut e = session_at(44_100);
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        wav_named(&dir.join("Lib"), "track.wav", 44_100, 22_050);
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        assert_eq!(first_audio(&reopen(&path)), audio);
+        // Changed after the save: opening says so instead of loading it silently.
+        let (wav, _) = library_wav(&dir.join("Lib2"), 44_100);
+        let (_, path) = saved_with(&dir.join("B"), &wav);
+        wav_named(&dir.join("Lib2"), "track.wav", 44_100, 22_050);
+        let mut r = Engine::default();
+        let report = open_session_checked(&mut r, &path).unwrap();
+        assert!(report.missing.is_empty());
+        assert_eq!(report.changed.len(), 1);
+        assert!(report.changed[0].contains("changed on disk") && report.changed[0].contains("22050 frames"), "{:?}", report.changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bounce_never_replaces_a_referenced_file() {
+        let dir = folder("in-place-bounce");
+        let (wav, _) = library_wav(&dir.join("Lib"), 44_100);
+        let before = std::fs::read(&wav).unwrap();
+        let (mut e, _) = saved_with(&dir, &wav);
+        let err = e.execute("file.bounce_mix", &json!({"path": wav})).unwrap_err().to_string();
+        assert!(err.contains("audio file of source"), "{err}");
+        assert_eq!(std::fs::read(&wav).unwrap(), before);
+        let other = dir.join("mix.wav").to_string_lossy().into_owned();
+        e.execute("file.bounce_mix", &json!({"path": other})).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_copy_can_take_all_its_audio_along() {
+        let dir = folder("in-place-copy");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        let (mut e, _) = saved_with(&dir, &wav);
+        let plain = dir.join("Plain/Plain.scraft").to_string_lossy().into_owned();
+        let r = e.execute("session.save_copy", &json!({"path": plain})).unwrap();
+        assert_eq!(r["audio_files_written"], 0);
+        let full = dir.join("Full/Full.scraft").to_string_lossy().into_owned();
+        let r = e.execute("session.save_copy", &json!({"path": full, "copy_audio": true})).unwrap();
+        assert_eq!(r["audio_files_written"], 1);
+        assert!(stored(&full).sources[0].path.starts_with("Audio Files/"));
+        // The open session still references the file in place.
+        assert_eq!(e.session().sources[0].path, wav);
+        std::fs::remove_file(&wav).unwrap();
+        assert_eq!(first_audio(&reopen(&full)), audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_file_imported_twice_stays_one_reference() {
+        let dir = folder("in-place-twice");
+        let (wav, _) = library_wav(&dir.join("Lib"), 44_100);
+        let mut e = session_at(44_100);
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 0);
+        assert!(stored(&path).sources.iter().all(|x| x.path == wav));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moved_audio_is_relinked_by_name_and_by_name_without_key_tags() {
+        let dir = folder("in-place-relink");
+        let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
+        let (_, path) = saved_with(&dir, &wav);
+        // Moved into a subfolder and renamed with Mixed In Key tags, next to a decoy of another
+        // length whose name differs only by its tags.
+        let moved = dir.join("New/Sorted");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::rename(&wav, moved.join("1A - 128 - track.wav")).unwrap();
+        wav_named(&dir.join("New"), "track - 5B.wav", 44_100, 1_000);
+        let mut r = Engine::default();
+        assert_eq!(open_session(&mut r, &path).unwrap().len(), 1);
+        let out = r.execute("file.relink_audio", &json!({"folder": dir.join("New")})).unwrap();
+        assert_eq!(out["relinked"].as_array().unwrap().len(), 1, "{out}");
+        assert!(out["missing"].as_array().unwrap().is_empty());
+        assert_eq!(Path::new(&r.session().sources[0].path), moved.join("1A - 128 - track.wav"));
+        assert_eq!(first_audio(&r), audio);
+        // Saved again, it references the file where it now is.
+        let again = dir.join("Again/Again.scraft").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut r, &again).unwrap(), 0);
+        assert_eq!(first_audio(&reopen(&again)), audio);
+        // Nothing to find: reported as still missing.
+        std::fs::remove_dir_all(dir.join("New")).unwrap();
+        let mut gone = Engine::default();
+        open_session(&mut gone, &path).unwrap();
+        let out = gone.execute("file.relink_audio", &json!({"folder": dir.join("Set")})).unwrap();
+        assert_eq!(out["missing"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_tags_are_stripped_only_at_the_ends() {
+        assert_eq!(untagged_stem("1A - 128 - Song - Remix"), "song - remix");
+        assert_eq!(untagged_stem("Song - 12B"), "song");
+        assert_eq!(untagged_stem("8A - Energy 6 - Song"), "song");
+        assert_eq!(untagged_stem("128"), "128");
+        assert_eq!(untagged_stem("Song - Part 2"), "song - part 2");
     }
 }

@@ -193,11 +193,19 @@ impl Autosave {
         let audio_dir = self.dir.join("Audio Files");
         let mut s = session.clone();
         let mut copies = BTreeMap::new();
+        // Recovery follows the paths as if stored in the original session file, or in this one.
+        let links = origin.map_or_else(|| self.dir.join(SESSION), PathBuf::from);
         for src in &mut s.sources {
-            let file = if Path::new(&src.path).is_absolute() { Some(PathBuf::from(&src.path)) } else { base.as_ref().map(|b| b.join(&src.path)) };
+            let absolute = Path::new(&src.path).is_absolute();
+            let file = if absolute { Some(PathBuf::from(&src.path)) } else { base.as_ref().map(|b| b.join(&src.path)) };
             let audio = s.pool.get(src.id);
+            // A file referenced in place (outside every `Audio Files`) is kept only while recovery
+            // can reopen it and it is still the file the audio was decoded from.
+            let kept = |f: &Path, a: &Arc<SourceAudio>| {
+                !absolute || crate::io::in_audio_files(f) || crate::io::kept_reference(&src.path, &links, a).is_some()
+            };
             if let Some(f) = &file
-                && (audio.is_none() || !src.unsaved && f.is_file())
+                && (audio.is_none() || !src.unsaved && f.is_file() && audio.is_some_and(|a| kept(f, a)))
             {
                 src.path = f.to_string_lossy().into_owned();
                 continue;

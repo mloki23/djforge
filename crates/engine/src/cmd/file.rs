@@ -11,9 +11,25 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "session.new", "New...", ["File"], Some("Cmd+N"), "{name?: 'Untitled', sample_rate?: 48000, bit_depth?: 24, template?: blank|demo}", always, new_session),
         cmd!(noundo "session.open", "Open Session...", ["File"], Some("Cmd+O"), "{path}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.open", "`path` required"))?.to_string();
-            let missing = crate::io::open_session(e, &path)?;
-            Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": missing}))
+            let report = crate::io::open_session_checked(e, &path)?;
+            Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": report.missing, "changed": report.changed}))
         }),
+        cmd!(
+            "file.relink_audio",
+            "Relink Audio...",
+            ["File"],
+            None,
+            "{folder, source?: id (default: every missing source)} — finds missing audio files in `folder` and its subfolders by name, also ignoring Mixed In Key key/energy/tempo tags, and relinks those that decode to the length the session recorded",
+            always,
+            |e, p| {
+                let folder = str_param(p, "folder").ok_or_else(|| bad("file.relink_audio", "`folder` required"))?.to_string();
+                let only = match p.get("source") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(soundcraft_model::SourceId(v.as_u64().ok_or_else(|| bad("file.relink_audio", "`source` must be a source id"))?)),
+                };
+                crate::io::relink_audio(e, only, std::path::Path::new(&folder))
+            }
+        ),
         cmd!(noundo "session.close", "Close Session", ["File"], Some("Cmd+Shift+W"), "{}", always, |e, _| { e.replace_session(Session::default()); e.path = None; Ok(json!({})) }),
         cmd!(noundo "session.save", "Save Session", ["File"], Some("Cmd+S"), "{path?, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").map(str::to_string).or_else(|| e.path.clone()).ok_or_else(|| bad("session.save", "no path yet: pass `path` (Save As)"))?;
@@ -27,10 +43,10 @@ pub fn specs() -> Vec<CommandSpec> {
             let written = crate::io::save_session(e, &path)?;
             Ok(json!({"path": path, "audio_files_written": written}))
         }),
-        cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false}", always, |e, p| {
+        cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false, copy_audio?: false (true: every source's audio goes into the copy's Audio Files, files referenced in place too)}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
             refuse_replacing(e, "session.save_copy", &crate::io::session_file(&path), p)?;
-            let written = crate::io::save_session_copy(e, &path)?;
+            let written = crate::io::save_session_copy(e, &path, bool_or(p, "copy_audio", false))?;
             Ok(json!({"path": path, "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_template", "Save As Template...", ["File"], None, "{path, replace?: false}", always, |e, p| {
