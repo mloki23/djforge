@@ -20,7 +20,8 @@ mod warp;
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use dj::{
-    DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource, NudgeSuggestion, Transition, TransitionStyle,
+    Applied, AppliedFade, AppliedPoint, DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource,
+    NudgeSuggestion, OwnedSpan, Transition, TransitionStyle,
 };
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};

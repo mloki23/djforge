@@ -293,6 +293,8 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
                     nudge_source: NudgeSource::None,
                     suggestion: None,
                     edited: false,
+                    stale: false,
+                    applied: None,
                 };
                 e.session_mut().dj.transitions.push(t.clone());
                 t

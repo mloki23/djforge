@@ -342,6 +342,13 @@ impl Engine {
                     if !relocks.is_empty() {
                         cmd::dj::apply_relocks(self.session_mut(), &relocks);
                     }
+                    // Transitions note a tempo change, and hand edits of what their recipes wrote.
+                    if !cmd::dj::recipe::WRITERS.contains(&id) {
+                        let marks = cmd::dj::recipe::marks(&self.doc);
+                        if !marks.is_empty() {
+                            cmd::dj::recipe::apply_marks(self.session_mut(), &marks);
+                        }
+                    }
                 }
                 // Copied parts of beat-locked clips remember which part they are before any later
                 // tempo change.
