@@ -54,6 +54,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_template", "`path` required"))?.to_string();
             let file = crate::io::session_file(&path);
             refuse_replacing(e, "session.save_template", &file, p)?;
+            crate::io::refuse_source_file(e.session(), &file)?;
             let mut s = e.session().clone();
             for t in &mut s.tracks { for pl in &mut t.playlists { pl.clips.clear() } }
             s.sources.clear();
@@ -124,13 +125,13 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = str_param(p, "path").ok_or_else(|| bad("file.export_midi", "`path` required"))?.to_string();
             let only = if p.get("tracks").is_some() || p.get("track").is_some() { Some(tracks_param(e, "file.export_midi", p)?) } else { None };
             let bytes = crate::io::export_midi(e, only.as_deref())?;
-            crate::io::write_file(&path, &bytes)?;
+            crate::io::write_user_file(e.session(), &path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }),
         cmd!(noundo "file.export_session_text", "Session Info as Text...", ["File", "Export"], None, "{path?}", always, |e, p| {
             let text = crate::inspect::session_text(e);
             if let Some(path) = str_param(p, "path") {
-                crate::io::write_file(path, text.as_bytes())?;
+                crate::io::write_user_file(e.session(), path, text.as_bytes())?;
             }
             Ok(json!({"text": text}))
         }),
@@ -346,7 +347,7 @@ fn write_score(e: &mut Engine, p: &Value, id: &str, svg: bool) -> Result<Value> 
         Some(p) => p.to_string(),
         None => std::env::temp_dir().join(format!("{}.{ext}", crate::io::sanitize_name(&setup.title))).to_string_lossy().to_string(),
     };
-    crate::io::write_file(&path, text.as_bytes())?;
+    crate::io::write_user_file(e.session(), &path, text.as_bytes())?;
     let measures = parts.iter().map(|p| p.measures.len()).max().unwrap_or(0);
     Ok(json!({"path": path, "parts": parts.len(), "measures": measures}))
 }

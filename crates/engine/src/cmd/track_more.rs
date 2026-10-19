@@ -263,7 +263,7 @@ fn save_preset(e: &mut Engine, p: &Value) -> Result<Value> {
         "comments": tr.comments,
     });
     let text = serde_json::to_string_pretty(&preset).map_err(|err| EngineError::Io(err.to_string()))?;
-    crate::io::write_file(&path, text.as_bytes())?;
+    crate::io::write_user_file(e.session(), &path, text.as_bytes())?;
     Ok(json!({"path": path, "track": first}))
 }
 

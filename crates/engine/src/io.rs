@@ -1074,6 +1074,7 @@ fn write_session(session: &Session, path: &str, overwrite: bool, copy_audio: boo
     let p = session_file(path);
     // Before any audio is written: a session saved outside the write root changes nothing.
     crate::file_access::check_write(&p).map_err(EngineError::Io)?;
+    refuse_source_file(session, &p)?;
     let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
     let audio_dir = dir.join("Audio Files");
     let mut s = session.clone();
@@ -1584,6 +1585,13 @@ pub fn set_deliver(h: DeliverHook) {
 
 /// Write one output file: to `path` natively; in the browser, delivered under its file name.
 /// Without this, every export on the web failed with «operation not supported on this platform».
+/// [`write_file`] for a path the person chose while session `s` is open: refused when it is
+/// the audio file of one of its sources ([`refuse_source_file`]).
+pub fn write_user_file(s: &Session, path: &str, bytes: &[u8]) -> Result<()> {
+    refuse_source_file(s, Path::new(path))?;
+    write_file(path, bytes)
+}
+
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     if cfg!(target_arch = "wasm32") {
         let deliver = DELIVER.get().ok_or_else(|| EngineError::Io("saving files is not available in this build".into()))?;
@@ -2627,6 +2635,25 @@ mod in_place_tests {
         let (mut e, _) = saved_with(&dir, &wav);
         let err = e.execute("file.bounce_mix", &json!({"path": wav})).unwrap_err().to_string();
         assert!(err.contains("audio file of source"), "{err}");
+        // Every export that writes a path the person picks refuses it too.
+        let track = e.session().tracks[0].id.0;
+        let clip = e.session().tracks[0].clips()[0].id.0;
+        e.session_mut().add_track(TrackKind::Midi, ChannelFormat::Mono, Some("Notes"));
+        let exports = [
+            ("file.export_midi", json!({"path": wav})),
+            ("file.export_session_text", json!({"path": wav})),
+            ("file.export_sibelius", json!({"path": wav})),
+            ("track.save_preset", json!({"path": wav, "tracks": [track]})),
+            ("file.export_clip_groups", json!({"path": wav, "clips": [clip]})),
+            ("session.save_template", json!({"path": wav, "replace": true})),
+            ("session.save_copy", json!({"path": wav, "replace": true})),
+        ];
+        for (id, p) in exports {
+            match e.execute(id, &p) {
+                Err(err) => assert!(err.to_string().contains("audio file of source"), "{id}: {err}"),
+                Ok(v) => panic!("{id} wrote over the source: {v}"),
+            }
+        }
         assert_eq!(std::fs::read(&wav).unwrap(), before);
         let other = dir.join("mix.wav").to_string_lossy().into_owned();
         e.execute("file.bounce_mix", &json!({"path": other})).unwrap();

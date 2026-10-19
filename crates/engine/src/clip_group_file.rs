@@ -35,6 +35,7 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
     // First, so a refused group file leaves nothing behind and is refused whatever else is wrong.
     crate::file_access::check_write(&p).map_err(EngineError::Io)?;
     let s = e.session();
+    crate::io::refuse_source_file(s, &p)?;
     let mut lanes: Vec<(usize, Vec<Clip>)> = Vec::new();
     for id in ids {
         let Some((t, c)) = s.find_clip(*id) else { continue };
@@ -67,6 +68,7 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
                 crate::io::make_dir(dir.join(&audio_dir_name))?;
                 let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
                 let bytes = soundcraft_audio_io::encode(&buf.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+                crate::io::refuse_source_file(s, &dir.join(&rel))?;
                 crate::io::write_path(dir.join(&rel), bytes)?;
                 slot.insert(rel);
             }
