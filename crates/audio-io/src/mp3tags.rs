@@ -151,6 +151,22 @@ pub fn fill(bytes: &[u8], fill: &TagFill) -> Result<(Vec<u8>, TagReport), TagErr
     Ok((out, report))
 }
 
+/// Whether `bytes` start with an ID3v2 tag holding prep's `TXXX:djforge_prep` note (a copy prep
+/// wrote). The tag is walked as [`fill`] walks it and only `TXXX` frames are decoded, so frames
+/// `id3` can't read (which `fill` copies unread) don't hide the note.
+pub fn has_prep_note(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"ID3") {
+        return false;
+    }
+    let Ok(tag) = OldTag::parse(bytes) else { return false };
+    tag.frames
+        .iter()
+        .filter_map(|r| tag.body.get(r.clone()))
+        .filter(|raw| raw.starts_with(b"TXXX"))
+        .filter_map(|raw| decode(tag.major, raw).ok())
+        .any(|f| f.content().extended_text().is_some_and(|x| x.description == PREP_DESCRIPTION))
+}
+
 const UNSYNC: u8 = 0x80;
 const EXTENDED: u8 = 0x40;
 const FOOTER: u8 = 0x10;
@@ -450,6 +466,22 @@ mod tests {
         let n = body.len();
         let size = [(n >> 21) as u8 & 0x7F, (n >> 14) as u8 & 0x7F, (n >> 7) as u8 & 0x7F, n as u8 & 0x7F];
         [&b"ID3"[..], &[major, 0, flags], &size, body].concat()
+    }
+
+    #[test]
+    fn the_prep_note_is_found_past_frames_id3_cannot_read() {
+        let note = [&[0u8][..], &b"djforge_prep"[..], &[0], &b"gain -3.0 dB"[..]].concat();
+        // Text encoding 7 doesn't exist: `id3` refuses the whole tag over it.
+        let odd = raw_frame(b"TXXX", 0, &[7, b'x', 0, b'y']);
+        let other = raw_frame(b"TXXX", 0, &[&[0u8][..], &b"EnergyLevel"[..], &[0], &b"6"[..]].concat());
+        let file = [raw_tag(3, 0, &[odd.clone(), other.clone(), raw_frame(b"TXXX", 0, &note)].concat()), audio().to_vec()].concat();
+        assert!(Tag::read_from2(Cursor::new(&file)).is_err());
+        assert!(has_prep_note(&file));
+        let without = [raw_tag(3, 0, &[odd, other].concat()), audio().to_vec()].concat();
+        assert!(!has_prep_note(&without));
+        assert!(!has_prep_note(audio()));
+        let (filled, _) = fill(CBR128, &prep("gain +1.5 dB")).unwrap();
+        assert!(has_prep_note(&filled) && !has_prep_note(CBR128));
     }
 
     #[test]

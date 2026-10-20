@@ -130,11 +130,6 @@ fn default_out(name: &str) -> Result<PathBuf> {
     Ok(normalise(&PathBuf::from(home).join("Music").join("djforge-prepped").join(name)))
 }
 
-/// Whether MP3 `bytes` carry prep's `TXXX:djforge_prep` note: a copy an earlier run wrote.
-fn has_prep_note(bytes: &[u8]) -> bool {
-    id3::Tag::read_from2(std::io::Cursor::new(bytes)).is_ok_and(|t| t.extended_texts().any(|x| x.description == mp3tags::PREP_DESCRIPTION))
-}
-
 /// The text of the earlier prep report at `path`, if that is what it is.
 fn prep_report(path: &Path) -> Option<String> {
     crate::io::read_text(path).ok().filter(|t| t.starts_with(REPORT_HEADER))
@@ -206,7 +201,7 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBu
             .map_err(|err| bad(CMD, format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display())))?;
         let name = d.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
-        let ours = (mp3 && has_prep_note(&bytes)) || earlier.as_deref().is_some_and(|r| listed_unnoted(r, name));
+        let ours = (mp3 && mp3tags::has_prep_note(&bytes)) || earlier.as_deref().is_some_and(|r| listed_unnoted(r, name));
         if !ours {
             return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
         }
@@ -259,7 +254,17 @@ pub fn run(
         }
         r
     };
-    let rows: Vec<Row> = files.iter().zip(&dests).map(|(src, dest)| prep_one(s, src, dest, target_lufs, ceiling, &analyse)).collect();
+    let rows: Vec<Row> = files
+        .iter()
+        .zip(&dests)
+        .map(|(src, dest)| {
+            let mut row = prep_one(s, src, dest, target_lufs, ceiling, &analyse);
+            if row.status == "failed" && crate::io::path_exists(dest) {
+                row.doubts.push("the earlier copy in the output folder was left as it was".into());
+            }
+            row
+        })
+        .collect();
 
     let count = |st: &str| rows.iter().filter(|r| r.status == st).count();
     let written = || rows.iter().filter(|r| r.status != "failed");
@@ -601,18 +606,6 @@ fn prep_note(row: &Row, target: f64) -> String {
     )
 }
 
-/// Where the audio starts: after every leading ID3v2 tag (10-byte header, syncsafe size, and a
-/// 10-byte footer when flagged).
-fn id3_end(b: &[u8]) -> usize {
-    let mut at = 0usize;
-    while let Some(h) = b.get(at..at.saturating_add(10)).filter(|h| h.starts_with(b"ID3")) {
-        let size = h.get(6..10).unwrap_or_default().iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F));
-        let footer = if h.get(5).is_some_and(|f| f & 0x10 != 0) { 10 } else { 0 };
-        at = at.saturating_add(10).saturating_add(size).saturating_add(footer);
-    }
-    at.min(b.len())
-}
-
 /// Preps MP3 `bytes` from `src`: the copy to write, or `None` when the track failed.
 fn prep_mp3(
     bytes: Vec<u8>,
@@ -691,7 +684,7 @@ fn tagged(
             return Some(adjusted);
         }
     };
-    if bytes.get(id3_end(&bytes)..) != adjusted.get(id3_end(&adjusted)..) {
+    if bytes.get(mp3gain::skip_id3v2(&bytes)..) != adjusted.get(mp3gain::skip_id3v2(&adjusted)..) {
         row.failed("writing the tags changed the audio after them");
         return None;
     }
@@ -904,19 +897,6 @@ mod tests {
         for bad in ["13A", "0A", "+4B", "A1", "4C", "", "H", "Am7", "100A"] {
             assert_eq!(to_camelot(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn the_audio_starts_after_every_leading_tag() {
-        let tag = |size: u8, flags: u8| [b'I', b'D', b'3', 4, 0, flags, 0, 0, 0, size];
-        let mut b = tag(2, 0).to_vec();
-        b.extend([0, 0]);
-        b.extend(tag(0, 0x10));
-        b.extend([0u8; 10]);
-        b.extend(b"audio");
-        assert_eq!(id3_end(&b), b.len() - 5);
-        assert_eq!(id3_end(b"audio"), 0);
-        assert_eq!(id3_end(&tag(100, 0)), 10);
     }
 
     #[test]

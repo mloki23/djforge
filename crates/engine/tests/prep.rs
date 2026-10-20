@@ -499,3 +499,57 @@ fn an_out_that_is_a_junction_to_the_source_folder_is_refused() {
     assert!(err.contains("source"), "{err}");
     assert_eq!(snapshot(&src), before);
 }
+
+/// `audio` (a fixture, its own tag dropped) under an ID3v2.3 tag with header `flags` holding the
+/// raw frame bodies `frames`.
+fn with_raw_tag(audio: &[u8], flags: u8, frames: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let audio = &audio[10 + soundcraft_size(audio)..];
+    let body: Vec<u8> = frames.iter().flat_map(|(id, b)| [&id[..], &(b.len() as u32).to_be_bytes(), &[0, 0], b].concat()).collect();
+    let n = body.len();
+    let size = [(n >> 21) as u8 & 0x7F, (n >> 14) as u8 & 0x7F, (n >> 7) as u8 & 0x7F, n as u8 & 0x7F];
+    [&b"ID3"[..], &[3, 0, flags], &size, &body, audio].concat()
+}
+
+#[test]
+fn an_earlier_copy_is_recognised_by_its_note_even_when_id3_cannot_read_its_tag() {
+    let dir = scratch("odd-copy");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // An earlier copy whose tag also holds a TXXX in a text encoding that doesn't exist.
+    let note = [&[0u8][..], &b"djforge_prep"[..], &[0], &b"gain +0.0 dB"[..]].concat();
+    let copy = with_raw_tag(&fixture(FIXTURES[0]), 0, &[(b"TXXX", vec![7, b'x', 0, b'y']), (b"TXXX", note)]);
+    std::fs::write(out.join(FIXTURES[0]), &copy).unwrap();
+    let r = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(track(&r, FIXTURES[0])["status"], "ok", "{r}");
+}
+
+#[test]
+fn a_v23_tag_with_a_stray_footer_flag_preps() {
+    let dir = scratch("stray-footer");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let tss = [&[0u8][..], &b"Lavf"[..]].concat();
+    std::fs::write(src.join("flag.mp3"), with_raw_tag(&fixture(FIXTURES[0]), 0x10, &[(b"TSSE", tss)])).unwrap();
+    let r = run(&src, &dir.join("out"), &no_analysis).unwrap();
+    let t = track(&r, "flag.mp3");
+    assert_eq!(t["status"], "ok", "{t}");
+    assert_ne!(t["steps"], 0, "{t}");
+}
+
+#[test]
+fn a_track_that_fails_on_a_re_run_says_its_earlier_copy_was_kept() {
+    let dir = scratch("kept-copy");
+    let src = source_folder(&dir);
+    let plan = plan_at(&dir, &[src.join(FIXTURES[0]), src.join(FIXTURES[2])]);
+    let out = dir.join("out");
+    run(&plan, &out, &no_analysis).unwrap();
+    let earlier = std::fs::read(out.join(FIXTURES[0])).unwrap();
+    std::fs::remove_file(src.join(FIXTURES[0])).unwrap();
+    let r = run(&plan, &out, &no_analysis).unwrap();
+    let t = track(&r, FIXTURES[0]);
+    assert_eq!(t["status"], "failed", "{t}");
+    assert!(t["doubts"].as_array().unwrap().iter().any(|d| d == "the earlier copy in the output folder was left as it was"), "{t}");
+    assert_eq!(std::fs::read(out.join(FIXTURES[0])).unwrap(), earlier);
+    assert!(!track(&r, FIXTURES[2])["doubts"].as_array().unwrap().iter().any(|d| d.as_str().unwrap().contains("earlier copy")));
+}
