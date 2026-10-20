@@ -1,0 +1,4 @@
+# Stage 3 gate: prep loki journey's 20 tracks into a test folder (originals are only read).
+# Run from the repo root (DJFORGE_PYTHON and DJFORGE_MIXFORGE must be set to fill missing key/BPM):
+#   soundcraft-cli script tools/prep/prep_loki.cmds
+prep.tracks {"source": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json", "out": "C:/Users/marty/Music/djforge-tests/prepped/loki journey"}
