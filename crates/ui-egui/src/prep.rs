@@ -55,67 +55,30 @@ pub fn holds_quit(app: &mut SoundApp) -> bool {
     true
 }
 
-/// Refuses to replace the session while a prep runs: the prep refuses to write over the audio of
-/// the session it started in (a snapshot of its source files), so a session opened meanwhile
-/// could play a file it is replacing. True when refused; the status line says why.
-pub fn refuses_session_switch(app: &mut SoundApp) -> bool {
-    if app.prep.is_some() {
-        app.ui.status = "Finish or cancel the prep first".into();
+/// Refuses command `id` while a prep runs when it reads or writes files or replaces the session:
+/// every `file.` and `session.` command but the read-only ones, `dj.import_set` and another
+/// `prep.tracks`. The prep refuses to write over the audio of the session it started in (a
+/// snapshot of its source files), so neither a file it may replace nor another session may come
+/// in meanwhile. Playback, editing and mixing go on. True when refused; the status line says why.
+pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
+    if app.prep.is_none() {
+        return false;
     }
-    app.prep.is_some()
-}
-
-/// Refuses command `id` while a prep runs when it names a file or folder inside the folder the
-/// prep writes (`path`, `plan`, `dir`, `source`, or the session's own folder when saving): an
-/// import from there would put a file the prep may replace into the session after the prep took
-/// its snapshot of the session's files, and a save there could be replaced too. True when
-/// refused; the status line says why.
-pub fn refuses_target(app: &mut SoundApp, id: &str, params: &Value) -> bool {
-    let Some(job) = &app.prep else { return false };
-    let out = job.out().to_path_buf();
-    let mut targets: Vec<std::path::PathBuf> =
-        ["path", "plan", "dir", "source"].iter().filter_map(|k| params.get(*k).and_then(Value::as_str)).map(std::path::PathBuf::from).collect();
-    if id.starts_with("session.save")
-        && let Some(folder) = &app.engine.session().folder
-    {
-        targets.push(folder.clone());
+    let read_only = soundcraft_engine::find_command(id).is_some_and(|c| !c.journal && !c.undoable && !c.view);
+    let refused = ((id.starts_with("file.") || id.starts_with("session.")) && !read_only) || matches!(id, "dj.import_set" | "prep.tracks");
+    if refused {
+        app.ui.status = "Wait for the prep to finish (or cancel it)".into();
+        log::warn!("{id}: {}", app.ui.status);
     }
-    let Some(hit) = targets.into_iter().find(|t| inside(t, &out)) else { return false };
-    app.ui.status = format!("{} is in the folder the prep is writing ({}); wait for the prep or cancel it", hit.display(), out.display());
-    log::warn!("{id}: {}", app.ui.status);
-    true
-}
-
-/// Whether `path` (made absolute, `.` and `..` resolved by name) is `dir` or inside it, without
-/// regard to case on Windows.
-fn inside(path: &std::path::Path, dir: &std::path::Path) -> bool {
-    use std::path::Component;
-    let resolved = |p: &std::path::Path| {
-        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-        let mut out: Vec<String> = Vec::new();
-        for c in abs.components() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    out.pop();
-                }
-                other => {
-                    let s = other.as_os_str().to_string_lossy();
-                    out.push(if cfg!(windows) { s.to_lowercase() } else { s.into_owned() });
-                }
-            }
-        }
-        out
-    };
-    let (path, dir) = (resolved(path), resolved(dir));
-    path.len() >= dir.len() && path.iter().zip(&dir).all(|(a, b)| a == b)
+    refused
 }
 
 /// The status line after `prep.tracks` (of `total` tracks): where the copies went and the totals.
 pub(crate) fn status(v: &Value, total: usize) -> String {
     let t = &v["totals"];
     let n = |k: &str| t[k].as_u64().unwrap_or(0);
-    let done = v["tracks"].as_array().map_or(0, Vec::len);
+    // A track cancelled part-way was not prepped.
+    let done = v["tracks"].as_array().map_or(0, |t| t.iter().filter(|t| t["status"] != "cancelled").count());
     let cancelled = if v["cancelled"].as_bool().unwrap_or(false) { format!("; cancelled after {done} of {total}") } else { String::new() };
     format!(
         "Prepped {done} track(s) into {}: {} ok, {} not adjusted, {} failed; {} of {} on target{cancelled}; see prep-report.txt",

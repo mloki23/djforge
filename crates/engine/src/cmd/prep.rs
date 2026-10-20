@@ -41,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Prep Tracks",
         [],
         None,
-        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed}], totals, cancelled (always false here; true when the app's progress window stopped the run early)}",
+        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed|cancelled}], totals, cancelled (always false here; true when the app's progress window stopped the run early)}",
         always,
         prep_tracks
     )]
@@ -169,25 +169,61 @@ impl Unnoted {
 
     /// Its report line: `      unnoted copy: 5000 bytes, fnv1a64 0123456789abcdef, <name>`.
     fn line(&self) -> String {
-        format!("{UNNOTED}{} bytes, fnv1a64 {:016x}, {}\n", self.len, self.hash, self.name)
+        format!("{UNNOTED}{} bytes, fnv1a64 {:016x}, {}\n", self.len, self.hash, clean(&self.name))
     }
 
-    /// The copies `report` lists without a note.
+    /// The listing on report line `l`, if it is one.
+    fn parse(l: &str) -> Option<Self> {
+        let (len, rest) = l.strip_prefix(UNNOTED)?.split_once(" bytes, fnv1a64 ")?;
+        let (hash, name) = rest.split_once(", ")?;
+        Some(Self { name: name.to_string(), len: len.parse().ok()?, hash: u64::from_str_radix(hash, 16).ok()? })
+    }
+
+    /// The copies `report` lists without a note: only listings right under their own track's
+    /// line, or in the section of earlier copies at its end, count.
     fn listed(report: &str) -> Vec<Self> {
-        report
-            .lines()
-            .filter_map(|l| {
-                let (len, rest) = l.strip_prefix(UNNOTED)?.split_once(" bytes, fnv1a64 ")?;
-                let (hash, name) = rest.split_once(", ")?;
-                Some(Self { name: name.to_string(), len: len.parse().ok()?, hash: u64::from_str_radix(hash, 16).ok()? })
-            })
-            .collect()
+        let mut found = Vec::new();
+        let (mut above, mut in_earlier) = (None, false);
+        for l in report.lines() {
+            if l == EARLIER {
+                in_earlier = true;
+            } else if let Some(u) = Self::parse(l) {
+                if in_earlier || above.is_some_and(|row| row_names(row, &u.name)) {
+                    found.push(u);
+                }
+                above = None;
+                continue;
+            }
+            above = Some(l);
+        }
+        found
     }
 
     /// Whether `bytes` are this copy.
     fn is(&self, bytes: &[u8]) -> bool {
         self.len == bytes.len() as u64 && self.hash == fnv1a64(bytes)
     }
+}
+
+/// The heading of the report's section of earlier copies this run kept listing.
+const EARLIER: &str = "earlier copies this run has not replaced, left as they were:";
+
+/// Whether report line `row` is the track line of a copy named `name`: `<n>  <name>  before …`.
+fn row_names(row: &str, name: &str) -> bool {
+    let rest = row.trim_start().trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.strip_prefix("  ").and_then(|r| r.strip_prefix(name)).is_some_and(|r| r.starts_with("  before "))
+}
+
+/// `text` with every control character (line breaks, tabs, …) made a space, so text from files
+/// (names, tags, messages) can't start a line of its own in the report.
+fn clean(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Whether file names `a` and `b` are one name: without regard to case on Windows, whose file
+/// systems ignore it.
+fn same_name(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.to_lowercase() == b.to_lowercase() } else { a == b }
 }
 
 /// The 64-bit FNV-1a hash of `bytes`.
@@ -265,7 +301,7 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathB
         let ours = if mp3 && mp3tags::has_prep_note(&head) {
             true
         } else {
-            let listed: Vec<&Unnoted> = earlier.iter().filter(|u| u.name == name).collect();
+            let listed: Vec<&Unnoted> = earlier.iter().filter(|u| same_name(&u.name, name)).collect();
             !listed.is_empty() && {
                 let bytes = crate::io::read_file(d).map_err(unreadable)?;
                 listed.iter().any(|u| u.is(&bytes))
@@ -331,7 +367,9 @@ impl Plan {
                 None => default_root()?.join(&name),
             }),
         };
-        let (dests, earlier) = destinations(s, &files, &out)?;
+        let (dests, mut earlier) = destinations(s, &files, &out)?;
+        // Listings of copies still in `out` are kept, also those of tracks not in this set.
+        earlier.retain(|u| crate::io::path_exists(out.join(&u.name)));
         crate::io::make_dir(&out)?;
         // Now that it exists, `out` is compared with the sources again with its links followed.
         refuse_sources(&files, &out, &dests)?;
@@ -355,13 +393,24 @@ impl Plan {
         // After one analysis times out the rest are skipped, so a stuck sidecar costs one
         // timeout, not one per track. A cancel stops the one running.
         let timed_out = std::cell::Cell::new(false);
+        let stopped = std::cell::Cell::new(false);
         let analyse = |path: &str| {
             if timed_out.get() {
                 return Err("skipped after an earlier timeout".to_string());
             }
-            let r = analyse(path, &cancelled);
+            // Stopped by the cancel: the analysis saw it and gave up.
+            let saw_cancel = std::cell::Cell::new(false);
+            let stop = || {
+                let c = cancelled();
+                saw_cancel.set(saw_cancel.get() || c);
+                c
+            };
+            let r = analyse(path, &stop);
             if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
                 timed_out.set(true);
+            }
+            if r.is_err() && saw_cancel.get() {
+                stopped.set(true);
             }
             r
         };
@@ -374,7 +423,12 @@ impl Plan {
                 break;
             }
             shared.update(|p| p.current = dest.file_name().map(|n| n.to_string_lossy().into_owned()));
-            let (mut row, copy) = prepare(src, dest, target_lufs, ceiling, &analyse);
+            let (mut row, mut copy) = prepare(src, dest, target_lufs, ceiling, &analyse);
+            if stopped.get() {
+                // Its analysis was cut short: nothing is written for it.
+                row = Row { file: row.file, status: "cancelled", doubts: vec!["cancelled before this track finished".into()], ..Row::default() };
+                copy = None;
+            }
             if let Some(copy) = copy {
                 if !mp3tags::has_prep_note(&copy) {
                     row.unnoted = Some(Unnoted::of(&row.file, &copy));
@@ -393,7 +447,7 @@ impl Plan {
                 rows.push(row);
             }
             if let Some(row) = rows.last_mut()
-                && row.status == "failed"
+                && !row.written()
                 && crate::io::path_exists(dest)
             {
                 row.doubts.push("the earlier copy in the output folder was left as it was".into());
@@ -403,10 +457,11 @@ impl Plan {
             }
             shared.update(|p| (p.done, p.current) = (p.done + 1, None));
         }
-        let cancelled = rows.len() < total;
+        let finished = rows.iter().filter(|r| r.status != "cancelled").count();
+        let cancelled = finished < total;
 
         let count = |st: &str| rows.iter().filter(|r| r.status == st).count();
-        let written = || rows.iter().filter(|r| r.status != "failed");
+        let written = || rows.iter().filter(|r| r.written());
         let measured = written().filter(|r| r.lufs_after.is_some()).count();
         let on_target = written().filter(|r| r.lufs_after.is_some_and(|l| (l - target_lufs).abs() <= ON_TARGET_DB)).count();
         let over = written().filter(|r| r.over(ceiling)).count();
@@ -418,7 +473,7 @@ impl Plan {
             count("failed"),
         );
         if cancelled {
-            tail.push_str(&format!("cancelled after {} of {total} tracks; the rest were not prepped\n", rows.len()));
+            tail.push_str(&format!("cancelled after {finished} of {total} tracks; the rest were not prepped\n"));
         }
         write_report(self.report(&rows, rows.len(), &tail))?;
         Ok(json!({
@@ -447,22 +502,24 @@ impl Plan {
     }
 
     /// The report text: a header, one line per track in `rows`, then `tail`. The earlier report's
-    /// listings of copies without a note are kept for each track this run has not replaced (from
-    /// `rows[done]` on, and every failed one), so those copies are still recognised as prep's.
+    /// listings of copies without a note are kept for each copy this run has not replaced (from
+    /// `rows[done]` on, every one not written, and those of tracks not in this set), so those
+    /// copies are still recognised as prep's. Text from files is [`clean`]ed.
     fn report(&self, rows: &[Row], done: usize, tail: &str) -> String {
-        let mut out = format!("{REPORT_HEADER}{}\ntarget {} LUFS, ceiling {} dBTP, {}\n\n", self.source, self.target_lufs, self.ceiling, self.date);
+        let mut out =
+            format!("{REPORT_HEADER}{}\ntarget {} LUFS, ceiling {} dBTP, {}\n\n", clean(&self.source), self.target_lufs, self.ceiling, self.date);
         for (i, row) in rows.iter().enumerate() {
             let filled = if row.filled.is_empty() { "-".to_string() } else { row.filled.join(",") };
             out.push_str(&format!(
                 "{:>2}  {}  before {} LUFS / {} dBTP  gain {:+.1} dB  after {} / {}  filled {filled}  | {}\n",
                 i + 1,
-                row.file,
+                clean(&row.file),
                 db(row.lufs_before),
                 db(row.tp_before),
                 row.gain_db(),
                 db(row.lufs_after),
                 db(row.tp_after),
-                row.doubts.join("; ")
+                clean(&row.doubts.join("; "))
             ));
             if let Some(u) = &row.unnoted {
                 out.push_str(&u.line());
@@ -470,14 +527,10 @@ impl Plan {
         }
         out.push('\n');
         out.push_str(tail);
-        let replaced = |name: &str| rows.iter().take(done).any(|r| r.file == name && r.status != "failed");
-        let kept: Vec<&Unnoted> = self
-            .earlier
-            .iter()
-            .filter(|u| self.dests.iter().any(|d| d.file_name().and_then(|n| n.to_str()) == Some(u.name.as_str())) && !replaced(&u.name))
-            .collect();
+        let replaced = |name: &str| rows.iter().take(done).any(|r| same_name(&r.file, name) && r.written());
+        let kept: Vec<&Unnoted> = self.earlier.iter().filter(|u| !replaced(&u.name)).collect();
         if !kept.is_empty() {
-            out.push_str("\nearlier copies this run has not replaced, left as they were:\n");
+            out.push_str(&format!("\n{EARLIER}\n"));
             for u in kept {
                 out.push_str(&u.line());
             }
@@ -652,6 +705,11 @@ impl Row {
     fn failed(&mut self, why: impl std::fmt::Display) {
         self.status = "failed";
         self.doubts.push(format!("failed: {why}"));
+    }
+
+    /// Whether its copy was written.
+    fn written(&self) -> bool {
+        matches!(self.status, "ok" | "not_adjusted")
     }
 
     fn gain_db(&self) -> f64 {

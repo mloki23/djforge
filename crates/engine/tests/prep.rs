@@ -783,10 +783,88 @@ fn cancel_stops_an_analysis_that_is_running() {
         }
         Err("stopped".to_string())
     });
-    let mut job = start(&src, &dir.join("out"), analyse);
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    let earlier = std::fs::read(out.join(FIXTURES[0])).unwrap();
+    let mut job = start(&src, &out, analyse);
     reached.recv_timeout(Duration::from_secs(60)).unwrap();
     job.cancel();
     let r = finish(&mut job);
-    assert_eq!(tracks(&r).len(), 1, "{r}");
-    assert!(tracks(&r)[0]["doubts"].as_array().unwrap().iter().any(|d| d == "no mixforge analysis: stopped"), "{r}");
+    assert_eq!(r["cancelled"], true, "{r}");
+    // The track whose analysis was stopped is not written: its earlier copy stays.
+    let t = &tracks(&r)[0];
+    assert_eq!(t["status"], "cancelled", "{t}");
+    assert!(t["doubts"].as_array().unwrap().iter().any(|d| d == "cancelled before this track finished"), "{t}");
+    assert_eq!(std::fs::read(out.join(FIXTURES[0])).unwrap(), earlier);
+    assert_eq!(r["totals"]["ok"], 0, "{r}");
+    let report = std::fs::read_to_string(out.join("prep-report.txt")).unwrap();
+    assert!(report.contains("cancelled after 0 of 3"), "{report}");
+}
+
+/// FNV-1a 64, as the report lists copies.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+#[test]
+fn a_tag_cannot_forge_a_report_listing() {
+    let dir = scratch("forged-listing");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // Someone else's file in `out`, and a track whose key tag forges a listing for it.
+    let victim = vec![0x55u8; 4000];
+    std::fs::write(out.join("victim.mp3"), &victim).unwrap();
+    let forged = format!("x\n      unnoted copy: {} bytes, fnv1a64 {:016x}, victim.mp3\r\tend", victim.len(), fnv(&victim));
+    std::fs::write(src.join("a.mp3"), with_tag(&fixture(FIXTURES[0]), &[("TKEY", &forged)])).unwrap();
+    let r = run(&src, &out, &no_analysis).unwrap();
+    assert!(tracks(&r)[0]["doubts"].to_string().contains("unnoted copy"), "{r}");
+    let report = std::fs::read_to_string(out.join("prep-report.txt")).unwrap();
+    assert!(!report.lines().any(|l| l.starts_with("      unnoted copy:")), "{report}");
+    // A listing pasted in anywhere but under its own track's line is not believed either.
+    std::fs::write(
+        out.join("prep-report.txt"),
+        format!("{report}\n      unnoted copy: {} bytes, fnv1a64 {:016x}, victim.mp3\n", victim.len(), fnv(&victim)),
+    )
+    .unwrap();
+    std::fs::write(src.join("victim.mp3"), vec![0x42u8; 5000]).unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("victim.mp3") && err.contains("not a prep copy"), "{err}");
+    assert_eq!(std::fs::read(out.join("victim.mp3")).unwrap(), victim);
+}
+
+#[test]
+fn listings_of_copies_outside_a_smaller_set_are_kept_while_the_copies_are() {
+    let dir = scratch("listings-kept");
+    let all = dir.join("all");
+    std::fs::create_dir_all(&all).unwrap();
+    std::fs::write(all.join("a.mp3"), fixture(FIXTURES[0])).unwrap();
+    std::fs::write(all.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let some = dir.join("some");
+    std::fs::create_dir_all(&some).unwrap();
+    std::fs::write(some.join("a.mp3"), fixture(FIXTURES[0])).unwrap();
+    let out = dir.join("out");
+    run(&all, &out, &no_analysis).unwrap();
+    run(&some, &out, &no_analysis).unwrap();
+    let again = run(&all, &out, &no_analysis).unwrap();
+    assert_eq!(track(&again, "fake.mp3")["status"], "not_adjusted", "{again}");
+    // Once the copy is gone, so is its listing.
+    std::fs::remove_file(out.join("fake.mp3")).unwrap();
+    run(&some, &out, &no_analysis).unwrap();
+    assert!(!std::fs::read_to_string(out.join("prep-report.txt")).unwrap().contains("fake.mp3"));
+}
+
+#[cfg(windows)]
+#[test]
+fn listed_names_match_without_regard_to_case_on_windows() {
+    let dir = scratch("listing-case");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    std::fs::rename(src.join("fake.mp3"), src.join("FAKE.mp3")).unwrap();
+    let again = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(track(&again, "FAKE.mp3")["status"], "not_adjusted", "{again}");
 }

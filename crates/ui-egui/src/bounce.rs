@@ -11,6 +11,9 @@ pub fn start(app: &mut SoundApp, params: &Value) {
         app.ui.status = "A bounce is already running".into();
         return;
     }
+    if crate::prep::refuses_command(app, "file.bounce_mix") {
+        return;
+    }
     // Third-party plugins keep state the session can't see: store it first.
     app.capture_plugin_states();
     match soundcraft_engine::cmd::bounce_job(&app.engine, params) {

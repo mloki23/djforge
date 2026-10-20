@@ -186,26 +186,34 @@ fn escape_cancels_and_the_session_cannot_be_replaced_while_it_preps() {
 }
 
 #[test]
-fn files_in_the_prep_folder_cannot_be_imported_or_saved_to_while_it_runs() {
-    let dir = scratch("prep-targets");
+fn file_and_session_commands_wait_for_the_prep_while_playing_and_editing_go_on() {
+    let dir = scratch("prep-commands");
     let src = mp3_folder(&dir, "set");
     let out = dir.join("out");
     let mut h = harness();
     let (job, reached, go) = gated_job(&src, &out);
     h.state_mut().prep = Some(job);
     reached.recv_timeout(Duration::from_secs(60)).unwrap();
-    let copy = out.join(".").join(FIXTURES[0]);
+    let copy = out.join(FIXTURES[0]).to_string_lossy().into_owned();
     for (id, params) in [
-        ("file.import_audio", json!({"path": copy.to_string_lossy()})),
-        ("session.save_as", json!({"path": out.join("Mine.scraft").to_string_lossy()})),
-        ("dj.import_set", json!({"plan": out.join("plan.json").to_string_lossy()})),
+        ("file.import_audio", json!({"paths": [copy]})),
+        ("file.relink_audio", json!({"file": copy})),
+        ("session.save_as", json!({"path": dir.join("Mine.scraft").to_string_lossy()})),
+        ("session.new", json!({})),
+        ("dj.import_set", json!({"plan": dir.join("plan.json").to_string_lossy(), "report": copy})),
+        ("prep.tracks", json!({"source": src.to_string_lossy(), "out": dir.join("other").to_string_lossy()})),
     ] {
         let err = h.state_mut().run(id, params).unwrap_err();
-        assert!(err.contains("the prep is writing"), "{id}: {err}");
+        assert_eq!(err, "Wait for the prep to finish (or cancel it)", "{id}");
     }
-    // Elsewhere is fine (this one fails for its own reason).
-    let err = h.state_mut().run("file.import_audio", json!({"path": dir.join("nothing.wav").to_string_lossy()})).unwrap_err();
-    assert!(!err.contains("the prep is writing"), "{err}");
+    assert!(!dir.join("other").exists() && !dir.join("Mine.scraft").exists());
+    // The Bounce dialog starts its bounce without `run`, and is held back too.
+    soundcraft_ui_egui::bounce::start(h.state_mut(), &json!({"path": dir.join("Mix.wav").to_string_lossy()}));
+    assert!(h.state().bounce.is_none());
+    // Read-only queries, editing and playback go on.
+    for id in ["session.inspect", "file.get_info", "edit.select_none", "transport.play", "transport.stop"] {
+        assert!(h.state_mut().run(id, json!({})).is_ok(), "{id}: {}", h.state().ui.status);
+    }
     go.send(()).unwrap();
     for _ in 0..2 {
         if reached.recv_timeout(Duration::from_secs(60)).is_ok() {
@@ -213,7 +221,7 @@ fn files_in_the_prep_folder_cannot_be_imported_or_saved_to_while_it_runs() {
         }
     }
     step_until_prepped(&mut h);
-    assert!(h.state_mut().run("file.import_audio", json!({"path": out.join(FIXTURES[0]).to_string_lossy()})).is_ok());
+    assert!(h.state_mut().run("file.import_audio", json!({"path": copy})).is_ok(), "{}", h.state().ui.status);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
