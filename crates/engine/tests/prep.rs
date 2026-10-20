@@ -553,3 +553,29 @@ fn a_track_that_fails_on_a_re_run_says_its_earlier_copy_was_kept() {
     assert_eq!(std::fs::read(out.join(FIXTURES[0])).unwrap(), earlier);
     assert!(!track(&r, FIXTURES[2])["doubts"].as_array().unwrap().iter().any(|d| d.as_str().unwrap().contains("earlier copy")));
 }
+
+#[test]
+fn leftover_temp_files_in_out_are_cleared_and_nothing_else() {
+    let dir = scratch("stale-temps");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(out.join(".folder.djforge-tmp")).unwrap();
+    // Left by a run that stopped part-way: one for a track still in the set, one for a track no
+    // longer in it, and the report's.
+    let stale = [format!(".{}.djforge-tmp", FIXTURES[1]), ".gone.mp3.djforge-tmp".into(), ".prep-report.txt.djforge-tmp".into()];
+    for f in &stale {
+        std::fs::write(out.join(f), "half a copy").unwrap();
+    }
+    let kept = ["gone.mp3.djforge-tmp", ".djforge-tmp", ".gone.mp3.djforge-tmp.bak", "x.djforge-tmp"];
+    for f in kept {
+        std::fs::write(out.join(f), "not ours").unwrap();
+    }
+    run(&src, &out, &no_analysis).unwrap();
+    for f in &stale {
+        assert!(!out.join(f).exists(), "{f} is still there");
+    }
+    for f in kept {
+        assert_eq!(std::fs::read_to_string(out.join(f)).unwrap(), "not ours", "{f}");
+    }
+    assert!(out.join(".folder.djforge-tmp").is_dir());
+}

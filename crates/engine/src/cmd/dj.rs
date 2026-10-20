@@ -340,28 +340,44 @@ pub(crate) const TIMED_OUT: &str = "timed out";
 const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Runs `command` (stdout and stderr captured) and returns its output, or `None` (after killing
-/// it) when it runs longer than `limit`.
+/// it) when it runs longer than `limit`, or when a process it started keeps its output open past
+/// `limit` after it exited.
 fn output_within(command: &mut std::process::Command, limit: std::time::Duration) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read as _;
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
-    // Both pipes are drained as the child writes, so a full pipe can't stall it.
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
+    // Both pipes are drained as the child writes, so a full pipe can't stall it. Each reader sends
+    // what it read once its pipe closes; one that never closes is not waited for past `limit`.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>, is_stdout: bool| {
+        let tx = tx.clone();
+        // A reader that can't start drops its sender: that output is lost, nothing waits for it.
+        let _ = std::thread::Builder::new().name("sidecar-pipe".into()).spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send((is_stdout, buf));
+        });
     };
-    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
-    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), true);
+    drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), false);
+    drop(tx);
     let started = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let take = |h: std::thread::JoinHandle<Vec<u8>>| h.join().unwrap_or_default();
-            return Ok(Some(std::process::Output { status, stdout: take(stdout), stderr: take(stderr) }));
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            for _ in 0..2 {
+                match rx.recv_timeout(limit.saturating_sub(started.elapsed())) {
+                    Ok((true, buf)) => stdout = buf,
+                    Ok((false, buf)) => stderr = buf,
+                    // A process the child started still holds a pipe: as good as timed out.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                    // A reader ended without sending (it panicked): its output is lost.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            return Ok(Some(std::process::Output { status, stdout, stderr }));
         }
         if started.elapsed() >= limit {
             // The readers end when the pipes close; they are not waited for, since a process the
@@ -662,6 +678,23 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(output_within(&mut slow, std::time::Duration::from_millis(300)).unwrap().is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_process_left_holding_the_pipes_does_not_outlast_the_limit() {
+        // The shell exits at once, leaving a process it started holding its stdout for 20 s.
+        let mut held = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start /b ping -n 20 127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "sleep 20 &"]);
+            c
+        };
+        let started = std::time::Instant::now();
+        assert!(output_within(&mut held, std::time::Duration::from_secs(2)).unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
     use crate::edit as ops;
     use soundcraft_audio_io::{AudioBuffer, FileFormat};

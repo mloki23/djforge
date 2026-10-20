@@ -239,6 +239,8 @@ pub fn run(
     crate::io::make_dir(&out)?;
     // Now that it exists, `out` is compared with the sources again with its links followed.
     refuse_sources(&files, &out, &dests)?;
+    // Temporary files a run that stopped part-way left behind.
+    crate::io::remove_stale_temps(&out);
 
     // One track at a time, so only one track's audio is in memory.
     // After one analysis times out the rest are skipped, so a stuck sidecar costs one timeout,

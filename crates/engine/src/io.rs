@@ -1645,6 +1645,25 @@ pub fn write_user_file(s: &Session, path: &str, bytes: &[u8]) -> Result<()> {
     write_file(path, bytes)
 }
 
+/// How [`replace_user_file`]'s temporary file for `<name>` is named: `.<name>.djforge-tmp`.
+const TMP_SUFFIX: &str = ".djforge-tmp";
+
+/// Removes the temporary files [`replace_user_file`] left in folder `dir` (`.<name>.djforge-tmp`,
+/// directly in it) when a write stopped part-way. Only files and links are removed, never what a
+/// link names; one that can't be removed stays. Returns how many were removed.
+pub(crate) fn remove_stale_temps(dir: &Path) -> usize {
+    if cfg!(target_arch = "wasm32") {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let stale = |name: &str| name.strip_prefix('.').and_then(|n| n.strip_suffix(TMP_SUFFIX)).is_some_and(|n| !n.is_empty());
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(stale) && e.file_type().is_ok_and(|t| !t.is_dir()))
+        .filter(|e| crate::file_access::check_write(e.path()).is_ok() && std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
 /// [`write_user_file`] that replaces the file at `path` instead of writing into it: the bytes go
 /// to a temporary file in the same folder, which is then renamed over `path`. A link at `path`
 /// (symbolic or hard) is replaced, so whatever else it names is left as it was.
@@ -1657,7 +1676,7 @@ pub fn replace_user_file(s: &Session, path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path.file_name().ok_or_else(|| EngineError::Io(format!("{shown}: not a file name")))?;
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(".djforge-tmp");
+    tmp_name.push(TMP_SUFFIX);
     let tmp = path.with_file_name(tmp_name);
     crate::file_access::check_write(path).map_err(EngineError::Io)?;
     crate::file_access::check_write(&tmp).map_err(EngineError::Io)?;
