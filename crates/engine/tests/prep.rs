@@ -419,3 +419,83 @@ fn file_keys_in_musical_notation_are_compared_as_camelot() {
     assert!(doubts("c.mp3").contains(&"key: file F#m (11A), mixforge 8A (file kept)".to_string()), "{:?}", doubts("c.mp3"));
     assert!(doubts("c.mp3").iter().any(|d| d.starts_with("bpm: file `fast` is not a number")), "{:?}", doubts("c.mp3"));
 }
+
+/// The bad-tag fixture: its TSSE frame claims more bytes than the tag holds.
+fn bad_tag() -> Vec<u8> {
+    let mut bytes = fixture(FIXTURES[0]);
+    bytes[14..18].copy_from_slice(&0x0FFF_FFFFu32.to_be_bytes());
+    bytes
+}
+
+#[test]
+fn a_re_run_accepts_its_own_copies_even_without_a_prep_note() {
+    let dir = scratch("rerun-untagged");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("bad.mp3"), bad_tag()).unwrap();
+    std::fs::write(src.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let out = dir.join("out");
+    let first = run(&src, &out, &no_analysis).unwrap();
+    assert!(track(&first, "bad.mp3")["doubts"].as_array().unwrap().iter().any(|d| d.as_str().unwrap().starts_with("tags left as they are")));
+    let again = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(track(&again, "bad.mp3")["status"], "ok", "{again}");
+    assert_eq!(track(&again, "fake.mp3")["status"], "not_adjusted", "{again}");
+}
+
+#[test]
+fn a_planted_temp_file_is_not_written_through() {
+    let dir = scratch("planted");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "keep me").unwrap();
+    std::fs::hard_link(&victim, out.join(format!(".{}.djforge-tmp", FIXTURES[0]))).unwrap();
+    let r = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(track(&r, FIXTURES[0])["status"], "ok", "{r}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    assert!(!out.join(format!(".{}.djforge-tmp", FIXTURES[0])).exists());
+}
+
+#[test]
+fn a_destination_that_cannot_be_read_is_refused() {
+    let dir = scratch("unreadable");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(out.join(FIXTURES[0])).unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains(FIXTURES[0]), "{err}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "something was written");
+}
+
+#[test]
+fn after_one_analysis_times_out_the_rest_are_skipped() {
+    let dir = scratch("timeout");
+    let src = source_folder(&dir);
+    let calls = std::cell::Cell::new(0);
+    let slow = |_: &str| {
+        calls.set(calls.get() + 1);
+        Err("timed out after 120 s".to_string())
+    };
+    let r = run(&src, &dir.join("out"), &slow).unwrap();
+    assert_eq!(calls.get(), 1);
+    let skipped = tracks(&r)
+        .iter()
+        .filter(|t| t["doubts"].as_array().unwrap().iter().any(|d| d == "no mixforge analysis: skipped after an earlier timeout"))
+        .count();
+    assert_eq!(skipped, 2, "{r}");
+}
+
+#[cfg(windows)]
+#[test]
+fn an_out_that_is_a_junction_to_the_source_folder_is_refused() {
+    let dir = scratch("junction");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&out).arg(&src).output().unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let before = snapshot(&src);
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("source"), "{err}");
+    assert_eq!(snapshot(&src), before);
+}

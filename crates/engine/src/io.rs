@@ -1661,11 +1661,30 @@ pub fn replace_user_file(s: &Session, path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(tmp_name);
     crate::file_access::check_write(path).map_err(EngineError::Io)?;
     crate::file_access::check_write(&tmp).map_err(EngineError::Io)?;
-    std::fs::write(&tmp, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", tmp.display())))?;
+    let tmp_err = |err: std::io::Error| {
+        let _ = std::fs::remove_file(&tmp);
+        EngineError::Io(format!("{}: {err}", tmp.display()))
+    };
+    // A leftover (or planted) temp file goes first, and the new one must not exist yet, so the
+    // bytes never reach a file through a link.
+    match std::fs::remove_file(&tmp) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(EngineError::Io(format!("{}: {err}", tmp.display()))),
+        _ => {}
+    }
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|err| EngineError::Io(format!("{}: {err}", tmp.display())))?;
+    std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all()).map_err(tmp_err)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(|err| {
         let _ = std::fs::remove_file(&tmp);
-        EngineError::Io(format!("{shown}: {err}"))
+        EngineError::Io(format!("{shown}: {err}; close the file in any player and run again"))
     })
+}
+
+/// Whether anything (a file, a folder, a link, even a broken one) is at `path`, whatever the
+/// automation roots allow: used to refuse writing over it, not to read it.
+pub(crate) fn path_exists(path: impl AsRef<Path>) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {

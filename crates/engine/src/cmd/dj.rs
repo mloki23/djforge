@@ -321,7 +321,7 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
     }
     let out = match output_within(&mut command, SIDECAR_TIMEOUT) {
         Ok(Some(out)) => out,
-        Ok(None) => return Err(bad(cmd, format!("timed out after {} s", SIDECAR_TIMEOUT.as_secs()))),
+        Ok(None) => return Err(bad(cmd, format!("{TIMED_OUT} after {} s", SIDECAR_TIMEOUT.as_secs()))),
         Err(err) => return Err(bad(cmd, format!("could not run DJFORGE_PYTHON ({python}): {err}"))),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -334,6 +334,8 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
     parse_analysis(cmd, &stdout)
 }
 
+/// How the error for a sidecar that ran out of time starts.
+pub(crate) const TIMED_OUT: &str = "timed out";
 /// Longest the mixforge sidecar may take over one file.
 const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 

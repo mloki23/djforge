@@ -135,9 +135,22 @@ fn has_prep_note(bytes: &[u8]) -> bool {
     id3::Tag::read_from2(std::io::Cursor::new(bytes)).is_ok_and(|t| t.extended_texts().any(|x| x.description == mp3tags::PREP_DESCRIPTION))
 }
 
-/// Whether the file at `path` is an earlier prep report.
-fn is_prep_report(path: &Path) -> bool {
-    crate::io::read_file(path).is_ok_and(|b| b.starts_with(REPORT_HEADER.as_bytes()))
+/// The text of the earlier prep report at `path`, if that is what it is.
+fn prep_report(path: &Path) -> Option<String> {
+    crate::io::read_text(path).ok().filter(|t| t.starts_with(REPORT_HEADER))
+}
+
+/// Doubts that mean prep wrote a copy without its `TXXX:djforge_prep` note.
+const UNNOTED: [&str; 3] = [TAGS_LEFT, NOT_MPEG, NOT_AN_MP3];
+const TAGS_LEFT: &str = "tags left as they are";
+const NOT_MPEG: &str = "not MPEG audio";
+const NOT_AN_MP3: &str = "not an MP3";
+
+/// Whether `report` (an earlier prep report) says it wrote a copy named `name` without its note,
+/// so the copy can't be recognised by its tag.
+fn listed_unnoted(report: &str, name: &str) -> bool {
+    let line = format!("  {name}  before ");
+    report.lines().any(|l| l.contains(&line) && UNNOTED.iter().any(|d| l.contains(d)))
 }
 
 /// `out` is not a source's folder and nothing in it is a source (by name or link): checked by
@@ -174,18 +187,28 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBu
         dests.push(out.join(name));
     }
     refuse_sources(files, out, &dests)?;
+    // Only earlier prep output may be replaced: a copy carrying prep's note, or one the earlier
+    // report there lists as written without it (tags left alone, not MPEG, not an MP3).
     let report = out.join(REPORT);
-    let report_found = crate::io::file_found(&report);
-    if report_found && !is_prep_report(&report) {
-        return Err(bad(CMD, format!("{}: exists and is not a prep report; move it or choose another `out`", report.display())));
-    }
+    let earlier = if crate::io::path_exists(&report) {
+        Some(
+            prep_report(&report)
+                .ok_or_else(|| bad(CMD, format!("{}: exists and is not a prep report; move it or choose another `out`", report.display())))?,
+        )
+    } else {
+        None
+    };
     for d in &dests {
-        if crate::io::file_found(d) {
-            let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
-            let ours = if mp3 { crate::io::read_file(d).is_ok_and(|b| has_prep_note(&b)) } else { report_found };
-            if !ours {
-                return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
-            }
+        if !crate::io::path_exists(d) {
+            continue;
+        }
+        let bytes = crate::io::read_file(d)
+            .map_err(|err| bad(CMD, format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display())))?;
+        let name = d.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
+        let ours = (mp3 && has_prep_note(&bytes)) || earlier.as_deref().is_some_and(|r| listed_unnoted(r, name));
+        if !ours {
+            return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
         }
     }
     for d in dests.iter().chain([&report]) {
@@ -223,7 +246,20 @@ pub fn run(
     refuse_sources(&files, &out, &dests)?;
 
     // One track at a time, so only one track's audio is in memory.
-    let rows: Vec<Row> = files.iter().zip(&dests).map(|(src, dest)| prep_one(s, src, dest, target_lufs, ceiling, analyse)).collect();
+    // After one analysis times out the rest are skipped, so a stuck sidecar costs one timeout,
+    // not one per track.
+    let timed_out = std::cell::Cell::new(false);
+    let analyse = |path: &str| {
+        if timed_out.get() {
+            return Err("skipped after an earlier timeout".to_string());
+        }
+        let r = analyse(path);
+        if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
+            timed_out.set(true);
+        }
+        r
+    };
+    let rows: Vec<Row> = files.iter().zip(&dests).map(|(src, dest)| prep_one(s, src, dest, target_lufs, ceiling, &analyse)).collect();
 
     let count = |st: &str| rows.iter().filter(|r| r.status == st).count();
     let written = || rows.iter().filter(|r| r.status != "failed");
@@ -591,7 +627,7 @@ fn prep_mp3(
         // No MPEG audio frames: nothing to adjust, and tags would be written into a file no
         // player reads as an MP3.
         row.status = "not_adjusted";
-        row.doubts.push("not MPEG audio".into());
+        row.doubts.push(NOT_MPEG.into());
         return Some(bytes);
     }
     let long = probe(&bytes, Some("mp3")).is_ok_and(|i| i.duration_secs() > MAX_SECS);
@@ -624,7 +660,7 @@ fn prep_one(s: &Session, src: &Path, dest: &Path, target: f64, ceiling: f64, ana
         let Some(copy) = prep_mp3(bytes, src, target, ceiling, &mut row, analyse) else { return row };
         copy
     } else {
-        row.not_adjusted("not an MP3");
+        row.not_adjusted(NOT_AN_MP3);
         bytes
     };
     if row.over(ceiling) {
@@ -651,7 +687,7 @@ fn tagged(
     let (bytes, tags) = match mp3tags::fill(&adjusted, &TagFill { camelot: key.as_deref(), bpm, prep_note: &note }) {
         Ok(x) => x,
         Err(err) => {
-            row.doubts.push(format!("tags left as they are: {err}"));
+            row.doubts.push(format!("{TAGS_LEFT}: {err}"));
             return Some(adjusted);
         }
     };
