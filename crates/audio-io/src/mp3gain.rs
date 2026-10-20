@@ -100,13 +100,16 @@ pub(crate) struct Frame {
     pub info: bool,
 }
 
-/// Where the audio sits between the leading and trailing tags, and its whole frames.
+/// Where the audio sits between the leading and trailing tags, and its whole frames. Bytes in
+/// `audio_end..tags_at` are trailing data (a partial frame or junk), copied unchanged.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Layout {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub audio_start: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// End of the last whole frame.
     pub audio_end: usize,
+    /// Start of the trailing tags (ID3v1, Lyrics3v2, appended ID3v2, APEv2), or the file end.
+    pub tags_at: usize,
     pub frames: Vec<Frame>,
 }
 
@@ -127,32 +130,66 @@ fn free_format_at(b: &[u8], at: usize) -> bool {
 fn skip_id3v2(b: &[u8]) -> usize {
     let mut at = 0usize;
     while let (Some(b"ID3"), Some(&flags), Some(size)) = (b.get(at..at + 3), b.get(at + 5), b.get(at + 6..at + 10)) {
-        let size = size.iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F));
         let footer = if flags & 0x10 != 0 { 10 } else { 0 };
-        at = at.saturating_add(10 + footer).saturating_add(size).min(b.len());
+        at = at.saturating_add(10 + footer).saturating_add(syncsafe(size)).min(b.len());
     }
     at
 }
 
-/// End of the audio: before a trailing ID3v1 tag (128 bytes, `TAG`), then before an APEv2 tag
-/// (32-byte `APETAGEX` footer; size, footer included, is the LE u32 at 12; flags bit 31 = has a
-/// 32-byte header).
-fn trim_tags(b: &[u8], start: usize) -> usize {
+fn syncsafe(b: &[u8]) -> usize {
+    b.iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F))
+}
+
+/// The candidate ends of the audio, innermost first, each before one more trailing tag:
+/// - ID3v1: the last 128 bytes, starting `TAG`;
+/// - Lyrics3v2, right before ID3v1: `LYRICSBEGIN`… then a 6-digit size and `LYRICS200`; the
+///   size excludes those 15 bytes;
+/// - an appended ID3v2 tag: a 10-byte `3DI` footer, syncsafe size at 6..10, + 20 for header
+///   and footer;
+/// - APEv2: a 32-byte `APETAGEX` footer; size, footer included, is the LE u32 at 12; flags
+///   bit 31 = a 32-byte header too.
+fn tag_ends(b: &[u8], start: usize) -> Vec<usize> {
+    let mut ends = vec![b.len()];
     let mut end = b.len();
-    if let Some(v1) = end.checked_sub(128).filter(|&at| b.get(at..at + 3) == Some(b"TAG")) {
+    if let Some(v1) = end.checked_sub(128).filter(|&at| at >= start && b.get(at..at + 3) == Some(b"TAG")) {
         end = v1;
-    }
-    let le = |at: usize| b.get(at..at + 4).and_then(|x| x.try_into().ok()).map(u32::from_le_bytes);
-    if let Some(foot) = end.checked_sub(32).filter(|&at| b.get(at..at + 8) == Some(b"APETAGEX"))
-        && let (Some(size), Some(flags)) = (le(foot + 12), le(foot + 20))
-    {
-        let header = if flags & 0x8000_0000 != 0 { 32 } else { 0 };
-        let total = usize::try_from(size).ok().and_then(|n| n.checked_add(header));
-        if let Some(at) = total.and_then(|n| end.checked_sub(n)) {
+        ends.push(end);
+        if let Some(at) = lyrics3v2(b, end).filter(|&at| at >= start) {
             end = at;
+            ends.push(end);
         }
     }
-    end.max(start)
+    let le = |at: usize| b.get(at..at + 4).and_then(|x| x.try_into().ok()).map(u32::from_le_bytes);
+    loop {
+        let id3 = end.checked_sub(10).filter(|&at| b.get(at..at + 3) == Some(b"3DI")).and_then(|foot| {
+            let total = syncsafe(b.get(foot + 6..foot + 10)?).checked_add(20)?;
+            end.checked_sub(total).filter(|&at| b.get(at..at + 3) == Some(b"ID3"))
+        });
+        let ape = end.checked_sub(32).filter(|&at| b.get(at..at + 8) == Some(b"APETAGEX")).and_then(|foot| {
+            let header = if le(foot + 20)? & 0x8000_0000 != 0 { 32 } else { 0 };
+            end.checked_sub(usize::try_from(le(foot + 12)?).ok()?.checked_add(header)?)
+        });
+        match id3.or(ape).filter(|&at| at >= start && at < end) {
+            Some(at) => {
+                end = at;
+                ends.push(end);
+            }
+            None => break,
+        }
+    }
+    ends.reverse();
+    ends
+}
+
+/// Start of a Lyrics3v2 block ending at `end`.
+fn lyrics3v2(b: &[u8], end: usize) -> Option<usize> {
+    let foot = end.checked_sub(15)?;
+    if b.get(foot + 6..end)? != b"LYRICS200" {
+        return None;
+    }
+    let digits = std::str::from_utf8(b.get(foot..foot + 6)?).ok()?;
+    let at = foot.checked_sub(digits.parse::<usize>().ok()?)?;
+    (b.get(at..at + 11)? == b"LYRICSBEGIN").then_some(at)
 }
 
 /// Xing/Info after zeroed side info, or VBRI 32 bytes after the header.
@@ -163,32 +200,58 @@ fn is_info(b: &[u8], at: usize, h: &FrameHeader) -> bool {
     (zero && matches!(tag, Some(b"Xing" | b"Info"))) || b.get(at + 36..at + 40) == Some(b"VBRI")
 }
 
-/// Find the audio between the tags and chain its frames.
+/// A header at `at` whose next frame's header has the same version and rate.
+fn chained_at(b: &[u8], at: usize) -> Option<FrameHeader> {
+    let h = header_at(b, at)?;
+    header_at(b, at + h.len).filter(|n| (n.version, n.rate) == (h.version, h.rate)).map(|_| h)
+}
+
+/// A free-format header followed, within the largest free-format frame (640 kbit/s at
+/// 32 kHz: 2880 bytes), by another with the same version and rate.
+fn free_chain_at(b: &[u8], at: usize) -> bool {
+    let same = |x: usize| b.get(x + 1) == b.get(at + 1) && b.get(x + 2).map(|v| v & 0x0C) == b.get(at + 2).map(|v| v & 0x0C);
+    free_format_at(b, at) && (at + 5..at + 2_882).any(|x| free_format_at(b, x) && same(x))
+}
+
+/// Chain the frames of `b[..end]` from the first one found at or after `start`. Returns them
+/// and where the chain stops; that is `end` unless trailing data follows.
+fn walk(b: &[u8], start: usize, end: usize) -> Result<(Vec<Frame>, usize), GainError> {
+    let audio = b.get(..end).unwrap_or(b);
+    let search_end = start.saturating_add(SEARCH).min(end);
+    // A lone frame counts only if it starts the audio and fills it.
+    let first = (start..search_end)
+        .find_map(|at| chained_at(audio, at).or_else(|| header_at(audio, at).filter(|h| at == start && at + h.len == end)).map(|h| (at, h)));
+    let Some((mut at, first)) = first else {
+        return Err(if (start..search_end).any(|at| free_chain_at(audio, at)) { GainError::FreeFormat } else { GainError::NotLayer3 });
+    };
+    let mut frames: Vec<Frame> = Vec::new();
+    while at < end {
+        match header_at(audio, at).filter(|h| (h.version, h.rate) == (first.version, first.rate)) {
+            Some(header) if at + header.len <= end => {
+                frames.push(Frame { at, header, info: frames.is_empty() && is_info(audio, at, &header) });
+                at += header.len;
+            }
+            // Trailing data, unless frames chain again further on (corruption mid-file).
+            _ if frames.len() >= 2 && !(at..end).any(|x| chained_at(audio, x).is_some()) => break,
+            _ => return Err(GainError::SyncLost(at)),
+        }
+    }
+    Ok((frames, at))
+}
+
+/// Find the audio between the tags and chain its frames. A trailing tag is trusted only if the
+/// frames end exactly where it starts; otherwise the walk is retried with it counted as audio.
 pub(crate) fn frames(b: &[u8]) -> Result<Layout, GainError> {
     let audio_start = skip_id3v2(b);
-    let audio_end = trim_tags(b, audio_start);
-    let audio = b.get(..audio_end).unwrap_or(b);
-    let search_end = audio_start.saturating_add(SEARCH).min(audio_end);
-    let mut free = false;
-    let first = (audio_start..search_end).find(|&at| {
-        free |= free_format_at(audio, at);
-        header_at(audio, at).is_some_and(|h| {
-            let next = at + h.len;
-            next == audio_end || header_at(audio, next).is_some_and(|n| (n.version, n.rate) == (h.version, h.rate))
-        })
-    });
-    let Some(mut at) = first else { return Err(if free { GainError::FreeFormat } else { GainError::NotLayer3 }) };
-    let mut frames = Vec::new();
-    while at.checked_add(4).is_some_and(|e| e <= audio_end) {
-        let header = header_at(audio, at).ok_or(GainError::SyncLost(at))?;
-        let next = at.checked_add(header.len).ok_or(GainError::SyncLost(at))?;
-        if next > audio_end {
+    let ends = tag_ends(b, audio_start);
+    let mut last = Err(GainError::NotLayer3);
+    for &tags_at in &ends {
+        last = walk(b, audio_start, tags_at).map(|(frames, audio_end)| Layout { audio_start, audio_end, tags_at, frames });
+        if matches!(&last, Ok(l) if l.audio_end == tags_at) {
             break;
         }
-        frames.push(Frame { at, header, info: is_info(audio, at, &header) });
-        at = next;
     }
-    Ok(Layout { audio_start, audio_end, frames })
+    last
 }
 
 /// One global_gain step in dB: amplitude ×2^(1/4).
@@ -234,6 +297,12 @@ fn set_bits(buf: &mut [u8], bit: usize, n: usize, v: u32) -> Option<()> {
     Some(())
 }
 
+/// A granule/channel block with no Huffman data (part2_3_length 0, the 12 bits at its start,
+/// 21 bits before global_gain): it decodes to zeros.
+fn silent(side: &[u8], gain_bit: usize) -> bool {
+    gain_bit.checked_sub(21).and_then(|bit| get_bits(side, bit, 12)) == Some(0)
+}
+
 /// Every audio (non-info) frame with the offset of its side info.
 fn audio_frames(b: &[u8]) -> Result<Vec<(Frame, usize)>, GainError> {
     let audio: Vec<_> = frames(b)?.frames.into_iter().filter(|f| !f.info).map(|f| (f, f.at + f.header.side_info_at())).collect();
@@ -241,6 +310,7 @@ fn audio_frames(b: &[u8]) -> Result<Vec<(Frame, usize)>, GainError> {
 }
 
 /// The steps that keep every audio granule's global_gain within 0..=255: (most negative, most positive).
+/// Silent granules (part2_3_length 0) don't count; [`adjust`] saturates them.
 pub fn step_range(bytes: &[u8]) -> Result<(i32, i32), GainError> {
     range(bytes, &audio_frames(bytes)?)
 }
@@ -250,6 +320,9 @@ fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError
     for &(f, side) in audio {
         let side = bytes.get(side..).ok_or(GainError::SyncLost(f.at))?;
         for bit in gain_bits(&f.header) {
+            if silent(side, bit) {
+                continue;
+            }
             let g = get_bits(side, bit, 8).ok_or(GainError::SyncLost(f.at))?;
             (lo, hi) = (lo.min(g), hi.max(g));
         }
@@ -259,7 +332,7 @@ fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError
 }
 
 /// A copy of `bytes` with every audio frame's global_gain moved by `steps` (CRC frames re-protected,
-/// info frames, tags and any trailing partial frame copied unchanged).
+/// info frames, tags and trailing data copied unchanged; silent granules saturate into 0..=255).
 pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
     let audio = audio_frames(bytes)?;
     let (lo, hi) = range(bytes, &audio)?;
@@ -272,7 +345,10 @@ pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
         let side_bytes = out.get_mut(side..side + f.header.side_info_len()).ok_or(lost.clone())?;
         for bit in gain_bits(&f.header) {
             let g = get_bits(side_bytes, bit, 8).and_then(|g| i32::try_from(g).ok()).ok_or(lost.clone())?;
-            let g = g.checked_add(steps).and_then(|g| u32::try_from(g).ok()).ok_or(GainError::NoRoom)?;
+            let g = g.saturating_add(steps);
+            // A silent granule decodes to zeros at any gain, so it saturates instead.
+            let g = if silent(side_bytes, bit) { g.clamp(0, 255) } else { g };
+            let g = u32::try_from(g).map_err(|_| GainError::NoRoom)?;
             set_bits(side_bytes, bit, 8, g).ok_or(GainError::NoRoom)?;
         }
         if f.header.crc {
@@ -333,17 +409,18 @@ mod tests {
     const CBR64_MONO: &[u8] = include_bytes!("../tests/fixtures/mp3/cbr64_44k_mono.mp3");
     const MPEG2_MONO: &[u8] = include_bytes!("../tests/fixtures/mp3/mpeg2_22k_mono.mp3");
     const MPEG2_STEREO: &[u8] = include_bytes!("../tests/fixtures/mp3/mpeg2_24k_stereo.mp3");
-    const FIXTURES: [&[u8]; 5] = [CBR128, VBR48, CBR64_MONO, MPEG2_MONO, MPEG2_STEREO];
+    const MPEG25_MONO: &[u8] = include_bytes!("../tests/fixtures/mp3/mpeg25_11k_mono.mp3");
+    const FIXTURES: [&[u8]; 6] = [CBR128, VBR48, CBR64_MONO, MPEG2_MONO, MPEG2_STEREO, MPEG25_MONO];
 
-    /// An ID3v2.3 tag of `body` zero bytes, with a footer when `footer` is set.
+    /// An ID3v2 tag of `body` zero bytes: v2.3, or v2.4 with a footer when `footer` is set.
     fn id3v2(body: usize, footer: bool) -> Vec<u8> {
         let syncsafe = |n: usize| [(n >> 21) as u8 & 0x7F, (n >> 14) as u8 & 0x7F, (n >> 7) as u8 & 0x7F, n as u8 & 0x7F];
-        let mut t = b"ID3\x03\x00".to_vec();
+        let mut t = if footer { b"ID3\x04\x00".to_vec() } else { b"ID3\x03\x00".to_vec() };
         t.push(if footer { 0x10 } else { 0 });
         t.extend(syncsafe(body));
         t.resize(10 + body, 0);
         if footer {
-            t.extend(b"3DI\x03\x00\x10");
+            t.extend(b"3DI\x04\x00\x10");
             t.extend(syncsafe(body));
         }
         t
@@ -362,7 +439,7 @@ mod tests {
     fn every_fixture_walks_to_the_end() {
         for (i, f) in FIXTURES.iter().enumerate() {
             let l = frames(f).unwrap();
-            assert_eq!((l.audio_start, l.audio_end), (44, f.len()), "fixture {i}");
+            assert_eq!((l.audio_start, l.audio_end, l.tags_at), (44, f.len(), f.len()), "fixture {i}");
             assert!(l.frames.len() > 20, "fixture {i}");
             let last = l.frames.last().unwrap();
             assert_eq!(last.at + last.header.len, f.len(), "fixture {i} ends on a frame");
@@ -372,7 +449,7 @@ mod tests {
 
     #[test]
     fn info_frames_are_marked() {
-        for f in [VBR48, MPEG2_STEREO] {
+        for f in [VBR48, MPEG2_STEREO, MPEG25_MONO] {
             let l = frames(f).unwrap();
             assert!(l.frames[0].info);
             assert!(l.frames[1..].iter().all(|f| !f.info));
@@ -409,7 +486,7 @@ mod tests {
         for f in FIXTURES {
             let tagged = [f, &ape(), &v1].concat();
             let l = frames(&tagged).unwrap();
-            assert_eq!(l.audio_end, f.len());
+            assert_eq!((l.audio_end, l.tags_at), (f.len(), f.len()));
             assert_eq!(l.frames.len(), frames(f).unwrap().frames.len());
         }
     }
@@ -427,7 +504,8 @@ mod tests {
         let full = frames(CBR128).unwrap();
         let cut = &CBR128[..CBR128.len() - 100];
         let l = frames(cut).unwrap();
-        assert_eq!((l.audio_end, l.frames.len()), (cut.len(), full.frames.len() - 1));
+        let last = full.frames[full.frames.len() - 2];
+        assert_eq!((l.audio_end, l.tags_at, l.frames.len()), (last.at + last.header.len, cut.len(), full.frames.len() - 1));
     }
 
     #[test]
@@ -493,6 +571,17 @@ mod tests {
         out
     }
 
+    /// global_gain of every audio block with Huffman data (part2_3_length > 0).
+    fn audible_gains(b: &[u8]) -> Vec<u32> {
+        let l = frames(b).unwrap();
+        let mut out = Vec::new();
+        for f in l.frames.iter().filter(|f| !f.info) {
+            let side = &b[f.at + f.header.side_info_at()..][..f.header.side_info_len()];
+            out.extend(gain_bits(&f.header).filter(|&bit| get_bits(side, bit - 21, 12) != Some(0)).map(|bit| get_bits(side, bit, 8).unwrap()));
+        }
+        out
+    }
+
     #[test]
     fn adjusting_up_and_back_restores_every_byte() {
         for f in FIXTURES {
@@ -527,16 +616,16 @@ mod tests {
     /// `CBR128` with every frame CRC-protected: protection bit cleared and a CRC inserted after
     /// the header. Frame lengths stay the same, so the 2 bytes come off the main data (the audio
     /// is garbage; only the bits matter).
-    fn protected() -> Vec<u8> {
-        let l = frames(CBR128).unwrap();
-        let mut out = CBR128[..l.frames[0].at].to_vec();
+    fn protected(src: &[u8]) -> Vec<u8> {
+        let l = frames(src).unwrap();
+        let mut out = src[..l.frames[0].at].to_vec();
         for f in &l.frames {
-            let frame = &CBR128[f.at..f.at + f.header.len];
+            let frame = &src[f.at..f.at + f.header.len];
             let mut p = vec![frame[0], frame[1] & !1, frame[2], frame[3], 0, 0];
             p.extend(&frame[4..frame.len() - 2]);
             out.extend(p);
         }
-        out.extend(&CBR128[l.frames.last().map(|f| f.at + f.header.len).unwrap()..]);
+        out.extend(&src[l.frames.last().map(|f| f.at + f.header.len).unwrap()..]);
         let l = frames(&out).unwrap();
         for f in &l.frames {
             let crc = expected_crc(&out, f);
@@ -557,9 +646,15 @@ mod tests {
 
     #[test]
     fn crc_frames_are_reprotected() {
-        let p = protected();
+        for src in [CBR128, MPEG2_MONO, MPEG2_STEREO] {
+            crc_frames_are_reprotected_in(src);
+        }
+    }
+
+    fn crc_frames_are_reprotected_in(src: &[u8]) {
+        let p = protected(src);
         let l = frames(&p).unwrap();
-        assert_eq!(l.frames.len(), frames(CBR128).unwrap().frames.len());
+        assert_eq!(l.frames.len(), frames(src).unwrap().frames.len());
         assert!(l.frames.iter().all(|f| f.header.crc && stored_crc(&p, f) == expected_crc(&p, f)));
         let out = adjust(&p, 2).unwrap();
         assert_eq!(gains(&out), gains(&p).iter().map(|g| g + 2).collect::<Vec<_>>());
@@ -568,12 +663,12 @@ mod tests {
             assert_eq!(stored_crc(&out, f), expected_crc(&out, f), "frame at {}", f.at);
         }
         // The CRCs did have to change, so a skipped recompute fails the check above.
-        assert!(out_frames.iter().all(|f| stored_crc(&p, f) != expected_crc(&out, f)));
+        assert!(out_frames.iter().filter(|f| !f.info).all(|f| stored_crc(&p, f) != expected_crc(&out, f)));
     }
 
     #[test]
     fn a_stale_crc_is_caught() {
-        let mut out = adjust(&protected(), 2).unwrap();
+        let mut out = adjust(&protected(CBR128), 2).unwrap();
         let f = frames(&out).unwrap().frames[7];
         out[f.at + 5] ^= 0x01;
         assert_ne!(stored_crc(&out, &f), expected_crc(&out, &f));
@@ -582,7 +677,7 @@ mod tests {
     #[test]
     fn step_range_keeps_global_gain_in_a_byte() {
         for f in FIXTURES {
-            let g = gains(f);
+            let g = audible_gains(f);
             let (lo, hi) = (*g.iter().min().unwrap() as i32, *g.iter().max().unwrap() as i32);
             assert_eq!(step_range(f).unwrap(), (-lo, 255 - hi));
             assert!(adjust(f, 255 - hi).is_ok());
@@ -590,6 +685,8 @@ mod tests {
             assert_eq!(adjust(f, 255 - hi + 1).unwrap_err(), GainError::NoRoom);
             assert_eq!(adjust(f, -lo - 1).unwrap_err(), GainError::NoRoom);
         }
+        // The real encoder leaves silent granules in some fixtures, so the exclusion is exercised.
+        assert!(FIXTURES.iter().any(|f| audible_gains(f).len() < gains(f).len()));
     }
 
     #[test]
@@ -603,5 +700,122 @@ mod tests {
         assert!(first.info);
         assert_eq!(out[..first.at + first.header.len], tagged[..first.at + first.header.len]);
         assert_eq!(out[l.audio_end..], tagged[l.audio_end..]);
+    }
+
+    /// An ID3v1 tag (128 bytes).
+    fn id3v1() -> Vec<u8> {
+        let mut v1 = b"TAG".to_vec();
+        v1.resize(128, b' ');
+        v1
+    }
+
+    #[test]
+    fn lyrics3v2_before_id3v1_is_trimmed() {
+        // Size counts LYRICSBEGIN and the fields, not the 6 digits or LYRICS200.
+        let lyrics = [&b"LYRICSBEGIN"[..], b"LYR00005hello", b"000024", b"LYRICS200"].concat();
+        for f in FIXTURES {
+            let l = frames(&[f, &lyrics, &id3v1()].concat()).unwrap();
+            assert_eq!((l.audio_end, l.tags_at), (f.len(), f.len()));
+            assert_eq!(l.frames.len(), frames(f).unwrap().frames.len());
+        }
+    }
+
+    #[test]
+    fn an_appended_id3v2_tag_with_a_footer_is_trimmed() {
+        for f in FIXTURES {
+            for tail in [id3v2(500, true), [id3v2(500, true), id3v1()].concat()] {
+                let l = frames(&[f, &tail].concat()).unwrap();
+                assert_eq!((l.audio_end, l.tags_at), (f.len(), f.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_data_after_the_last_frame_is_kept() {
+        for f in FIXTURES {
+            let padded = [f, &[0; 1024][..]].concat();
+            let l = frames(&padded).unwrap();
+            assert_eq!((l.audio_end, l.tags_at, l.frames.len()), (f.len(), padded.len(), frames(f).unwrap().frames.len()));
+            let out = adjust(&padded, 2).unwrap();
+            assert_eq!(out[f.len()..], padded[f.len()..]);
+            assert_eq!(adjust(&out, -2).unwrap(), padded);
+        }
+    }
+
+    #[test]
+    fn garbage_mid_file_loses_sync() {
+        let at = frames(CBR128).unwrap().frames[10].at;
+        let b = [&CBR128[..at], &[0x55; 50], &CBR128[at..]].concat();
+        assert_eq!(frames(&b).unwrap_err(), GainError::SyncLost(at));
+    }
+
+    #[test]
+    fn a_tag_size_that_cuts_into_the_audio_is_not_trusted() {
+        let mut tag = ape();
+        let foot = tag.len() - 32;
+        tag[foot + 12..foot + 16].copy_from_slice(&5_000u32.to_le_bytes());
+        let tagged = [CBR128, &tag, &id3v1()].concat();
+        let plain = frames(CBR128).unwrap();
+        let l = frames(&tagged).unwrap();
+        assert_eq!((l.frames.len(), l.audio_end), (plain.frames.len(), CBR128.len()));
+        let out = adjust(&tagged, 2).unwrap();
+        assert_eq!(gains(&out), gains(&tagged).iter().map(|g| g + 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn only_the_first_frame_can_be_an_info_frame() {
+        let mut b = CBR128.to_vec();
+        let f = frames(CBR128).unwrap().frames[10];
+        let side = f.at + f.header.side_info_at();
+        b[side..side + f.header.side_info_len()].fill(0);
+        b[side + f.header.side_info_len()..][..4].copy_from_slice(b"Info");
+        b[f.at + 36..f.at + 40].copy_from_slice(b"VBRI");
+        assert!(!frames(&b).unwrap().frames[10].info);
+    }
+
+    #[test]
+    fn a_lone_frame_counts_only_at_the_start() {
+        let f = frames(CBR128).unwrap().frames[3];
+        let frame = &CBR128[f.at..f.at + f.header.len];
+        assert_eq!(frames(frame).unwrap().frames.len(), 1);
+        assert_eq!(frames(&[&b"abc"[..], frame].concat()).unwrap_err(), GainError::NotLayer3);
+    }
+
+    #[test]
+    fn a_lone_free_format_header_is_not_free_format() {
+        let b = [&[0u8; 300][..], &[0xFF, 0xFB, 0x00, 0x00], &[0; 300]].concat();
+        assert_eq!(frames(&b).unwrap_err(), GainError::NotLayer3);
+    }
+
+    #[test]
+    fn silent_granules_do_not_limit_the_range() {
+        // Make the last block (gr 1, ch 1) of frames 10..20 silent: part2_3_length 0, big_values
+        // 0, global_gain 0, scalefac_compress 0. Nothing in those frames' main data follows it,
+        // so the rest still decodes.
+        let mut b = CBR128.to_vec();
+        let l = frames(CBR128).unwrap();
+        for f in &l.frames[10..20] {
+            let side = &mut b[f.at + f.header.side_info_at()..][..f.header.side_info_len()];
+            let gain = gain_bits(&f.header).last().unwrap();
+            for (bit, n) in [(gain - 21, 12), (gain - 9, 9), (gain, 8), (gain + 8, 4)] {
+                set_bits(side, bit, n, 0).unwrap();
+            }
+        }
+        let (lo, _) = step_range(&b).unwrap();
+        assert!(lo <= -3, "{lo}");
+        let (_, x) = crate::decode(&b, Some("mp3")).unwrap();
+        for steps in [-3, 2] {
+            let out = adjust(&b, steps).unwrap();
+            // The silent blocks saturate into 0..=255.
+            let f = l.frames[12];
+            let gain = gain_bits(&f.header).last().unwrap();
+            assert_eq!(get_bits(&out[f.at + f.header.side_info_at()..], gain, 8), Some(steps.max(0) as u32));
+            let (_, y) = crate::decode(&out, Some("mp3")).unwrap();
+            let (x, y) = (x.interleaved(), y.interleaved());
+            assert_eq!(x.len(), y.len());
+            let want = 2f64.powf(f64::from(steps) / 4.0);
+            let err = x.iter().zip(&y).map(|(&a, &b)| (f64::from(b) - want * f64::from(a)).abs()).fold(0.0, f64::max);
+            assert!(err < 1e-4, "{steps}: max residual {err}");
+        }
     }
 }

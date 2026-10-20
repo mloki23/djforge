@@ -3,12 +3,13 @@
 
 use soundcraft_audio_io::{decode, mp3gain};
 
-const FIXTURES: [(&str, &[u8]); 5] = [
+const FIXTURES: [(&str, &[u8]); 6] = [
     ("cbr128_44k_stereo", include_bytes!("fixtures/mp3/cbr128_44k_stereo.mp3")),
     ("vbr_48k_stereo", include_bytes!("fixtures/mp3/vbr_48k_stereo.mp3")),
     ("cbr64_44k_mono", include_bytes!("fixtures/mp3/cbr64_44k_mono.mp3")),
     ("mpeg2_22k_mono", include_bytes!("fixtures/mp3/mpeg2_22k_mono.mp3")),
     ("mpeg2_24k_stereo", include_bytes!("fixtures/mp3/mpeg2_24k_stereo.mp3")),
+    ("mpeg25_11k_mono", include_bytes!("fixtures/mp3/mpeg25_11k_mono.mp3")),
 ];
 
 #[test]

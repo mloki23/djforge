@@ -17,3 +17,4 @@ make vbr_48k_stereo.mp3 -ar 48000 -ac 2 -c:a libmp3lame -q:a 2
 make cbr64_44k_mono.mp3 -ar 44100 -ac 1 -c:a libmp3lame -b:a 64k -write_xing 0
 make mpeg2_22k_mono.mp3 -ar 22050 -ac 1 -c:a libmp3lame -b:a 32k -write_xing 0
 make mpeg2_24k_stereo.mp3 -ar 24000 -ac 2 -c:a libmp3lame -b:a 64k
+make mpeg25_11k_mono.mp3 -ar 11025 -ac 1 -c:a libmp3lame -b:a 16k
