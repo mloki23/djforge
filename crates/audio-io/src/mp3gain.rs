@@ -307,10 +307,31 @@ fn set_bits(buf: &mut [u8], bit: usize, n: usize, v: u32) -> Option<()> {
     Some(())
 }
 
-/// A granule/channel block with no Huffman data (part2_3_length 0, the 12 bits at its start,
-/// 21 bits before global_gain): it decodes to zeros.
-fn silent(side: &[u8], gain_bit: usize) -> bool {
-    gain_bit.checked_sub(21).and_then(|bit| get_bits(side, bit, 12)) == Some(0)
+/// Output below this is inaudible (−120 dBFS).
+const INAUDIBLE: f64 = 1e-6;
+/// Largest Layer III Huffman value: 15 plus 13 linbits, 15 + 8191.
+const MAX_IS: f64 = 8206.0;
+/// Loose bound on the gain from dequantized values to PCM, rounded up to 2^14: stereo
+/// processing and alias reduction (√2 each), overlap-added IMDCT (36 terms, |cos| and window
+/// ≤ 1), 32 subbands into the polyphase matrix (|cos| ≤ 1), and its window (Σ|D| per output
+/// sample taken as ≤ 3).
+const SYNTH_GAIN: f64 = 16_384.0;
+
+/// Upper bound on a granule's output at `global_gain`: dequantized values are at most
+/// |is|^(4/3) × 2^((global_gain − 210)/4), since scalefactors and subblock gain only reduce them.
+fn max_amplitude(global_gain: u32) -> f64 {
+    MAX_IS.powf(4.0 / 3.0) * 2f64.powf((f64::from(global_gain) - 210.0) / 4.0) * SYNTH_GAIN
+}
+
+/// The lowest global_gain whose output bound reaches [`INAUDIBLE`]; every lower one is inaudible.
+fn inaudible_below() -> u32 {
+    (0..=255).find(|&g| max_amplitude(g) >= INAUDIBLE).unwrap_or(0)
+}
+
+/// A granule/channel block that can't be heard: no Huffman data (part2_3_length 0, the 12 bits
+/// at its start, 21 bits before global_gain), or global_gain below `below`.
+fn inaudible(side: &[u8], gain_bit: usize, below: u32) -> bool {
+    gain_bit.checked_sub(21).and_then(|bit| get_bits(side, bit, 12)) == Some(0) || get_bits(side, gain_bit, 8).is_some_and(|g| g < below)
 }
 
 /// Every audio (non-info) frame with the offset of its side info.
@@ -320,17 +341,18 @@ fn audio_frames(b: &[u8]) -> Result<Vec<(Frame, usize)>, GainError> {
 }
 
 /// The steps that keep every audio granule's global_gain within 0..=255: (most negative, most positive).
-/// Silent granules (part2_3_length 0) don't count; [`adjust`] saturates them.
+/// Inaudible granules (part2_3_length 0, or global_gain too low to reach −120 dBFS) don't count;
+/// [`adjust`] saturates them.
 pub fn step_range(bytes: &[u8]) -> Result<(i32, i32), GainError> {
     range(bytes, &audio_frames(bytes)?)
 }
 
 fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError> {
-    let (mut lo, mut hi) = (255u32, 0u32);
+    let (mut lo, mut hi, below) = (255u32, 0u32, inaudible_below());
     for &(f, side) in audio {
         let side = bytes.get(side..).ok_or(GainError::SyncLost(f.at))?;
         for bit in gain_bits(&f.header) {
-            if silent(side, bit) {
+            if inaudible(side, bit, below) {
                 continue;
             }
             let g = get_bits(side, bit, 8).ok_or(GainError::SyncLost(f.at))?;
@@ -342,8 +364,8 @@ fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError
 }
 
 /// A copy of `bytes` with every audio frame's global_gain moved by `steps` (CRC frames re-protected,
-/// info frames, tags and trailing data copied unchanged; silent granules saturate into 0..=255).
-/// Once a silent granule has saturated, adjusting back by −`steps` decodes the same but is not
+/// info frames, tags and trailing data copied unchanged; inaudible granules saturate into 0..=255).
+/// Once an inaudible granule has saturated, adjusting back by −`steps` decodes the same but is not
 /// byte-identical: keep the original rather than re-adjusting.
 pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
     let audio = audio_frames(bytes)?;
@@ -351,15 +373,15 @@ pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
     if !(lo..=hi).contains(&steps) {
         return Err(GainError::NoRoom);
     }
-    let mut out = bytes.to_vec();
+    let (mut out, below) = (bytes.to_vec(), inaudible_below());
     for (f, side) in audio {
         let lost = GainError::SyncLost(f.at);
         let side_bytes = out.get_mut(side..side + f.header.side_info_len()).ok_or(lost.clone())?;
         for bit in gain_bits(&f.header) {
             let g = get_bits(side_bytes, bit, 8).and_then(|g| i32::try_from(g).ok()).ok_or(lost.clone())?;
             let g = g.saturating_add(steps);
-            // A silent granule decodes to zeros at any gain, so it saturates instead.
-            let g = if silent(side_bytes, bit) { g.clamp(0, 255) } else { g };
+            // An inaudible granule stays inaudible at any lower gain, so it saturates instead.
+            let g = if inaudible(side_bytes, bit, below) { g.clamp(0, 255) } else { g };
             let g = u32::try_from(g).map_err(|_| GainError::NoRoom)?;
             set_bits(side_bytes, bit, 8, g).ok_or(GainError::NoRoom)?;
         }
@@ -874,7 +896,7 @@ mod tests {
         // A footer-only APE tag whose size claims a start 100 bytes into frame 30.
         let plain = frames(CBR128).unwrap();
         let start = plain.frames[30].at + 100;
-        let item = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes(), b"Title hello"].concat();
+        let item = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes(), b"Title\0hello"].concat();
         let size = u32::try_from(CBR128.len() - start + item.len() + 32).unwrap();
         let footer = [&b"APETAGEX"[..], &2000u32.to_le_bytes(), &size.to_le_bytes(), &1u32.to_le_bytes(), &0u32.to_le_bytes(), &[0; 8]].concat();
         let tagged = [CBR128, &item, &footer, &id3v1()].concat();
@@ -882,5 +904,43 @@ mod tests {
         assert_eq!((l.frames.len(), l.audio_end), (plain.frames.len(), CBR128.len()));
         let out = adjust(&tagged, 2).unwrap();
         assert_eq!(gains(&out), gains(&tagged).iter().map(|g| g + 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_inaudible_threshold_follows_from_the_spec_bound() {
+        let below = inaudible_below();
+        assert!(below > 0, "{below}");
+        assert!(max_amplitude(below - 1) < INAUDIBLE, "{below}");
+        assert!(max_amplitude(below) >= INAUDIBLE, "{below}");
+    }
+
+    #[test]
+    fn inaudible_granules_do_not_limit_the_range() {
+        // Force global_gain 0 in the first block of frames 10..14, keeping their Huffman data.
+        let mut b = CBR128.to_vec();
+        let l = frames(CBR128).unwrap();
+        let (_, hi) = step_range(CBR128).unwrap();
+        for f in &l.frames[10..14] {
+            let side = &mut b[f.at + f.header.side_info_at()..][..f.header.side_info_len()];
+            let gain = gain_bits(&f.header).next().unwrap();
+            assert_ne!(get_bits(side, gain - 21, 12), Some(0));
+            set_bits(side, gain, 8, 0).unwrap();
+        }
+        let (lo, hi_forced) = step_range(&b).unwrap();
+        assert!(lo <= -3, "{lo}");
+        assert_eq!(hi_forced, hi);
+        let (_, x) = crate::decode(&b, Some("mp3")).unwrap();
+        for steps in [-3, 2] {
+            let out = adjust(&b, steps).unwrap();
+            let f = l.frames[12];
+            let gain = gain_bits(&f.header).next().unwrap();
+            assert_eq!(get_bits(&out[f.at + f.header.side_info_at()..], gain, 8), Some(steps.max(0) as u32));
+            let (_, y) = crate::decode(&out, Some("mp3")).unwrap();
+            let (x, y) = (x.interleaved(), y.interleaved());
+            assert_eq!(x.len(), y.len());
+            let want = 2f64.powf(f64::from(steps) / 4.0);
+            let err = x.iter().zip(&y).map(|(&a, &b)| (f64::from(b) - want * f64::from(a)).abs()).fold(0.0, f64::max);
+            assert!(err < 1e-5, "{steps}: max residual {err}");
+        }
     }
 }
