@@ -319,7 +319,11 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
         // CREATE_NO_WINDOW: the GUI must not flash a console.
         command.creation_flags(0x0800_0000);
     }
-    let out = command.output().map_err(|err| bad(cmd, format!("could not run DJFORGE_PYTHON ({python}): {err}")))?;
+    let out = match output_within(&mut command, SIDECAR_TIMEOUT) {
+        Ok(Some(out)) => out,
+        Ok(None) => return Err(bad(cmd, format!("timed out after {} s", SIDECAR_TIMEOUT.as_secs()))),
+        Err(err) => return Err(bad(cmd, format!("could not run DJFORGE_PYTHON ({python}): {err}"))),
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -328,6 +332,44 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
         return Err(bad(cmd, format!("mixforge printed nothing ({}): {tail}", out.status)));
     }
     parse_analysis(cmd, &stdout)
+}
+
+/// Longest the mixforge sidecar may take over one file.
+const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs `command` (stdout and stderr captured) and returns its output, or `None` (after killing
+/// it) when it runs longer than `limit`.
+fn output_within(command: &mut std::process::Command, limit: std::time::Duration) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read as _;
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    // Both pipes are drained as the child writes, so a full pipe can't stall it.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let take = |h: std::thread::JoinHandle<Vec<u8>>| h.join().unwrap_or_default();
+            return Ok(Some(std::process::Output { status, stdout: take(stdout), stderr: take(stderr) }));
+        }
+        if started.elapsed() >= limit {
+            // The readers end when the pipes close; they are not waited for, since a process the
+            // child started may still hold them.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// The sidecar's output as a JSON object; its `{error}` becomes command `cmd`'s error.
@@ -600,6 +642,25 @@ pub(crate) fn settle_clipboard(cb: &mut crate::Clipboard, s: &Session) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sidecar_that_runs_too_long_is_stopped() {
+        let command = |argv: &[&str]| {
+            let mut c = std::process::Command::new(argv.first().copied().unwrap_or_default());
+            c.args(argv.get(1..).unwrap_or_default());
+            c
+        };
+        let (mut quick, mut slow) = if cfg!(windows) {
+            (command(&["cmd", "/C", "echo hi"]), command(&["ping", "-n", "30", "127.0.0.1"]))
+        } else {
+            (command(&["echo", "hi"]), command(&["sleep", "30"]))
+        };
+        let out = output_within(&mut quick, std::time::Duration::from_secs(20)).unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+        let started = std::time::Instant::now();
+        assert!(output_within(&mut slow, std::time::Duration::from_millis(300)).unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
     use crate::edit as ops;
     use soundcraft_audio_io::{AudioBuffer, FileFormat};
     use soundcraft_model::{ChannelFormat, TrackKind};

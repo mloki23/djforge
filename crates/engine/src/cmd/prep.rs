@@ -1,25 +1,37 @@
 //! `prep.tracks`: level-matched, tagged copies of a set's or a folder's MP3s. Each copy's frames
 //! get a lossless global_gain change (whole 1.5 dB steps, no re-encode) towards a loudness target
 //! without passing a true-peak ceiling; missing key and BPM tags are filled from mixforge's
-//! analysis. The originals are only read.
+//! analysis. The originals are only read, and nothing in `out` but earlier prep output is replaced.
 
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_audio_io::mp3gain::{self, STEP_DB};
+use soundcraft_audio_io::mp3gain::{self, GainError, STEP_DB};
 use soundcraft_audio_io::mp3tags::{self, TagFill};
-use soundcraft_audio_io::{AudioBuffer, decode};
+use soundcraft_audio_io::{AudioBuffer, decode, probe};
 use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_model::Session;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 const CMD: &str = "prep.tracks";
 /// The report written next to the copies.
 const REPORT: &str = "prep-report.txt";
+/// How the report starts: an existing `prep-report.txt` is replaced only when it starts so.
+const REPORT_HEADER: &str = "djforge track prep: ";
 /// Integrated loudness at or below this is too quiet to measure (the meter's absolute gate).
 const QUIET_LUFS: f64 = -70.0;
 /// Tracks within this many dB of the target count as on target in the totals.
 const ON_TARGET_DB: f64 = 0.75;
+/// How far over the ceiling a measured true peak may read before the copy counts as over it.
+const TP_SLACK_DB: f64 = 0.05;
+/// A decoded sample at or past this is clamped (the MP3 decoder stops at full scale), so the
+/// audio there is louder than it reads.
+const CLAMPED: f32 = 1.0 - 1e-6;
+/// Most steps cut past the pick to bring a clipped master's real peaks under the ceiling.
+const MAX_EXTRA_CUTS: i32 = 12;
+/// Longest track prepped, in seconds: each is decoded whole, twice.
+const MAX_SECS: f64 = 30.0 * 60.0;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![cmd!(
@@ -27,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Prep Tracks",
         [],
         None,
-        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written. Writes out/prep-report.txt. Returns {out, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed}], totals}",
+        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed}], totals}",
         always,
         prep_tracks
     )]
@@ -55,27 +67,50 @@ fn prep_tracks(e: &mut Engine, p: &Value) -> Result<Value> {
     run(e.session(), source, out, target, ceiling, &analyse)
 }
 
+/// `p` made absolute with `.` and `..` resolved by name (not by following links), in the
+/// platform's own separators.
+fn normalise(p: &Path) -> PathBuf {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            // `..` at the root stays at the root.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The tracks of `source` (a plan.json, or a folder's MP3s sorted by name) and the name the
-/// default output folder takes (the plan's folder, or the folder).
+/// default output folder takes (the plan's folder, or the folder). A plan naming one file twice
+/// is refused.
 fn sources(source: &str) -> Result<(String, Vec<PathBuf>)> {
-    let path = Path::new(source);
+    let path = normalise(Path::new(source));
     let folder_name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
     let is_plan = path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("json"));
     if is_plan {
-        let plan = super::dj::plan::parse_plan(&crate::io::read_text(path)?).map_err(|m| bad(CMD, m))?;
+        let plan = super::dj::plan::parse_plan(&crate::io::read_text(&path)?).map_err(|m| bad(CMD, m))?;
         let dir = path.parent().unwrap_or(Path::new(""));
-        let files = plan
+        let files: Vec<PathBuf> = plan
             .tracks
             .iter()
             .map(|t| {
                 let p = Path::new(&t.path);
-                if p.is_relative() { dir.join(p) } else { p.to_path_buf() }
+                normalise(&if p.is_relative() { dir.join(p) } else { p.to_path_buf() })
             })
             .collect();
-        let name = std::path::absolute(path).ok().and_then(|p| p.parent().and_then(folder_name)).unwrap_or_else(|| "set".to_string());
+        let mut seen = HashSet::new();
+        if let Some(twice) = files.iter().find(|f| !seen.insert(crate::io::file_key(f))) {
+            return Err(bad(CMD, format!("listed twice: {}; the plan must name each file once (nothing was written)", twice.display())));
+        }
+        let name = path.parent().and_then(folder_name).unwrap_or_else(|| "set".to_string());
         return Ok((name, files));
     }
-    let mut files: Vec<PathBuf> = crate::io::list_files(path)
+    let mut files: Vec<PathBuf> = crate::io::list_files(&path)
         .map_err(|err| EngineError::Io(format!("{err} (`source` must be a plan.json or a folder of MP3s)")))?
         .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3")))
@@ -84,7 +119,7 @@ fn sources(source: &str) -> Result<(String, Vec<PathBuf>)> {
     if files.is_empty() {
         return Err(bad(CMD, format!("{source}: holds no MP3s")));
     }
-    let name = std::path::absolute(path).ok().as_deref().and_then(folder_name).unwrap_or_else(|| "folder".to_string());
+    let name = folder_name(&path).unwrap_or_else(|| "folder".to_string());
     Ok((name, files))
 }
 
@@ -92,27 +127,43 @@ fn sources(source: &str) -> Result<(String, Vec<PathBuf>)> {
 fn default_out(name: &str) -> Result<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let home = std::env::var_os(var).filter(|h| !h.is_empty()).ok_or_else(|| bad(CMD, format!("{var} is not set; pass `out`")))?;
-    Ok(PathBuf::from(home).join("Music").join("djforge-prepped").join(name))
+    Ok(normalise(&PathBuf::from(home).join("Music").join("djforge-prepped").join(name)))
+}
+
+/// Whether MP3 `bytes` carry prep's `TXXX:djforge_prep` note: a copy an earlier run wrote.
+fn has_prep_note(bytes: &[u8]) -> bool {
+    id3::Tag::read_from2(std::io::Cursor::new(bytes)).is_ok_and(|t| t.extended_texts().any(|x| x.description == mp3tags::PREP_DESCRIPTION))
+}
+
+/// Whether the file at `path` is an earlier prep report.
+fn is_prep_report(path: &Path) -> bool {
+    crate::io::read_file(path).is_ok_and(|b| b.starts_with(REPORT_HEADER.as_bytes()))
+}
+
+/// `out` is not a source's folder and nothing in it is a source (by name or link): checked by
+/// name before `out` exists and again, links followed, once it does.
+fn refuse_sources(files: &[PathBuf], out: &Path, dests: &[PathBuf]) -> Result<()> {
+    let key = crate::io::file_key;
+    let out_key = key(out);
+    if let Some(f) = files.iter().find(|f| f.parent().is_some_and(|p| p == out || key(p) == out_key)) {
+        return Err(bad(CMD, format!("`out` is the folder of source {}; choose another folder so the originals are never overwritten", f.display())));
+    }
+    let source_keys: HashSet<PathBuf> = files.iter().map(|f| key(f)).collect();
+    if let Some(d) = dests.iter().chain([&out.join(REPORT)]).find(|d| source_keys.contains(&key(d))) {
+        return Err(bad(CMD, format!("{}: is a source file; choose another `out`", d.display())));
+    }
+    Ok(())
 }
 
 /// Where each track's copy goes (`out/<file name>`), once every refusal and access check passed:
-/// `out` is not a source's folder, no two sources share a name, and no copy (or the report)
-/// would land on a source or a session's audio.
+/// `out` is not a source's folder, no two sources share a name, no copy (or the report) would
+/// land on a source or a session's audio, and every file already there is earlier prep output.
 fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBuf>> {
-    let key = crate::io::file_key;
-    let out_key = key(out);
-    let source_keys: std::collections::HashSet<PathBuf> = files.iter().map(|f| key(f)).collect();
-    let mut names: std::collections::HashMap<String, &Path> = std::collections::HashMap::new();
+    let mut names: HashMap<String, &Path> = HashMap::new();
     let mut dests = Vec::with_capacity(files.len());
     for f in files {
         crate::file_access::check_read(f).map_err(EngineError::Io)?;
         let name = f.file_name().and_then(|n| n.to_str()).ok_or_else(|| bad(CMD, format!("{}: not a file name", f.display())))?;
-        if f.parent().is_some_and(|p| key(p) == out_key) {
-            return Err(bad(
-                CMD,
-                format!("`out` is the folder of source {}; choose another folder so the originals are never overwritten", f.display()),
-            ));
-        }
         let lower = name.to_lowercase();
         if lower == REPORT {
             return Err(bad(CMD, format!("{}: is named like the report; rename it", f.display())));
@@ -122,10 +173,22 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBu
         }
         dests.push(out.join(name));
     }
-    for d in dests.iter().chain([&out.join(REPORT)]) {
-        if source_keys.contains(&key(d)) {
-            return Err(bad(CMD, format!("{}: is a source file; choose another `out`", d.display())));
+    refuse_sources(files, out, &dests)?;
+    let report = out.join(REPORT);
+    let report_found = crate::io::file_found(&report);
+    if report_found && !is_prep_report(&report) {
+        return Err(bad(CMD, format!("{}: exists and is not a prep report; move it or choose another `out`", report.display())));
+    }
+    for d in &dests {
+        if crate::io::file_found(d) {
+            let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
+            let ours = if mp3 { crate::io::read_file(d).is_ok_and(|b| has_prep_note(&b)) } else { report_found };
+            if !ours {
+                return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
+            }
         }
+    }
+    for d in dests.iter().chain([&report]) {
         crate::io::refuse_source_file(s, d)?;
         crate::file_access::check_write(d).map_err(EngineError::Io)?;
     }
@@ -151,11 +214,13 @@ pub fn run(
     }
     let (name, files) = sources(source)?;
     let out = match out {
-        Some(o) => PathBuf::from(o),
+        Some(o) => normalise(Path::new(o)),
         None => default_out(&name)?,
     };
     let dests = destinations(s, &files, &out)?;
     crate::io::make_dir(&out)?;
+    // Now that it exists, `out` is compared with the sources again with its links followed.
+    refuse_sources(&files, &out, &dests)?;
 
     // One track at a time, so only one track's audio is in memory.
     let rows: Vec<Row> = files.iter().zip(&dests).map(|(src, dest)| prep_one(s, src, dest, target_lufs, ceiling, analyse)).collect();
@@ -164,7 +229,7 @@ pub fn run(
     let written = || rows.iter().filter(|r| r.status != "failed");
     let measured = written().filter(|r| r.lufs_after.is_some()).count();
     let on_target = written().filter(|r| r.lufs_after.is_some_and(|l| (l - target_lufs).abs() <= ON_TARGET_DB)).count();
-    let over = written().filter(|r| r.tp_after.is_some_and(|tp| tp > ceiling)).count();
+    let over = written().filter(|r| r.over(ceiling)).count();
     let totals = json!({
         "ok": count("ok"),
         "not_adjusted": count("not_adjusted"),
@@ -184,8 +249,7 @@ pub fn run(
         "tracks": rows.iter().map(Row::json).collect::<Vec<_>>(),
         "totals": totals,
     });
-    let path = report_path.to_str().ok_or_else(|| EngineError::Io(format!("{}: not a Unicode path", report_path.display())))?;
-    crate::io::write_user_file(s, path, text_report(&r, &rows, utc_now()).as_bytes())?;
+    crate::io::replace_user_file(s, &report_path, text_report(&r, &rows, utc_now()).as_bytes())?;
     Ok(r)
 }
 
@@ -220,6 +284,11 @@ impl Row {
         f64::from(self.steps) * STEP_DB
     }
 
+    /// Whether the copy's true peak is over `ceiling`.
+    fn over(&self, ceiling: f64) -> bool {
+        self.tp_after.is_some_and(|tp| tp > ceiling + TP_SLACK_DB)
+    }
+
     fn json(&self) -> Value {
         json!({
             "file": self.file,
@@ -237,11 +306,21 @@ impl Row {
     }
 }
 
-/// Integrated loudness (LUFS) and true peak (dBTP).
+/// Integrated loudness (LUFS) and true peak (dBTP), and whether any decoded sample was clamped at
+/// full scale (then the true values are higher than these).
 #[derive(Debug, Clone, Copy)]
 struct Level {
     lufs: f64,
     tp: f64,
+    clamped: bool,
+}
+
+impl Level {
+    /// These levels moved by `steps` gain steps.
+    fn moved(self, steps: i32) -> Self {
+        let db = f64::from(steps) * STEP_DB;
+        Self { lufs: self.lufs + db, tp: self.tp + db, clamped: self.clamped }
+    }
 }
 
 /// The decoded audio of MP3 `bytes` and its level.
@@ -253,18 +332,26 @@ fn measure(bytes: &[u8]) -> std::result::Result<(AudioBuffer, Level), String> {
     }
     let mut meter = LoudnessMeter::new(buf.sample_rate as f32, buf.channels.len());
     meter.process(&buf.channels, frames);
-    let level = Level { lufs: f64::from(meter.integrated_lufs()), tp: f64::from(meter.true_peak_db()) };
+    let clamped = buf.channels.iter().flatten().any(|s| s.abs() >= CLAMPED);
+    let level = Level { lufs: f64::from(meter.integrated_lufs()), tp: f64::from(meter.true_peak_db()), clamped };
     Ok((buf, level))
 }
 
 /// Whether `y` is `x` scaled by exactly `steps` global_gain steps: the same shape, a least-squares
 /// ratio within 0.01 dB of the step, and nowhere off that ratio by more than 1e-3 of the peak (so
-/// a level change part-way through fails even when the overall ratio is close).
+/// a level change part-way through fails even when the overall ratio is close). Samples clamped
+/// at full scale in either are left out (the decoder lost their true value); at least half the
+/// samples must remain.
 fn verify(x: &AudioBuffer, y: &AudioBuffer, steps: i32) -> std::result::Result<(), String> {
     if x.channels.len() != y.channels.len() || x.channels.iter().zip(&y.channels).any(|(a, b)| a.len() != b.len()) {
         return Err("the copy decodes to a different length".into());
     }
-    let pairs = || x.channels.iter().zip(&y.channels).flat_map(|(a, b)| a.iter().zip(b)).map(|(&a, &b)| (f64::from(a), f64::from(b)));
+    let all = || x.channels.iter().zip(&y.channels).flat_map(|(a, b)| a.iter().zip(b));
+    let pairs = || all().filter(|(a, b)| a.abs() < CLAMPED && b.abs() < CLAMPED).map(|(&a, &b)| (f64::from(a), f64::from(b)));
+    let (used, total) = (pairs().count(), all().count());
+    if used == 0 || used < total / 2 {
+        return Err(format!("too few unclipped samples to compare ({used} of {total})"));
+    }
     let (xy, xx, peak) = pairs().fold((0.0, 0.0, 0.0f64), |(xy, xx, pk), (a, b)| (xy + a * b, xx + a * a, pk.max(a.abs()).max(b.abs())));
     if !(xx > 0.0 && xy > 0.0) {
         return Err("the audio is silent or inverted".into());
@@ -272,7 +359,7 @@ fn verify(x: &AudioBuffer, y: &AudioBuffer, steps: i32) -> std::result::Result<(
     let ratio = xy / xx;
     let off_db = 20.0 * ratio.log10() - f64::from(steps) * STEP_DB;
     if off_db.is_nan() || off_db.abs() >= 0.01 {
-        return Err(format!("the copy is {off_db:+.3} dB off the {:+.1} dB step", f64::from(steps) * STEP_DB));
+        return Err(format!("the copy is {off_db:+.3} dB off the step"));
     }
     let residual = pairs().map(|(a, b)| (b - ratio * a).abs()).fold(0.0, f64::max);
     if residual > 1e-3 * peak {
@@ -281,62 +368,153 @@ fn verify(x: &AudioBuffer, y: &AudioBuffer, steps: i32) -> std::result::Result<(
     Ok(())
 }
 
-/// The gain-adjusted copy of MP3 `bytes`, filling `row`'s levels; the bytes unchanged when they
-/// can't be adjusted, `None` when the adjusted copy fails verification.
-fn level(bytes: &[u8], target: f64, ceiling: f64, row: &mut Row) -> Option<Vec<u8>> {
-    let (x, before) = match measure(bytes) {
+/// MP3 `bytes` moved by `steps` and checked against the original's decoded audio `x` (at `before`):
+/// the copy and its level, or `None` (with `row` failed) when it does not decode or verify.
+fn attempt(bytes: &[u8], x: &AudioBuffer, before: Level, steps: i32, row: &mut Row) -> std::result::Result<Option<(Vec<u8>, Level)>, GainError> {
+    if steps == 0 {
+        return Ok(Some((bytes.to_vec(), before)));
+    }
+    let adjusted = mp3gain::adjust(bytes, steps)?;
+    let tried = format!("{steps} steps, {:+.1} dB", f64::from(steps) * STEP_DB);
+    let checked = measure(&adjusted).and_then(|(y, after)| verify(x, &y, steps).map(|()| after));
+    match checked {
+        Ok(after) => Ok(Some((adjusted, after))),
+        Err(m) => {
+            row.failed(format!("the adjusted copy ({tried}) did not verify: {m}"));
+            Ok(None)
+        }
+    }
+}
+
+/// The gain-adjusted copy of MP3 `bytes` (whose step range is `range`), filling `row`'s levels;
+/// the bytes unchanged when they can't be adjusted, `None` when a copy fails verification.
+///
+/// A clipped master decodes clamped at full scale, so its first measurement reads low. A copy
+/// that still clamps, or whose true peak is over the ceiling, is cut one more step (up to
+/// [`MAX_EXTRA_CUTS`]); once a copy is clean, the original's levels are taken from it (the copy's
+/// less the gain) and the step is picked again from those.
+fn level(bytes: &[u8], range: std::result::Result<(i32, i32), GainError>, target: f64, ceiling: f64, row: &mut Row) -> Option<Vec<u8>> {
+    let (x, measured) = match measure(bytes) {
         Ok(m) => m,
         Err(m) => {
             row.not_adjusted(format!("does not decode ({m})"));
             return Some(bytes.to_vec());
         }
     };
-    (row.lufs_before, row.tp_before, row.lufs_after, row.tp_after) = (Some(before.lufs), Some(before.tp), Some(before.lufs), Some(before.tp));
-    let range = match mp3gain::step_range(bytes) {
+    let set_before = |row: &mut Row, l: Level| (row.lufs_before, row.tp_before) = (Some(l.lufs), Some(l.tp));
+    let set_after = |row: &mut Row, l: Level| (row.lufs_after, row.tp_after) = (Some(l.lufs), Some(l.tp));
+    set_before(row, measured);
+    set_after(row, measured);
+    let clip_note = |l: Level| format!("original clips at 0 dBFS (true peak ≈ {:+.1} dBTP)", l.tp);
+    let range = match range {
         Ok(r) => r,
         Err(err) => {
+            if measured.clamped {
+                row.doubts.push(format!("original clips at 0 dBFS (true peak above {:+.1} dBTP)", measured.tp));
+            }
             row.not_adjusted(err);
             return Some(bytes.to_vec());
         }
     };
-    let lufs = if before.lufs > QUIET_LUFS { before.lufs } else { f64::NAN };
-    let pick = pick_steps(lufs, before.tp, target, ceiling, range);
+    let measurable = |l: Level| if l.lufs > QUIET_LUFS { l.lufs } else { f64::NAN };
+    let mut pick = pick_steps(measurable(measured), measured.tp, target, ceiling, range);
     if pick.limited_by == Some("unmeasurable") {
         row.not_adjusted("too quiet to measure");
         return Some(bytes.to_vec());
     }
-    row.limited_by = pick.limited_by;
-    if pick.steps == 0 {
-        return Some(bytes.to_vec());
-    }
-    let adjusted = match mp3gain::adjust(bytes, pick.steps) {
-        Ok(a) => a,
-        Err(err) => {
-            row.limited_by = None;
-            row.not_adjusted(err);
-            return Some(bytes.to_vec());
+    let (mut k, mut cuts, mut repicked) = (pick.steps, 0, false);
+    let (copy, after) = loop {
+        let (copy, after) = match attempt(bytes, &x, measured, k, row) {
+            Ok(Some(a)) => a,
+            Ok(None) => return None,
+            Err(err) => {
+                row.not_adjusted(err);
+                return Some(bytes.to_vec());
+            }
+        };
+        if measured.clamped && !after.clamped && k != 0 && !repicked {
+            repicked = true;
+            let honest = after.moved(-k);
+            let again = pick_steps(measurable(honest), honest.tp, target, ceiling, range);
+            if again.limited_by != Some("unmeasurable") {
+                pick = again;
+                if again.steps != k {
+                    k = again.steps;
+                    continue;
+                }
+            }
         }
+        let hot = after.clamped || after.tp > ceiling + TP_SLACK_DB;
+        if hot && cuts < MAX_EXTRA_CUTS && k > range.0 {
+            (k, cuts) = (k - 1, cuts + 1);
+            continue;
+        }
+        break (copy, after);
     };
-    let checked = measure(&adjusted).and_then(|(y, after)| verify(&x, &y, pick.steps).map(|()| after));
     drop(x);
-    match checked {
-        Ok(after) => {
-            row.steps = pick.steps;
-            (row.lufs_after, row.tp_after) = (Some(after.lufs), Some(after.tp));
-            Some(adjusted)
-        }
-        Err(m) => {
-            row.failed(format!("the adjusted copy did not verify: {m}"));
-            None
+    row.steps = k;
+    set_after(row, after);
+    if measured.clamped {
+        if after.clamped || k == 0 {
+            row.doubts.push(format!("original clips at 0 dBFS (true peak above {:+.1} dBTP)", measured.tp));
+        } else {
+            let honest = after.moved(-k);
+            set_before(row, honest);
+            row.doubts.push(clip_note(honest));
         }
     }
+    let hot = after.clamped || after.tp > ceiling + TP_SLACK_DB;
+    row.limited_by = if hot {
+        Some(if k <= range.0 { "global_gain" } else { "peaks" })
+    } else if k < pick.steps {
+        Some("peaks")
+    } else {
+        pick.limited_by
+    };
+    if after.clamped {
+        row.doubts.push("the copy still clips at 0 dBFS".into());
+    }
+    Some(copy)
 }
 
-/// `1A`–`12B`, the Camelot keys Mixed In Key writes.
-fn camelot(k: &str) -> Option<String> {
-    let k = k.trim().to_ascii_uppercase();
-    let n = k.strip_suffix(['A', 'B'])?;
-    (!n.starts_with('0') && n.parse::<u8>().is_ok_and(|n| (1..=12).contains(&n))).then_some(k.clone())
+/// `k` as a Camelot key (`1A`–`12B`): Camelot itself (`4B`, `04b`) or musical notation (`Am`,
+/// `F#m`, `Db`, `Ebmin`, `C major`).
+fn to_camelot(k: &str) -> Option<String> {
+    let k = k.trim();
+    let upper = k.to_ascii_uppercase();
+    if let Some(digits) = upper.strip_suffix(['A', 'B']).filter(|d| !d.is_empty() && d.len() <= 2 && d.bytes().all(|b| b.is_ascii_digit())) {
+        let n: u8 = digits.parse().ok()?;
+        let letter = upper.chars().last()?;
+        return (1..=12).contains(&n).then(|| format!("{n}{letter}"));
+    }
+    let mut chars = k.chars();
+    let root: u32 = match chars.next()?.to_ascii_uppercase() {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let rest = chars.as_str();
+    let (shift, rest) = match (rest.strip_prefix(['#', '♯']), rest.strip_prefix(['b', '♭'])) {
+        (Some(r), _) => (1, r),
+        (_, Some(r)) => (11, r),
+        _ => (0, rest),
+    };
+    let minor = match rest.trim().to_ascii_lowercase().as_str() {
+        "" | "maj" | "major" => false,
+        "m" | "min" | "minor" => true,
+        _ => return None,
+    };
+    let pc = (root + shift) % 12;
+    // Camelot numbers follow the circle of fifths from C major = 8B; a minor key is its
+    // relative major's number with A.
+    let major = if minor { (pc + 3) % 12 } else { pc };
+    let n = (major * 7 % 12 + 7) % 12 + 1;
+    Some(format!("{n}{}", if minor { 'A' } else { 'B' }))
 }
 
 /// mixforge's key and BPM for `src`, when usable; the doubts otherwise.
@@ -353,8 +531,8 @@ fn analysis(src: &Path, analyse: &dyn Fn(&str) -> std::result::Result<Value, Str
         }
     };
     let key = match a.get("camelot").and_then(Value::as_str) {
-        Some(k) => camelot(k).or_else(|| {
-            doubts.push(format!("mixforge's key `{k}` is not a Camelot key (not filled)"));
+        Some(k) => to_camelot(k).or_else(|| {
+            doubts.push(format!("mixforge's key `{k}` is not a key (not filled)"));
             None
         }),
         None => None,
@@ -387,6 +565,50 @@ fn prep_note(row: &Row, target: f64) -> String {
     )
 }
 
+/// Where the audio starts: after every leading ID3v2 tag (10-byte header, syncsafe size, and a
+/// 10-byte footer when flagged).
+fn id3_end(b: &[u8]) -> usize {
+    let mut at = 0usize;
+    while let Some(h) = b.get(at..at.saturating_add(10)).filter(|h| h.starts_with(b"ID3")) {
+        let size = h.get(6..10).unwrap_or_default().iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F));
+        let footer = if h.get(5).is_some_and(|f| f & 0x10 != 0) { 10 } else { 0 };
+        at = at.saturating_add(10).saturating_add(size).saturating_add(footer);
+    }
+    at.min(b.len())
+}
+
+/// Preps MP3 `bytes` from `src`: the copy to write, or `None` when the track failed.
+fn prep_mp3(
+    bytes: Vec<u8>,
+    src: &Path,
+    target: f64,
+    ceiling: f64,
+    row: &mut Row,
+    analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
+) -> Option<Vec<u8>> {
+    let range = mp3gain::step_range(&bytes);
+    if matches!(range, Err(GainError::NotLayer3)) {
+        // No MPEG audio frames: nothing to adjust, and tags would be written into a file no
+        // player reads as an MP3.
+        row.status = "not_adjusted";
+        row.doubts.push("not MPEG audio".into());
+        return Some(bytes);
+    }
+    let long = probe(&bytes, Some("mp3")).is_ok_and(|i| i.duration_secs() > MAX_SECS);
+    let adjusted = if long {
+        row.not_adjusted("longer than 30 min");
+        bytes
+    } else {
+        let adjusted = level(&bytes, range, target, ceiling, row)?;
+        drop(bytes);
+        adjusted
+    };
+    if let (Some(why), Some(after)) = (row.limited_by, row.lufs_after) {
+        row.doubts.insert(0, format!("{why}: reaches {after:.1} LUFS"));
+    }
+    tagged(adjusted, src, target, row, analyse)
+}
+
 /// Preps one track from `src` to `dest`.
 fn prep_one(s: &Session, src: &Path, dest: &Path, target: f64, ceiling: f64, analyse: &dyn Fn(&str) -> std::result::Result<Value, String>) -> Row {
     let mut row = Row { file: dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), status: "ok", ..Row::default() };
@@ -399,50 +621,65 @@ fn prep_one(s: &Session, src: &Path, dest: &Path, target: f64, ceiling: f64, ana
     };
     let is_mp3 = src.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
     let copy = if is_mp3 {
-        let Some(adjusted) = level(&bytes, target, ceiling, &mut row) else { return row };
-        drop(bytes);
-        if let (Some(why), Some(after)) = (row.limited_by, row.lufs_after) {
-            row.doubts.insert(0, format!("{why}: reaches {after:.1} LUFS"));
-        }
-        tagged(adjusted, src, target, &mut row, analyse)
+        let Some(copy) = prep_mp3(bytes, src, target, ceiling, &mut row, analyse) else { return row };
+        copy
     } else {
         row.not_adjusted("not an MP3");
         bytes
     };
-    let written = dest
-        .to_str()
-        .ok_or_else(|| EngineError::Io(format!("{}: not a Unicode path", dest.display())))
-        .and_then(|d| crate::io::write_user_file(s, d, &copy));
-    if let Err(err) = written {
+    if row.over(ceiling) {
+        row.doubts.push(format!("above the ceiling: tp {} dBTP", db(row.tp_after)));
+    }
+    if let Err(err) = crate::io::replace_user_file(s, dest, &copy) {
         row.failed(err);
     }
     row
 }
 
 /// `adjusted` with missing key and BPM tags filled from mixforge and the prep note added; with its
-/// tags untouched when they can't be rewritten. Notes what the tags say in `row`.
-fn tagged(adjusted: Vec<u8>, src: &Path, target: f64, row: &mut Row, analyse: &dyn Fn(&str) -> std::result::Result<Value, String>) -> Vec<u8> {
+/// tags untouched when they can't be rewritten. Notes what the tags say in `row`. `None` (the
+/// track failed) if the rewrite changed anything after the tag.
+fn tagged(
+    adjusted: Vec<u8>,
+    src: &Path,
+    target: f64,
+    row: &mut Row,
+    analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
+) -> Option<Vec<u8>> {
     let (key, bpm) = analysis(src, analyse, &mut row.doubts);
     let note = prep_note(row, target);
     let (bytes, tags) = match mp3tags::fill(&adjusted, &TagFill { camelot: key.as_deref(), bpm, prep_note: &note }) {
         Ok(x) => x,
         Err(err) => {
             row.doubts.push(format!("tags left as they are: {err}"));
-            return adjusted;
+            return Some(adjusted);
         }
     };
+    if bytes.get(id3_end(&bytes)..) != adjusted.get(id3_end(&adjusted)..) {
+        row.failed("writing the tags changed the audio after them");
+        return None;
+    }
     drop(adjusted);
     row.filled = tags.filled.clone();
-    if let (Some(file), Some(mf)) = (&tags.existing_key, &key)
-        && !file.trim().eq_ignore_ascii_case(mf)
-    {
-        row.doubts.push(format!("key: file {}, mixforge {mf} (file kept)", file.trim()));
+    if let Some(file) = tags.existing_key.as_deref().map(str::trim) {
+        match (to_camelot(file), &key) {
+            (Some(c), Some(mf)) if &c != mf => {
+                let shown = if c == file { c.clone() } else { format!("{file} ({c})") };
+                row.doubts.push(format!("key: file {shown}, mixforge {mf} (file kept)"));
+            }
+            (None, _) => row.doubts.push(format!("key: file `{file}` is not a key (file kept)")),
+            _ => {}
+        }
     }
-    if let (Some(file), Some(mf)) = (tags.existing_bpm.as_deref().and_then(|b| b.trim().parse::<f64>().ok()), bpm)
-        && (file - mf).abs() > 1.0
-    {
-        let twice = (file - 2.0 * mf).abs() <= 1.0 || (file - mf / 2.0).abs() <= 1.0;
-        row.doubts.push(format!("bpm: file {file}, mixforge {mf:.1}{} (file kept)", if twice { " (half/double)" } else { "" }));
+    if let Some(file) = tags.existing_bpm.as_deref().map(str::trim) {
+        match (file.parse::<f64>().ok().filter(|f| f.is_finite()), bpm) {
+            (Some(f), Some(mf)) if (f - mf).abs() > 1.0 => {
+                let twice = (f - 2.0 * mf).abs() <= 1.0 || (f - mf / 2.0).abs() <= 1.0;
+                row.doubts.push(format!("bpm: file {f}, mixforge {mf:.1}{} (file kept)", if twice { " (half/double)" } else { "" }));
+            }
+            (None, _) => row.doubts.push(format!("bpm: file `{file}` is not a number (file kept)")),
+            _ => {}
+        }
     }
     if !tags.unreadable.is_empty() {
         row.doubts.push(format!("unreadable tag frames (kept as they are): {}", tags.unreadable.join(", ")));
@@ -456,14 +693,14 @@ fn tagged(adjusted: Vec<u8>, src: &Path, target: f64, row: &mut Row, analyse: &d
     if !tags.album {
         row.doubts.push("no album".into());
     }
-    bytes
+    Some(bytes)
 }
 
 /// The plain-text report: a header, one line per track, then the totals.
 fn text_report(r: &Value, rows: &[Row], date: String) -> String {
     let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     let src = r.get("source").and_then(Value::as_str).unwrap_or("");
-    let mut out = format!("djforge track prep: {src}\ntarget {} LUFS, ceiling {} dBTP, {date}\n\n", num("target_lufs"), num("ceiling"));
+    let mut out = format!("{REPORT_HEADER}{src}\ntarget {} LUFS, ceiling {} dBTP, {date}\n\n", num("target_lufs"), num("ceiling"));
     for (i, row) in rows.iter().enumerate() {
         let filled = if row.filled.is_empty() { "-".to_string() } else { row.filled.join(",") };
         out.push_str(&format!(
@@ -593,12 +830,63 @@ mod tests {
     }
 
     #[test]
-    fn camelot_keys_are_normalised_or_refused() {
-        assert_eq!(camelot(" 4b "), Some("4B".to_string()));
-        assert_eq!(camelot("12A"), Some("12A".to_string()));
-        for bad in ["13A", "0A", "04B", "A", "4C", "", "Dm"] {
-            assert_eq!(camelot(bad), None, "{bad}");
+    fn verify_leaves_out_samples_the_decoder_clamped() {
+        // A master driven 6 dB past full scale, decoded clamped; cut 4 steps, it is clean.
+        let loud = |n: usize| 4.0 * (n as f32 * 0.05).sin();
+        let clamp = |v: f32| v.clamp(-1.0, 1.0);
+        let x = AudioBuffer { sample_rate: 48_000, channels: vec![(0..4_800).map(|n| clamp(loud(n))).collect()] };
+        let cut = 10f32.powf((-4.0 * STEP_DB / 20.0) as f32);
+        let y = AudioBuffer { sample_rate: 48_000, channels: vec![(0..4_800).map(|n| clamp(loud(n) * cut)).collect()] };
+        // Most samples clamp at 4×: too few left to compare.
+        assert!(verify(&x, &y, -4).unwrap_err().contains("too few"));
+        // At 1.1× about a quarter clamp; the rest compare exactly.
+        let mild = |n: usize| 1.1 * (n as f32 * 0.05).sin();
+        let x = AudioBuffer { sample_rate: 48_000, channels: vec![(0..4_800).map(|n| clamp(mild(n))).collect()] };
+        let y = AudioBuffer { sample_rate: 48_000, channels: vec![(0..4_800).map(|n| clamp(mild(n) * cut)).collect()] };
+        assert_eq!(verify(&x, &y, -4), Ok(()));
+        assert!(verify(&x, &y, -3).is_err());
+    }
+
+    #[test]
+    fn keys_in_either_notation_become_camelot() {
+        for (k, want) in [
+            (" 4b ", "4B"),
+            ("12A", "12A"),
+            ("04B", "4B"),
+            ("Am", "8A"),
+            ("F#m", "11A"),
+            ("Db", "3B"),
+            ("D#", "5B"),
+            ("Dm", "7A"),
+            ("Bbm", "3A"),
+            ("Ebmin", "2A"),
+            ("C major", "8B"),
+            ("E", "12B"),
+        ] {
+            assert_eq!(to_camelot(k).as_deref(), Some(want), "{k}");
         }
+        for bad in ["13A", "0A", "+4B", "A1", "4C", "", "H", "Am7", "100A"] {
+            assert_eq!(to_camelot(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_audio_starts_after_every_leading_tag() {
+        let tag = |size: u8, flags: u8| [b'I', b'D', b'3', 4, 0, flags, 0, 0, 0, size];
+        let mut b = tag(2, 0).to_vec();
+        b.extend([0, 0]);
+        b.extend(tag(0, 0x10));
+        b.extend([0u8; 10]);
+        b.extend(b"audio");
+        assert_eq!(id3_end(&b), b.len() - 5);
+        assert_eq!(id3_end(b"audio"), 0);
+        assert_eq!(id3_end(&tag(100, 0)), 10);
+    }
+
+    #[test]
+    fn dots_in_a_path_are_resolved_by_name() {
+        let base = std::path::absolute(".").unwrap();
+        assert_eq!(normalise(&base.join("a").join("..").join(".").join("b")), normalise(&base.join("b")));
     }
 
     #[test]

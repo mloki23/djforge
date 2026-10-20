@@ -1645,6 +1645,29 @@ pub fn write_user_file(s: &Session, path: &str, bytes: &[u8]) -> Result<()> {
     write_file(path, bytes)
 }
 
+/// [`write_user_file`] that replaces the file at `path` instead of writing into it: the bytes go
+/// to a temporary file in the same folder, which is then renamed over `path`. A link at `path`
+/// (symbolic or hard) is replaced, so whatever else it names is left as it was.
+pub fn replace_user_file(s: &Session, path: &Path, bytes: &[u8]) -> Result<()> {
+    refuse_source_file(s, path)?;
+    let shown = path.display();
+    if cfg!(target_arch = "wasm32") {
+        return write_file(path.to_str().ok_or_else(|| EngineError::Io(format!("{shown}: not a Unicode path")))?, bytes);
+    }
+    let name = path.file_name().ok_or_else(|| EngineError::Io(format!("{shown}: not a file name")))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".djforge-tmp");
+    let tmp = path.with_file_name(tmp_name);
+    crate::file_access::check_write(path).map_err(EngineError::Io)?;
+    crate::file_access::check_write(&tmp).map_err(EngineError::Io)?;
+    std::fs::write(&tmp, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        EngineError::Io(format!("{shown}: {err}"))
+    })
+}
+
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     if cfg!(target_arch = "wasm32") {
         let deliver = DELIVER.get().ok_or_else(|| EngineError::Io("saving files is not available in this build".into()))?;

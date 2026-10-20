@@ -255,3 +255,167 @@ fn a_malformed_tag_is_kept_as_it_is_on_the_adjusted_copy() {
     assert_eq!(copy[..tag], bytes[..tag], "the tag changed");
     assert_ne!(copy, bytes, "the gain did not change");
 }
+
+fn hot_master() -> Vec<u8> {
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hot_master.mp3")).unwrap()
+}
+
+/// A clipped master (pink noise, ffmpeg: -4.9 LUFS, +5.1 dBTP; it decodes past 0 dBFS).
+fn hot_folder(dir: &Path) -> PathBuf {
+    let src = dir.join("hot");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("master.mp3"), hot_master()).unwrap();
+    src
+}
+
+#[test]
+fn a_clipped_master_is_cut_to_the_target_and_measured_honestly() {
+    let dir = scratch("hot");
+    let src = hot_folder(&dir);
+    let out = dir.join("out");
+    let r = run(&src, &out, &no_analysis).unwrap();
+    let t = track(&r, "master.mp3");
+    assert_eq!(t["status"], "ok", "{t}");
+    let steps = t["steps"].as_i64().unwrap();
+    assert_eq!(steps, -6, "{t}");
+    // ffmpeg's ebur128 of the original: -4.9 LUFS, +5.1 dBTP.
+    assert!((t["lufs_before"].as_f64().unwrap() + 4.9).abs() < 0.3, "{t}");
+    assert!((t["tp_before"].as_f64().unwrap() - 5.1).abs() < 0.3, "{t}");
+    assert!((t["lufs_after"].as_f64().unwrap() + 14.0).abs() <= 0.76, "{t}");
+    assert!(t["tp_after"].as_f64().unwrap() <= -1.0 + 0.05, "{t}");
+    assert!(t["doubts"].as_array().unwrap().iter().any(|d| d.as_str().unwrap().starts_with("original clips at 0 dBFS")), "{t}");
+    assert_eq!(r["totals"]["over_ceiling"], 0);
+}
+
+#[test]
+fn a_clipped_master_is_cut_below_a_hot_target_until_its_peaks_clear_the_ceiling() {
+    let dir = scratch("hot-target");
+    let src = hot_folder(&dir);
+    let out = dir.join("out");
+    let r = prep_run(&Session::default(), src.to_str().unwrap(), Some(out.to_str().unwrap()), -6.0, -1.0, &no_analysis).unwrap();
+    let t = track(&r, "master.mp3");
+    assert_eq!(t["status"], "ok", "{t}");
+    assert_eq!(t["limited_by"], "peaks", "{t}");
+    assert!(t["steps"].as_i64().unwrap() <= -5, "{t}");
+    assert!(t["tp_after"].as_f64().unwrap() <= -1.0 + 0.05, "{t}");
+}
+
+/// Re-runs into an `out` that holds files: only earlier prep copies (and an earlier report) may
+/// be replaced.
+#[test]
+fn files_in_out_that_prep_did_not_write_are_never_replaced() {
+    let dir = scratch("guard");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    // A second run over its own copies and report is fine.
+    run(&src, &out, &no_analysis).unwrap();
+
+    // An original-looking file (no prep note) where a copy would go.
+    let foreign = out.join(FIXTURES[1]);
+    std::fs::write(&foreign, fixture(FIXTURES[1])).unwrap();
+    let before = snapshot(&out);
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains(FIXTURES[1]) && err.contains("not a prep copy"), "{err}");
+    assert_eq!(snapshot(&out), before, "something was written");
+
+    // A hard link to the original where a copy would go.
+    std::fs::remove_file(&foreign).unwrap();
+    std::fs::hard_link(src.join(FIXTURES[1]), &foreign).unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("not a prep copy"), "{err}");
+    assert_eq!(std::fs::read(src.join(FIXTURES[1])).unwrap(), fixture(FIXTURES[1]));
+    std::fs::remove_file(&foreign).unwrap();
+
+    // A report that isn't prep's.
+    std::fs::write(out.join("prep-report.txt"), "my notes").unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("prep-report.txt"), "{err}");
+    assert_eq!(std::fs::read_to_string(out.join("prep-report.txt")).unwrap(), "my notes");
+}
+
+#[test]
+fn a_copy_replaces_a_link_rather_than_writing_through_it() {
+    let dir = scratch("link");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    // An earlier prep copy hard-linked elsewhere: the next run must not change the other name.
+    let elsewhere = dir.join("kept.mp3");
+    std::fs::hard_link(out.join(FIXTURES[0]), &elsewhere).unwrap();
+    let kept = std::fs::read(&elsewhere).unwrap();
+    run(&src, &out, &|_: &str| Ok(json!({"camelot": "4B"}))).unwrap();
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), kept);
+    assert_ne!(std::fs::read(out.join(FIXTURES[0])).unwrap(), kept);
+}
+
+#[test]
+fn out_spelled_with_dots_is_still_the_source_folder() {
+    let dir = scratch("dots");
+    let src = source_folder(&dir);
+    let sneaky = src.join("missing").join("..");
+    let err = run(&src, &sneaky, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("source"), "{err}");
+    assert!(!src.join("missing").exists());
+}
+
+#[test]
+fn a_plan_listing_a_file_twice_is_refused() {
+    let dir = scratch("twice");
+    let src = source_folder(&dir);
+    let plan = plan_at(&dir, &[src.join(FIXTURES[0]), src.join(".").join(FIXTURES[0])]);
+    let err = run(&plan, &dir.join("out"), &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("listed twice"), "{err}");
+}
+
+#[test]
+fn non_mpeg_bytes_are_copied_without_new_tags() {
+    let dir = scratch("not-mpeg");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let junk = vec![0x42u8; 5000];
+    std::fs::write(src.join("fake.mp3"), &junk).unwrap();
+    let out = dir.join("out");
+    let r = run(&src, &out, &|_: &str| Ok(json!({"camelot": "4B", "bpm": 120.0}))).unwrap();
+    let t = track(&r, "fake.mp3");
+    assert_eq!(t["status"], "not_adjusted", "{t}");
+    assert!(t["doubts"].as_array().unwrap().iter().any(|d| d == "not MPEG audio"), "{t}");
+    assert_eq!(std::fs::read(out.join("fake.mp3")).unwrap(), junk);
+    assert!(r["report"].as_str().unwrap().ends_with(&format!("out{}prep-report.txt", std::path::MAIN_SEPARATOR)), "{r}");
+}
+
+/// `audio` (a fixture, its own tag dropped) under an ID3v2.3 tag of Latin-1 text frames.
+fn with_tag(audio: &[u8], frames: &[(&str, &str)]) -> Vec<u8> {
+    let audio = &audio[10 + soundcraft_size(audio)..];
+    let mut body = Vec::new();
+    for (id, text) in frames {
+        body.extend_from_slice(id.as_bytes());
+        body.extend_from_slice(&(text.len() as u32 + 1).to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0]);
+        body.extend_from_slice(text.as_bytes());
+    }
+    let n = body.len();
+    let mut out = b"ID3\x03\x00\x00".to_vec();
+    out.extend([(n >> 21) as u8 & 0x7F, (n >> 14) as u8 & 0x7F, (n >> 7) as u8 & 0x7F, n as u8 & 0x7F]);
+    out.extend(body);
+    out.extend_from_slice(audio);
+    out
+}
+
+#[test]
+fn file_keys_in_musical_notation_are_compared_as_camelot() {
+    let dir = scratch("keys");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let audio = fixture(FIXTURES[0]);
+    for (name, key, bpm) in [("a.mp3", "Am", "120"), ("b.mp3", "04B", "120"), ("c.mp3", "F#m", "fast")] {
+        std::fs::write(src.join(name), with_tag(&audio, &[("TKEY", key), ("TBPM", bpm)])).unwrap();
+    }
+    let out = dir.join("out");
+    let r = run(&src, &out, &|_: &str| Ok(json!({"camelot": "8A", "bpm": 120.0}))).unwrap();
+    let doubts = |f: &str| -> Vec<String> { track(&r, f)["doubts"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string()).collect() };
+    assert!(!doubts("a.mp3").iter().any(|d| d.starts_with("key:")), "{:?}", doubts("a.mp3"));
+    assert!(doubts("b.mp3").contains(&"key: file 04B (4B), mixforge 8A (file kept)".to_string()), "{:?}", doubts("b.mp3"));
+    assert!(doubts("c.mp3").contains(&"key: file F#m (11A), mixforge 8A (file kept)".to_string()), "{:?}", doubts("c.mp3"));
+    assert!(doubts("c.mp3").iter().any(|d| d.starts_with("bpm: file `fast` is not a number")), "{:?}", doubts("c.mp3"));
+}
