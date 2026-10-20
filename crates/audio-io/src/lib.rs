@@ -19,6 +19,7 @@ mod buffer;
 mod caf;
 mod flac;
 pub mod mp3gain;
+pub mod mp3tags;
 mod mp4;
 mod pcm;
 pub mod peaks;

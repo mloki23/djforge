@@ -12,6 +12,7 @@ serde.workspace = true
 thiserror.workspace = true
 log.workspace = true
 symphonia.workspace = true
+id3.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

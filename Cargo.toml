@@ -41,6 +41,8 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "fla
 rustfft = "6"
 # Session bundles (one file holding a session and its audio, for the browser): stored entries only.
 zip = { version = "9", default-features = false }
+# ID3v2 tags (MP3 prep fills missing key and BPM).
+id3 = { version = "1.17.2", default-features = false }
 cpal = "0.16"
 
 # Which file paths stored in a session may be opened.

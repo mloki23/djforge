@@ -127,7 +127,7 @@ fn free_format_at(b: &[u8], at: usize) -> bool {
 
 /// Offset after the ID3v2 tags at the start: 10-byte header, syncsafe size at 6..10, plus a
 /// 10-byte footer when flag 0x10 is set. Files may carry more than one.
-fn skip_id3v2(b: &[u8]) -> usize {
+pub(crate) fn skip_id3v2(b: &[u8]) -> usize {
     let mut at = 0usize;
     while let (Some(b"ID3"), Some(&flags), Some(size)) = (b.get(at..at + 3), b.get(at + 5), b.get(at + 6..at + 10)) {
         let footer = if flags & 0x10 != 0 { 10 } else { 0 };
@@ -136,7 +136,7 @@ fn skip_id3v2(b: &[u8]) -> usize {
     at
 }
 
-fn syncsafe(b: &[u8]) -> usize {
+pub(crate) fn syncsafe(b: &[u8]) -> usize {
     b.iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F))
 }
 
