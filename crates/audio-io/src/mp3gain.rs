@@ -243,8 +243,9 @@ fn walk(b: &[u8], start: usize, end: usize) -> Result<(Vec<Frame>, usize), GainE
 
 /// Find the audio between the tags and chain its frames. A trailing tag is trusted only if the
 /// frames end exactly where it starts; otherwise the walk is retried with it counted as audio.
-/// Without an exact match, the innermost walk that succeeded wins (an outer one may scan a tag
-/// body that holds frame-like bytes), else the last error.
+/// Without an exact match, the successful walk with the most audio wins (all share the same
+/// chain, so it holds the others; a corrupt trim can stop one mid-frame, and an outer one may
+/// fail on frame-like bytes in a tag body), else the last error.
 pub(crate) fn frames(b: &[u8]) -> Result<Layout, GainError> {
     let audio_start = skip_id3v2(b);
     let (mut inner, mut err) = (None, GainError::NotLayer3);
@@ -252,7 +253,9 @@ pub(crate) fn frames(b: &[u8]) -> Result<Layout, GainError> {
         match walk(b, audio_start, tags_at) {
             Ok((frames, audio_end)) if audio_end == tags_at => return Ok(Layout { audio_start, audio_end, tags_at, frames }),
             Ok((frames, audio_end)) => {
-                inner.get_or_insert(Layout { audio_start, audio_end, tags_at, frames });
+                if inner.as_ref().is_none_or(|l: &Layout| audio_end > l.audio_end) {
+                    inner = Some(Layout { audio_start, audio_end, tags_at, frames });
+                }
             }
             Err(e) => err = e,
         }
@@ -855,5 +858,20 @@ mod tests {
         let b = [CBR128, &[0x42][..], &tag, &id3v1()].concat();
         let got = frames(&b).unwrap();
         assert_eq!((got.frames.len(), got.audio_end, got.tags_at), (l.frames.len(), CBR128.len(), CBR128.len() + 1));
+    }
+
+    #[test]
+    fn a_tag_size_that_lands_mid_frame_is_not_trusted() {
+        // A footer-only APE tag whose size claims a start 100 bytes into frame 30.
+        let plain = frames(CBR128).unwrap();
+        let start = plain.frames[30].at + 100;
+        let item = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes(), b"Title hello"].concat();
+        let size = u32::try_from(CBR128.len() - start + item.len() + 32).unwrap();
+        let footer = [&b"APETAGEX"[..], &2000u32.to_le_bytes(), &size.to_le_bytes(), &1u32.to_le_bytes(), &0u32.to_le_bytes(), &[0; 8]].concat();
+        let tagged = [CBR128, &item, &footer, &id3v1()].concat();
+        let l = frames(&tagged).unwrap();
+        assert_eq!((l.frames.len(), l.audio_end), (plain.frames.len(), CBR128.len()));
+        let out = adjust(&tagged, 2).unwrap();
+        assert_eq!(gains(&out), gains(&tagged).iter().map(|g| g + 2).collect::<Vec<_>>());
     }
 }
