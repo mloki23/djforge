@@ -2,9 +2,11 @@
 
 use serde_json::{Value, json};
 use soundcraft_audio_io::{decode, mp3gain::STEP_DB, mp3tags};
-use soundcraft_engine::cmd::prep_run;
+use soundcraft_engine::cmd::{PrepJob, PrepProgress, prep_run, prep_start};
 use soundcraft_engine::model::Session;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 const FIXTURES: [&str; 3] = ["cbr128_44k_stereo.mp3", "vbr_48k_stereo.mp3", "cbr64_44k_mono.mp3"];
 
@@ -578,4 +580,128 @@ fn leftover_temp_files_in_out_are_cleared_and_nothing_else() {
         assert_eq!(std::fs::read_to_string(out.join(f)).unwrap(), "not ours", "{f}");
     }
     assert!(out.join(".folder.djforge-tmp").is_dir());
+}
+
+type Analyse = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>;
+
+/// An analysis that says which file it reached and then waits for the test's go-ahead.
+fn gated() -> (Analyse, mpsc::Receiver<String>, mpsc::Sender<()>) {
+    let (reached_tx, reached) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+    let analyse = move |path: &str| {
+        reached_tx.lock().unwrap().send(path.to_string()).unwrap();
+        go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
+        Err("no analysis here".to_string())
+    };
+    (Arc::new(analyse), reached, go)
+}
+
+fn start(source: &Path, out: &Path, analyse: Analyse) -> PrepJob {
+    prep_start(&Session::default(), source.to_str().unwrap(), Some(out.to_str().unwrap()), -14.0, -1.0, analyse).unwrap()
+}
+
+/// The job's result once it ended.
+fn finish(job: &mut PrepJob) -> Value {
+    let until = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(r) = job.poll() {
+            return r.unwrap();
+        }
+        assert!(std::time::Instant::now() < until, "the job never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_job_reports_each_track_while_it_preps_it() {
+    let dir = scratch("job-progress");
+    let src = source_folder(&dir);
+    let (analyse, reached, go) = gated();
+    let mut job = start(&src, &dir.join("out"), analyse);
+    let mut names = FIXTURES.to_vec();
+    names.sort();
+    for (i, name) in names.iter().enumerate() {
+        let path = reached.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(path.ends_with(name), "{path}");
+        assert_eq!(job.progress(), PrepProgress { done: i, total: 3, current: Some(name.to_string()) });
+        assert!(job.poll().is_none());
+        go.send(()).unwrap();
+    }
+    let r = finish(&mut job);
+    assert_eq!(r["cancelled"], false, "{r}");
+    assert_eq!(tracks(&r).len(), 3);
+    assert_eq!(job.progress(), PrepProgress { done: 3, total: 3, current: None });
+    assert!(!std::fs::read_to_string(dir.join("out").join("prep-report.txt")).unwrap().contains("cancelled"));
+}
+
+#[test]
+fn a_cancelled_job_stops_after_the_track_it_is_on_and_its_report_says_so() {
+    let dir = scratch("job-cancel");
+    let src = source_folder(&dir);
+    let out = dir.join("out");
+    let (analyse, reached, go) = gated();
+    let mut job = start(&src, &out, analyse);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    job.cancel();
+    assert!(job.cancelling());
+    go.send(()).unwrap();
+    let r = finish(&mut job);
+    assert_eq!(r["cancelled"], true, "{r}");
+    assert_eq!(tracks(&r).len(), 1);
+    assert_eq!(r["totals"]["ok"], 1);
+    assert!(reached.try_recv().is_err(), "a second track was started");
+    let mut written: Vec<String> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    written.sort();
+    assert_eq!(written, ["cbr128_44k_stereo.mp3", "prep-report.txt"]);
+    let report = std::fs::read_to_string(out.join("prep-report.txt")).unwrap();
+    assert!(report.contains("cancelled after 1 of 3"), "{report}");
+    // The next run takes the copy as its own.
+    let again = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(again["totals"]["ok"], 3, "{again}");
+}
+
+#[test]
+fn a_job_checks_everything_before_it_starts_and_gives_what_the_command_gives() {
+    let dir = scratch("job-same");
+    let src = source_folder(&dir);
+    let before = snapshot(&src);
+    let err = prep_start(&Session::default(), src.to_str().unwrap(), Some(src.to_str().unwrap()), -14.0, -1.0, Arc::new(no_analysis));
+    assert!(err.err().unwrap().to_string().contains("source"));
+    assert_eq!(snapshot(&src), before);
+
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    let by_command = run(&src, &a, &no_analysis).unwrap();
+    let by_job = finish(&mut start(&src, &b, Arc::new(no_analysis)));
+    assert_eq!(by_command["tracks"], by_job["tracks"]);
+    assert_eq!(by_command["cancelled"], false);
+    let without_time = |r: &Value| {
+        let mut t = r["totals"].clone();
+        t.as_object_mut().unwrap().remove("seconds");
+        t
+    };
+    assert_eq!(without_time(&by_command), without_time(&by_job));
+    for f in FIXTURES {
+        assert_eq!(std::fs::read(a.join(f)).unwrap(), std::fs::read(b.join(f)).unwrap(), "{f}");
+    }
+}
+
+#[test]
+fn a_cancelled_run_keeps_the_earlier_report_lines_of_the_tracks_it_did_not_reach() {
+    let dir = scratch("job-cancel-keeps");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.mp3"), fixture(FIXTURES[0])).unwrap();
+    // Not MPEG audio: its copy carries no prep note, only the report says it is prep's.
+    std::fs::write(src.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    let (analyse, reached, go) = gated();
+    let mut job = start(&src, &out, analyse);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    job.cancel();
+    go.send(()).unwrap();
+    assert_eq!(tracks(&finish(&mut job)).len(), 1);
+    let again = run(&src, &out, &no_analysis).unwrap();
+    assert_eq!(track(&again, "fake.mp3")["status"], "not_adjusted", "{again}");
 }

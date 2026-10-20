@@ -13,6 +13,8 @@ use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_model::Session;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 const CMD: &str = "prep.tracks";
 /// The report written next to the copies.
@@ -39,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Prep Tracks",
         [],
         None,
-        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed}], totals}",
+        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed}], totals, cancelled (always false here; true when the app's progress window stopped the run early)}",
         always,
         prep_tracks
     )]
@@ -54,17 +56,25 @@ fn num(p: &Value, key: &str, d: f64, range: std::ops::RangeInclusive<f64>) -> Re
 }
 
 fn prep_tracks(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (source, out, target, ceiling) = params(p)?;
+    run(e.session(), source, out, target, ceiling, &mixforge)
+}
+
+/// `prep.tracks`'s `source`, `out`, `target_lufs` and `ceiling`.
+fn params(p: &Value) -> Result<(&str, Option<&str>, f64, f64)> {
     let source = str_param(p, "source").ok_or_else(|| bad(CMD, "`source` required: a mixforge plan.json or a folder of MP3s"))?;
     let out = str_param(p, "out");
     let target = num(p, "target_lufs", -14.0, -40.0..=0.0)?;
     let ceiling = num(p, "ceiling", -1.0, -20.0..=0.0)?;
-    let analyse = |path: &str| {
-        super::dj::analyze_file(CMD, path).map_err(|err| match err {
-            EngineError::BadParams(_, msg) => msg,
-            other => other.to_string(),
-        })
-    };
-    run(e.session(), source, out, target, ceiling, &analyse)
+    Ok((source, out, target, ceiling))
+}
+
+/// mixforge's analysis of the track at `path`, or why there is none.
+fn mixforge(path: &str) -> std::result::Result<Value, String> {
+    super::dj::analyze_file(CMD, path).map_err(|err| match err {
+        EngineError::BadParams(_, msg) => msg,
+        other => other.to_string(),
+    })
 }
 
 /// `p` made absolute with `.` and `..` resolved by name (not by following links), in the
@@ -166,7 +176,8 @@ fn refuse_sources(files: &[PathBuf], out: &Path, dests: &[PathBuf]) -> Result<()
 /// Where each track's copy goes (`out/<file name>`), once every refusal and access check passed:
 /// `out` is not a source's folder, no two sources share a name, no copy (or the report) would
 /// land on a source or a session's audio, and every file already there is earlier prep output.
-fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBuf>> {
+/// Also returns the text of the earlier report in `out`, if there is one.
+fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathBuf>, Option<String>)> {
     let mut names: HashMap<String, &Path> = HashMap::new();
     let mut dests = Vec::with_capacity(files.len());
     for f in files {
@@ -211,7 +222,7 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<Vec<PathBu
         crate::file_access::check_write(d).map_err(EngineError::Io)?;
     }
     crate::file_access::check_write(out).map_err(EngineError::Io)?;
-    Ok(dests)
+    Ok((dests, earlier))
 }
 
 /// Preps the tracks of `source` (a mixforge plan.json or a folder of MP3s) into `out` (default:
@@ -226,74 +237,258 @@ pub fn run(
     ceiling: f64,
     analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
 ) -> Result<Value> {
-    let started = std::time::Instant::now();
-    if !(target_lufs.is_finite() && ceiling.is_finite()) {
-        return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
-    }
-    let (name, files) = sources(source)?;
-    let out = match out {
-        Some(o) => normalise(Path::new(o)),
-        None => default_out(&name)?,
-    };
-    let dests = destinations(s, &files, &out)?;
-    crate::io::make_dir(&out)?;
-    // Now that it exists, `out` is compared with the sources again with its links followed.
-    refuse_sources(&files, &out, &dests)?;
-    // Temporary files a run that stopped part-way left behind.
-    crate::io::remove_stale_temps(&out);
+    Plan::new(s, source, out, target_lufs, ceiling)?.prep(analyse, &Shared::default())
+}
 
-    // One track at a time, so only one track's audio is in memory.
-    // After one analysis times out the rest are skipped, so a stuck sidecar costs one timeout,
-    // not one per track.
-    let timed_out = std::cell::Cell::new(false);
-    let analyse = |path: &str| {
-        if timed_out.get() {
-            return Err("skipped after an earlier timeout".to_string());
+/// A prep run whose checks all passed and whose output folder exists: what it reads and writes.
+struct Plan {
+    started: std::time::Instant,
+    source: String,
+    out: PathBuf,
+    target_lufs: f64,
+    ceiling: f64,
+    files: Vec<PathBuf>,
+    dests: Vec<PathBuf>,
+    /// The report the last run left in `out`.
+    earlier: Option<String>,
+    /// The session's audio files, never written.
+    session_files: crate::io::SourceFiles,
+}
+
+impl Plan {
+    /// Every refusal and check of `prep.tracks`, then `out` made: nothing else is written yet.
+    fn new(s: &Session, source: &str, out: Option<&str>, target_lufs: f64, ceiling: f64) -> Result<Self> {
+        let started = std::time::Instant::now();
+        if !(target_lufs.is_finite() && ceiling.is_finite()) {
+            return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
         }
-        let r = analyse(path);
-        if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
-            timed_out.set(true);
-        }
-        r
-    };
-    let rows: Vec<Row> = files
-        .iter()
-        .zip(&dests)
-        .map(|(src, dest)| {
-            let mut row = prep_one(s, src, dest, target_lufs, ceiling, &analyse);
+        let (name, files) = sources(source)?;
+        let out = match out {
+            Some(o) => normalise(Path::new(o)),
+            None => default_out(&name)?,
+        };
+        let (dests, earlier) = destinations(s, &files, &out)?;
+        crate::io::make_dir(&out)?;
+        // Now that it exists, `out` is compared with the sources again with its links followed.
+        refuse_sources(&files, &out, &dests)?;
+        // Temporary files a run that stopped part-way left behind.
+        crate::io::remove_stale_temps(&out);
+        let session_files = crate::io::SourceFiles::of(s);
+        Ok(Self { started, source: source.to_string(), out, target_lufs, ceiling, files, dests, earlier, session_files })
+    }
+
+    /// Preps the tracks one at a time (so only one track's audio is in memory), noting each in
+    /// `shared` and stopping before the next once it is cancelled; then writes the report.
+    fn prep(&self, analyse: &dyn Fn(&str) -> std::result::Result<Value, String>, shared: &Shared) -> Result<Value> {
+        let (target_lufs, ceiling) = (self.target_lufs, self.ceiling);
+        // After one analysis times out the rest are skipped, so a stuck sidecar costs one
+        // timeout, not one per track.
+        let timed_out = std::cell::Cell::new(false);
+        let analyse = |path: &str| {
+            if timed_out.get() {
+                return Err("skipped after an earlier timeout".to_string());
+            }
+            let r = analyse(path);
+            if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
+                timed_out.set(true);
+            }
+            r
+        };
+        let total = self.files.len();
+        shared.update(|p| *p = PrepProgress { done: 0, total, current: None });
+        let mut rows: Vec<Row> = Vec::with_capacity(total);
+        for (src, dest) in self.files.iter().zip(&self.dests) {
+            if shared.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            shared.update(|p| p.current = dest.file_name().map(|n| n.to_string_lossy().into_owned()));
+            let mut row = prep_one(&self.session_files, src, dest, target_lufs, ceiling, &analyse);
             if row.status == "failed" && crate::io::path_exists(dest) {
                 row.doubts.push("the earlier copy in the output folder was left as it was".into());
             }
-            row
-        })
-        .collect();
+            rows.push(row);
+            shared.update(|p| (p.done, p.current) = (p.done + 1, None));
+        }
+        let cancelled = rows.len() < total;
 
-    let count = |st: &str| rows.iter().filter(|r| r.status == st).count();
-    let written = || rows.iter().filter(|r| r.status != "failed");
-    let measured = written().filter(|r| r.lufs_after.is_some()).count();
-    let on_target = written().filter(|r| r.lufs_after.is_some_and(|l| (l - target_lufs).abs() <= ON_TARGET_DB)).count();
-    let over = written().filter(|r| r.over(ceiling)).count();
-    let totals = json!({
-        "ok": count("ok"),
-        "not_adjusted": count("not_adjusted"),
-        "failed": count("failed"),
-        "measured": measured,
-        "on_target": on_target,
-        "over_ceiling": over,
-        "seconds": started.elapsed().as_secs_f64(),
-    });
-    let report_path = out.join(REPORT);
-    let r = json!({
-        "source": source,
-        "out": out.to_string_lossy(),
-        "report": report_path.to_string_lossy(),
-        "target_lufs": target_lufs,
-        "ceiling": ceiling,
-        "tracks": rows.iter().map(Row::json).collect::<Vec<_>>(),
-        "totals": totals,
-    });
-    crate::io::replace_user_file(s, &report_path, text_report(&r, &rows, utc_now()).as_bytes())?;
-    Ok(r)
+        let count = |st: &str| rows.iter().filter(|r| r.status == st).count();
+        let written = || rows.iter().filter(|r| r.status != "failed");
+        let measured = written().filter(|r| r.lufs_after.is_some()).count();
+        let on_target = written().filter(|r| r.lufs_after.is_some_and(|l| (l - target_lufs).abs() <= ON_TARGET_DB)).count();
+        let over = written().filter(|r| r.over(ceiling)).count();
+        let totals = json!({
+            "ok": count("ok"),
+            "not_adjusted": count("not_adjusted"),
+            "failed": count("failed"),
+            "measured": measured,
+            "on_target": on_target,
+            "over_ceiling": over,
+            "seconds": self.started.elapsed().as_secs_f64(),
+        });
+        let report_path = self.out.join(REPORT);
+        let r = json!({
+            "source": self.source,
+            "out": self.out.to_string_lossy(),
+            "report": report_path.to_string_lossy(),
+            "target_lufs": target_lufs,
+            "ceiling": ceiling,
+            "tracks": rows.iter().map(Row::json).collect::<Vec<_>>(),
+            "totals": totals,
+            "cancelled": cancelled,
+        });
+        let mut text = text_report(&r, &rows, utc_now());
+        if cancelled {
+            text.push_str(&self.cancelled_note(rows.len()));
+        }
+        crate::io::replace_file_refusing(&self.session_files, &report_path, text.as_bytes())?;
+        Ok(r)
+    }
+
+    /// The report's ending for a run cancelled after `done` tracks. The earlier report's lines for
+    /// the tracks not reached are kept, so their copies are still recognised as prep's.
+    fn cancelled_note(&self, done: usize) -> String {
+        let mut note = format!("cancelled after {done} of {} tracks; the rest were not prepped\n", self.files.len());
+        let earlier = self.earlier.as_deref().unwrap_or_default();
+        let kept: Vec<&str> = self
+            .dests
+            .iter()
+            .skip(done)
+            .filter_map(|d| d.file_name().and_then(|n| n.to_str()))
+            .flat_map(|name| {
+                let line = format!("  {name}  before ");
+                earlier.lines().filter(move |l| l.contains(&line))
+            })
+            .collect();
+        if !kept.is_empty() {
+            note.push_str("\nearlier copies of the tracks not reached, left as they were:\n");
+            for l in kept {
+                note.push_str(l);
+                note.push('\n');
+            }
+        }
+        note
+    }
+}
+
+/// How far a prep run got.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrepProgress {
+    /// Tracks finished.
+    pub done: usize,
+    pub total: usize,
+    /// The file name of the track being prepped now.
+    pub current: Option<String>,
+}
+
+/// What a running prep and the job watching it share.
+#[derive(Debug, Default)]
+struct Shared {
+    cancel: AtomicBool,
+    progress: Mutex<PrepProgress>,
+}
+
+impl Shared {
+    fn update(&self, f: impl FnOnce(&mut PrepProgress)) {
+        f(&mut self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+}
+
+/// mixforge's analysis of a track's path, callable from the prep thread.
+pub type Analyse = Arc<dyn Fn(&str) -> std::result::Result<Value, String> + Send + Sync>;
+
+/// A `prep.tracks` run on its own thread (in the browser, which has none, it has run already):
+/// how far it got, a cancel that stops it before its next track, and its result.
+pub struct PrepJob {
+    shared: Arc<Shared>,
+    out: PathBuf,
+    state: JobState,
+}
+
+enum JobState {
+    Running(std::thread::JoinHandle<Result<Value>>),
+    Ended(Option<Result<Value>>),
+}
+
+/// Starts the run `prep.tracks` does for `p`: every check is made, and `out` created, before
+/// this returns; the tracks are prepped on another thread.
+pub fn prep_job(e: &Engine, p: &Value) -> Result<PrepJob> {
+    let (source, out, target, ceiling) = params(p)?;
+    start(e.session(), source, out, target, ceiling, Arc::new(mixforge))
+}
+
+/// [`run`] on another thread: see [`prep_job`].
+pub fn start(s: &Session, source: &str, out: Option<&str>, target_lufs: f64, ceiling: f64, analyse: Analyse) -> Result<PrepJob> {
+    let plan = Arc::new(Plan::new(s, source, out, target_lufs, ceiling)?);
+    let shared = Arc::new(Shared::default());
+    shared.update(|p| p.total = plan.files.len());
+    let out = plan.out.clone();
+    let ended = |r| Ok(PrepJob { shared: Arc::clone(&shared), out: out.clone(), state: JobState::Ended(Some(r)) });
+    if cfg!(target_arch = "wasm32") {
+        return ended(plan.prep(&*analyse, &shared));
+    }
+    // The worker checks paths against the automation roots in force here.
+    let roots = crate::file_access::current();
+    let (worker_plan, worker_shared, worker_analyse) = (Arc::clone(&plan), Arc::clone(&shared), Arc::clone(&analyse));
+    let work = move || {
+        let prep = || worker_plan.prep(&*worker_analyse, &worker_shared);
+        match &roots {
+            Some(r) => crate::file_access::confine(Some(r), prep),
+            None => crate::file_access::unconfined(prep),
+        }
+    };
+    match std::thread::Builder::new().name("prep-tracks".into()).spawn(work) {
+        Ok(handle) => Ok(PrepJob { shared: Arc::clone(&shared), out, state: JobState::Running(handle) }),
+        // No thread to be had: prep here instead.
+        Err(_) => ended(plan.prep(&*analyse, &shared)),
+    }
+}
+
+impl PrepJob {
+    /// How far it got.
+    pub fn progress(&self) -> PrepProgress {
+        self.shared.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Stops the run before its next track; the report covers the tracks done.
+    pub fn cancel(&self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether it was cancelled.
+    pub fn cancelling(&self) -> bool {
+        self.shared.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The folder the copies go to.
+    pub fn out(&self) -> &Path {
+        &self.out
+    }
+
+    /// The result (what `prep.tracks` returns) once the run ended, given once; `None` before.
+    pub fn poll(&mut self) -> Option<Result<Value>> {
+        if let JobState::Running(handle) = &self.state
+            && !handle.is_finished()
+        {
+            return None;
+        }
+        match std::mem::replace(&mut self.state, JobState::Ended(None)) {
+            JobState::Running(handle) => Some(joined(handle)),
+            JobState::Ended(r) => r,
+        }
+    }
+
+    /// Waits for the run to end and gives its result.
+    pub fn wait(mut self) -> Result<Value> {
+        match std::mem::replace(&mut self.state, JobState::Ended(None)) {
+            JobState::Running(handle) => joined(handle),
+            JobState::Ended(r) => r.unwrap_or_else(|| Err(EngineError::Internal(CMD.into(), "the result was taken already".into()))),
+        }
+    }
+}
+
+/// The result of the worker `handle`, or its panic as an error.
+fn joined(handle: std::thread::JoinHandle<Result<Value>>) -> Result<Value> {
+    handle.join().unwrap_or_else(|p| Err(EngineError::Internal(CMD.into(), crate::panic_message(&*p))))
 }
 
 /// One track's outcome.
@@ -641,7 +836,14 @@ fn prep_mp3(
 }
 
 /// Preps one track from `src` to `dest`.
-fn prep_one(s: &Session, src: &Path, dest: &Path, target: f64, ceiling: f64, analyse: &dyn Fn(&str) -> std::result::Result<Value, String>) -> Row {
+fn prep_one(
+    session_files: &crate::io::SourceFiles,
+    src: &Path,
+    dest: &Path,
+    target: f64,
+    ceiling: f64,
+    analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
+) -> Row {
     let mut row = Row { file: dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), status: "ok", ..Row::default() };
     let bytes = match crate::io::read_file(src) {
         Ok(b) => b,
@@ -661,7 +863,7 @@ fn prep_one(s: &Session, src: &Path, dest: &Path, target: f64, ceiling: f64, ana
     if row.over(ceiling) {
         row.doubts.push(format!("above the ceiling: tp {} dBTP", db(row.tp_after)));
     }
-    if let Err(err) = crate::io::replace_user_file(s, dest, &copy) {
+    if let Err(err) = crate::io::replace_file_refusing(session_files, dest, &copy) {
         row.failed(err);
     }
     row

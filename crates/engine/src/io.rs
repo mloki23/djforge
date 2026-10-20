@@ -206,17 +206,33 @@ fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
 /// Refuse to write `out` when it is the file of one of `s`'s sources: a bounce or export must
 /// never replace audio the session plays, least of all a library file referenced in place.
 pub fn refuse_source_file(s: &Session, out: &Path) -> Result<()> {
-    let out_key = file_key(out);
-    let hit = s.sources.iter().find(|src| {
-        let p = Path::new(&src.path);
-        let file = if p.is_absolute() { p.to_path_buf() } else { s.folder.as_deref().map_or_else(|| p.to_path_buf(), |f| f.join(p)) };
-        file_key(&file) == out_key
-    });
-    match hit {
-        Some(src) => {
-            Err(EngineError::Io(format!("{}: is the audio file of source `{}` in this session; choose another file", out.display(), src.name)))
+    SourceFiles::of(s).refuse(out)
+}
+
+/// The files of a session's sources, kept so that work running after the session moved on (on
+/// another thread) still refuses to write over them ([`refuse_source_file`]).
+#[derive(Debug, Clone, Default)]
+pub struct SourceFiles(Vec<(PathBuf, String)>);
+
+impl SourceFiles {
+    /// The files of `s`'s sources, relative paths taken from its folder.
+    pub fn of(s: &Session) -> Self {
+        let file = |path: &str| {
+            let p = Path::new(path);
+            if p.is_absolute() { p.to_path_buf() } else { s.folder.as_deref().map_or_else(|| p.to_path_buf(), |f| f.join(p)) }
+        };
+        Self(s.sources.iter().map(|src| (file(&src.path), src.name.clone())).collect())
+    }
+
+    /// Refuse to write `out` when it is one of these files (links followed now, not when taken).
+    pub fn refuse(&self, out: &Path) -> Result<()> {
+        let out_key = file_key(out);
+        match self.0.iter().find(|(file, _)| file_key(file) == out_key) {
+            Some((_, name)) => {
+                Err(EngineError::Io(format!("{}: is the audio file of source `{name}` in this session; choose another file", out.display())))
+            }
+            None => Ok(()),
         }
-        None => Ok(()),
     }
 }
 
@@ -1668,7 +1684,12 @@ pub(crate) fn remove_stale_temps(dir: &Path) -> usize {
 /// to a temporary file in the same folder, which is then renamed over `path`. A link at `path`
 /// (symbolic or hard) is replaced, so whatever else it names is left as it was.
 pub fn replace_user_file(s: &Session, path: &Path, bytes: &[u8]) -> Result<()> {
-    refuse_source_file(s, path)?;
+    replace_file_refusing(&SourceFiles::of(s), path, bytes)
+}
+
+/// [`replace_user_file`] refusing `sources`, taken from a session earlier.
+pub fn replace_file_refusing(sources: &SourceFiles, path: &Path, bytes: &[u8]) -> Result<()> {
+    sources.refuse(path)?;
     let shown = path.display();
     if cfg!(target_arch = "wasm32") {
         return write_file(path.to_str().ok_or_else(|| EngineError::Io(format!("{shown}: not a Unicode path")))?, bytes);

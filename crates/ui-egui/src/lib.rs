@@ -19,6 +19,7 @@ pub mod mix_window;
 pub mod ops_windows;
 pub mod palette;
 pub mod panels;
+pub mod prep;
 mod recent;
 pub mod recovery;
 pub mod sampler_window;
@@ -372,6 +373,8 @@ pub struct SoundApp {
     pub video: video_track::VideoPool,
     /// The Bounce Mix in progress, rendered a slice per frame.
     pub bounce: Option<soundcraft_engine::io::Bounce>,
+    /// The Prep Tracks run in progress, on its own thread.
+    pub prep: Option<soundcraft_engine::cmd::PrepJob>,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -446,6 +449,7 @@ impl SoundApp {
             last_meter_poll: f64::NEG_INFINITY,
             video: video_track::VideoPool::default(),
             bounce: None,
+            prep: None,
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -458,7 +462,9 @@ impl SoundApp {
 
     /// Run a command; errors go to the status line. Returns the result.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
+        if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert")
+            && (bounce::refuses_session_switch(self) || prep::refuses_session_switch(self))
+        {
             return Err(self.ui.status.clone());
         }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
@@ -1184,6 +1190,7 @@ impl SoundApp {
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
+        prep::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;

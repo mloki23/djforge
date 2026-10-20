@@ -41,7 +41,7 @@ mod vst3;
 mod zoom_toggle;
 
 pub use file::bounce_job;
-pub use prep::run as prep_run;
+pub use prep::{Analyse as PrepAnalyse, PrepJob, PrepProgress, prep_job, run as prep_run, start as prep_start};
 
 pub(crate) use edit::remember_selection;
 

@@ -281,6 +281,7 @@ fn default_dir() -> String {
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
+    crate::prep::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
     let mut keep = true;
     let mut action: Option<(String, Value)> = None;
@@ -635,13 +636,16 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let saving = action.as_ref().is_some_and(|(cmd, _)| cmd.starts_with("session.save"));
     if let Some((cmd, params)) = action {
         keep = false;
-        match app.run(&cmd, params) {
-            Ok(v) if cmd == "file.export_clips" => {
-                app.ui.status = format!("Exported {} clip(s) to {}", v["written"], v["dir"].as_str().unwrap_or_default());
+        if cmd == "prep.tracks" {
+            crate::prep::start(app, &params);
+        } else {
+            match app.run(&cmd, params) {
+                Ok(v) if cmd == "file.export_clips" => {
+                    app.ui.status = format!("Exported {} clip(s) to {}", v["written"], v["dir"].as_str().unwrap_or_default());
+                }
+                Ok(_) => {}
+                Err(e) => app.ui.status = e,
             }
-            Ok(v) if cmd == "prep.tracks" => app.ui.status = prep_status(&v),
-            Ok(_) => {}
-            Err(e) => app.ui.status = e,
         }
     }
     if saving
@@ -654,22 +658,6 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     if keep {
         app.dialogs.open = Some(d);
     }
-}
-
-/// The status line after `prep.tracks`: where the copies went and the totals.
-fn prep_status(v: &Value) -> String {
-    let t = &v["totals"];
-    let n = |k: &str| t[k].as_u64().unwrap_or(0);
-    format!(
-        "Prepped {} track(s) into {}: {} ok, {} not adjusted, {} failed; {} of {} on target; see prep-report.txt",
-        v["tracks"].as_array().map_or(0, Vec::len),
-        v["out"].as_str().unwrap_or_default(),
-        n("ok"),
-        n("not_adjusted"),
-        n("failed"),
-        n("on_target"),
-        n("measured")
-    )
 }
 
 /// Cancel/OK row; returns true when OK was pressed (or Enter).
