@@ -166,10 +166,12 @@ fn tag_ends(b: &[u8], start: usize) -> Vec<usize> {
             end.checked_sub(total).filter(|&at| b.get(at..at + 3) == Some(b"ID3"))
         });
         let ape = end.checked_sub(32).filter(|&at| b.get(at..at + 8) == Some(b"APETAGEX")).and_then(|foot| {
-            let header = if le(foot + 20)? & 0x8000_0000 != 0 { 32 } else { 0 };
-            end.checked_sub(usize::try_from(le(foot + 12)?).ok()?.checked_add(header)?)
+            let header = le(foot + 20)? & 0x8000_0000 != 0;
+            let at = end.checked_sub(usize::try_from(le(foot + 12)?).ok()?.checked_add(if header { 32 } else { 0 })?)?;
+            (!header || b.get(at..at + 8) == Some(b"APETAGEX")).then_some(at)
         });
-        match id3.or(ape).filter(|&at| at >= start && at < end) {
+        // A claimed start on a frame header is a corrupt size, not a tag.
+        match id3.or(ape).filter(|&at| at >= start && at < end && header_at(b, at).is_none()) {
             Some(at) => {
                 end = at;
                 ends.push(end);
@@ -241,17 +243,21 @@ fn walk(b: &[u8], start: usize, end: usize) -> Result<(Vec<Frame>, usize), GainE
 
 /// Find the audio between the tags and chain its frames. A trailing tag is trusted only if the
 /// frames end exactly where it starts; otherwise the walk is retried with it counted as audio.
+/// Without an exact match, the innermost walk that succeeded wins (an outer one may scan a tag
+/// body that holds frame-like bytes), else the last error.
 pub(crate) fn frames(b: &[u8]) -> Result<Layout, GainError> {
     let audio_start = skip_id3v2(b);
-    let ends = tag_ends(b, audio_start);
-    let mut last = Err(GainError::NotLayer3);
-    for &tags_at in &ends {
-        last = walk(b, audio_start, tags_at).map(|(frames, audio_end)| Layout { audio_start, audio_end, tags_at, frames });
-        if matches!(&last, Ok(l) if l.audio_end == tags_at) {
-            break;
+    let (mut inner, mut err) = (None, GainError::NotLayer3);
+    for tags_at in tag_ends(b, audio_start) {
+        match walk(b, audio_start, tags_at) {
+            Ok((frames, audio_end)) if audio_end == tags_at => return Ok(Layout { audio_start, audio_end, tags_at, frames }),
+            Ok((frames, audio_end)) => {
+                inner.get_or_insert(Layout { audio_start, audio_end, tags_at, frames });
+            }
+            Err(e) => err = e,
         }
     }
-    last
+    inner.ok_or(err)
 }
 
 /// One global_gain step in dB: amplitude ×2^(1/4).
@@ -333,6 +339,8 @@ fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError
 
 /// A copy of `bytes` with every audio frame's global_gain moved by `steps` (CRC frames re-protected,
 /// info frames, tags and trailing data copied unchanged; silent granules saturate into 0..=255).
+/// Once a silent granule has saturated, adjusting back by −`steps` decodes the same but is not
+/// byte-identical: keep the original rather than re-adjusting.
 pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
     let audio = audio_frames(bytes)?;
     let (lo, hi) = range(bytes, &audio)?;
@@ -817,5 +825,35 @@ mod tests {
             let err = x.iter().zip(&y).map(|(&a, &b)| (f64::from(b) - want * f64::from(a)).abs()).fold(0.0, f64::max);
             assert!(err < 1e-4, "{steps}: max residual {err}");
         }
+    }
+
+    #[test]
+    fn a_tag_size_that_lands_on_a_frame_is_not_trusted() {
+        let plain = frames(CBR128).unwrap();
+        let start = plain.frames[30].at;
+        let item = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes(), b"Title\0hello"].concat();
+        // A footer-only tag and one claiming a header, each sized to start exactly on frame 30.
+        for flags in [0u32, 0x8000_0000] {
+            let header = if flags != 0 { 32 } else { 0 };
+            let size = u32::try_from(CBR128.len() - start + item.len() + 32 - header).unwrap();
+            let footer = [&b"APETAGEX"[..], &2000u32.to_le_bytes(), &size.to_le_bytes(), &1u32.to_le_bytes(), &flags.to_le_bytes(), &[0; 8]].concat();
+            let tagged = [CBR128, &item, &footer, &id3v1()].concat();
+            let l = frames(&tagged).unwrap();
+            assert_eq!((l.frames.len(), l.audio_end), (plain.frames.len(), CBR128.len()), "flags {flags:#X}");
+            let out = adjust(&tagged, 2).unwrap();
+            assert_eq!(gains(&out), gains(&tagged).iter().map(|g| g + 2).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn frame_like_bytes_in_an_outer_tag_do_not_override_a_good_walk() {
+        // CBR128, 1 junk byte, an ID3v2.4 tag (with footer) whose body holds two real frames, ID3v1.
+        let l = frames(CBR128).unwrap();
+        let body = &CBR128[l.frames[3].at..l.frames[5].at];
+        let mut tag = id3v2(body.len(), true);
+        tag[10..10 + body.len()].copy_from_slice(body);
+        let b = [CBR128, &[0x42][..], &tag, &id3v1()].concat();
+        let got = frames(&b).unwrap();
+        assert_eq!((got.frames.len(), got.audio_end, got.tags_at), (l.frames.len(), CBR128.len(), CBR128.len() + 1));
     }
 }
