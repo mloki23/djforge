@@ -90,6 +90,7 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
 const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Import mixforge Set...", "dj.import_set"),
     ("DJ > Load Track Beat-Locked...", "dj.load_warped"),
+    ("DJ > Prep Tracks...", "prep.tracks"),
     ("DJ > Build Transition from Selected Clips", "dj.transition"),
     ("DJ > Move Transition 4 Bars Later", "dj.move_transition"),
     ("DJ > Move Transition 4 Bars Earlier", "dj.move_transition"),
@@ -183,6 +184,7 @@ const DIALOG_COMMANDS: &[&str] = &[
     "clip.rename",
     "dj.import_set",
     "dj.tempo_ramp",
+    "prep.tracks",
 ];
 
 /// Shared menu hierarchy for egui and native desktop hosts.

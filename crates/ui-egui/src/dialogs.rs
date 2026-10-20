@@ -128,6 +128,9 @@ impl Dialogs {
             }
             "edit.fades_create" => Dialog::Fades { shape: "equal power".into() },
             "dj.import_set" => Dialog::PathPrompt { cmd: id.into(), title: "Import mixforge Set (plan.json)".into(), path: home, key: "plan".into() },
+            "prep.tracks" => {
+                Dialog::PathPrompt { cmd: id.into(), title: "Prep Tracks (plan.json or folder)".into(), path: home, key: "source".into() }
+            }
             "dj.tempo_ramp" => {
                 // The tempo the selection ends in (the next track's, when it reaches into it).
                 let s = e.session();
@@ -636,6 +639,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             Ok(v) if cmd == "file.export_clips" => {
                 app.ui.status = format!("Exported {} clip(s) to {}", v["written"], v["dir"].as_str().unwrap_or_default());
             }
+            Ok(v) if cmd == "prep.tracks" => app.ui.status = prep_status(&v),
             Ok(_) => {}
             Err(e) => app.ui.status = e,
         }
@@ -650,6 +654,22 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     if keep {
         app.dialogs.open = Some(d);
     }
+}
+
+/// The status line after `prep.tracks`: where the copies went and the totals.
+fn prep_status(v: &Value) -> String {
+    let t = &v["totals"];
+    let n = |k: &str| t[k].as_u64().unwrap_or(0);
+    format!(
+        "Prepped {} track(s) into {}: {} ok, {} not adjusted, {} failed; {} of {} on target; see prep-report.txt",
+        v["tracks"].as_array().map_or(0, Vec::len),
+        v["out"].as_str().unwrap_or_default(),
+        n("ok"),
+        n("not_adjusted"),
+        n("failed"),
+        n("on_target"),
+        n("measured")
+    )
 }
 
 /// Cancel/OK row; returns true when OK was pressed (or Enter).
