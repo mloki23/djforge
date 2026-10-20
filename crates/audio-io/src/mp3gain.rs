@@ -126,11 +126,12 @@ fn free_format_at(b: &[u8], at: usize) -> bool {
 }
 
 /// Offset after the ID3v2 tags at the start: 10-byte header, syncsafe size at 6..10, plus a
-/// 10-byte footer when flag 0x10 is set. Files may carry more than one.
+/// 10-byte footer when flag 0x10 is set in a v2.4 tag (earlier versions define no footer). Files
+/// may carry more than one.
 pub(crate) fn skip_id3v2(b: &[u8]) -> usize {
     let mut at = 0usize;
-    while let (Some(b"ID3"), Some(&flags), Some(size)) = (b.get(at..at + 3), b.get(at + 5), b.get(at + 6..at + 10)) {
-        let footer = if flags & 0x10 != 0 { 10 } else { 0 };
+    while let (Some(&[b'I', b'D', b'3', major, _, flags]), Some(size)) = (b.get(at..at + 6), b.get(at + 6..at + 10)) {
+        let footer = if major == 4 && flags & 0x10 != 0 { 10 } else { 0 };
         at = at.saturating_add(10 + footer).saturating_add(syncsafe(size)).min(b.len());
     }
     at
@@ -488,6 +489,14 @@ mod tests {
         assert_eq!(l.audio_start, plain.audio_start + 370);
         assert_eq!(l.frames.len(), plain.frames.len());
         assert_eq!(l.frames[0].at, plain.frames[0].at + 370);
+    }
+
+    #[test]
+    fn only_a_v24_tag_has_a_footer() {
+        let mut v23 = id3v2(50, false);
+        v23[5] = 0x10;
+        assert_eq!(skip_id3v2(&[&v23[..], CBR128].concat()), 60 + skip_id3v2(CBR128));
+        assert_eq!(skip_id3v2(&id3v2(50, true)), 70);
     }
 
     #[test]

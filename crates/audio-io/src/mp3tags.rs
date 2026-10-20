@@ -212,13 +212,7 @@ impl OldTag {
             }
             flags &= !EXTENDED;
         }
-        // v2.4 sizes are syncsafe, but old iTunes wrote plain ones: take whichever walks cleanly.
-        let ways: &[bool] = if major == 3 { &[true] } else { &[false, true] };
-        let Some((frames, frames_end, plain)) = ways.iter().find_map(|&plain| walk(&body, plain).map(|(f, end)| (f, end, plain))) else {
-            return Err(malformed(
-                "the frames do not walk to the end of the tag (an unknown frame ID, a frame that overruns it, or data in the padding)",
-            ));
-        };
+        let (frames, frames_end, plain) = frames_of(&body, major)?;
         Ok(OldTag { major, revision, flags, size, body, frames, frames_end, plain_sizes: major == 4 && plain, rest_at })
     }
 
@@ -251,26 +245,63 @@ impl OldTag {
     }
 }
 
+/// The frames of `body`, where they stop, and whether their sizes are plain.
+///
+/// v2.4 sizes are syncsafe, but old iTunes wrote plain ones. Both readings are walked: when both
+/// walk cleanly they must agree; plain alone is trusted only when the syncsafe reading broke on a
+/// size, never when it stopped on stray bytes in the padding.
+fn frames_of(body: &[u8], major: u8) -> Result<(Vec<Range<usize>>, usize, bool), TagError> {
+    let unreadable = |why: &str| TagError::Malformed(format!("the frames do not walk to the end of the tag: {why}"));
+    let why = |stop: Stop| match stop {
+        Stop::Size => "a frame size does not fit",
+        Stop::Junk { padding: true, .. } => "the padding holds data",
+        Stop::Junk { .. } => "an unknown frame ID",
+    };
+    if major == 3 {
+        return walk(body, true).map(|(f, end)| (f, end, true)).map_err(|s| unreadable(why(s)));
+    }
+    match (walk(body, false), walk(body, true)) {
+        (Ok(safe), Ok(plain)) if safe.0 == plain.0 => Ok((safe.0, safe.1, false)),
+        (Ok(_), Ok(_)) => Err(unreadable("its frame sizes read as syncsafe and as plain numbers give different frames")),
+        (Ok((f, end)), Err(_)) => Ok((f, end, false)),
+        (Err(Stop::Size | Stop::Junk { padding: false, sizes_differ: true }), Ok((f, end))) => Ok((f, end, true)),
+        (Err(stop), _) => Err(unreadable(why(stop))),
+    }
+}
+
+/// Why a walk stopped short.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    /// A size with a high bit set (syncsafe), or a frame that overruns the tag.
+    Size,
+    /// Neither a frame nor zero padding: `padding` when it starts with a zero byte;
+    /// `sizes_differ` when a frame on the way reads differently as syncsafe and as plain.
+    Junk { padding: bool, sizes_differ: bool },
+}
+
 /// The frames of `body` and where they stop, if they walk to its end or to zero padding.
 /// `plain`: sizes are plain 32-bit numbers rather than syncsafe ones.
-fn walk(body: &[u8], plain: bool) -> Option<(Vec<Range<usize>>, usize)> {
+fn walk(body: &[u8], plain: bool) -> Result<(Vec<Range<usize>>, usize), Stop> {
     let mut frames = Vec::new();
     let mut at = 0usize;
+    let mut sizes_differ = false;
     while let Some(&[a, b, c, d, s0, s1, s2, s3, _, _]) = body.get(at..at.saturating_add(10))
         && [a, b, c, d].iter().all(|x| x.is_ascii_uppercase() || x.is_ascii_digit())
     {
         let s = [s0, s1, s2, s3];
         if !plain && s.iter().any(|x| x & 0x80 != 0) {
-            return None;
+            return Err(Stop::Size);
         }
+        sizes_differ |= be_size(&s) != syncsafe(&s);
         let next = at.saturating_add(10).saturating_add(if plain { be_size(&s) } else { syncsafe(&s) });
         if next > body.len() {
-            return None;
+            return Err(Stop::Size);
         }
         frames.push(at..next);
         at = next;
     }
-    body.get(at..)?.iter().all(|&x| x == 0).then_some((frames, at))
+    let rest = body.get(at..).unwrap_or_default();
+    if rest.iter().all(|&x| x == 0) { Ok((frames, at)) } else { Err(Stop::Junk { padding: rest.first() == Some(&0), sizes_differ }) }
 }
 
 /// Whether an undecodable TXXX frame might be a `djforge_prep` note: it is compressed or
@@ -646,6 +677,27 @@ mod tests {
         for (major, frames) in [(3, after_odd_id), (3, junk_padding), (4, neither)] {
             let src = [raw_tag(major, 0, &[&frames[..], &[0; 16]].concat()), audio().to_vec()].concat();
             assert!(matches!(fill(&src, &prep("p")), Err(TagError::Malformed(_))), "{frames:02X?}");
+        }
+    }
+
+    #[test]
+    fn v24_frame_sizes_that_read_both_ways_refuse_the_file() {
+        // Plain sizes (iTunes) whose last frame ends in zeros: read as syncsafe, the 256-byte GEOB
+        // is 128 bytes long and its zero tail looks like padding.
+        let mut data = vec![0u8; 256];
+        data.iter_mut().take(100).enumerate().skip(1).for_each(|(i, x)| *x = i as u8 | 1);
+        let itunes = [v24_frame(b"TKEY", true, 0, b"\x009A"), v24_frame(b"GEOB", true, 0, &data), vec![0; 64]].concat();
+        // Syncsafe sizes with a stale byte in the padding: read as plain, the 200-byte PRIV
+        // (00 00 01 48) is 328 bytes long and swallows the stale byte.
+        let private: Vec<u8> = (0..200u32).map(|i| (i % 250 + 1) as u8).collect();
+        let mut stale = vec![0u8; 300];
+        stale[5] = 0x55;
+        let syncsafe =
+            [v24_frame(b"TIT2", false, 0, b"\x03ab"), v24_frame(b"TKEY", false, 0, b"\x039A"), v24_frame(b"PRIV", false, 0, &private), stale]
+                .concat();
+        for body in [itunes, syncsafe] {
+            let src = [raw_tag(4, 0, &body), audio().to_vec()].concat();
+            assert!(matches!(fill(&src, &prep("p")), Err(TagError::Malformed(_))));
         }
     }
 
