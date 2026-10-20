@@ -1,9 +1,6 @@
 //! Lossless MP3 gain: moves every Layer III granule's `global_gain` in 1.5 dB steps, written from
 //! ISO/IEC 11172-3 and 13818-3.
 
-// Items are used by the frame walker and gain writer added next.
-#![cfg_attr(not(test), allow(dead_code))]
-
 /// CRC-16 over `bytes`: polynomial 0x8005, MSB first, not reflected, no final XOR (11172-3 2.4.3.1).
 pub(crate) fn crc16(init: u16, bytes: &[u8]) -> u16 {
     bytes.iter().fold(init, |crc, &b| (0..8).fold(crc ^ (u16::from(b) << 8), |c, _| if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 }))
@@ -106,7 +103,9 @@ pub(crate) struct Frame {
 /// Where the audio sits between the leading and trailing tags, and its whole frames.
 #[derive(Debug, Clone)]
 pub(crate) struct Layout {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub audio_start: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub audio_end: usize,
     pub frames: Vec<Frame>,
 }
@@ -190,6 +189,101 @@ pub(crate) fn frames(b: &[u8]) -> Result<Layout, GainError> {
         at = next;
     }
     Ok(Layout { audio_start, audio_end, frames })
+}
+
+/// One global_gain step in dB: amplitude ×2^(1/4).
+pub const STEP_DB: f64 = 1.505_149_978_319_906;
+
+/// Bit offsets of each granule/channel block's 8-bit global_gain in the side info: after the
+/// side-info bits before the blocks, block `gr * channels + ch`, 21 bits in (after
+/// part2_3_length 12 and big_values 9).
+fn gain_bits(h: &FrameHeader) -> impl Iterator<Item = usize> {
+    // (bits before the blocks, block size, granules); MPEG-1 main_data_begin 9 + private 5/3 +
+    // scfsi 4 per channel, MPEG-2/2.5 main_data_begin 8 + private 1/2.
+    let (before, size, granules) = match (h.version, h.mono) {
+        (Version::Mpeg1, true) => (18, 59, 2),
+        (Version::Mpeg1, false) => (20, 59, 2),
+        (_, true) => (9, 63, 1),
+        (_, false) => (10, 63, 1),
+    };
+    let channels = if h.mono { 1 } else { 2 };
+    (0..granules * channels).map(move |block| before + block * size + 21)
+}
+
+/// `n` (≤ 32) bits at bit offset `bit`, MSB first.
+fn get_bits(buf: &[u8], bit: usize, n: usize) -> Option<u32> {
+    if n > 32 {
+        return None;
+    }
+    (bit..bit.checked_add(n)?).try_fold(0u32, |v, i| Some((v << 1) | u32::from((buf.get(i / 8)? >> (7 - i % 8)) & 1)))
+}
+
+/// Write `v` into `n` (≤ 32) bits at bit offset `bit`, MSB first; None (and nothing written) if
+/// the field runs past `buf` or `v` does not fit.
+fn set_bits(buf: &mut [u8], bit: usize, n: usize, v: u32) -> Option<()> {
+    let end = bit.checked_add(n)?;
+    if n > 32 || (n < 32 && v >> n != 0) || end > buf.len().checked_mul(8)? {
+        return None;
+    }
+    for (k, i) in (bit..end).enumerate() {
+        let on = (v >> (n - 1 - k)) & 1 == 1;
+        let byte = buf.get_mut(i / 8)?;
+        let m = 0x80u8 >> (i % 8);
+        *byte = if on { *byte | m } else { *byte & !m };
+    }
+    Some(())
+}
+
+/// Every audio (non-info) frame with the offset of its side info.
+fn audio_frames(b: &[u8]) -> Result<Vec<(Frame, usize)>, GainError> {
+    let audio: Vec<_> = frames(b)?.frames.into_iter().filter(|f| !f.info).map(|f| (f, f.at + f.header.side_info_at())).collect();
+    if audio.is_empty() { Err(GainError::NotLayer3) } else { Ok(audio) }
+}
+
+/// The steps that keep every audio granule's global_gain within 0..=255: (most negative, most positive).
+pub fn step_range(bytes: &[u8]) -> Result<(i32, i32), GainError> {
+    range(bytes, &audio_frames(bytes)?)
+}
+
+fn range(bytes: &[u8], audio: &[(Frame, usize)]) -> Result<(i32, i32), GainError> {
+    let (mut lo, mut hi) = (255u32, 0u32);
+    for &(f, side) in audio {
+        let side = bytes.get(side..).ok_or(GainError::SyncLost(f.at))?;
+        for bit in gain_bits(&f.header) {
+            let g = get_bits(side, bit, 8).ok_or(GainError::SyncLost(f.at))?;
+            (lo, hi) = (lo.min(g), hi.max(g));
+        }
+    }
+    let (lo, hi) = (i32::try_from(lo).unwrap_or(0), i32::try_from(hi).unwrap_or(255));
+    Ok((-lo, 255 - hi))
+}
+
+/// A copy of `bytes` with every audio frame's global_gain moved by `steps` (CRC frames re-protected,
+/// info frames, tags and any trailing partial frame copied unchanged).
+pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
+    let audio = audio_frames(bytes)?;
+    let (lo, hi) = range(bytes, &audio)?;
+    if !(lo..=hi).contains(&steps) {
+        return Err(GainError::NoRoom);
+    }
+    let mut out = bytes.to_vec();
+    for (f, side) in audio {
+        let lost = GainError::SyncLost(f.at);
+        let side_bytes = out.get_mut(side..side + f.header.side_info_len()).ok_or(lost.clone())?;
+        for bit in gain_bits(&f.header) {
+            let g = get_bits(side_bytes, bit, 8).and_then(|g| i32::try_from(g).ok()).ok_or(lost.clone())?;
+            let g = g.checked_add(steps).and_then(|g| u32::try_from(g).ok()).ok_or(GainError::NoRoom)?;
+            set_bits(side_bytes, bit, 8, g).ok_or(GainError::NoRoom)?;
+        }
+        if f.header.crc {
+            // CRC-16 over header bytes 2..4 then the side info, stored big-endian after the header.
+            let head = out.get(f.at + 2..f.at + 4).ok_or(lost.clone())?;
+            let side_bytes = out.get(side..side + f.header.side_info_len()).ok_or(lost.clone())?;
+            let crc = crc16(crc16(0xFFFF, head), side_bytes);
+            out.get_mut(f.at + 4..f.at + 6).ok_or(lost)?.copy_from_slice(&crc.to_be_bytes());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -358,5 +452,156 @@ mod tests {
         // Free-format Layer III frames: bitrate index 0.
         let free = [[0xFF, 0xFB, 0x00, 0x00].as_slice(), &[0; 400]].concat().repeat(4);
         assert_eq!(frames(&free).unwrap_err(), GainError::FreeFormat);
+    }
+    #[test]
+    fn bits_round_trip_across_byte_boundaries() {
+        let mut buf = [0u8; 6];
+        for (bit, n, v) in [(3, 8, 0xA5), (13, 12, 0xABC), (1, 1, 1), (7, 9, 0x1FF), (21, 8, 0x5A), (5, 32, 0xDEAD_BEEF)] {
+            let (mut copy, old) = (buf, get_bits(&buf, bit, n).unwrap());
+            set_bits(&mut copy, bit, n, v).unwrap();
+            assert_eq!(get_bits(&copy, bit, n), Some(v), "bit {bit} n {n}");
+            // Nothing outside the field changed.
+            set_bits(&mut copy, bit, n, old).unwrap();
+            assert_eq!(copy, buf);
+            buf[0] ^= 0x5A; // vary the surroundings for the next case
+        }
+        assert_eq!(get_bits(&[0b1010_0000], 0, 3), Some(0b101));
+        assert_eq!(get_bits(&[0; 2], 9, 8), None);
+        assert_eq!(set_bits(&mut [0; 2], 9, 8, 1), None);
+        assert_eq!(set_bits(&mut [0; 2], 0, 4, 16), None, "value wider than the field");
+    }
+
+    #[test]
+    fn gain_fields_sit_where_the_spec_puts_them() {
+        // Side-info bits before the blocks + block * block size + 21 (part2_3_length 12, big_values 9).
+        let offsets = |b: [u8; 4]| gain_bits(&FrameHeader::parse(b).unwrap()).collect::<Vec<_>>();
+        assert_eq!(offsets([0xFF, 0xFB, 0x90, 0xC0]), [18 + 21, 18 + 59 + 21]);
+        assert_eq!(offsets([0xFF, 0xFB, 0x90, 0x00]), [20 + 21, 20 + 59 + 21, 20 + 118 + 21, 20 + 177 + 21]);
+        assert_eq!(offsets([0xFF, 0xF3, 0x80, 0xC0]), [9 + 21]);
+        assert_eq!(offsets([0xFF, 0xF3, 0x80, 0x00]), [10 + 21, 10 + 63 + 21]);
+        assert_eq!(offsets([0xFF, 0xE3, 0x18, 0x40]), [10 + 21, 10 + 63 + 21]);
+    }
+
+    /// Every audio block's global_gain, in file order.
+    fn gains(b: &[u8]) -> Vec<u32> {
+        let l = frames(b).unwrap();
+        let mut out = Vec::new();
+        for f in l.frames.iter().filter(|f| !f.info) {
+            let side = &b[f.at + f.header.side_info_at()..][..f.header.side_info_len()];
+            out.extend(gain_bits(&f.header).map(|bit| get_bits(side, bit, 8).unwrap()));
+        }
+        out
+    }
+
+    #[test]
+    fn adjusting_up_and_back_restores_every_byte() {
+        for f in FIXTURES {
+            let up = adjust(f, 2).unwrap();
+            assert_ne!(up, f);
+            assert_eq!(adjust(&up, -2).unwrap(), f);
+            assert_eq!(adjust(f, 0).unwrap(), f);
+        }
+    }
+
+    #[test]
+    fn adjusting_moves_only_global_gain() {
+        for f in FIXTURES {
+            let out = adjust(f, 3).unwrap();
+            assert_eq!(out.len(), f.len());
+            let (before, after) = (gains(f), gains(&out));
+            assert!(!before.is_empty());
+            assert_eq!(after, before.iter().map(|g| g + 3).collect::<Vec<_>>());
+            // Mask the global_gain bits; every other bit must match.
+            let mut mask = vec![0u8; f.len()];
+            for fr in frames(f).unwrap().frames.iter().filter(|fr| !fr.info) {
+                let side = fr.at + fr.header.side_info_at();
+                for bit in gain_bits(&fr.header) {
+                    set_bits(&mut mask[side..], bit, 8, 0xFF).unwrap();
+                }
+            }
+            let stray = f.iter().zip(&out).zip(&mask).position(|((a, b), m)| (a ^ b) & !m != 0);
+            assert_eq!(stray, None);
+        }
+    }
+
+    /// `CBR128` with every frame CRC-protected: protection bit cleared and a CRC inserted after
+    /// the header. Frame lengths stay the same, so the 2 bytes come off the main data (the audio
+    /// is garbage; only the bits matter).
+    fn protected() -> Vec<u8> {
+        let l = frames(CBR128).unwrap();
+        let mut out = CBR128[..l.frames[0].at].to_vec();
+        for f in &l.frames {
+            let frame = &CBR128[f.at..f.at + f.header.len];
+            let mut p = vec![frame[0], frame[1] & !1, frame[2], frame[3], 0, 0];
+            p.extend(&frame[4..frame.len() - 2]);
+            out.extend(p);
+        }
+        out.extend(&CBR128[l.frames.last().map(|f| f.at + f.header.len).unwrap()..]);
+        let l = frames(&out).unwrap();
+        for f in &l.frames {
+            let crc = expected_crc(&out, f);
+            out[f.at + 4..f.at + 6].copy_from_slice(&crc.to_be_bytes());
+        }
+        out
+    }
+
+    /// CRC over header bytes 2..4 and the side info.
+    fn expected_crc(b: &[u8], f: &Frame) -> u16 {
+        let side = &b[f.at + 6..][..f.header.side_info_len()];
+        crc16(crc16(0xFFFF, &b[f.at + 2..f.at + 4]), side)
+    }
+
+    fn stored_crc(b: &[u8], f: &Frame) -> u16 {
+        u16::from_be_bytes([b[f.at + 4], b[f.at + 5]])
+    }
+
+    #[test]
+    fn crc_frames_are_reprotected() {
+        let p = protected();
+        let l = frames(&p).unwrap();
+        assert_eq!(l.frames.len(), frames(CBR128).unwrap().frames.len());
+        assert!(l.frames.iter().all(|f| f.header.crc && stored_crc(&p, f) == expected_crc(&p, f)));
+        let out = adjust(&p, 2).unwrap();
+        assert_eq!(gains(&out), gains(&p).iter().map(|g| g + 2).collect::<Vec<_>>());
+        let out_frames = frames(&out).unwrap().frames;
+        for f in &out_frames {
+            assert_eq!(stored_crc(&out, f), expected_crc(&out, f), "frame at {}", f.at);
+        }
+        // The CRCs did have to change, so a skipped recompute fails the check above.
+        assert!(out_frames.iter().all(|f| stored_crc(&p, f) != expected_crc(&out, f)));
+    }
+
+    #[test]
+    fn a_stale_crc_is_caught() {
+        let mut out = adjust(&protected(), 2).unwrap();
+        let f = frames(&out).unwrap().frames[7];
+        out[f.at + 5] ^= 0x01;
+        assert_ne!(stored_crc(&out, &f), expected_crc(&out, &f));
+    }
+
+    #[test]
+    fn step_range_keeps_global_gain_in_a_byte() {
+        for f in FIXTURES {
+            let g = gains(f);
+            let (lo, hi) = (*g.iter().min().unwrap() as i32, *g.iter().max().unwrap() as i32);
+            assert_eq!(step_range(f).unwrap(), (-lo, 255 - hi));
+            assert!(adjust(f, 255 - hi).is_ok());
+            assert!(adjust(f, -lo).is_ok());
+            assert_eq!(adjust(f, 255 - hi + 1).unwrap_err(), GainError::NoRoom);
+            assert_eq!(adjust(f, -lo - 1).unwrap_err(), GainError::NoRoom);
+        }
+    }
+
+    #[test]
+    fn tags_and_info_frames_are_copied_unchanged() {
+        let mut v1 = b"TAG".to_vec();
+        v1.resize(128, b'x');
+        let tagged = [&id3v2(290, false)[..], VBR48, &ape(), &v1].concat();
+        let out = adjust(&tagged, -2).unwrap();
+        let l = frames(&tagged).unwrap();
+        let first = l.frames[0];
+        assert!(first.info);
+        assert_eq!(out[..first.at + first.header.len], tagged[..first.at + first.header.len]);
+        assert_eq!(out[l.audio_end..], tagged[l.audio_end..]);
     }
 }
