@@ -305,7 +305,7 @@ const MIXFORGE_BEATS: &str = include_str!("mixforge_beats.py");
 
 /// mixforge's analysis of the audio file at `path`, through the sidecar run with the python in
 /// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`. Errors name command `cmd`.
-fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
+pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
     crate::file_access::check_read(path).map_err(EngineError::Io)?;
     let var =
         |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| bad(cmd, format!("set {name} to {what}")));

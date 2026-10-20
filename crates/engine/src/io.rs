@@ -242,6 +242,15 @@ pub(crate) fn make_dir(dir: impl AsRef<Path>) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))
 }
 
+/// The regular files directly in folder `dir` (not its subfolders), inside the automation read
+/// root when there is one; unsorted. Errors name the folder.
+pub(crate) fn list_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let dir = dir.as_ref();
+    crate::file_access::check_read(dir).map_err(EngineError::Io)?;
+    let entries = std::fs::read_dir(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
+    Ok(entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file())).collect())
+}
+
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
 pub(crate) fn write_path(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<()> {
     let path = path.as_ref();
