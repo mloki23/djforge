@@ -133,11 +133,12 @@ fn sources(source: &str) -> Result<(String, Vec<PathBuf>)> {
     Ok((name, files))
 }
 
-/// `Music/djforge-prepped/<name>` in the home folder.
-fn default_out(name: &str) -> Result<PathBuf> {
+/// Where prepped copies go when `out` is not given: `Music/djforge-prepped` in the home folder
+/// (each run in a folder named for its set or source folder).
+pub fn default_root() -> Result<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let home = std::env::var_os(var).filter(|h| !h.is_empty()).ok_or_else(|| bad(CMD, format!("{var} is not set; pass `out`")))?;
-    Ok(normalise(&PathBuf::from(home).join("Music").join("djforge-prepped").join(name)))
+    Ok(PathBuf::from(home).join("Music").join("djforge-prepped"))
 }
 
 /// The text of the earlier prep report at `path`, if that is what it is.
@@ -237,7 +238,7 @@ pub fn run(
     ceiling: f64,
     analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
 ) -> Result<Value> {
-    Plan::new(s, source, out, target_lufs, ceiling)?.prep(analyse, &Shared::default())
+    Plan::new(s, source, out, None, target_lufs, ceiling)?.prep(analyse, &Shared::default())
 }
 
 /// A prep run whose checks all passed and whose output folder exists: what it reads and writes.
@@ -257,7 +258,8 @@ struct Plan {
 
 impl Plan {
     /// Every refusal and check of `prep.tracks`, then `out` made: nothing else is written yet.
-    fn new(s: &Session, source: &str, out: Option<&str>, target_lufs: f64, ceiling: f64) -> Result<Self> {
+    /// Without `out`, the copies go to `<root>/<name>` (`root` default: [`default_root`]).
+    fn new(s: &Session, source: &str, out: Option<&str>, root: Option<&Path>, target_lufs: f64, ceiling: f64) -> Result<Self> {
         let started = std::time::Instant::now();
         if !(target_lufs.is_finite() && ceiling.is_finite()) {
             return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
@@ -265,7 +267,10 @@ impl Plan {
         let (name, files) = sources(source)?;
         let out = match out {
             Some(o) => normalise(Path::new(o)),
-            None => default_out(&name)?,
+            None => normalise(&match root {
+                Some(r) => r.join(&name),
+                None => default_root()?.join(&name),
+            }),
         };
         let (dests, earlier) = destinations(s, &files, &out)?;
         crate::io::make_dir(&out)?;
@@ -412,13 +417,29 @@ enum JobState {
 /// Starts the run `prep.tracks` does for `p`: every check is made, and `out` created, before
 /// this returns; the tracks are prepped on another thread.
 pub fn prep_job(e: &Engine, p: &Value) -> Result<PrepJob> {
+    prep_job_in(e, p, None, mixforge_analysis())
+}
+
+/// [`prep_job`] whose copies go to `<root>/<name>` when `p` gives no `out` (`root` default:
+/// [`default_root`]), with mixforge's analysis given by `analyse` (see [`mixforge_analysis`]).
+pub fn prep_job_in(e: &Engine, p: &Value, root: Option<&Path>, analyse: Analyse) -> Result<PrepJob> {
     let (source, out, target, ceiling) = params(p)?;
-    start(e.session(), source, out, target, ceiling, Arc::new(mixforge))
+    spawn(Plan::new(e.session(), source, out, root, target, ceiling)?, analyse)
+}
+
+/// mixforge's analysis through its sidecar, as [`prep_job`] uses it.
+pub fn mixforge_analysis() -> Analyse {
+    Arc::new(mixforge)
 }
 
 /// [`run`] on another thread: see [`prep_job`].
 pub fn start(s: &Session, source: &str, out: Option<&str>, target_lufs: f64, ceiling: f64, analyse: Analyse) -> Result<PrepJob> {
-    let plan = Arc::new(Plan::new(s, source, out, target_lufs, ceiling)?);
+    spawn(Plan::new(s, source, out, None, target_lufs, ceiling)?, analyse)
+}
+
+/// Preps `plan` on another thread.
+fn spawn(plan: Plan, analyse: Analyse) -> Result<PrepJob> {
+    let plan = Arc::new(plan);
     let shared = Arc::new(Shared::default());
     shared.update(|p| p.total = plan.files.len());
     let out = plan.out.clone();

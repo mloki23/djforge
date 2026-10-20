@@ -375,6 +375,11 @@ pub struct SoundApp {
     pub bounce: Option<soundcraft_engine::io::Bounce>,
     /// The Prep Tracks run in progress, on its own thread.
     pub prep: Option<soundcraft_engine::cmd::PrepJob>,
+    /// Where Prep Tracks puts each run's folder when no `out` is given (`None`: the engine's
+    /// default, which needs the home folder). Tests point it at a scratch folder.
+    pub prep_root: Option<std::path::PathBuf>,
+    /// mixforge's analysis for Prep Tracks; tests swap in a fake so no sidecar runs.
+    pub prep_analyse: soundcraft_engine::cmd::PrepAnalyse,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -450,6 +455,8 @@ impl SoundApp {
             video: video_track::VideoPool::default(),
             bounce: None,
             prep: None,
+            prep_root: soundcraft_engine::cmd::prep_default_root().ok(),
+            prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }

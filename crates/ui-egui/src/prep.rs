@@ -5,14 +5,16 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold};
 use serde_json::Value;
 
-/// Starts the prep `prep.tracks` runs for `params`: its checks are made here (a refusal goes to
+/// Starts the prep `prep.tracks` runs for `params` (without `out`, into a folder in
+/// `app.prep_root`, analysed by `app.prep_analyse`): its checks are made here (a refusal goes to
 /// the status line), the tracks are prepped on another thread and [`step`] collects the result.
 pub fn start(app: &mut SoundApp, params: &Value) {
     if app.prep.is_some() {
         app.ui.status = "A prep is already running".into();
         return;
     }
-    match soundcraft_engine::cmd::prep_job(&app.engine, params) {
+    let analyse = std::sync::Arc::clone(&app.prep_analyse);
+    match soundcraft_engine::cmd::prep_job_in(&app.engine, params, app.prep_root.as_deref(), analyse) {
         Ok(job) => app.prep = Some(job),
         Err(e) => app.ui.status = e.to_string(),
     }

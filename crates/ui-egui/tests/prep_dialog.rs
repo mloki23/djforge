@@ -79,18 +79,19 @@ fn names_in(dir: &Path) -> Vec<String> {
 
 #[test]
 fn the_dialog_starts_a_prep_and_stepping_the_app_completes_it() {
-    // The prompt sends only `source`, so the copies go to the default folder in the home folder:
-    // one named for this test run, removed again.
-    let name = format!("djforge-ui-prep-test-{}", std::process::id());
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap();
-    let prepped = PathBuf::from(home).join("Music").join("djforge-prepped");
-    let out = prepped.join(&name);
-    let _ = std::fs::remove_dir_all(&out);
     let dir = scratch("prep-dialog");
-    let src = mp3_folder(&dir, &name);
-
+    let src = mp3_folder(&dir, "my set");
+    let root = dir.join("prepped");
     let mut h = harness();
     let app = h.state_mut();
+    // The prompt sends only `source`: the copies go to a folder named for it in the app's root.
+    app.prep_root = Some(root.clone());
+    let analysed = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&analysed);
+    app.prep_analyse = Arc::new(move |path: &str| {
+        seen.lock().unwrap().push(path.to_string());
+        Ok(json!({"camelot": "8A", "bpm": 124.0}))
+    });
     assert!(app.dialogs.open_for_command(&app.engine, "prep.tracks"));
     if let Some(Dialog::PathPrompt { path, .. }) = &mut app.dialogs.open {
         *path = src.to_string_lossy().into_owned();
@@ -105,14 +106,14 @@ fn the_dialog_starts_a_prep_and_stepping_the_app_completes_it() {
     let status = h.state().ui.status.clone();
     assert!(status.starts_with("Prepped 3 track(s) into"), "{status}");
     assert!(!status.contains("cancelled"), "{status}");
+    let out = root.join("my set");
     let mut want: Vec<String> = FIXTURES.iter().map(|f| f.to_string()).chain(["prep-report.txt".into()]).collect();
     want.sort();
     assert_eq!(names_in(&out), want);
+    // Every track was analysed by the app's analysis, not mixforge's sidecar.
+    assert_eq!(analysed.lock().unwrap().len(), 3);
     // Like a bounce, a prep started from its dialog doesn't go through the command journal.
     assert_eq!(h.state().engine.journal.len(), journaled);
-
-    let _ = std::fs::remove_dir_all(&out);
-    let _ = std::fs::remove_dir(&prepped);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
