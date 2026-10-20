@@ -306,6 +306,11 @@ const MIXFORGE_BEATS: &str = include_str!("mixforge_beats.py");
 /// mixforge's analysis of the audio file at `path`, through the sidecar run with the python in
 /// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`. Errors name command `cmd`.
 pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
+    analyze_file_until(cmd, path, &|| false)
+}
+
+/// [`analyze_file`], killing the sidecar as soon as `stop` says so (an error then).
+pub(crate) fn analyze_file_until(cmd: &str, path: &str, stop: &dyn Fn() -> bool) -> Result<Value> {
     crate::file_access::check_read(path).map_err(EngineError::Io)?;
     let var =
         |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| bad(cmd, format!("set {name} to {what}")));
@@ -319,9 +324,11 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
         // CREATE_NO_WINDOW: the GUI must not flash a console.
         command.creation_flags(0x0800_0000);
     }
-    let out = match output_within(&mut command, SIDECAR_TIMEOUT) {
-        Ok(Some(out)) => out,
-        Ok(None) => return Err(bad(cmd, format!("{TIMED_OUT} after {} s", SIDECAR_TIMEOUT.as_secs()))),
+    let out = match output_within(&mut command, SIDECAR_TIMEOUT, stop) {
+        Ok(Sidecar::Ran(out)) => out,
+        Ok(Sidecar::TimedOut) => return Err(bad(cmd, format!("{TIMED_OUT} after {} s", SIDECAR_TIMEOUT.as_secs()))),
+        Ok(Sidecar::LeftHolding) => return Err(bad(cmd, "the mixforge sidecar left a process holding its output")),
+        Ok(Sidecar::Stopped) => return Err(bad(cmd, STOPPED)),
         Err(err) => return Err(bad(cmd, format!("could not run DJFORGE_PYTHON ({python}): {err}"))),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -336,18 +343,34 @@ pub(crate) fn analyze_file(cmd: &str, path: &str) -> Result<Value> {
 
 /// How the error for a sidecar that ran out of time starts.
 pub(crate) const TIMED_OUT: &str = "timed out";
+/// The error for a sidecar stopped part-way.
+pub(crate) const STOPPED: &str = "stopped: the prep was cancelled";
 /// Longest the mixforge sidecar may take over one file.
 const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long the sidecar's output is waited for after it exited.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Runs `command` (stdout and stderr captured) and returns its output, or `None` (after killing
-/// it) when it runs longer than `limit`, or when a process it started keeps its output open past
-/// `limit` after it exited.
-fn output_within(command: &mut std::process::Command, limit: std::time::Duration) -> std::io::Result<Option<std::process::Output>> {
+/// How a run of the sidecar ended.
+#[derive(Debug)]
+enum Sidecar {
+    /// It exited, and its output was read.
+    Ran(std::process::Output),
+    /// It ran past its limit and was killed.
+    TimedOut,
+    /// It exited, but a process it started kept its output open past [`EXIT_GRACE`].
+    LeftHolding,
+    /// It was killed when asked to stop.
+    Stopped,
+}
+
+/// Runs `command` (stdout and stderr captured) and returns its output; kills it when it runs
+/// longer than `limit` or `stop` says so (checked every 20 ms).
+fn output_within(command: &mut std::process::Command, limit: std::time::Duration, stop: &dyn Fn() -> bool) -> std::io::Result<Sidecar> {
     use std::io::Read as _;
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     // Both pipes are drained as the child writes, so a full pipe can't stall it. Each reader sends
-    // what it read once its pipe closes; one that never closes is not waited for past `limit`.
+    // what it read once its pipe closes; one that never closes is not waited for.
     let (tx, rx) = std::sync::mpsc::channel();
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>, is_stdout: bool| {
         let tx = tx.clone();
@@ -367,24 +390,27 @@ fn output_within(command: &mut std::process::Command, limit: std::time::Duration
     loop {
         if let Some(status) = child.try_wait()? {
             let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let until = std::time::Instant::now() + EXIT_GRACE;
             for _ in 0..2 {
-                match rx.recv_timeout(limit.saturating_sub(started.elapsed())) {
+                match rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
                     Ok((true, buf)) => stdout = buf,
                     Ok((false, buf)) => stderr = buf,
-                    // A process the child started still holds a pipe: as good as timed out.
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                    // A process the child started still holds a pipe; the readers are left to
+                    // end when it closes.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(Sidecar::LeftHolding),
                     // A reader ended without sending (it panicked): its output is lost.
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-            return Ok(Some(std::process::Output { status, stdout, stderr }));
+            return Ok(Sidecar::Ran(std::process::Output { status, stdout, stderr }));
         }
-        if started.elapsed() >= limit {
+        let stopped = stop();
+        if stopped || started.elapsed() >= limit {
             // The readers end when the pipes close; they are not waited for, since a process the
             // child started may still hold them.
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(None);
+            return Ok(if stopped { Sidecar::Stopped } else { Sidecar::TimedOut });
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -673,15 +699,34 @@ mod tests {
         } else {
             (command(&["echo", "hi"]), command(&["sleep", "30"]))
         };
-        let out = output_within(&mut quick, std::time::Duration::from_secs(20)).unwrap().unwrap();
+        let Sidecar::Ran(out) = output_within(&mut quick, std::time::Duration::from_secs(20), &|| false).unwrap() else {
+            panic!("quick did not run")
+        };
         assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
         let started = std::time::Instant::now();
-        assert!(output_within(&mut slow, std::time::Duration::from_millis(300)).unwrap().is_none());
+        assert!(matches!(output_within(&mut slow, std::time::Duration::from_millis(300), &|| false).unwrap(), Sidecar::TimedOut));
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
-    fn a_process_left_holding_the_pipes_does_not_outlast_the_limit() {
+    fn a_stopped_sidecar_is_killed_at_once() {
+        let mut slow = if cfg!(windows) {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let started = std::time::Instant::now();
+        let stop = || started.elapsed() > std::time::Duration::from_millis(300);
+        assert!(matches!(output_within(&mut slow, std::time::Duration::from_secs(60), &stop).unwrap(), Sidecar::Stopped));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_process_left_holding_the_pipes_is_given_up_on_soon_after_the_sidecar_exits() {
         // The shell exits at once, leaving a process it started holding its stdout for 20 s.
         let mut held = if cfg!(windows) {
             let mut c = std::process::Command::new("cmd");
@@ -693,7 +738,8 @@ mod tests {
             c
         };
         let started = std::time::Instant::now();
-        assert!(output_within(&mut held, std::time::Duration::from_secs(2)).unwrap().is_none());
+        // Given up after the grace period, not the whole 60 s budget.
+        assert!(matches!(output_within(&mut held, std::time::Duration::from_secs(60), &|| false).unwrap(), Sidecar::LeftHolding));
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
     use crate::edit as ops;

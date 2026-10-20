@@ -88,7 +88,7 @@ fn the_dialog_starts_a_prep_and_stepping_the_app_completes_it() {
     app.prep_root = Some(root.clone());
     let analysed = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&analysed);
-    app.prep_analyse = Arc::new(move |path: &str| {
+    app.prep_analyse = Arc::new(move |path: &str, _: &dyn Fn() -> bool| {
         seen.lock().unwrap().push(path.to_string());
         Ok(json!({"camelot": "8A", "bpm": 124.0}))
     });
@@ -122,7 +122,7 @@ fn gated_job(src: &Path, out: &Path) -> (PrepJob, mpsc::Receiver<String>, mpsc::
     let (reached_tx, reached) = mpsc::channel();
     let (go, go_rx) = mpsc::channel::<()>();
     let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
-    let analyse: PrepAnalyse = Arc::new(move |path: &str| {
+    let analyse: PrepAnalyse = Arc::new(move |path: &str, _: &dyn Fn() -> bool| {
         reached_tx.lock().unwrap().send(path.to_string()).unwrap();
         go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
         Err::<Value, String>("no analysis here".into())
@@ -182,5 +182,57 @@ fn escape_cancels_and_the_session_cannot_be_replaced_while_it_preps() {
     step_until_prepped(&mut h);
     assert!(h.state().ui.status.contains("cancelled after 1 of 3"), "{}", h.state().ui.status);
     assert!(h.state_mut().run("session.close", json!({})).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn files_in_the_prep_folder_cannot_be_imported_or_saved_to_while_it_runs() {
+    let dir = scratch("prep-targets");
+    let src = mp3_folder(&dir, "set");
+    let out = dir.join("out");
+    let mut h = harness();
+    let (job, reached, go) = gated_job(&src, &out);
+    h.state_mut().prep = Some(job);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    let copy = out.join(".").join(FIXTURES[0]);
+    for (id, params) in [
+        ("file.import_audio", json!({"path": copy.to_string_lossy()})),
+        ("session.save_as", json!({"path": out.join("Mine.scraft").to_string_lossy()})),
+        ("dj.import_set", json!({"plan": out.join("plan.json").to_string_lossy()})),
+    ] {
+        let err = h.state_mut().run(id, params).unwrap_err();
+        assert!(err.contains("the prep is writing"), "{id}: {err}");
+    }
+    // Elsewhere is fine (this one fails for its own reason).
+    let err = h.state_mut().run("file.import_audio", json!({"path": dir.join("nothing.wav").to_string_lossy()})).unwrap_err();
+    assert!(!err.contains("the prep is writing"), "{err}");
+    go.send(()).unwrap();
+    for _ in 0..2 {
+        if reached.recv_timeout(Duration::from_secs(60)).is_ok() {
+            go.send(()).unwrap();
+        }
+    }
+    step_until_prepped(&mut h);
+    assert!(h.state_mut().run("file.import_audio", json!({"path": out.join(FIXTURES[0]).to_string_lossy()})).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_quit_cancels_the_prep_and_waits_for_it_to_stop() {
+    let dir = scratch("prep-quit");
+    let src = mp3_folder(&dir, "set");
+    let mut h = harness();
+    assert!(!soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
+    let (job, reached, go) = gated_job(&src, &dir.join("out"));
+    h.state_mut().prep = Some(job);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert!(soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
+    assert!(h.state().prep.as_ref().is_some_and(PrepJob::cancelling));
+    assert!(h.state().prep_quit);
+    go.send(()).unwrap();
+    step_until_prepped(&mut h);
+    assert!(!h.state().prep_quit, "the quit was not asked again");
+    assert!(h.state().ui.status.contains("cancelled after 1 of 3"), "{}", h.state().ui.status);
+    assert!(!soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
     let _ = std::fs::remove_dir_all(&dir);
 }

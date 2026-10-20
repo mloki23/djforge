@@ -251,6 +251,21 @@ pub(crate) fn kept_reference(stored: &str, session: &Path, audio: &Arc<SourceAud
     (file_found(&file) && !in_audio_files(&file) && decodes_unchanged(audio, &file)).then_some(file)
 }
 
+/// At most the first `max` bytes of the file at `path`, inside the automation read root when
+/// there is one.
+pub(crate) fn read_head(path: impl AsRef<Path>, max: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let path = path.as_ref();
+    let err = |err: std::io::Error| EngineError::Io(format!("{}: {err}", path.display()));
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    if !std::fs::metadata(path).map_err(err)?.is_file() {
+        return Err(EngineError::Io(format!("{}: not a file", path.display())));
+    }
+    let mut head = Vec::new();
+    std::fs::File::open(path).map_err(err)?.take(max as u64).read_to_end(&mut head).map_err(err)?;
+    Ok(head)
+}
+
 /// Create `dir` and its parents, inside the automation write root when there is one.
 pub(crate) fn make_dir(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
@@ -1664,19 +1679,24 @@ pub fn write_user_file(s: &Session, path: &str, bytes: &[u8]) -> Result<()> {
 /// How [`replace_user_file`]'s temporary file for `<name>` is named: `.<name>.djforge-tmp`.
 const TMP_SUFFIX: &str = ".djforge-tmp";
 
-/// Removes the temporary files [`replace_user_file`] left in folder `dir` (`.<name>.djforge-tmp`,
-/// directly in it) when a write stopped part-way. Only files and links are removed, never what a
-/// link names; one that can't be removed stays. Returns how many were removed.
-pub(crate) fn remove_stale_temps(dir: &Path) -> usize {
+/// Removes the temporary files [`replace_user_file`] left in folder `dir` when a write stopped
+/// part-way, for the files named `names` only (`.<name>.djforge-tmp`, directly in `dir`). Only
+/// files and links are removed, never what a link names; one that can't be removed stays.
+/// Returns how many were removed.
+pub(crate) fn remove_stale_temps(dir: &Path, names: &[&std::ffi::OsStr]) -> usize {
     if cfg!(target_arch = "wasm32") {
         return 0;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
-    let stale = |name: &str| name.strip_prefix('.').and_then(|n| n.strip_suffix(TMP_SUFFIX)).is_some_and(|n| !n.is_empty());
-    entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_str().is_some_and(stale) && e.file_type().is_ok_and(|t| !t.is_dir()))
-        .filter(|e| crate::file_access::check_write(e.path()).is_ok() && std::fs::remove_file(e.path()).is_ok())
+    names
+        .iter()
+        .map(|name| {
+            let mut tmp = std::ffi::OsString::from(".");
+            tmp.push(name);
+            tmp.push(TMP_SUFFIX);
+            dir.join(tmp)
+        })
+        .filter(|tmp| std::fs::symlink_metadata(tmp).is_ok_and(|m| !m.is_dir()))
+        .filter(|tmp| crate::file_access::check_write(tmp).is_ok() && std::fs::remove_file(tmp).is_ok())
         .count()
 }
 

@@ -380,6 +380,8 @@ pub struct SoundApp {
     pub prep_root: Option<std::path::PathBuf>,
     /// mixforge's analysis for Prep Tracks; tests swap in a fake so no sidecar runs.
     pub prep_analyse: soundcraft_engine::cmd::PrepAnalyse,
+    /// A quit waits for the running prep to stop ([`prep::holds_quit`]).
+    pub prep_quit: bool,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -457,6 +459,7 @@ impl SoundApp {
             prep: None,
             prep_root: soundcraft_engine::cmd::prep_default_root().ok(),
             prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
+            prep_quit: false,
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -472,6 +475,9 @@ impl SoundApp {
         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert")
             && (bounce::refuses_session_switch(self) || prep::refuses_session_switch(self))
         {
+            return Err(self.ui.status.clone());
+        }
+        if prep::refuses_target(self, id, &params) {
             return Err(self.ui.status.clone());
         }
         if let Some(r) = menus::run_ui_command(self, id, &params) {

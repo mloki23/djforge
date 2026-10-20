@@ -557,18 +557,18 @@ fn a_track_that_fails_on_a_re_run_says_its_earlier_copy_was_kept() {
 }
 
 #[test]
-fn leftover_temp_files_in_out_are_cleared_and_nothing_else() {
+fn leftover_temp_files_of_this_runs_copies_are_cleared_and_nothing_else() {
     let dir = scratch("stale-temps");
     let src = source_folder(&dir);
     let out = dir.join("out");
-    std::fs::create_dir_all(out.join(".folder.djforge-tmp")).unwrap();
-    // Left by a run that stopped part-way: one for a track still in the set, one for a track no
-    // longer in it, and the report's.
-    let stale = [format!(".{}.djforge-tmp", FIXTURES[1]), ".gone.mp3.djforge-tmp".into(), ".prep-report.txt.djforge-tmp".into()];
+    std::fs::create_dir_all(out.join(format!(".{}.djforge-tmp", FIXTURES[0]))).unwrap();
+    // Left by a run that stopped part-way: one for a track of this run, and the report's.
+    let stale = [format!(".{}.djforge-tmp", FIXTURES[1]), ".prep-report.txt.djforge-tmp".into()];
     for f in &stale {
         std::fs::write(out.join(f), "half a copy").unwrap();
     }
-    let kept = ["gone.mp3.djforge-tmp", ".djforge-tmp", ".gone.mp3.djforge-tmp.bak", "x.djforge-tmp"];
+    // A track no longer in the set, and names that only look alike, are not this run's.
+    let kept = [".gone.mp3.djforge-tmp", "gone.mp3.djforge-tmp", ".djforge-tmp", ".gone.mp3.djforge-tmp.bak", "x.djforge-tmp"];
     for f in kept {
         std::fs::write(out.join(f), "not ours").unwrap();
     }
@@ -579,17 +579,17 @@ fn leftover_temp_files_in_out_are_cleared_and_nothing_else() {
     for f in kept {
         assert_eq!(std::fs::read_to_string(out.join(f)).unwrap(), "not ours", "{f}");
     }
-    assert!(out.join(".folder.djforge-tmp").is_dir());
+    assert!(out.join(format!(".{}.djforge-tmp", FIXTURES[0])).is_dir());
 }
 
-type Analyse = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>;
+type Analyse = soundcraft_engine::cmd::PrepAnalyse;
 
 /// An analysis that says which file it reached and then waits for the test's go-ahead.
 fn gated() -> (Analyse, mpsc::Receiver<String>, mpsc::Sender<()>) {
     let (reached_tx, reached) = mpsc::channel();
     let (go, go_rx) = mpsc::channel::<()>();
     let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
-    let analyse = move |path: &str| {
+    let analyse = move |path: &str, _: &dyn Fn() -> bool| {
         reached_tx.lock().unwrap().send(path.to_string()).unwrap();
         go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
         Err("no analysis here".to_string())
@@ -666,13 +666,20 @@ fn a_job_checks_everything_before_it_starts_and_gives_what_the_command_gives() {
     let dir = scratch("job-same");
     let src = source_folder(&dir);
     let before = snapshot(&src);
-    let err = prep_start(&Session::default(), src.to_str().unwrap(), Some(src.to_str().unwrap()), -14.0, -1.0, Arc::new(no_analysis));
+    let err = prep_start(
+        &Session::default(),
+        src.to_str().unwrap(),
+        Some(src.to_str().unwrap()),
+        -14.0,
+        -1.0,
+        Arc::new(|path: &str, _: &dyn Fn() -> bool| no_analysis(path)),
+    );
     assert!(err.err().unwrap().to_string().contains("source"));
     assert_eq!(snapshot(&src), before);
 
     let (a, b) = (dir.join("a"), dir.join("b"));
     let by_command = run(&src, &a, &no_analysis).unwrap();
-    let by_job = finish(&mut start(&src, &b, Arc::new(no_analysis)));
+    let by_job = finish(&mut start(&src, &b, Arc::new(|path: &str, _: &dyn Fn() -> bool| no_analysis(path))));
     assert_eq!(by_command["tracks"], by_job["tracks"]);
     assert_eq!(by_command["cancelled"], false);
     let without_time = |r: &Value| {
@@ -704,4 +711,82 @@ fn a_cancelled_run_keeps_the_earlier_report_lines_of_the_tracks_it_did_not_reach
     assert_eq!(tracks(&finish(&mut job)).len(), 1);
     let again = run(&src, &out, &no_analysis).unwrap();
     assert_eq!(track(&again, "fake.mp3")["status"], "not_adjusted", "{again}");
+}
+
+#[test]
+fn the_report_on_disk_lists_every_copy_while_the_run_goes_on() {
+    let dir = scratch("job-incremental");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Not MPEG audio: its copy carries no prep note, only the report says it is prep's.
+    std::fs::write(src.join("a fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    std::fs::write(src.join("b.mp3"), fixture(FIXTURES[0])).unwrap();
+    let out = dir.join("out");
+    let (analyse, reached, go) = gated();
+    let mut job = start(&src, &out, analyse);
+    // On the second track: the app quitting now would leave `out` as it is.
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    let report = std::fs::read_to_string(out.join("prep-report.txt")).unwrap();
+    assert!(report.contains("in progress: 1 of 2 tracks done"), "{report}");
+    assert!(report.contains("unnoted copy: 5000 bytes, fnv1a64 "), "{report}");
+    let left = dir.join("left");
+    std::fs::create_dir_all(&left).unwrap();
+    for f in ["a fake.mp3", "prep-report.txt"] {
+        std::fs::copy(out.join(f), left.join(f)).unwrap();
+    }
+    assert_eq!(names(&out), ["a fake.mp3", "prep-report.txt"]);
+    go.send(()).unwrap();
+    finish(&mut job);
+    // A run into what the interrupted one left takes its copy as prep's.
+    let again = run(&src, &left, &no_analysis).unwrap();
+    assert_eq!(track(&again, "a fake.mp3")["status"], "not_adjusted", "{again}");
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn an_unnoted_copy_is_recognised_only_by_its_exact_name_size_and_hash() {
+    let dir = scratch("unnoted-hash");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let out = dir.join("out");
+    run(&src, &out, &no_analysis).unwrap();
+    // Changed since prep wrote it (same size): no longer prep's.
+    std::fs::write(out.join("fake.mp3"), vec![0x43u8; 5000]).unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("not a prep copy"), "{err}");
+    // A listing for another name that merely contains this one doesn't count either.
+    std::fs::write(out.join("fake.mp3"), vec![0x42u8; 5000]).unwrap();
+    let report = std::fs::read_to_string(out.join("prep-report.txt")).unwrap();
+    std::fs::write(out.join("prep-report.txt"), report.replace(", fake.mp3", ", my fake.mp3")).unwrap();
+    let err = run(&src, &out, &no_analysis).unwrap_err().to_string();
+    assert!(err.contains("not a prep copy"), "{err}");
+}
+
+#[test]
+fn cancel_stops_an_analysis_that_is_running() {
+    let dir = scratch("job-stop-analysis");
+    let src = source_folder(&dir);
+    let (reached_tx, reached) = mpsc::channel();
+    let reached_tx = Mutex::new(reached_tx);
+    let analyse: Analyse = Arc::new(move |path: &str, stop: &dyn Fn() -> bool| {
+        reached_tx.lock().unwrap().send(path.to_string()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !stop() {
+            assert!(std::time::Instant::now() < until, "never told to stop");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err("stopped".to_string())
+    });
+    let mut job = start(&src, &dir.join("out"), analyse);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    job.cancel();
+    let r = finish(&mut job);
+    assert_eq!(tracks(&r).len(), 1, "{r}");
+    assert!(tracks(&r)[0]["doubts"].as_array().unwrap().iter().any(|d| d == "no mixforge analysis: stopped"), "{r}");
 }

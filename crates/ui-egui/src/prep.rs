@@ -11,12 +11,16 @@ use serde_json::Value;
 pub fn start(app: &mut SoundApp, params: &Value) {
     if app.prep.is_some() {
         app.ui.status = "A prep is already running".into();
+        log::warn!("prep.tracks: {}", app.ui.status);
         return;
     }
     let analyse = std::sync::Arc::clone(&app.prep_analyse);
     match soundcraft_engine::cmd::prep_job_in(&app.engine, params, app.prep_root.as_deref(), analyse) {
         Ok(job) => app.prep = Some(job),
-        Err(e) => app.ui.status = e.to_string(),
+        Err(e) => {
+            app.ui.status = e.to_string();
+            log::warn!("prep.tracks: {e}");
+        }
     }
 }
 
@@ -34,16 +38,77 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
         Err(e) => e.to_string(),
     };
     app.prep = None;
+    if std::mem::take(&mut app.prep_quit) && !app.quit_requested {
+        // The window's close waited for the prep: ask again, now that it has stopped.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Holds a quit while a prep runs: cancels it, and the quit goes ahead once the prep has stopped
+/// after its current track (the window is closed again then; a quit asked by command stays
+/// asked). True when held; the status line says why.
+pub fn holds_quit(app: &mut SoundApp) -> bool {
+    let Some(job) = &app.prep else { return false };
+    job.cancel();
+    app.prep_quit = true;
+    app.ui.status = "Quitting once the prep stops after the current track".into();
+    true
 }
 
 /// Refuses to replace the session while a prep runs: the prep refuses to write over the audio of
-/// the session it started in, and a session opened meanwhile could play a file it is replacing.
-/// True when refused; the status line says why.
+/// the session it started in (a snapshot of its source files), so a session opened meanwhile
+/// could play a file it is replacing. True when refused; the status line says why.
 pub fn refuses_session_switch(app: &mut SoundApp) -> bool {
     if app.prep.is_some() {
         app.ui.status = "Finish or cancel the prep first".into();
     }
     app.prep.is_some()
+}
+
+/// Refuses command `id` while a prep runs when it names a file or folder inside the folder the
+/// prep writes (`path`, `plan`, `dir`, `source`, or the session's own folder when saving): an
+/// import from there would put a file the prep may replace into the session after the prep took
+/// its snapshot of the session's files, and a save there could be replaced too. True when
+/// refused; the status line says why.
+pub fn refuses_target(app: &mut SoundApp, id: &str, params: &Value) -> bool {
+    let Some(job) = &app.prep else { return false };
+    let out = job.out().to_path_buf();
+    let mut targets: Vec<std::path::PathBuf> =
+        ["path", "plan", "dir", "source"].iter().filter_map(|k| params.get(*k).and_then(Value::as_str)).map(std::path::PathBuf::from).collect();
+    if id.starts_with("session.save")
+        && let Some(folder) = &app.engine.session().folder
+    {
+        targets.push(folder.clone());
+    }
+    let Some(hit) = targets.into_iter().find(|t| inside(t, &out)) else { return false };
+    app.ui.status = format!("{} is in the folder the prep is writing ({}); wait for the prep or cancel it", hit.display(), out.display());
+    log::warn!("{id}: {}", app.ui.status);
+    true
+}
+
+/// Whether `path` (made absolute, `.` and `..` resolved by name) is `dir` or inside it, without
+/// regard to case on Windows.
+fn inside(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    use std::path::Component;
+    let resolved = |p: &std::path::Path| {
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut out: Vec<String> = Vec::new();
+        for c in abs.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                other => {
+                    let s = other.as_os_str().to_string_lossy();
+                    out.push(if cfg!(windows) { s.to_lowercase() } else { s.into_owned() });
+                }
+            }
+        }
+        out
+    };
+    let (path, dir) = (resolved(path), resolved(dir));
+    path.len() >= dir.len() && path.iter().zip(&dir).all(|(a, b)| a == b)
 }
 
 /// The status line after `prep.tracks` (of `total` tracks): where the copies went and the totals.
@@ -69,7 +134,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let Some(job) = &app.prep else { return };
     let p = job.progress();
     let stopping = job.cancelling();
-    let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // Esc is taken here, so it doesn't also reach what's behind the window.
+    let mut cancel = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     egui::Modal::new(egui::Id::new("prep_progress")).show(ctx, |ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
         ui.set_width(360.0);

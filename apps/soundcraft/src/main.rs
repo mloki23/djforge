@@ -56,9 +56,14 @@ impl eframe::App for App {
         for p in dropped {
             open_path(&mut self.0, &p);
         }
+        // A running prep is cancelled first, and the quit waits for it to stop after its track.
         if self.0.quit_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) && dialogs::ask_to_save(&mut self.0, "app.quit", &serde_json::json!({})) {
+            if !soundcraft_ui_egui::prep::holds_quit(&mut self.0) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if ctx.input(|i| i.viewport().close_requested())
+            && (soundcraft_ui_egui::prep::holds_quit(&mut self.0) || dialogs::ask_to_save(&mut self.0, "app.quit", &serde_json::json!({})))
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         soundcraft_ui_egui::fit_window_to_screen(ctx);

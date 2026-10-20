@@ -57,7 +57,7 @@ fn num(p: &Value, key: &str, d: f64, range: std::ops::RangeInclusive<f64>) -> Re
 
 fn prep_tracks(e: &mut Engine, p: &Value) -> Result<Value> {
     let (source, out, target, ceiling) = params(p)?;
-    run(e.session(), source, out, target, ceiling, &mixforge)
+    run(e.session(), source, out, target, ceiling, &|path| mixforge(path, &|| false))
 }
 
 /// `prep.tracks`'s `source`, `out`, `target_lufs` and `ceiling`.
@@ -70,8 +70,8 @@ fn params(p: &Value) -> Result<(&str, Option<&str>, f64, f64)> {
 }
 
 /// mixforge's analysis of the track at `path`, or why there is none.
-fn mixforge(path: &str) -> std::result::Result<Value, String> {
-    super::dj::analyze_file(CMD, path).map_err(|err| match err {
+fn mixforge(path: &str, stop: &dyn Fn() -> bool) -> std::result::Result<Value, String> {
+    super::dj::analyze_file_until(CMD, path, stop).map_err(|err| match err {
         EngineError::BadParams(_, msg) => msg,
         other => other.to_string(),
     })
@@ -146,17 +146,66 @@ fn prep_report(path: &Path) -> Option<String> {
     crate::io::read_text(path).ok().filter(|t| t.starts_with(REPORT_HEADER))
 }
 
-/// Doubts that mean prep wrote a copy without its `TXXX:djforge_prep` note.
-const UNNOTED: [&str; 3] = [TAGS_LEFT, NOT_MPEG, NOT_AN_MP3];
 const TAGS_LEFT: &str = "tags left as they are";
 const NOT_MPEG: &str = "not MPEG audio";
 const NOT_AN_MP3: &str = "not an MP3";
 
-/// Whether `report` (an earlier prep report) says it wrote a copy named `name` without its note,
-/// so the copy can't be recognised by its tag.
-fn listed_unnoted(report: &str, name: &str) -> bool {
-    let line = format!("  {name}  before ");
-    report.lines().any(|l| l.contains(&line) && UNNOTED.iter().any(|d| l.contains(d)))
+/// How a report line starts that lists a copy written without prep's `TXXX:djforge_prep` note
+/// (tags left alone, not MPEG, not an MP3), so the next run can still recognise it.
+const UNNOTED: &str = "      unnoted copy: ";
+
+/// A copy a report lists as written without prep's note: its exact name, size and FNV-1a hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unnoted {
+    name: String,
+    len: u64,
+    hash: u64,
+}
+
+impl Unnoted {
+    fn of(name: &str, bytes: &[u8]) -> Self {
+        Self { name: name.to_string(), len: bytes.len() as u64, hash: fnv1a64(bytes) }
+    }
+
+    /// Its report line: `      unnoted copy: 5000 bytes, fnv1a64 0123456789abcdef, <name>`.
+    fn line(&self) -> String {
+        format!("{UNNOTED}{} bytes, fnv1a64 {:016x}, {}\n", self.len, self.hash, self.name)
+    }
+
+    /// The copies `report` lists without a note.
+    fn listed(report: &str) -> Vec<Self> {
+        report
+            .lines()
+            .filter_map(|l| {
+                let (len, rest) = l.strip_prefix(UNNOTED)?.split_once(" bytes, fnv1a64 ")?;
+                let (hash, name) = rest.split_once(", ")?;
+                Some(Self { name: name.to_string(), len: len.parse().ok()?, hash: u64::from_str_radix(hash, 16).ok()? })
+            })
+            .collect()
+    }
+
+    /// Whether `bytes` are this copy.
+    fn is(&self, bytes: &[u8]) -> bool {
+        self.len == bytes.len() as u64 && self.hash == fnv1a64(bytes)
+    }
+}
+
+/// The 64-bit FNV-1a hash of `bytes`.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// Most bytes of a copy's ID3v2 tag read to look for prep's note.
+const MAX_TAG: usize = 64 << 20;
+
+/// The leading ID3v2 tag of the file at `path` (nothing else of the file is read); empty when it
+/// has none.
+fn tag_head(path: &Path) -> Result<Vec<u8>> {
+    let head = crate::io::read_head(path, 10)?;
+    let [b'I', b'D', b'3', major, _, flags, size @ ..] = head.as_slice() else { return Ok(Vec::new()) };
+    let footer = if *major == 4 && flags & 0x10 != 0 { 10 } else { 0 };
+    let size = size.iter().fold(0usize, |n, &x| (n << 7) | usize::from(x & 0x7F));
+    crate::io::read_head(path, (10 + footer + size).min(MAX_TAG))
 }
 
 /// `out` is not a source's folder and nothing in it is a source (by name or link): checked by
@@ -177,8 +226,8 @@ fn refuse_sources(files: &[PathBuf], out: &Path, dests: &[PathBuf]) -> Result<()
 /// Where each track's copy goes (`out/<file name>`), once every refusal and access check passed:
 /// `out` is not a source's folder, no two sources share a name, no copy (or the report) would
 /// land on a source or a session's audio, and every file already there is earlier prep output.
-/// Also returns the text of the earlier report in `out`, if there is one.
-fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathBuf>, Option<String>)> {
+/// Also returns the copies the earlier report in `out` lists without a note.
+fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathBuf>, Vec<Unnoted>)> {
     let mut names: HashMap<String, &Path> = HashMap::new();
     let mut dests = Vec::with_capacity(files.len());
     for f in files {
@@ -195,25 +244,33 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathB
     }
     refuse_sources(files, out, &dests)?;
     // Only earlier prep output may be replaced: a copy carrying prep's note, or one the earlier
-    // report there lists as written without it (tags left alone, not MPEG, not an MP3).
+    // report there lists (by exact name, size and hash) as written without it.
     let report = out.join(REPORT);
     let earlier = if crate::io::path_exists(&report) {
-        Some(
-            prep_report(&report)
-                .ok_or_else(|| bad(CMD, format!("{}: exists and is not a prep report; move it or choose another `out`", report.display())))?,
-        )
+        let text = prep_report(&report)
+            .ok_or_else(|| bad(CMD, format!("{}: exists and is not a prep report; move it or choose another `out`", report.display())))?;
+        Unnoted::listed(&text)
     } else {
-        None
+        Vec::new()
     };
     for d in &dests {
         if !crate::io::path_exists(d) {
             continue;
         }
-        let bytes = crate::io::read_file(d)
-            .map_err(|err| bad(CMD, format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display())))?;
+        let unreadable = |err: EngineError| bad(CMD, format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display()));
+        // Only the tag is read to look for the note: copies can be large.
+        let head = tag_head(d).map_err(unreadable)?;
         let name = d.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
-        let ours = (mp3 && mp3tags::has_prep_note(&bytes)) || earlier.as_deref().is_some_and(|r| listed_unnoted(r, name));
+        let ours = if mp3 && mp3tags::has_prep_note(&head) {
+            true
+        } else {
+            let listed: Vec<&Unnoted> = earlier.iter().filter(|u| u.name == name).collect();
+            !listed.is_empty() && {
+                let bytes = crate::io::read_file(d).map_err(unreadable)?;
+                listed.iter().any(|u| u.is(&bytes))
+            }
+        };
         if !ours {
             return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
         }
@@ -238,20 +295,22 @@ pub fn run(
     ceiling: f64,
     analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
 ) -> Result<Value> {
-    Plan::new(s, source, out, None, target_lufs, ceiling)?.prep(analyse, &Shared::default())
+    Plan::new(s, source, out, None, target_lufs, ceiling)?.prep(&|path, _| analyse(path), &Shared::default())
 }
 
 /// A prep run whose checks all passed and whose output folder exists: what it reads and writes.
 struct Plan {
     started: std::time::Instant,
+    /// When it started, for the report.
+    date: String,
     source: String,
     out: PathBuf,
     target_lufs: f64,
     ceiling: f64,
     files: Vec<PathBuf>,
     dests: Vec<PathBuf>,
-    /// The report the last run left in `out`.
-    earlier: Option<String>,
+    /// The copies the last run's report lists without a note.
+    earlier: Vec<Unnoted>,
     /// The session's audio files, never written.
     session_files: crate::io::SourceFiles,
 }
@@ -276,24 +335,31 @@ impl Plan {
         crate::io::make_dir(&out)?;
         // Now that it exists, `out` is compared with the sources again with its links followed.
         refuse_sources(&files, &out, &dests)?;
-        // Temporary files a run that stopped part-way left behind.
-        crate::io::remove_stale_temps(&out);
+        // Temporary files of this run's copies and report that a run stopped part-way left.
+        let names: Vec<&std::ffi::OsStr> = dests.iter().filter_map(|d| d.file_name()).chain([std::ffi::OsStr::new(REPORT)]).collect();
+        crate::io::remove_stale_temps(&out, &names);
         let session_files = crate::io::SourceFiles::of(s);
-        Ok(Self { started, source: source.to_string(), out, target_lufs, ceiling, files, dests, earlier, session_files })
+        let date = utc_now();
+        Ok(Self { started, date, source: source.to_string(), out, target_lufs, ceiling, files, dests, earlier, session_files })
     }
 
     /// Preps the tracks one at a time (so only one track's audio is in memory), noting each in
-    /// `shared` and stopping before the next once it is cancelled; then writes the report.
-    fn prep(&self, analyse: &dyn Fn(&str) -> std::result::Result<Value, String>, shared: &Shared) -> Result<Value> {
+    /// `shared` and stopping before the next once it is cancelled. The report is rewritten before
+    /// each copy is written (listing it) and after each track, so whenever the run stops (a quit,
+    /// a crash) it lists every copy prep wrote; the last write adds the totals.
+    fn prep(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> Result<Value> {
         let (target_lufs, ceiling) = (self.target_lufs, self.ceiling);
+        let report_path = self.out.join(REPORT);
+        let write_report = |text: String| crate::io::replace_file_refusing(&self.session_files, &report_path, text.as_bytes());
+        let cancelled = || shared.cancel.load(Ordering::Relaxed);
         // After one analysis times out the rest are skipped, so a stuck sidecar costs one
-        // timeout, not one per track.
+        // timeout, not one per track. A cancel stops the one running.
         let timed_out = std::cell::Cell::new(false);
         let analyse = |path: &str| {
             if timed_out.get() {
                 return Err("skipped after an earlier timeout".to_string());
             }
-            let r = analyse(path);
+            let r = analyse(path, &cancelled);
             if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
                 timed_out.set(true);
             }
@@ -302,16 +368,39 @@ impl Plan {
         let total = self.files.len();
         shared.update(|p| *p = PrepProgress { done: 0, total, current: None });
         let mut rows: Vec<Row> = Vec::with_capacity(total);
+        write_report(self.report(&rows, 0, &self.in_progress(0)))?;
         for (src, dest) in self.files.iter().zip(&self.dests) {
-            if shared.cancel.load(Ordering::Relaxed) {
+            if cancelled() {
                 break;
             }
             shared.update(|p| p.current = dest.file_name().map(|n| n.to_string_lossy().into_owned()));
-            let mut row = prep_one(&self.session_files, src, dest, target_lufs, ceiling, &analyse);
-            if row.status == "failed" && crate::io::path_exists(dest) {
+            let (mut row, copy) = prepare(src, dest, target_lufs, ceiling, &analyse);
+            if let Some(copy) = copy {
+                if !mp3tags::has_prep_note(&copy) {
+                    row.unnoted = Some(Unnoted::of(&row.file, &copy));
+                }
+                // Listed before it is written; until then the earlier copy's listing is kept too.
+                let done = rows.len();
+                rows.push(row);
+                write_report(self.report(&rows, done, &self.in_progress(done)))?;
+                let Some(mut row) = rows.pop() else { break };
+                if let Err(err) = crate::io::replace_file_refusing(&self.session_files, dest, &copy) {
+                    row.failed(err);
+                    row.unnoted = None;
+                }
+                rows.push(row);
+            } else {
+                rows.push(row);
+            }
+            if let Some(row) = rows.last_mut()
+                && row.status == "failed"
+                && crate::io::path_exists(dest)
+            {
                 row.doubts.push("the earlier copy in the output folder was left as it was".into());
             }
-            rows.push(row);
+            if rows.len() < total {
+                write_report(self.report(&rows, rows.len(), &self.in_progress(rows.len())))?;
+            }
             shared.update(|p| (p.done, p.current) = (p.done + 1, None));
         }
         let cancelled = rows.len() < total;
@@ -321,57 +410,79 @@ impl Plan {
         let measured = written().filter(|r| r.lufs_after.is_some()).count();
         let on_target = written().filter(|r| r.lufs_after.is_some_and(|l| (l - target_lufs).abs() <= ON_TARGET_DB)).count();
         let over = written().filter(|r| r.over(ceiling)).count();
-        let totals = json!({
-            "ok": count("ok"),
-            "not_adjusted": count("not_adjusted"),
-            "failed": count("failed"),
-            "measured": measured,
-            "on_target": on_target,
-            "over_ceiling": over,
-            "seconds": self.started.elapsed().as_secs_f64(),
-        });
-        let report_path = self.out.join(REPORT);
-        let r = json!({
+        let seconds = self.started.elapsed().as_secs_f64();
+        let mut tail = format!(
+            "{} ok, {} not adjusted, {} failed; {on_target} of {measured} within ±{ON_TARGET_DB} dB of the target; {over} above the ceiling; {seconds:.1} s\n",
+            count("ok"),
+            count("not_adjusted"),
+            count("failed"),
+        );
+        if cancelled {
+            tail.push_str(&format!("cancelled after {} of {total} tracks; the rest were not prepped\n", rows.len()));
+        }
+        write_report(self.report(&rows, rows.len(), &tail))?;
+        Ok(json!({
             "source": self.source,
             "out": self.out.to_string_lossy(),
             "report": report_path.to_string_lossy(),
             "target_lufs": target_lufs,
             "ceiling": ceiling,
             "tracks": rows.iter().map(Row::json).collect::<Vec<_>>(),
-            "totals": totals,
+            "totals": {
+                "ok": count("ok"),
+                "not_adjusted": count("not_adjusted"),
+                "failed": count("failed"),
+                "measured": measured,
+                "on_target": on_target,
+                "over_ceiling": over,
+                "seconds": seconds,
+            },
             "cancelled": cancelled,
-        });
-        let mut text = text_report(&r, &rows, utc_now());
-        if cancelled {
-            text.push_str(&self.cancelled_note(rows.len()));
-        }
-        crate::io::replace_file_refusing(&self.session_files, &report_path, text.as_bytes())?;
-        Ok(r)
+        }))
     }
 
-    /// The report's ending for a run cancelled after `done` tracks. The earlier report's lines for
-    /// the tracks not reached are kept, so their copies are still recognised as prep's.
-    fn cancelled_note(&self, done: usize) -> String {
-        let mut note = format!("cancelled after {done} of {} tracks; the rest were not prepped\n", self.files.len());
-        let earlier = self.earlier.as_deref().unwrap_or_default();
-        let kept: Vec<&str> = self
-            .dests
-            .iter()
-            .skip(done)
-            .filter_map(|d| d.file_name().and_then(|n| n.to_str()))
-            .flat_map(|name| {
-                let line = format!("  {name}  before ");
-                earlier.lines().filter(move |l| l.contains(&line))
-            })
-            .collect();
-        if !kept.is_empty() {
-            note.push_str("\nearlier copies of the tracks not reached, left as they were:\n");
-            for l in kept {
-                note.push_str(l);
-                note.push('\n');
+    /// The report's ending while `done` tracks are done.
+    fn in_progress(&self, done: usize) -> String {
+        format!("in progress: {done} of {} tracks done\n", self.files.len())
+    }
+
+    /// The report text: a header, one line per track in `rows`, then `tail`. The earlier report's
+    /// listings of copies without a note are kept for each track this run has not replaced (from
+    /// `rows[done]` on, and every failed one), so those copies are still recognised as prep's.
+    fn report(&self, rows: &[Row], done: usize, tail: &str) -> String {
+        let mut out = format!("{REPORT_HEADER}{}\ntarget {} LUFS, ceiling {} dBTP, {}\n\n", self.source, self.target_lufs, self.ceiling, self.date);
+        for (i, row) in rows.iter().enumerate() {
+            let filled = if row.filled.is_empty() { "-".to_string() } else { row.filled.join(",") };
+            out.push_str(&format!(
+                "{:>2}  {}  before {} LUFS / {} dBTP  gain {:+.1} dB  after {} / {}  filled {filled}  | {}\n",
+                i + 1,
+                row.file,
+                db(row.lufs_before),
+                db(row.tp_before),
+                row.gain_db(),
+                db(row.lufs_after),
+                db(row.tp_after),
+                row.doubts.join("; ")
+            ));
+            if let Some(u) = &row.unnoted {
+                out.push_str(&u.line());
             }
         }
-        note
+        out.push('\n');
+        out.push_str(tail);
+        let replaced = |name: &str| rows.iter().take(done).any(|r| r.file == name && r.status != "failed");
+        let kept: Vec<&Unnoted> = self
+            .earlier
+            .iter()
+            .filter(|u| self.dests.iter().any(|d| d.file_name().and_then(|n| n.to_str()) == Some(u.name.as_str())) && !replaced(&u.name))
+            .collect();
+        if !kept.is_empty() {
+            out.push_str("\nearlier copies this run has not replaced, left as they were:\n");
+            for u in kept {
+                out.push_str(&u.line());
+            }
+        }
+        out
     }
 }
 
@@ -399,7 +510,9 @@ impl Shared {
 }
 
 /// mixforge's analysis of a track's path, callable from the prep thread.
-pub type Analyse = Arc<dyn Fn(&str) -> std::result::Result<Value, String> + Send + Sync>;
+/// The second argument says whether the run was cancelled meanwhile: an analysis still running
+/// should then stop (mixforge's sidecar is killed).
+pub type Analyse = Arc<dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String> + Send + Sync>;
 
 /// A `prep.tracks` run on its own thread (in the browser, which has none, it has run already):
 /// how far it got, a cancel that stops it before its next track, and its result.
@@ -525,6 +638,8 @@ struct Row {
     filled: Vec<&'static str>,
     doubts: Vec<String>,
     status: &'static str,
+    /// What the report lists for a copy written without prep's note.
+    unnoted: Option<Unnoted>,
 }
 
 impl Row {
@@ -856,26 +971,25 @@ fn prep_mp3(
     tagged(adjusted, src, target, row, analyse)
 }
 
-/// Preps one track from `src` to `dest`.
-fn prep_one(
-    session_files: &crate::io::SourceFiles,
+/// Preps one track from `src` for `dest`: its row, and the copy to write (`None` when it failed).
+fn prepare(
     src: &Path,
     dest: &Path,
     target: f64,
     ceiling: f64,
     analyse: &dyn Fn(&str) -> std::result::Result<Value, String>,
-) -> Row {
+) -> (Row, Option<Vec<u8>>) {
     let mut row = Row { file: dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), status: "ok", ..Row::default() };
     let bytes = match crate::io::read_file(src) {
         Ok(b) => b,
         Err(err) => {
             row.failed(err);
-            return row;
+            return (row, None);
         }
     };
     let is_mp3 = src.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
     let copy = if is_mp3 {
-        let Some(copy) = prep_mp3(bytes, src, target, ceiling, &mut row, analyse) else { return row };
+        let Some(copy) = prep_mp3(bytes, src, target, ceiling, &mut row, analyse) else { return (row, None) };
         copy
     } else {
         row.not_adjusted(NOT_AN_MP3);
@@ -884,10 +998,7 @@ fn prep_one(
     if row.over(ceiling) {
         row.doubts.push(format!("above the ceiling: tp {} dBTP", db(row.tp_after)));
     }
-    if let Err(err) = crate::io::replace_file_refusing(session_files, dest, &copy) {
-        row.failed(err);
-    }
-    row
+    (row, Some(copy))
 }
 
 /// `adjusted` with missing key and BPM tags filled from mixforge and the prep note added; with its
@@ -948,40 +1059,6 @@ fn tagged(
         row.doubts.push("no album".into());
     }
     Some(bytes)
-}
-
-/// The plain-text report: a header, one line per track, then the totals.
-fn text_report(r: &Value, rows: &[Row], date: String) -> String {
-    let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
-    let src = r.get("source").and_then(Value::as_str).unwrap_or("");
-    let mut out = format!("{REPORT_HEADER}{src}\ntarget {} LUFS, ceiling {} dBTP, {date}\n\n", num("target_lufs"), num("ceiling"));
-    for (i, row) in rows.iter().enumerate() {
-        let filled = if row.filled.is_empty() { "-".to_string() } else { row.filled.join(",") };
-        out.push_str(&format!(
-            "{:>2}  {}  before {} LUFS / {} dBTP  gain {:+.1} dB  after {} / {}  filled {filled}  | {}\n",
-            i + 1,
-            row.file,
-            db(row.lufs_before),
-            db(row.tp_before),
-            row.gain_db(),
-            db(row.lufs_after),
-            db(row.tp_after),
-            row.doubts.join("; ")
-        ));
-    }
-    let t = r.get("totals").cloned().unwrap_or(Value::Null);
-    let int = |k: &str| t.get(k).and_then(Value::as_u64).unwrap_or(0);
-    out.push_str(&format!(
-        "\n{} ok, {} not adjusted, {} failed; {} of {} within ±{ON_TARGET_DB} dB of the target; {} above the ceiling; {:.1} s\n",
-        int("ok"),
-        int("not_adjusted"),
-        int("failed"),
-        int("on_target"),
-        int("measured"),
-        int("over_ceiling"),
-        t.get("seconds").and_then(Value::as_f64).unwrap_or(0.0)
-    ));
-    out
 }
 
 /// The current date and time, `YYYY-MM-DD HH:MM UTC`.
@@ -1122,6 +1199,19 @@ mod tests {
         for bad in ["13A", "0A", "+4B", "A1", "4C", "", "H", "Am7", "100A"] {
             assert_eq!(to_camelot(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn only_the_tag_of_a_copy_is_read_to_look_for_the_note() {
+        let dir = std::env::temp_dir().join(format!("djforge-tag-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A 20-byte tag (syncsafe size 10) before a megabyte of audio.
+        let tagged = [&[0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 10][..], &[7; 10], &vec![0xFF; 1 << 20]].concat();
+        std::fs::write(dir.join("a.mp3"), &tagged).unwrap();
+        assert_eq!(tag_head(&dir.join("a.mp3")).unwrap(), tagged[..20]);
+        std::fs::write(dir.join("b.mp3"), vec![0xFF; 1 << 20]).unwrap();
+        assert!(tag_head(&dir.join("b.mp3")).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
