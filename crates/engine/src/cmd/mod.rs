@@ -25,6 +25,7 @@ mod mix;
 mod more_util;
 mod options;
 mod plugin_state;
+pub(crate) mod prep;
 mod query;
 pub(crate) mod sampler;
 mod setup_more;
@@ -138,6 +139,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(video::specs());
         v.extend(zoom_toggle::specs());
         v.extend(dj::specs());
+        v.extend(prep::specs());
         v
     })
 }
