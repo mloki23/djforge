@@ -19,13 +19,21 @@
 //! can still split. So the root must never come from a command's arguments: it is
 //! [`default_root`] (or a test's temporary folder), and the stem WAVs a runner returns are read
 //! only from inside the split's own temporary folder.
+//!
+//! **Sessions.** `dj.split_stems` splits a clip's source on a worker thread ([`split_job`]) and
+//! `dj.attach_stems` gives the clip, and every other unsplit clip of that source, the four stems
+//! as sources referenced in place in the cache, in one undo step. The caches a session may read
+//! stems from are [`default_root`] and every cache a split used in this process; a session names
+//! a stem by its path, and only `<such a root>/<key>/<stem>.flac` is read outside the automation
+//! roots ([`is_cached_stem`]), so a reopened session plays its stems wherever automation is
+//! confined.
 
-use crate::io;
+use crate::{Engine, EngineError, io};
 use serde_json::{Value, json};
 use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions, FileFormat, decode, encode, probe};
-use soundcraft_model::STEMS;
+use soundcraft_model::{ClipId, STEMS, Session, SourceAudio, SourceId, StemSet};
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -151,6 +159,15 @@ impl StemCache {
             }
             Some((paths, scale_log2))
         })
+    }
+
+    /// Removes entry `key` (one whose stems turned out not to load), so the next split of its
+    /// file splits it again.
+    pub fn remove(&self, key: &str) -> Result<(), String> {
+        if !is_key(key) {
+            return Err(format!("`{key}` is not a stem cache key"));
+        }
+        cache_io(|| io::remove_tree(self.entry(key))).map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// Creates the root with its marker, and sweeps the temporary folders other processes left
@@ -659,6 +676,460 @@ fn kill_leftovers(tag: &str) {
         };
         // pkill exits 1 when nothing was left to kill.
         let _ = helper_output(&mut command);
+    }
+}
+
+// ─── Splitting clips ─────────────────────────────────────────────────────────────────────────
+
+const SPLIT: &str = "dj.split_stems";
+const ATTACH: &str = "dj.attach_stems";
+
+/// What a split is doing, for its progress window.
+pub const DECODING: &str = "decoding";
+pub const SEPARATING: &str = "separating (Demucs)";
+pub const ENCODING: &str = "encoding";
+pub const LOADING: &str = "loading the stems";
+
+pub fn specs() -> Vec<super::CommandSpec> {
+    vec![
+        crate::cmd!(
+            "dj.split_stems",
+            "Split into Stems",
+            [],
+            None,
+            "{clip} — splits the audio file of the clip's source (it must be a readable file path; save a recorded take first) into vocals, drums, bass and other with Demucs `htdemucs`, cached by the file's content in the app's stem cache (a cached file is not split again), then gives the clip, and every other unsplit clip of the same source, the four stems in one undo step. Waits for Demucs (seconds to minutes when the file is not cached yet). Returns {clip, key, hit, scale_log2, clips: [ids given the stems], skipped: [{clip, key}: clips of the source already split from other stems], seconds}, or {clip, already: true, key} when the clip is split already",
+            super::always,
+            split_stems
+        ),
+        crate::cmd!(
+            "dj.attach_stems",
+            "Attach Stems",
+            [],
+            None,
+            "{clip, key} — gives the clip, and every other unsplit clip of the same source, the stems of stem cache entry `key` (as dj.split_stems returns it; it must be the stems of the clip's audio file), referenced in place in the cache. Returns {clip, key, scale_log2, clips, skipped}, or {clip, already: true, key} when the clip is split already",
+            super::always,
+            attach_stems
+        ),
+    ]
+}
+
+/// The caches splits used in this process, most recent first: with [`default_root`], the only
+/// folders sessions may read stems from outside the automation roots.
+static USED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn used() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Notes that a split uses the cache at `root`.
+fn use_root(root: &Path) {
+    let key = path_key(root);
+    let mut roots = used();
+    roots.retain(|r| path_key(r) != key);
+    roots.insert(0, root.to_path_buf());
+}
+
+/// The caches stems are read from: those splits used here, most recent first, then the default.
+fn known_roots() -> Vec<PathBuf> {
+    let mut roots = used().clone();
+    if let Ok(root) = default_root()
+        && !roots.iter().any(|r| path_key(r) == path_key(&root))
+    {
+        roots.push(root);
+    }
+    roots
+}
+
+/// Whether `path` names a stem in a known stem cache: `<root>/<key>/<stem>.flac`, with `.` and
+/// `..` resolved by name first. Only such a file is read outside the automation roots when a
+/// session names it.
+pub(crate) fn is_cached_stem(path: &Path) -> bool {
+    let p = super::prep::normalise(path);
+    let Some(file) = p.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some(entry) = p.parent() else { return false };
+    let Some(key) = entry.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some(root) = entry.parent() else { return false };
+    is_key(key) && STEMS.iter().any(|s| file == format!("{s}.flac")) && known_roots().iter().any(|r| path_key(r) == path_key(root))
+}
+
+/// The cache holding complete entry `key`, its stems and their `scale_log2`.
+fn cached(key: &str) -> Option<(StemCache, [PathBuf; 4], u8)> {
+    known_roots().into_iter().map(StemCache::new).find_map(|c| c.hit(key).map(|(paths, k)| (c, paths, k)))
+}
+
+/// Four stems decoded at the session's rate, each with its file's own rate.
+type Loaded = [(Arc<SourceAudio>, u32); 4];
+
+/// The stems at `paths` decoded at `rate`.
+fn load_stems(paths: &[PathBuf; 4], rate: u32) -> Result<Loaded, String> {
+    let loaded = cache_io(|| paths.iter().map(|p| io::decode_audio_file(p, rate)).collect::<Result<Vec<_>, String>>())?;
+    Loaded::try_from(loaded).map_err(|_| "not four stems".to_string())
+}
+
+/// Stems a finished split decoded already, handed to the `dj.attach_stems` it runs.
+struct Prepared {
+    /// The cache the split used.
+    cache: StemCache,
+    paths: [PathBuf; 4],
+    loaded: Loaded,
+}
+
+thread_local! {
+    static PREPARED: std::cell::RefCell<Option<Prepared>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The audio file of source `id`, which must be there and readable.
+fn source_file(s: &Session, id: SourceId, cmd: &str) -> crate::Result<PathBuf> {
+    let src = s.source(id).ok_or_else(|| super::bad(cmd, "the clip's source is missing from the session"))?;
+    let stored = Path::new(&src.path);
+    let save_first = || super::bad(cmd, format!("`{}` is not in a file yet; save the session first", src.name));
+    let file = if stored.is_absolute() {
+        stored.to_path_buf()
+    } else if src.unsaved {
+        return Err(save_first());
+    } else {
+        s.folder.as_deref().map(|f| f.join(stored)).ok_or_else(save_first)?
+    };
+    crate::file_access::check_read(&file).map_err(EngineError::Io)?;
+    if !io::file_found(&file) {
+        return Err(EngineError::Io(format!("{}: the clip's audio file is not there; relink it first", file.display())));
+    }
+    Ok(file)
+}
+
+/// The audio clip `clip` of `s` and its source.
+fn audio_clip<'a>(s: &'a Session, clip: ClipId, cmd: &str) -> crate::Result<(&'a soundcraft_model::Clip, SourceId)> {
+    let (_, c) = s.find_clip(clip).ok_or_else(|| super::bad(cmd, format!("no clip {}", clip.0)))?;
+    let src = c.source().ok_or_else(|| super::bad(cmd, format!("clip {} is not an audio clip", clip.0)))?;
+    Ok((c, src))
+}
+
+fn already(clip: ClipId, key: &str) -> Value {
+    json!({"clip": clip.0, "already": true, "key": key})
+}
+
+fn attach_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
+    let clip = super::clip_id(p, ATTACH)?;
+    let key = super::str_param(p, "key").ok_or_else(|| super::bad(ATTACH, "`key` required: the stem cache entry dj.split_stems returned"))?;
+    let prepared = PREPARED.with(|p| p.borrow_mut().take());
+    attach(e, clip, key, prepared)
+}
+
+/// Gives `clip`, and every other unsplit clip of its source, the stems of cache entry `key`,
+/// decoded (`prepared`, when a split loaded them already and their files are unchanged).
+/// Stems that don't load are removed from the cache, so the next split makes them again.
+fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -> crate::Result<Value> {
+    let s = e.session();
+    let (c, src) = audio_clip(s, clip, ATTACH)?;
+    if let Some(set) = &c.stems {
+        return Ok(already(clip, &set.key));
+    }
+    if !is_key(key) {
+        return Err(super::bad(ATTACH, format!("`{key}` is not a stem cache key")));
+    }
+    // The cache the split used, else any this process knows.
+    let found = match &prepared {
+        Some(x) => x.cache.hit(key).map(|(paths, k)| (x.cache.clone(), paths, k)),
+        None => cached(key),
+    };
+    let (cache, paths, scale_log2) =
+        found.ok_or_else(|| super::bad(ATTACH, format!("no stems `{key}` in the stem cache; split the clip with dj.split_stems")))?;
+    let rate = s.sample_rate.hz();
+    let source = s.source(src).ok_or_else(|| super::bad(ATTACH, "the clip's source is missing from the session"))?;
+    let (frames, channels, name) = (source.frames, usize::from(source.channels), source.name.clone());
+    let fresh = |l: &Loaded| l.iter().zip(&paths).all(|((a, _), p)| a.buffer.sample_rate == rate && io::decoded_unchanged(a, p));
+    let loaded = match prepared.filter(|x| x.paths == paths && fresh(&x.loaded)) {
+        Some(x) => x.loaded,
+        None => {
+            // Asked for directly: the stems must be this clip's file's.
+            let file = source_file(s, src, ATTACH)?;
+            if key_of(&io::read_file(&file)?) != key {
+                return Err(super::bad(ATTACH, format!("`{key}` holds the stems of another file than {}", file.display())));
+            }
+            load_stems(&paths, rate).map_err(|m| {
+                let removed = match cache.remove(key) {
+                    Ok(()) => "they were removed from the stem cache, so splitting again makes them anew",
+                    Err(_) => "they could not be removed from the stem cache",
+                };
+                EngineError::Io(format!("the cached stems would not load ({m}); {removed}"))
+            })?
+        }
+    };
+    let mut fitted = Vec::with_capacity(STEMS.len());
+    for ((stem, (audio, file_rate)), path) in STEMS.iter().zip(loaded).zip(&paths) {
+        let (len, width) = (audio.buffer.frames() as u64, audio.buffer.num_channels());
+        if width != channels || (file_rate == rate && len != frames) || len.abs_diff(frames) > LENGTH_SLACK as u64 {
+            return Err(EngineError::Io(format!(
+                "stem {stem} of `{key}` is {len} frames, {width} channels; the clip's source is {frames} frames, {channels} channels"
+            )));
+        }
+        // Resampled stems can end a few frames off the resampled source.
+        let audio = if len == frames {
+            audio
+        } else {
+            let mut buffer = audio.buffer.clone();
+            let n = usize::try_from(frames).unwrap_or(usize::MAX);
+            buffer.channels.iter_mut().for_each(|c| c.resize(n, 0.0));
+            Arc::new(SourceAudio::new(buffer))
+        };
+        fitted.push((format!("{name} ({stem})"), path.clone(), audio, file_rate));
+    }
+    let s = e.session_mut();
+    let ids: Vec<SourceId> =
+        fitted.into_iter().map(|(name, path, audio, file_rate)| io::add_file_source(s, &name, &path, audio, FileFormat::Flac, file_rate)).collect();
+    let sources = <[SourceId; 4]>::try_from(ids).map_err(|_| EngineError::Internal(ATTACH.into(), "not four stems".into()))?;
+    let set = StemSet { key: key.to_string(), sources, scale_log2 };
+    // Every clip playing the same audio: the source itself, or the same file imported again.
+    let audio = s.pool.get(src).cloned();
+    let pool = &s.pool;
+    let same = |id: SourceId| id == src || audio.as_ref().is_some_and(|a| pool.get(id).is_some_and(|b| Arc::ptr_eq(a, b)));
+    let shared: Vec<SourceId> = s.sources.iter().map(|x| x.id).filter(|id| same(*id)).collect();
+    let (mut clips, mut skipped) = (Vec::new(), Vec::new());
+    for c in s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).flat_map(|p| p.clips.iter_mut()) {
+        if !c.source().is_some_and(|id| shared.contains(&id)) {
+            continue;
+        }
+        match &c.stems {
+            None => {
+                c.stems = Some(set.clone());
+                clips.push(c.id.0);
+            }
+            Some(other) if other.key != key => skipped.push(json!({"clip": c.id.0, "key": other.key})),
+            Some(_) => {}
+        }
+    }
+    Ok(json!({"clip": clip.0, "key": key, "scale_log2": scale_log2, "clips": clips, "skipped": skipped}))
+}
+
+fn split_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
+    let clip = super::clip_id(p, SPLIT)?;
+    if let Some(set) = audio_clip(e.session(), clip, SPLIT)?.0.stems.as_ref() {
+        return Ok(already(clip, &set.key));
+    }
+    let cache = StemCache::at_default().map_err(|m| super::bad(SPLIT, m))?;
+    let Some(job) = split_job_in(e, p, cache, demucs_runner())? else {
+        // Checked above: the clip is not split.
+        return Err(EngineError::Internal(SPLIT.into(), "the clip was split already".into()));
+    };
+    let split = job.wait()?;
+    let prepared = split.prepared();
+    let attached = attach(e, clip, &split.files.key, Some(prepared))?;
+    Ok(split.report(attached))
+}
+
+/// How far a split got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitProgress {
+    /// [`DECODING`], [`SEPARATING`], [`ENCODING`] or [`LOADING`].
+    pub stage: &'static str,
+}
+
+/// What a running split and the job watching it share.
+struct SplitShared {
+    cancel: AtomicBool,
+    stage: Mutex<&'static str>,
+}
+
+impl SplitShared {
+    fn set(&self, stage: &'static str) {
+        *self.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// A finished split, not yet applied to the session: its stems, decoded.
+pub struct Split {
+    clip: ClipId,
+    cache: StemCache,
+    files: StemFiles,
+    loaded: Loaded,
+    started: std::time::Instant,
+}
+
+impl Split {
+    /// The clip it splits.
+    pub fn clip(&self) -> ClipId {
+        self.clip
+    }
+
+    /// The stems in the cache.
+    pub fn files(&self) -> &StemFiles {
+        &self.files
+    }
+
+    /// Gives the clip (and the other unsplit clips of its source) the stems, as one undoable
+    /// `dj.attach_stems`. Returns what `dj.split_stems` does.
+    pub fn apply(self, e: &mut Engine) -> crate::Result<Value> {
+        let params = json!({"clip": self.clip.0, "key": self.files.key});
+        let prepared = self.prepared();
+        PREPARED.with(|p| *p.borrow_mut() = Some(prepared));
+        let attached = e.execute(ATTACH, &params);
+        PREPARED.with(|p| p.borrow_mut().take());
+        Ok(self.report(attached?))
+    }
+
+    fn prepared(&self) -> Prepared {
+        Prepared { cache: self.cache.clone(), paths: self.files.paths.clone(), loaded: self.loaded.clone() }
+    }
+
+    /// `attached` (what `dj.attach_stems` returned) with whether the stems were cached and how
+    /// long the split took.
+    fn report(&self, mut attached: Value) -> Value {
+        if let Some(o) = attached.as_object_mut().filter(|o| !o.contains_key("already")) {
+            o.insert("hit".into(), json!(self.files.hit));
+            o.insert("seconds".into(), json!(self.started.elapsed().as_secs_f64()));
+        }
+        attached
+    }
+}
+
+/// A `dj.split_stems` split on its own thread: its stage, a cancel (which stops Demucs), and
+/// the finished [`Split`] to apply.
+pub struct SplitJob {
+    shared: Arc<SplitShared>,
+    clip: ClipId,
+    state: SplitState,
+}
+
+enum SplitState {
+    Running(std::thread::JoinHandle<Result<Split, String>>),
+    Ended(Option<Box<Result<Split, String>>>),
+}
+
+/// Starts the split `dj.split_stems` makes for `p`, in the stem cache at [`default_root`] with
+/// Demucs: see [`split_job_in`].
+pub fn split_job(e: &Engine, p: &Value) -> crate::Result<Option<SplitJob>> {
+    let cache = StemCache::at_default().map_err(|m| super::bad(SPLIT, m))?;
+    split_job_in(e, p, cache, demucs_runner())
+}
+
+/// Starts the split `dj.split_stems` makes for `p` (`{clip}`) in `cache`, separating with
+/// `runner`. The clip and its audio file are checked here; `None` when the clip is split
+/// already. The split, and decoding the stems, happen on another thread; the session is not
+/// touched until [`Split::apply`]. `cache` is the app's own folder (or a test's), never one a
+/// command names.
+pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner) -> crate::Result<Option<SplitJob>> {
+    let clip = super::clip_id(p, SPLIT)?;
+    let s = e.session();
+    let (c, src) = audio_clip(s, clip, SPLIT)?;
+    if c.stems.is_some() {
+        return Ok(None);
+    }
+    let file = source_file(s, src, SPLIT)?;
+    let rate = s.sample_rate.hz();
+    use_root(cache.root());
+    let shared = Arc::new(SplitShared { cancel: AtomicBool::new(false), stage: Mutex::new(DECODING) });
+    let started = std::time::Instant::now();
+    let work = {
+        let shared = Arc::clone(&shared);
+        move || separate(&cache, &file, &runner, &shared, rate).map(|(files, loaded)| Split { clip, cache, files, loaded, started })
+    };
+    let ended = |r| Ok(Some(SplitJob { shared: Arc::clone(&shared), clip, state: SplitState::Ended(Some(Box::new(r))) }));
+    if cfg!(target_arch = "wasm32") {
+        return ended(work());
+    }
+    // The worker reads the source under the automation roots in force here.
+    let roots = crate::file_access::current();
+    let worker = move || match &roots {
+        Some(r) => crate::file_access::confine(Some(r), work),
+        None => crate::file_access::unconfined(work),
+    };
+    match std::thread::Builder::new().name("split-stems".into()).spawn(worker) {
+        Ok(handle) => Ok(Some(SplitJob { shared: Arc::clone(&shared), clip, state: SplitState::Running(handle) })),
+        Err(err) => Err(EngineError::Io(format!("could not start the split: {err}"))),
+    }
+}
+
+/// Splits `file` into `cache` and decodes the stems at `rate`. An entry whose stems don't
+/// decode counts as a miss: it is removed and the file split again, once.
+fn separate(cache: &StemCache, file: &Path, runner: &StemRunner, shared: &Arc<SplitShared>, rate: u32) -> Result<(StemFiles, Loaded), String> {
+    let staged: StemRunner = {
+        let (shared, runner) = (Arc::clone(shared), Arc::clone(runner));
+        Arc::new(move |input: &Path, out: &Path, stop: &dyn Fn() -> bool| {
+            shared.set(SEPARATING);
+            let r = runner(input, out, stop);
+            shared.set(ENCODING);
+            r
+        })
+    };
+    let stop = || shared.stopped();
+    let mut failed = None;
+    for _ in 0..2 {
+        shared.set(DECODING);
+        let files = split(cache, file, &staged, &stop)?;
+        if stop() {
+            return Err(CANCELLED.to_string());
+        }
+        shared.set(LOADING);
+        match load_stems(&files.paths, rate) {
+            Ok(loaded) => return Ok((files, loaded)),
+            Err(m) => {
+                cache.remove(&files.key)?;
+                if !files.hit {
+                    return Err(format!("the new stems would not load: {m}"));
+                }
+                failed = Some(m);
+            }
+        }
+    }
+    Err(format!("the stems would not load: {}", failed.unwrap_or_default()))
+}
+
+/// A thread's result, or its panic as an error.
+fn joined(handle: std::thread::JoinHandle<Result<Split, String>>) -> Result<Split, String> {
+    handle.join().unwrap_or_else(|p| Err(format!("the split stopped: {}", crate::panic_message(&*p))))
+}
+
+/// A split's error as the engine reports it.
+fn failed(msg: String) -> EngineError {
+    if msg == CANCELLED { EngineError::Io(CANCELLED.to_string()) } else { EngineError::Io(format!("{SPLIT}: {msg}")) }
+}
+
+impl SplitJob {
+    /// The clip it splits.
+    pub fn clip(&self) -> ClipId {
+        self.clip
+    }
+
+    /// What it is doing.
+    pub fn progress(&self) -> SplitProgress {
+        SplitProgress { stage: *self.shared.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+    }
+
+    /// Stops the split (Demucs is killed); it then ends with [`CANCELLED`] and the session stays
+    /// as it was.
+    pub fn cancel(&self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether it was cancelled.
+    pub fn cancelling(&self) -> bool {
+        self.shared.stopped()
+    }
+
+    /// The finished split once it ended, given once; `None` before.
+    pub fn poll(&mut self) -> Option<crate::Result<Split>> {
+        if let SplitState::Running(handle) = &self.state
+            && !handle.is_finished()
+        {
+            return None;
+        }
+        let r = match std::mem::replace(&mut self.state, SplitState::Ended(None)) {
+            SplitState::Running(handle) => Some(joined(handle)),
+            SplitState::Ended(r) => r.map(|r| *r),
+        };
+        r.map(|r| r.map_err(failed))
+    }
+
+    /// Waits for the split to end and gives it.
+    pub fn wait(mut self) -> crate::Result<Split> {
+        match std::mem::replace(&mut self.state, SplitState::Ended(None)) {
+            SplitState::Running(handle) => joined(handle).map_err(failed),
+            SplitState::Ended(r) => r.map_or_else(|| Err("the result was taken already".to_string()), |r| *r).map_err(failed),
+        }
     }
 }
 

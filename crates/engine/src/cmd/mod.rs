@@ -146,6 +146,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(zoom_toggle::specs());
         v.extend(dj::specs());
         v.extend(prep::specs());
+        v.extend(stems::specs());
         v
     })
 }

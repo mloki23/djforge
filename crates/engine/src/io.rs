@@ -248,7 +248,58 @@ pub(crate) fn kept_reference(stored: &str, session: &Path, audio: &Arc<SourceAud
         return None;
     }
     let file = stored_path(stored, session).ok()?;
-    (file_found(&file) && !in_audio_files(&file) && decodes_unchanged(audio, &file)).then_some(file)
+    stem_scope(&file, || file_found(&file) && !in_audio_files(&file) && decodes_unchanged(audio, &file)).then_some(file)
+}
+
+/// Runs `f`, which reads the file at `p`, outside the automation roots when `p` is a stem in a
+/// stem cache (the app's own folder, never one a command or a session chooses; see
+/// [`crate::cmd::stems::is_cached_stem`]), and under them otherwise.
+pub(crate) fn stem_scope<T>(p: &Path, f: impl FnOnce() -> T) -> T {
+    if crate::cmd::stems::is_cached_stem(p) { crate::file_access::unconfined(f) } else { f() }
+}
+
+/// The audio of the file at `p` at `rate`, and the file's own rate. The file must decode to the
+/// length its header states (a damaged one decodes shorter). The audio is remembered as decoded
+/// from the file, so a session can keep referencing it in place.
+pub(crate) fn decode_audio_file(p: &Path, rate: u32) -> std::result::Result<(Arc<SourceAudio>, u32), String> {
+    let bytes = read_file(p).map_err(|err| err.to_string())?;
+    let ext = p.extension().and_then(|x| x.to_str());
+    let shown = p.display();
+    let info = soundcraft_audio_io::probe(&bytes, ext).map_err(|err| format!("{shown}: {err}"))?;
+    let (_, buf) = soundcraft_audio_io::decode(&bytes, ext).map_err(|err| format!("{shown}: {err}"))?;
+    drop(bytes);
+    if info.frames != 0 && buf.frames() as u64 != info.frames {
+        return Err(format!("{shown}: decodes to {} frames; the file says {}", buf.frames(), info.frames));
+    }
+    let file_rate = buf.sample_rate;
+    let buf = at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or_else(|| format!("{shown}: too large to load"))?;
+    let audio = Arc::new(SourceAudio::new(buf));
+    remember_decoded(&audio, p);
+    Ok((audio, file_rate))
+}
+
+/// Adds a source named `name` for the file at absolute path `path`, playing `audio` (decoded
+/// from it at the session's rate). A file at the session's rate is referenced in place, with
+/// its size and time recorded; another is copied into the session when it is saved.
+pub(crate) fn add_file_source(s: &mut Session, name: &str, path: &Path, audio: Arc<SourceAudio>, format: FileFormat, file_rate: u32) -> SourceId {
+    let in_place = file_rate == s.sample_rate.hz();
+    let id = SourceId(s.alloc());
+    let (file_len, file_modified_ms) = if in_place { saved_stamp(path) } else { (0, 0) };
+    s.sources.push(Source {
+        id,
+        name: name.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        channels: u16::try_from(audio.buffer.num_channels()).unwrap_or(u16::MAX),
+        frames: audio.buffer.frames() as u64,
+        sample_rate: s.sample_rate.hz(),
+        format,
+        time_reference: 0,
+        unsaved: !in_place,
+        file_len,
+        file_modified_ms,
+    });
+    s.pool.insert(id, audio);
+    id
 }
 
 /// At most the first `max` bytes of the file at `path`, inside the automation read root when
@@ -1403,7 +1454,8 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
     for src in &s.sources {
         let decoded = stored_path(&src.path, links)
             .map_err(|why| format!("{}: {why}", src.path))
-            .and_then(|p| decode_file(&mut files, &p, s.sample_rate.hz()).map(|a| (p, a)));
+            // A stem in the stem cache is read there even when automation is confined elsewhere.
+            .and_then(|p| stem_scope(&p, || decode_file(&mut files, &p, s.sample_rate.hz())).map(|a| (p, a)));
         match decoded {
             Ok((p, audio)) => {
                 let (frames, channels) = (audio.buffer.frames() as u64, audio.buffer.num_channels());
