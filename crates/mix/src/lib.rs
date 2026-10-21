@@ -63,7 +63,7 @@ use std::sync::Arc;
 
 mod warp;
 use warp::WarpPlayers;
-pub use warp::{PlayerStem, PreparedWarp, SOURCE_PLAYER, WarpPlayer, played_sources};
+pub use warp::{PlayerStem, PreparedWarp, SOURCE_PLAYER, WarpPlayer, WarpRoom, played_sources};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -526,6 +526,42 @@ impl MixEngine {
         }
         self.retired_warps.extend(warps.drain(..).map(|w| w.player));
         warps
+    }
+
+    /// Gives the strips warp tables built off the audio thread, sized for every player the
+    /// snapshot `s` needs, and the retired list room for `WarpRoom`'s count, so placing players
+    /// and retiring them for that snapshot never grows a table or list here. Call after
+    /// `ensure_synced(s)`. Each strip's players that still play move into its new table; the
+    /// old tables, holding the players that no longer play, and the old retired list come back
+    /// in the returned room, for the host to drop off the audio thread. Neither allocates nor
+    /// frees.
+    pub fn adopt_room(&mut self, s: &Session, mut room: WarpRoom) -> WarpRoom {
+        for (id, table) in room.tables.iter_mut() {
+            let Some(st) = self.strips.get_mut(id) else { continue };
+            let track = s.track(*id);
+            let plays =
+                |(cid, stem): (u64, PlayerStem)| track.is_some_and(|t| t.clips().iter().any(|c| c.id.0 == cid && warp_player_plays(t, c, stem)));
+            // Move what still plays (as much as fits) into the new table, then swap the tables.
+            let mut left = table.capacity().saturating_sub(table.len());
+            let moving = st.warps.extract_if(|k, _| {
+                let take = left > 0 && plays(*k);
+                left -= usize::from(take);
+                take
+            });
+            for (k, p) in moving {
+                table.insert(k, p);
+            }
+            std::mem::swap(&mut st.warps, table);
+        }
+        if self.retired_warps.is_empty() && room.retired.capacity() > self.retired_warps.capacity() {
+            std::mem::swap(&mut self.retired_warps, &mut room.retired);
+        }
+        room
+    }
+
+    /// Capacity of the warp-player table of `track`'s strip (0 without a strip).
+    pub fn warp_table_capacity(&self, track: TrackId) -> usize {
+        self.strips.get(&track).map_or(0, |st| st.warps.capacity())
     }
 
     /// Takes the players of clips that no longer play on their strip's track (deleted, moved to
@@ -1584,9 +1620,29 @@ fn render_source(
 /// linear gain) between, so playback and bounces of any block size get the same gain.
 const STEM_STEP: Samples = 64;
 
+/// The stem fader of `t` for stem `i` at `at`, in dB: its `Stem(i)` lane when that has points
+/// and the track reads automation (outside Write, where the fader is what's written), else the
+/// fader, like [`volume_db_at`]. A non-finite value counts as 0 dB.
+fn stem_db_at(t: &Track, i: usize, at: Samples) -> f32 {
+    let base = finite_or(t.mixer.stem_gain_db.get(i).copied().unwrap_or(0.0), 0.0);
+    stem_lane(t, i).map_or(base, |l| finite_or(l.value_at(at, base), base))
+}
+
+fn finite_or(v: f32, d: f32) -> f32 {
+    if v.is_finite() { v } else { d }
+}
+
+/// The `Stem(i)` lane of `t` that [`stem_db_at`] reads, if any.
+fn stem_lane(t: &Track, i: usize) -> Option<&soundcraft_model::AutomationLane> {
+    if !t.mixer.automation_mode.reads() || t.mixer.automation_mode == soundcraft_model::AutomationMode::Write {
+        return None;
+    }
+    t.lane(&AutoParam::Stem(u8::try_from(i).unwrap_or(u8::MAX))).filter(|l| !l.points.is_empty())
+}
+
 /// Fills `out[..frames]` with the gain of stem `i` of split clip `clip` for the block at `pos`:
-/// the mask, times `db_to_gain(fader + Stem(i) lane)` (top +6 dB) when `faders` is given. False
-/// when the stem is silent for the whole block.
+/// the mask, times `db_to_gain(stem_db_at)` (top +6 dB) when `faders` is given. False when the
+/// stem is silent for the whole block.
 fn stem_gains(faders: Option<&Track>, clip: &Clip, i: usize, pos: Samples, frames: usize, out: &mut [f32]) -> bool {
     if !clip.stem_mask.get(i).copied().unwrap_or(false) {
         return false;
@@ -1596,31 +1652,27 @@ fn stem_gains(faders: Option<&Track>, clip: &Clip, i: usize, pos: Samples, frame
         out.iter_mut().take(n).for_each(|g| *g = 1.0);
         return n > 0;
     };
-    let base = t.mixer.stem_gain_db.get(i).copied().unwrap_or(0.0);
-    let lane = if t.mixer.automation_mode.reads() {
-        t.lane(&AutoParam::Stem(u8::try_from(i).unwrap_or(u8::MAX))).filter(|l| !l.points.is_empty())
-    } else {
-        None
-    };
-    let Some(lane) = lane else {
-        let g = db_to_gain(base.min(6.0));
+    let gain = |at: Samples| db_to_gain(stem_db_at(t, i, at).min(6.0));
+    if stem_lane(t, i).is_none() {
+        let g = gain(pos);
         out.iter_mut().take(n).for_each(|x| *x = g);
         return g != 0.0 && n > 0;
-    };
-    let gain = |at: Samples| db_to_gain((base + lane.value_at(at, 0.0)).min(6.0));
+    }
     let mut any = false;
+    let mut a = pos.div_euclid(STEM_STEP).saturating_mul(STEM_STEP);
+    // Each grid point's gain is computed once: a cell's end is the next one's start.
+    let mut ga = gain(a);
     let mut k = 0usize;
     while k < n {
-        let here = pos.saturating_add(k as i64);
-        let a = here.div_euclid(STEM_STEP).saturating_mul(STEM_STEP);
-        let (ga, gb) = (gain(a), gain(a.saturating_add(STEM_STEP)));
-        let end = usize::try_from(a.saturating_add(STEM_STEP).saturating_sub(pos)).unwrap_or(n).clamp(k + 1, n);
+        let b = a.saturating_add(STEM_STEP);
+        let gb = gain(b);
+        let end = usize::try_from(b.saturating_sub(pos)).unwrap_or(n).clamp(k + 1, n);
         any |= ga != 0.0 || gb != 0.0;
         for (j, x) in out.iter_mut().enumerate().take(end).skip(k) {
             let f = pos.saturating_add(j as i64).saturating_sub(a) as f32 / STEM_STEP as f32;
             *x = ga + (gb - ga) * f;
         }
-        k = end;
+        (a, ga, k) = (b, gb, end);
     }
     any
 }
@@ -2691,6 +2743,68 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].stems = None;
         eng.retire_stale_warps(&s);
         assert_eq!(eng.take_retired_warps().len(), 4, "unsplit: the stems' players go");
+    }
+
+    /// A session with `n` split, warped clips on one mono track (stems at 901..904).
+    fn split_session(n: i64) -> (Session, TrackId, Vec<soundcraft_model::ClipId>) {
+        let mut s = Session::default();
+        for k in 900..905 {
+            s.pool.insert(SourceId(k), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]] })));
+        }
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let mut ids = Vec::new();
+        for k in 0..n {
+            let id = s.new_clip_id();
+            let mut c = Clip::audio(id, "c", SourceId(900), 0, k * 48_000, 48_000);
+            c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+            c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+            ids.push(id);
+        }
+        (s, t, ids)
+    }
+
+    /// On the audio thread a stem without a prepared player is left out, never built there;
+    /// offline renders build it.
+    #[test]
+    fn the_audio_thread_never_builds_a_stem_player() {
+        let (s, _, _) = split_session(1);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        as_audio_thread(true, || eng.render(&s, 0, 512, &mut out));
+        assert_eq!(eng.warp_players().count(), 0);
+        assert!(out.iter().flatten().all(|x| *x == 0.0), "the stems wait for their players");
+        eng.render(&s, 512, 512, &mut out);
+        assert_eq!(eng.warp_players().count(), 4, "offline, they are built");
+    }
+
+    /// A room sized off the audio thread holds every player of 12 split clips (48): placing
+    /// them never grows the strip's table, and players that stop playing come back in the old
+    /// table rather than being pushed onto a list.
+    #[test]
+    fn a_warp_room_holds_every_player_without_growing() {
+        let (mut s, t, ids) = split_session(12);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.ensure_synced(&s);
+        let back = eng.adopt_room(&s, WarpRoom::for_session(&s, 48));
+        assert_eq!(back.players(), 0);
+        let cap = eng.warp_table_capacity(t);
+        assert!(cap >= 48, "room for 48, got {cap}");
+        let retired_cap = eng.retired_warps.capacity();
+        let batch: Vec<_> = ids.iter().flat_map(|id| (0..4).map(move |k| PreparedWarp::new(t, *id, k, 1, 48_000.0).unwrap())).collect();
+        eng.adopt_warps(batch);
+        as_audio_thread(true, || eng.render(&s, 0, 512, &mut out));
+        assert_eq!(eng.warp_players().count(), 48);
+        assert_eq!(eng.warp_table_capacity(t), cap, "placing never grew the table");
+        assert_eq!(eng.retired_warps.capacity(), retired_cap);
+        // Half the clips go: the next room keeps the 24 that play and hands back the rest.
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.truncate(6);
+        let back = eng.adopt_room(&s, WarpRoom::for_session(&s, 0));
+        assert_eq!(back.players(), 24);
+        assert_eq!(eng.warp_players().count(), 24);
+        eng.retire_stale_warps(&s);
+        assert!(eng.take_retired_warps().is_empty());
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {

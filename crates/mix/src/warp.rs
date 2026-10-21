@@ -27,6 +27,9 @@ pub struct WarpPlayer {
     next_pos: Samples,
     /// Source position fed next (fractional).
     next_src: f64,
+    /// The audio it last played: another source (a re-split clip) restarts it, so no stretcher
+    /// contents of the old audio are heard.
+    source: Option<SourceId>,
     input: Vec<Vec<f32>>,
     out: Vec<Vec<f32>>,
 }
@@ -71,6 +74,7 @@ impl WarpPlayer {
             prepared,
             next_pos: Samples::MIN,
             next_src: 0.0,
+            source: None,
         })
     }
 
@@ -109,6 +113,41 @@ impl PreparedWarp {
     /// Which of the clip's audio the player plays.
     pub fn stem(&self) -> PlayerStem {
         self.stem
+    }
+}
+
+/// Storage for warp players, built off the audio thread and handed to
+/// [`crate::MixEngine::adopt_room`] with each session snapshot (and with each later batch of
+/// players), so the audio thread never grows a player table or the retired list.
+pub struct WarpRoom {
+    pub(crate) tables: Vec<(TrackId, WarpPlayers)>,
+    pub(crate) retired: Vec<WarpPlayer>,
+}
+
+impl WarpRoom {
+    /// A table for every track of `s`, sized for all the players its clips play through
+    /// ([`crate::warp_clip_plays`], one per [`played_sources`] entry), and room to retire
+    /// `retire` players (the batch sent with it). Allocates.
+    pub fn for_session(s: &Session, retire: usize) -> WarpRoom {
+        let tables = s
+            .tracks
+            .iter()
+            .map(|t| {
+                let need: usize = t.clips().iter().filter(|c| crate::warp_clip_plays(t, c)).map(|c| played_sources(c).count()).sum();
+                (t.id, HashMap::with_capacity(need))
+            })
+            .collect();
+        WarpRoom { tables, retired: Vec::with_capacity(retire) }
+    }
+
+    /// Only room to retire `retire` players (a later batch for the same snapshot). Allocates.
+    pub fn retiring(retire: usize) -> WarpRoom {
+        WarpRoom { tables: Vec::new(), retired: Vec::with_capacity(retire) }
+    }
+
+    /// The players a room handed back still holds (those that no longer played).
+    pub fn players(&self) -> usize {
+        self.tables.iter().map(|(_, t)| t.len()).sum::<usize>() + self.retired.len()
     }
 }
 
@@ -153,11 +192,20 @@ pub(crate) fn render_warped(
     let sr = s.sample_rate.as_f64() as f32;
     let player = match players.entry((clip.id.0, stem)) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        // A stem's player is always prepared off the audio thread. Until it arrives (it comes
+        // with the snapshot for clips near the playhead, a UI frame or two later for others)
+        // the stem is left out rather than building a stretcher mid-mix, which could glitch
+        // the whole output. A source's player is still built as a fallback, as before stems.
+        std::collections::hash_map::Entry::Vacant(_) if stem != SOURCE_PLAYER && crate::on_audio_thread() => return,
         std::collections::hash_map::Entry::Vacant(e) => match WarpPlayer::build(src.len(), sr, false) {
             Some(p) => e.insert(p),
             None => return,
         },
     };
+    if player.source != Some(source) {
+        player.source = Some(source);
+        player.next_pos = Samples::MIN;
+    }
     let lat_in = player.st.input_latency() as f64;
     let lat_out = player.st.output_latency() as i64;
     let feed = |t: Samples| warp.source_at_time(&s.tempo, s.sample_rate, clip.start, t.saturating_add(lat_out)) + lat_in;

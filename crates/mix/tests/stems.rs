@@ -318,3 +318,67 @@ fn clip_renders_apply_the_mask_but_not_the_stem_faders() {
     assert!(peak(&want) > 0.1);
     assert!(max_diff(&got, &want) <= 1e-5);
 }
+
+/// A stem lane replaces the stem fader (the engine writes lanes as absolute fader values, like
+/// volume): a −6 dB fader with a written dip plays −6 dB outside the dip, not −12. In Write mode
+/// the fader plays, as for volume.
+#[test]
+fn a_stem_lane_replaces_the_fader() {
+    let bass = render_of(stems()[2].clone(), false);
+    let whole = render(&session(S, false, false, &[]).0);
+    let at_db = |db: f32| -> Vec<Vec<f32>> {
+        (0..2).map(|c| whole[c].iter().zip(&bass[c]).map(|(w, b)| w + (10f32.powf(db / 20.0) - 1.0) * b).collect()).collect()
+    };
+    let (mut s, t, _) = session(S, true, false, &[]);
+    s.track_mut(t).unwrap().mixer.stem_gain_db[BASS] = -6.0;
+    lane(&mut s, t, BASS as u8, &[(0, -6.0), (10_000, -6.0), (20_000, -30.0), (30_000, -6.0)]);
+    let got = render(&s);
+    let want = at_db(-6.0);
+    for c in 0..2 {
+        for i in (0..9_900).chain(30_100..got[c].len()) {
+            assert!((got[c][i] - want[c][i]).abs() <= 1e-5, "ch {c} at {i}: {} vs {}", got[c][i], want[c][i]);
+        }
+    }
+    // Write mode: the fader, not the lane.
+    s.track_mut(t).unwrap().mixer.automation_mode = soundcraft_model::AutomationMode::Write;
+    s.track_mut(t).unwrap().mixer.stem_gain_db[BASS] = -144.0;
+    assert!(max_diff(&render(&s), &at_db(-144.0)) <= 1e-5);
+}
+
+/// A non-finite stem fader plays at 0 dB rather than poisoning the mix.
+#[test]
+fn a_non_finite_stem_fader_plays_at_unity() {
+    let whole = render(&session(S, false, false, &[]).0);
+    let (mut s, t, _) = session(S, true, false, &[]);
+    s.track_mut(t).unwrap().mixer.stem_gain_db = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0];
+    let got = render(&s);
+    assert!(got.iter().flatten().all(|x| x.is_finite()));
+    assert!(max_diff(&got, &whole) <= 1e-5);
+}
+
+/// A re-split clip (same clip, new stem audio) restarts its stem players: the next block sounds
+/// exactly like a fresh start there, with nothing left over from the old stems.
+#[test]
+fn a_re_split_clip_restarts_its_stem_players() {
+    let st = stems();
+    let other: Vec<Vec<f32>> = st[3].iter().map(|c| c.iter().map(|x| -x).collect()).collect();
+    let (mut s, t, _) = session(S, true, true, &[(SourceId(960), other)]);
+    // Vocals only, the stem that changes, so only its player is compared.
+    clip_mut(&mut s, t).stem_mask = [true, false, false, false];
+    let mut resplit = s.clone();
+    if let Some(set) = &mut clip_mut(&mut resplit, t).stems {
+        set.sources[0] = SourceId(960);
+    }
+    let block = 1024;
+    let mut eng = MixEngine::new(SR as f32, block);
+    let mut out = vec![vec![0.0f32; block]; 2];
+    for k in 0..8 {
+        eng.render(&s, k * block as i64, block, &mut out);
+    }
+    eng.render(&resplit, 8 * block as i64, block, &mut out);
+    let mut fresh = MixEngine::new(SR as f32, block);
+    let mut want = vec![vec![0.0f32; block]; 2];
+    fresh.render(&resplit, 8 * block as i64, block, &mut want);
+    assert!(peak(&want) > 0.01);
+    assert_eq!(out, want);
+}
