@@ -98,7 +98,7 @@ fn file_stamp(p: &Path) -> Option<FileStamp> {
 
 /// The size and modification time (ms since 1970) a session records for the file at `p`; zeros
 /// when they are unknown.
-fn saved_stamp(p: &Path) -> (u64, u64) {
+pub(crate) fn saved_stamp(p: &Path) -> (u64, u64) {
     let Some(st) = file_stamp(p) else { return (0, 0) };
     let ms = st.modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     (st.len, ms)
@@ -248,20 +248,26 @@ pub(crate) fn kept_reference(stored: &str, session: &Path, audio: &Arc<SourceAud
         return None;
     }
     let file = stored_path(stored, session).ok()?;
-    stem_scope(&file, || file_found(&file) && !in_audio_files(&file) && decodes_unchanged(audio, &file)).then_some(file)
+    stem_scope(&file, |f| file_found(f) && !in_audio_files(f) && decodes_unchanged(audio, f)).then_some(file)
 }
 
-/// Runs `f`, which reads the file at `p`, outside the automation roots when `p` is a stem in a
-/// stem cache (the app's own folder, never one a command or a session chooses; see
-/// [`crate::cmd::stems::is_cached_stem`]), and under them otherwise.
-pub(crate) fn stem_scope<T>(p: &Path, f: impl FnOnce() -> T) -> T {
-    if crate::cmd::stems::is_cached_stem(p) { crate::file_access::unconfined(f) } else { f() }
+/// Runs `f` on the file at `p`. When `p` names a stem in a stem cache (the app's own folder,
+/// never one a command or a session chooses; see [`crate::cmd::stems::cached_stem`]), `f` gets
+/// the path that check matched (`.` and `..` resolved by name), so what is read is what was
+/// checked, and runs outside the automation roots; otherwise it gets `p`, under them.
+pub(crate) fn stem_scope<T>(p: &Path, f: impl FnOnce(&Path) -> T) -> T {
+    match crate::cmd::stems::cached_stem(p) {
+        Some(stem) => crate::file_access::unconfined(|| f(&stem)),
+        None => f(p),
+    }
 }
 
-/// The audio of the file at `p` at `rate`, and the file's own rate. The file must decode to the
-/// length its header states (a damaged one decodes shorter). The audio is remembered as decoded
-/// from the file, so a session can keep referencing it in place.
-pub(crate) fn decode_audio_file(p: &Path, rate: u32) -> std::result::Result<(Arc<SourceAudio>, u32), String> {
+/// The audio of the file at `p` at `rate`, and the file's own rate. The file must decode to
+/// exactly the length its header states (a damaged one decodes shorter). Only for files this app
+/// wrote with exact frame counts (the stem cache's FLACs), never for imports, whose headers may
+/// state an estimate. The audio is remembered as decoded from the file, so a session can keep
+/// referencing it in place.
+pub(crate) fn decode_exact_file(p: &Path, rate: u32) -> std::result::Result<(Arc<SourceAudio>, u32), String> {
     let bytes = read_file(p).map_err(|err| err.to_string())?;
     let ext = p.extension().and_then(|x| x.to_str());
     let shown = p.display();
@@ -1455,7 +1461,7 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
         let decoded = stored_path(&src.path, links)
             .map_err(|why| format!("{}: {why}", src.path))
             // A stem in the stem cache is read there even when automation is confined elsewhere.
-            .and_then(|p| stem_scope(&p, || decode_file(&mut files, &p, s.sample_rate.hz())).map(|a| (p, a)));
+            .and_then(|p| stem_scope(&p, |f| decode_file(&mut files, f, s.sample_rate.hz())).map(|a| (p, a)));
         match decoded {
             Ok((p, audio)) => {
                 let (frames, channels) = (audio.buffer.frames() as u64, audio.buffer.num_channels());

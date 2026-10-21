@@ -43,10 +43,15 @@ fn float_wav(buf: &AudioBuffer) -> Vec<u8> {
 
 /// A stereo source WAV `name` in `dir/music` of the four parts summed at `level`, 1 s at 48 kHz.
 fn source(dir: &Path, name: &str, level: f64) -> PathBuf {
-    let frames = RATE as usize;
-    let channels = (0..2).map(|ch| (0..frames).map(|k| (0..4).map(|i| part(i, level, ch, k as f64 / f64::from(RATE))).sum()).collect()).collect();
+    source_at(dir, name, level, RATE)
+}
+
+/// [`source`] at `rate`.
+fn source_at(dir: &Path, name: &str, level: f64, rate: u32) -> PathBuf {
+    let frames = rate as usize;
+    let channels = (0..2).map(|ch| (0..frames).map(|k| (0..4).map(|i| part(i, level, ch, k as f64 / f64::from(rate))).sum()).collect()).collect();
     let path = dir.join("music").join(name);
-    std::fs::write(&path, float_wav(&AudioBuffer { sample_rate: RATE, channels })).unwrap();
+    std::fs::write(&path, float_wav(&AudioBuffer { sample_rate: rate, channels })).unwrap();
     path
 }
 
@@ -376,5 +381,198 @@ fn attach_refuses_keys_that_are_not_this_clips_stems() {
     assert!(e.execute("dj.attach_stems", &json!({"clip": b.0})).unwrap_err().to_string().contains("`key` required"));
     assert!(e.execute("dj.split_stems", &json!({"clip": 999_999})).unwrap_err().to_string().contains("no clip"));
     assert!(stems_of(&e, b).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stem sources of the session (named "<track> (<stem>)").
+fn stem_sources(e: &Engine) -> usize {
+    e.session().sources.iter().filter(|s| STEMS.iter().any(|n| s.name.ends_with(&format!("({n})")))).count()
+}
+
+/// `path` as the session file's JSON writes it.
+fn in_json(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).unwrap().trim_matches('"').to_string()
+}
+
+/// Splitting a second import of an already split file reuses the four stem sources, so saving
+/// copies nothing into the session.
+#[test]
+fn a_file_split_again_reuses_its_stem_sources() {
+    const LEVEL: f64 = 0.97;
+    let dir = scratch("reuse");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    let c = cache(&dir);
+    let runner = fake(&Arc::new(AtomicUsize::new(0)), LEVEL);
+    split(&mut e, a, &c, &runner);
+    let again = ClipId(run(&mut e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    let r = split(&mut e, again, &c, &runner);
+    assert_eq!((r["hit"].as_bool(), r["clips"].clone()), (Some(true), json!([again.0])), "{r}");
+    assert_eq!(stem_sources(&e), 4);
+    assert_eq!(stems_of(&e, again), stems_of(&e, a));
+    run(&mut e, "session.save_as", json!({"path": dir.join("music").join("Set.scraft")}));
+    assert!(!dir.join("music").join("Audio Files").exists(), "nothing was copied into the session");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A split that finished for a clip id that, after an undo and another import, names a clip of
+/// another file never gives that clip the first file's stems.
+#[test]
+fn a_stale_split_never_attaches_to_a_clip_that_reuses_its_id() {
+    const LEVEL: f64 = 0.98;
+    let dir = scratch("stale");
+    let first = source(&dir, "first.wav", LEVEL);
+    let other = source(&dir, "other.wav", 0.4);
+    let mut e = Engine::default();
+    let import = |e: &mut Engine, p: &Path| ClipId(run(e, "file.import_audio", json!({"path": p}))["imported"][0]["clip"].as_u64().unwrap());
+    let a = import(&mut e, &first);
+    let first_source = e.session().all_clips().find(|c| c.id == a).unwrap().source();
+    let job = stems::split_job_in(&e, &json!({"clip": a.0}), cache(&dir), fake(&Arc::new(AtomicUsize::new(0)), LEVEL)).unwrap().unwrap();
+    let done = job.wait().unwrap();
+    run(&mut e, "edit.undo", json!({}));
+    let b = import(&mut e, &other);
+    assert_eq!(b, a, "the clip id is reused");
+    assert_eq!(e.session().all_clips().find(|c| c.id == b).unwrap().source(), first_source, "and the source id");
+    let err = done.apply(&mut e).unwrap_err().to_string();
+    assert!(err.contains("stems of another file"), "{err}");
+    assert!(stems_of(&e, b).is_none() && stem_sources(&e) == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cancel is honoured however late it comes: on a cache hit the split may be done already,
+/// and still nothing is applied.
+#[test]
+fn a_cancel_on_a_cache_hit_still_stops_the_split() {
+    const LEVEL: f64 = 0.99;
+    let dir = scratch("late-cancel");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    let c = cache(&dir);
+    let runner = fake(&Arc::new(AtomicUsize::new(0)), LEVEL);
+    split(&mut e, a, &c, &runner);
+    run(&mut e, "edit.undo", json!({}));
+    for poll in [false, true] {
+        let mut job = stems::split_job_in(&e, &json!({"clip": a.0}), c.clone(), runner.clone()).unwrap().unwrap();
+        // Let it finish first: the cancel comes after the stems loaded.
+        while job.progress().stage != stems::LOADING {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        job.cancel();
+        let r = if poll {
+            loop {
+                if let Some(r) = job.poll() {
+                    break r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        } else {
+            job.wait()
+        };
+        assert_eq!(r.err().map(|x| x.to_string()).as_deref(), Some(CANCELLED), "poll: {poll}");
+    }
+    assert!(stems_of(&e, a).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file at another rate than the session's (44.1 kHz in 48 kHz) is resampled on each import,
+/// so its clips hold different audio of the same file: they still share one split. The stems are
+/// resampled too, so they are copied into the session when it is saved, and the saved session
+/// names no file in the cache.
+#[test]
+fn a_file_at_another_rate_shares_its_split_and_copies_its_stems() {
+    const LEVEL: f64 = 0.89;
+    let dir = scratch("rate");
+    let path = source_at(&dir, "track.wav", LEVEL, 44_100);
+    let (mut e, a, b) = two_decks(&path);
+    let s = e.session();
+    let (sa, sb) = (s.all_clips().find(|c| c.id == a).unwrap().source().unwrap(), s.all_clips().find(|c| c.id == b).unwrap().source().unwrap());
+    assert!(!Arc::ptr_eq(s.pool.get(sa).unwrap(), s.pool.get(sb).unwrap()), "two resampled copies");
+    let c = cache(&dir);
+    let r = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    assert_eq!(r["clips"], json!([a.0, b.0]), "{r}");
+    let set = stems_of(&e, a).unwrap();
+    for id in set.sources {
+        let src = e.session().source(id).unwrap();
+        assert!(src.unsaved, "{src:?}: resampled, so not referenced in place");
+        assert_eq!(e.session().pool.get(id).unwrap().buffer.sample_rate, RATE);
+    }
+    let played = mix(&e);
+    let set_path = dir.join("music").join("Set.scraft");
+    run(&mut e, "session.save_as", json!({"path": set_path}));
+    let text = std::fs::read_to_string(&set_path).unwrap();
+    assert!(!text.contains(&in_json(c.root())), "the saved session names the cache");
+    let copied = std::fs::read_dir(dir.join("music").join("Audio Files")).unwrap().count();
+    assert!(copied >= 4, "{copied}");
+    let mut r = Engine::default();
+    assert_eq!(run(&mut r, "session.open", json!({"path": set_path}))["missing"], json!([]));
+    assert_eq!(mix(&r), played);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under confinement a session's stem paths are matched after `.` and `..` are resolved (and
+/// without regard to case on Windows): a detour that ends in the cache is read there, one that
+/// ends outside it is not read at all.
+#[test]
+fn crafted_stem_paths_are_matched_by_where_they_lead() {
+    const LEVEL: f64 = 0.88;
+    let dir = scratch("crafted");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    let c = cache(&dir);
+    let key = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
+    let set_path = dir.join("music").join("Set.scraft");
+    run(&mut e, "session.save_as", json!({"path": set_path}));
+    let entry = c.root().join(&key);
+    let elsewhere = dir.join("elsewhere").join(&key);
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::copy(entry.join("bass.flac"), elsewhere.join("bass.flac")).unwrap();
+    let detour = entry.join("..").join(&key).join("vocals.flac");
+    let through_music = dir.join("music").join("..").join("cache").join(&key).join("other.flac");
+    let out = entry.join("..").join("..").join("elsewhere").join(&key).join("bass.flac");
+    let mut text = std::fs::read_to_string(&set_path).unwrap();
+    for (stem, to) in [("vocals", &detour), ("other", &through_music), ("bass", &out)] {
+        let from = in_json(&entry.join(format!("{stem}.flac")));
+        assert!(text.contains(&from), "{stem}");
+        text = text.replace(&from, &in_json(to));
+    }
+    if cfg!(windows) {
+        let from = in_json(&entry.join("drums.flac"));
+        let root = in_json(c.root());
+        text = text.replace(&from, &from.replacen(&root, &root.to_uppercase(), 1));
+    }
+    std::fs::write(&set_path, text).unwrap();
+    let roots = AutomationRoots::new(Some(&dir.join("music")), Some(&dir.join("music"))).unwrap();
+    let mut r = Engine::default();
+    let opened = confine(roots.as_ref(), || r.execute("session.open", &json!({"path": set_path}))).unwrap();
+    let missing = opened["missing"].as_array().unwrap();
+    assert_eq!(missing.len(), 1, "{opened}");
+    assert!(missing[0].as_str().unwrap().contains("outside the read root") && missing[0].as_str().unwrap().contains("elsewhere"), "{opened}");
+    let set = stems_of(&r, a).unwrap();
+    let loaded: Vec<bool> = set.sources.iter().map(|id| r.session().pool.get(*id).is_some()).collect();
+    assert_eq!(loaded, [true, true, false, true], "vocals, drums, bass, other");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Importing a split clip's track from another session brings its stems along, read in the
+/// cache even where automation is confined to the music folder.
+#[test]
+fn imported_session_data_brings_the_stems_where_automation_is_confined() {
+    const LEVEL: f64 = 0.87;
+    let dir = scratch("import-data");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    split(&mut e, a, &cache(&dir), &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    let set_path = dir.join("music").join("Set.scraft");
+    run(&mut e, "session.save_as", json!({"path": set_path}));
+    let roots = AutomationRoots::new(Some(&dir.join("music")), Some(&dir.join("music"))).unwrap();
+    let mut r = Engine::default();
+    let got = confine(roots.as_ref(), || r.execute("file.import_session_data", &json!({"path": set_path}))).unwrap();
+    assert_eq!(got["missing"], json!([]), "{got}");
+    let split_clips: Vec<StemSet> = r.session().all_clips().filter_map(|c| c.stems.clone()).collect();
+    assert_eq!(split_clips.len(), 2, "{got}");
+    for id in split_clips[0].sources {
+        assert!(r.session().pool.get(id).is_some());
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

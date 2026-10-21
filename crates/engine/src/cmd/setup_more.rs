@@ -440,7 +440,8 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
         match crate::io::stored_path(&src.path, Path::new(&path)) {
             Ok(abs) => {
                 ns.path = abs.to_string_lossy().into_owned();
-                match crate::io::decode_file(&mut files, &abs, sr) {
+                // A stem in the stem cache is read there even when automation is confined elsewhere.
+                match crate::io::stem_scope(&abs, |f| crate::io::decode_file(&mut files, f, sr)) {
                     Ok(audio) => {
                         ns.frames = audio.buffer.frames() as u64;
                         ns.sample_rate = sr;
