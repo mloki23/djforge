@@ -431,8 +431,9 @@ impl Session {
         self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| &p.clips))
     }
 
+    /// Clips (any playlist) that play `src`, as their source or as one of their stems.
     pub fn clips_using(&self, src: SourceId) -> impl Iterator<Item = &Clip> {
-        self.all_clips().filter(move |c| c.source() == Some(src))
+        self.all_clips().filter(move |c| c.audio_sources().any(|x| x == src))
     }
 
     /// End of the last clip on any track (session length).
@@ -581,6 +582,8 @@ impl Session {
                 p.clips.iter_mut().for_each(Clip::sanitize);
                 p.sort();
             }
+            // A stem lane past the last stem controls nothing.
+            t.automation.retain(|l| !matches!(l.param, crate::AutoParam::Stem(i) if usize::from(i) >= crate::STEMS.len()));
             for l in &mut t.automation {
                 l.points.retain(|p| p.value.is_finite());
                 l.points.iter_mut().for_each(|p| bound(&mut p.at));
@@ -778,5 +781,69 @@ mod tests {
         assert_eq!(tr.active_playlist, 0);
         assert_eq!(tr.mixer.volume_db, 0.0);
         assert!(s.next_id > t.0);
+    }
+
+    /// A session with an audio track whose clip plays source 7, split into stems 11..14 with a
+    /// vocals-off mask, a −6 dB bass fader and a `stem:bass` lane.
+    fn split_session() -> (Session, TrackId, ClipId) {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let cid = s.new_clip_id();
+        let mut c = Clip::audio(cid, "c", SourceId(7), 0, 10, 100);
+        c.stems = Some(crate::StemSet { key: "k".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
+        c.stem_mask = [false, true, true, true];
+        if let Some(tr) = s.track_mut(t) {
+            tr.mixer.stem_gain_db[2] = -6.0;
+            let mut lane = crate::AutomationLane::new(crate::AutoParam::Stem(2));
+            lane.set_point(0, 0.0);
+            lane.set_point(50, -144.0);
+            tr.automation.push(lane);
+        }
+        if let Some(p) = s.track_mut(t).and_then(Track::playlist_mut) {
+            p.clips.push(c);
+        }
+        (s, t, cid)
+    }
+
+    #[test]
+    fn a_split_session_round_trips_and_one_saved_before_stems_loads_unsplit() {
+        let (s, t, cid) = split_session();
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back, s);
+        // The same session as an older build wrote it: no stem fields anywhere.
+        let mut v = serde_json::to_value(&s).unwrap();
+        for tr in v["tracks"].as_array_mut().unwrap() {
+            tr["mixer"].as_object_mut().unwrap().remove("stem_gain_db");
+            tr["automation"] = serde_json::json!([]);
+            for pl in tr["playlists"].as_array_mut().unwrap() {
+                for c in pl["clips"].as_array_mut().unwrap() {
+                    c.as_object_mut().unwrap().remove("stems");
+                    c.as_object_mut().unwrap().remove("stem_mask");
+                }
+            }
+        }
+        let old = Session::from_json(&v.to_string()).unwrap();
+        let c = old.find_clip(cid).unwrap().1;
+        assert_eq!((&c.stems, c.stem_mask), (&None, [true; 4]));
+        assert_eq!(old.track(t).unwrap().mixer.stem_gain_db, [0.0; 4]);
+    }
+
+    #[test]
+    fn stem_files_count_as_used_by_the_clip() {
+        let (s, _, cid) = split_session();
+        for src in [7, 11, 12, 13, 14] {
+            assert_eq!(s.clips_using(SourceId(src)).map(|c| c.id).collect::<Vec<_>>(), [cid], "source {src}");
+        }
+        assert_eq!(s.clips_using(SourceId(8)).count(), 0);
+    }
+
+    #[test]
+    fn a_stem_lane_past_the_last_stem_is_dropped_on_load() {
+        let (mut s, t, _) = split_session();
+        if let Some(tr) = s.track_mut(t) {
+            tr.automation.push(crate::AutomationLane::new(crate::AutoParam::Stem(4)));
+        }
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back.track(t).unwrap().automation.iter().map(|l| l.param.clone()).collect::<Vec<_>>(), [crate::AutoParam::Stem(2)]);
     }
 }

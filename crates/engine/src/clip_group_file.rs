@@ -60,10 +60,10 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
         let mut lane = Vec::new();
         for mut c in v {
             c.start -= start;
-            if let ClipContent::Audio { source, .. } = c.content
-                && let std::collections::btree_map::Entry::Vacant(slot) = audio.entry(source.0)
-                && let (Some(buf), Some(src)) = (s.pool.get(source), s.sources.iter().find(|x| x.id == source))
-            {
+            // A split clip's stems are written with its source.
+            for source in c.audio_sources() {
+                let std::collections::btree_map::Entry::Vacant(slot) = audio.entry(source.0) else { continue };
+                let (Some(buf), Some(src)) = (s.pool.get(source), s.sources.iter().find(|x| x.id == source)) else { continue };
                 let rel = format!("{audio_dir_name}/{}_{}.wav", crate::io::sanitize_name(&src.name), source.0);
                 crate::io::make_dir(dir.join(&audio_dir_name))?;
                 let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
@@ -159,6 +159,8 @@ pub fn import(e: &mut Engine, path: &str, first: Option<TrackId>, at: Samples) -
             } else if !matches!(c.content, ClipContent::Midi { .. }) {
                 continue;
             }
+            // Stems whose files are not all in the group can't play: the clip plays its source.
+            c.stems = c.stems.and_then(|set| set.remapped(|x| map.get(&x.0).copied()));
             c.id = s.new_clip_id();
             c.start = at.saturating_add(scale(c.start.max(0)));
             c.length = scale(c.length);
@@ -206,6 +208,49 @@ mod tests {
         e.undo();
         assert_eq!(e.session().tracks.len(), before);
         assert!(e.session().find_clip(soundcraft_model::ClipId(placed[0])).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_split_clip_takes_its_stems_into_the_group_and_back() {
+        let dir = std::env::temp_dir().join(format!("sc-grp-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("split.scgrp").to_string_lossy().to_string();
+        let mut e = crate::demo::demo_engine();
+        let s = e.session_mut();
+        let kick = s.track_by_name("Kick").unwrap().clips()[0].clone();
+        let audio = s.pool.get(kick.source().unwrap()).unwrap().buffer.clone();
+        // Four different stems, so each is its own file: a quarter, a half... of the kick.
+        let stems: [soundcraft_model::SourceId; 4] = std::array::from_fn(|i| {
+            let mut b = audio.clone();
+            b.channels.iter_mut().flatten().for_each(|x| *x *= (i + 1) as f32 / 4.0);
+            crate::io::add_source(s, soundcraft_model::STEMS[i], b, None, soundcraft_audio_io::FileFormat::Wav)
+        });
+        let c = s.find_clip_mut(kick.id).unwrap();
+        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: stems });
+        c.stem_mask = [true, false, false, false];
+        e.execute("file.export_clip_groups", &json!({"path": path, "clips": [kick.id.0]})).unwrap();
+        let r = e.execute("file.import_clip_groups", &json!({"path": path, "at": 30_000_000, "track": "Bass"})).unwrap();
+        let id = soundcraft_model::ClipId(r["clips"][0].as_u64().unwrap());
+        let s = e.session();
+        let c = s.find_clip(id).unwrap().1;
+        let set = c.stems.as_ref().unwrap();
+        assert_eq!(c.stem_mask, [true, false, false, false]);
+        for (i, src) in set.sources.iter().enumerate() {
+            assert!(!stems.contains(src) && Some(*src) != c.source(), "stem {i} is a new source");
+            let got = &s.pool.get(*src).unwrap().buffer.channels[0];
+            let want = &s.pool.get(stems[i]).unwrap().buffer.channels[0];
+            assert_eq!(got, want, "stem {i} plays its own audio");
+        }
+        // A group file that lacks one stem's audio gives an unsplit clip, not a broken one.
+        let mut file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        file["audio"].as_object_mut().unwrap().remove(&stems[3].0.to_string()).unwrap();
+        std::fs::write(&path, file.to_string()).unwrap();
+        let r = e.execute("file.import_clip_groups", &json!({"path": path, "at": 40_000_000, "track": "Bass"})).unwrap();
+        let id = soundcraft_model::ClipId(r["clips"][0].as_u64().unwrap());
+        let c = e.session().find_clip(id).unwrap().1;
+        assert!(c.stems.is_none() && c.source().is_some_and(|x| e.session().pool.contains(x)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

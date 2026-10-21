@@ -63,6 +63,8 @@ pub enum AutoParam {
         slot: u8,
         param: String,
     },
+    /// Stem fader level, dB (index in [`crate::STEMS`] order; split clips only).
+    Stem(u8),
 }
 
 impl AutoParam {
@@ -76,9 +78,14 @@ impl AutoParam {
             AutoParam::SendPan(i) => format!("send {} pan", slot_letter(*i)),
             AutoParam::SendMute(i) => format!("send {} mute", slot_letter(*i)),
             AutoParam::Plugin { slot, param } => format!("insert {} {param}", slot_letter(*slot)),
+            AutoParam::Stem(i) => match crate::STEMS.get(usize::from(*i)) {
+                Some(name) => format!("stem {name}"),
+                None => format!("stem {i}"),
+            },
         }
     }
-    /// Parse ids like `volume`, `pan`, `pan2`, `mute`, `send_a_level`, `plugin:a:threshold`.
+    /// Parse ids like `volume`, `pan`, `pan2`, `mute`, `send_a_level`, `plugin:a:threshold`,
+    /// `stem:vocals` (or `stem:0`).
     pub fn parse(s: &str) -> Option<AutoParam> {
         let s = s.trim().to_ascii_lowercase();
         match s.as_str() {
@@ -102,6 +109,10 @@ impl AutoParam {
             let (slot, param) = rest.split_once(':')?;
             return Some(AutoParam::Plugin { slot: letter_slot(slot)?, param: param.to_string() });
         }
+        if let Some(rest) = s.strip_prefix("stem:") {
+            let i = crate::STEMS.iter().position(|name| *name == rest).or_else(|| rest.parse().ok().filter(|i| *i < crate::STEMS.len()))?;
+            return u8::try_from(i).ok().map(AutoParam::Stem);
+        }
         None
     }
     /// Value range and default.
@@ -111,6 +122,8 @@ impl AutoParam {
             AutoParam::Pan(_) | AutoParam::SendPan(_) => (-1.0, 1.0, 0.0),
             AutoParam::Mute | AutoParam::SendMute(_) => (0.0, 1.0, 0.0),
             AutoParam::Plugin { .. } => (f32::MIN, f32::MAX, 0.0),
+            // −144 dB is silence, as for the fader.
+            AutoParam::Stem(_) => (-144.0, 6.0, 0.0),
         }
     }
 }
@@ -309,6 +322,26 @@ mod tests {
         assert_eq!(AutoParam::parse("plugin:a:threshold"), Some(AutoParam::Plugin { slot: 0, param: "threshold".into() }));
         assert_eq!(AutoParam::parse("nope"), None);
         assert_eq!(AutomationMode::from_id("touch/latch"), Some(AutomationMode::TouchLatch));
+    }
+
+    #[test]
+    fn stem_params_parse_by_name_or_index_and_label_by_name() {
+        for (i, name) in crate::STEMS.iter().enumerate() {
+            let want = AutoParam::Stem(i as u8);
+            assert_eq!(AutoParam::parse(&format!("stem:{name}")), Some(want.clone()));
+            assert_eq!(AutoParam::parse(&format!("Stem:{}", name.to_uppercase())), Some(want.clone()));
+            assert_eq!(AutoParam::parse(&format!("stem:{i}")), Some(want.clone()));
+            assert_eq!(want.label(), format!("stem {name}"));
+            assert_eq!(want.range(), (-144.0, 6.0, 0.0));
+        }
+        for bad in ["stem:4", "stem:", "stem:piano", "stem:-1", "stem"] {
+            assert_eq!(AutoParam::parse(bad), None, "{bad}");
+        }
+        assert_eq!(AutoParam::Stem(9).label(), "stem 9");
+        let mut lane = AutomationLane::new(AutoParam::Stem(2));
+        lane.set_point(0, 20.0);
+        lane.set_point(10, -500.0);
+        assert_eq!(lane.points.iter().map(|p| p.value).collect::<Vec<_>>(), [6.0, -144.0]);
     }
 
     #[test]

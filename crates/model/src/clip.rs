@@ -92,6 +92,28 @@ pub enum ClipContent {
     Video { source: SourceId, offset: Samples },
 }
 
+/// The four stems a clip can be split into, in their fixed index order (stem masks, stem
+/// faders, [`StemSet::sources`] and `AutoParam::Stem` all use it).
+pub const STEMS: [&str; 4] = ["vocals", "drums", "bass", "other"];
+
+/// The four stem files of a split audio clip, in [`STEMS`] order. Each is a source as long as
+/// the clip's own source, so the stems line up with it sample for sample.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StemSet {
+    /// The stem cache entry the files came from.
+    pub key: String,
+    pub sources: [SourceId; 4],
+}
+
+impl StemSet {
+    /// The set with each source renumbered by `map` (audio brought into another session), or
+    /// None when any stem has no counterpart, since a split clip needs all four.
+    pub fn remapped(&self, map: impl Fn(SourceId) -> Option<SourceId>) -> Option<StemSet> {
+        let [v, d, b, o] = self.sources.map(map);
+        Some(StemSet { key: self.key.clone(), sources: [v?, d?, b?, o?] })
+    }
+}
+
 /// A clip on a playlist.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
@@ -140,10 +162,24 @@ pub struct Clip {
     /// map through this map, pitch-preserved in realtime, and `stretch` is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warp: Option<WarpMap>,
+    /// The stems of a split audio clip, played instead of its source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stems: Option<StemSet>,
+    /// Which stems a split clip plays, in [`STEMS`] order (all by default).
+    #[serde(default = "all_stems", skip_serializing_if = "is_all")]
+    pub stem_mask: [bool; 4],
 }
 
 fn one() -> f64 {
     1.0
+}
+
+fn all_stems() -> [bool; 4] {
+    [true; 4]
+}
+
+fn is_all(mask: &[bool; 4]) -> bool {
+    mask.iter().all(|&on| on)
 }
 
 impl Clip {
@@ -168,6 +204,8 @@ impl Clip {
             group: None,
             loop_id: None,
             warp: None,
+            stems: None,
+            stem_mask: all_stems(),
         }
     }
 
@@ -206,6 +244,22 @@ impl Clip {
             ClipContent::Audio { source, .. } => Some(source),
             ClipContent::Midi { .. } | ClipContent::Video { .. } => None,
         }
+    }
+
+    /// Every audio source this clip plays or depends on: its source, then its stems (if split).
+    /// Empty for MIDI and video clips.
+    pub fn audio_sources(&self) -> impl Iterator<Item = SourceId> + '_ {
+        self.source().into_iter().chain(self.stems.iter().flat_map(|set| set.sources))
+    }
+
+    /// Point an audio clip at other audio (a render, a replacement file). Stems belong to the
+    /// audio they were split from, so new audio leaves the clip unsplit.
+    pub fn set_audio(&mut self, source: SourceId, offset: Samples) {
+        if self.source() != Some(source) {
+            self.stems = None;
+            self.stem_mask = all_stems();
+        }
+        self.content = ClipContent::Audio { source, offset };
     }
 
     /// The movie this clip shows (video clips only).
@@ -332,6 +386,12 @@ impl Clip {
         }
         if !self.is_audio() || !self.warp.as_ref().is_some_and(WarpMap::is_usable) {
             self.warp = None;
+        }
+        if !self.is_audio() {
+            self.stems = None;
+        }
+        if let Some(set) = &mut self.stems {
+            truncate_chars(&mut set.key, MAX_NAME_CHARS);
         }
     }
 }
@@ -504,6 +564,73 @@ mod tests {
         c.fade_out = Fade { len: 800, shape: FadeShape::Linear, curvature: 0.0 };
         c.trim_start_to(900);
         assert!(c.fade_out.len <= c.length);
+    }
+
+    fn split(clip: &mut Clip) {
+        clip.stems = Some(StemSet { key: "00ff-1234-htdemucs".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
+    }
+
+    #[test]
+    fn clips_saved_before_stems_load_unsplit_with_every_stem_on() {
+        let old = r#"{"id":1,"name":"a","start":0,"length":100,"content":{"Audio":{"source":7,"offset":0}}}"#;
+        let clip: Clip = serde_json::from_str(old).unwrap();
+        assert_eq!((clip.stems, clip.stem_mask), (None, [true; 4]));
+        // An unsplit clip with every stem on writes nothing new, so older builds read it unchanged.
+        let text = serde_json::to_string(&Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100)).unwrap();
+        assert!(!text.contains("stem"), "{text}");
+    }
+
+    #[test]
+    fn a_split_clip_round_trips_with_its_stems_and_mask() {
+        let mut clip = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
+        split(&mut clip);
+        clip.stem_mask = [true, false, false, true];
+        let back: Clip = serde_json::from_str(&serde_json::to_string(&clip).unwrap()).unwrap();
+        assert_eq!(back, clip);
+    }
+
+    #[test]
+    fn a_clip_lists_its_source_then_its_stems() {
+        let mut clip = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
+        assert_eq!(clip.audio_sources().collect::<Vec<_>>(), [SourceId(7)]);
+        split(&mut clip);
+        assert_eq!(clip.audio_sources().map(|s| s.0).collect::<Vec<_>>(), [7, 11, 12, 13, 14]);
+        let midi = Clip::midi(ClipId(2), "m", 0, 100, Sequence::default());
+        assert_eq!(midi.audio_sources().count(), 0);
+    }
+
+    #[test]
+    fn stems_are_renumbered_only_when_all_four_have_a_counterpart() {
+        let mut clip = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
+        split(&mut clip);
+        let set = clip.stems.unwrap();
+        let moved = set.remapped(|x| Some(SourceId(x.0 + 100))).unwrap();
+        assert_eq!((moved.key.as_str(), moved.sources.map(|x| x.0)), ("00ff-1234-htdemucs", [111, 112, 113, 114]));
+        assert_eq!(set.remapped(|x| (x.0 != 13).then_some(x)), None);
+    }
+
+    #[test]
+    fn new_audio_unsplits_a_clip_but_a_new_offset_does_not() {
+        let mut clip = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
+        split(&mut clip);
+        clip.stem_mask = [true, false, true, true];
+        clip.set_audio(SourceId(7), 50);
+        assert!(clip.stems.is_some());
+        assert_eq!(clip.source_offset(), 50);
+        clip.set_audio(SourceId(8), 0);
+        assert_eq!((&clip.stems, clip.stem_mask, clip.source()), (&None, [true; 4], Some(SourceId(8))));
+    }
+
+    #[test]
+    fn sanitize_drops_stems_from_clips_that_are_not_audio() {
+        let mut clip = Clip::midi(ClipId(2), "m", 0, 100, Sequence::default());
+        split(&mut clip);
+        clip.sanitize();
+        assert!(clip.stems.is_none());
+        let mut audio = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
+        split(&mut audio);
+        audio.sanitize();
+        assert!(audio.stems.is_some());
     }
 
     #[test]

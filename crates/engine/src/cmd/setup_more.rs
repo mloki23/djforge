@@ -422,8 +422,9 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
     if picked.is_empty() {
         return Err(bad(id, "nothing to import"));
     }
+    // A split clip's stems come along with its source.
     let mut needed: Vec<SourceId> =
-        picked.iter().flat_map(|t| t.playlists.iter().flat_map(|pl| pl.clips.iter().filter_map(|c| c.source()))).collect();
+        picked.iter().flat_map(|t| t.playlists.iter().flat_map(|pl| pl.clips.iter().flat_map(soundcraft_model::Clip::audio_sources))).collect();
     // A Sampler's sample is session audio too.
     needed.extend(picked.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)));
     needed.sort_by_key(|x| x.0);
@@ -474,6 +475,8 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
                 {
                     *source = *n;
                 }
+                // Stems whose files did not all come along can't play: the clip plays its source.
+                c.stems = c.stems.take().and_then(|set| set.remapped(|x| map.get(&x.0).copied()));
             }
         }
         // The donor's source ids mean nothing here: remap the sample, or drop it when it didn't come along.
@@ -599,6 +602,36 @@ mod tests {
         assert!(e.session().pool.get(src).is_some());
         assert_eq!(e.session().track_by_name("Keys").unwrap().clips().len(), 1);
         assert!(e.execute("file.import_session_data", &json!({"path": path, "tracks": ["Nope"]})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_session_data_brings_a_split_clips_stems() {
+        let dir = std::env::temp_dir().join(format!("sc-import-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let mut donor = crate::demo::demo_engine();
+        let s = donor.session_mut();
+        let kick = s.track_by_name("Kick").unwrap().clips()[0].clone();
+        let audio = s.pool.get(kick.source().unwrap()).unwrap().buffer.clone();
+        let stems = soundcraft_model::STEMS.map(|name| crate::io::add_source(s, name, audio.clone(), None, soundcraft_audio_io::FileFormat::Wav));
+        let c = s.find_clip_mut(kick.id).unwrap();
+        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: stems });
+        c.stem_mask = [false, true, true, false];
+        crate::io::save_session(&mut donor, &path).unwrap();
+        let mut e = Engine::default();
+        let r = e.execute("file.import_session_data", &json!({"path": path, "tracks": ["Kick"]})).unwrap();
+        assert_eq!(r["missing"], json!([]));
+        let s = e.session();
+        let clip = &s.track_by_name("Kick").unwrap().clips()[0];
+        let set = clip.stems.as_ref().unwrap();
+        assert_eq!(clip.stem_mask, [false, true, true, false]);
+        for (id, name) in set.sources.iter().zip(soundcraft_model::STEMS) {
+            assert_eq!(s.source(*id).map(|x| x.name.as_str()), Some(name));
+            assert!(s.pool.get(*id).is_some(), "{name} is loaded");
+            assert_ne!(Some(*id), clip.source());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

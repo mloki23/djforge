@@ -2402,6 +2402,10 @@ fn automation_id(p: &AutoParam) -> String {
         AutoParam::SendPan(i) => format!("send_{}_pan", (b'a' + i) as char),
         AutoParam::SendMute(i) => format!("send_{}_mute", (b'a' + i) as char),
         AutoParam::Plugin { slot, param } => format!("plugin:{}:{param}", (b'a' + slot) as char),
+        AutoParam::Stem(i) => match soundcraft_model::STEMS.get(usize::from(*i)) {
+            Some(name) => format!("stem:{name}"),
+            None => format!("stem:{i}"),
+        },
     }
 }
 

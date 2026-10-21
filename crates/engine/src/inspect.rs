@@ -2,7 +2,7 @@
 
 use crate::Engine;
 use serde_json::{Value, json};
-use soundcraft_model::{Clip, ClipContent, ClipId, Track, TrackId};
+use soundcraft_model::{Clip, ClipContent, ClipId, STEMS, Track, TrackId};
 use soundcraft_time::TimeFormat;
 
 fn clip_json(e: &Engine, c: &Clip) -> Value {
@@ -25,6 +25,11 @@ fn clip_json(e: &Engine, c: &Clip) -> Value {
             v["video"] = json!(source);
             v["offset"] = json!(offset);
         }
+    }
+    if let Some(set) = &c.stems {
+        let sources: serde_json::Map<String, Value> = STEMS.iter().zip(set.sources).map(|(n, id)| ((*n).to_string(), json!(id))).collect();
+        v["stems"] = json!({"key": set.key, "sources": sources});
+        v["stem_mask"] = json!(STEMS.iter().zip(c.stem_mask).filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>());
     }
     if !c.gain_env.is_empty() {
         v["gain_envelope"] = json!(c.gain_env);
@@ -55,7 +60,7 @@ fn track_json(e: &Engine, t: &Track, full: bool) -> Value {
         "id": t.id, "name": t.name, "kind": t.kind.id(), "format": t.format.label(),
         "volume_db": t.mixer.volume_db, "pan": t.mixer.pan, "surround": t.mixer.surround, "mute": t.mixer.mute, "solo": t.mixer.solo,
         "record_arm": t.mixer.record_arm, "input": t.mixer.input, "output": t.mixer.output,
-        "automation_mode": t.mixer.automation_mode.label(), "inserts": inserts, "sends": sends,
+        "automation_mode": t.mixer.automation_mode.label(), "inserts": inserts, "sends": sends, "stem_gain_db": t.mixer.stem_gain_db,
         "clips": t.clips().iter().map(|c| clip_json(e, c)).collect::<Vec<_>>(),
         "playlist": t.playlist().map(|p| p.name.clone()), "playlists": t.playlists.len(),
         "hidden": t.hidden, "inactive": t.inactive, "view": t.view, "height": t.height.label(),
@@ -170,5 +175,18 @@ mod tests {
         let entry = after["sources"].as_array().unwrap().iter().find(|s| s["id"] == json!(id)).expect("source still listed");
         assert_eq!(entry["loaded"], false, "{entry}");
         assert_eq!(entry["path"], before["sources"][0]["path"], "metadata stays even when unloaded");
+    }
+
+    #[test]
+    fn a_split_clip_shows_its_stems_and_mask() {
+        let mut e = crate::demo::demo_engine();
+        let id = e.session().all_clips().find(|c| c.is_audio()).unwrap().id;
+        let c = e.session_mut().find_clip_mut(id).unwrap();
+        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: [11, 12, 13, 14].map(soundcraft_model::SourceId) });
+        c.stem_mask = [false, true, true, true];
+        let c = e.session().find_clip(id).unwrap().1;
+        let v = clip_json(&e, c);
+        assert_eq!(v["stems"], json!({"key": "k", "sources": {"vocals": 11, "drums": 12, "bass": 13, "other": 14}}));
+        assert_eq!(v["stem_mask"], json!(["drums", "bass", "other"]));
     }
 }

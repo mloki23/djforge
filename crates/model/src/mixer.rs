@@ -522,6 +522,10 @@ pub struct Mixer {
     /// Surround panner, used when the output is multichannel (None = the stereo pan to L/R).
     #[serde(default)]
     pub surround: Option<SurroundPan>,
+    /// Stem fader levels in dB, in [`crate::STEMS`] order (−144 is silence, +6 the top). They
+    /// apply to split clips only.
+    #[serde(default)]
+    pub stem_gain_db: [f32; 4],
 }
 
 impl Mixer {
@@ -548,6 +552,7 @@ impl Mixer {
             trim_db: 0.0,
             vca: None,
             surround: None,
+            stem_gain_db: [0.0; 4],
         }
     }
 
@@ -570,6 +575,9 @@ impl Mixer {
             sp.sanitize();
         }
         self.trim_db = finite_or(self.trim_db, 0.0).clamp(-144.0, 24.0);
+        for g in &mut self.stem_gain_db {
+            *g = finite_or(*g, 0.0).clamp(-144.0, 6.0);
+        }
     }
 }
 
@@ -621,6 +629,21 @@ pub fn fader_db_to_pos(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stem_faders_default_to_0_db_and_sanitize_into_range() {
+        let mut m = Mixer::new(ChannelFormat::Stereo);
+        assert_eq!(m.stem_gain_db, [0.0; 4]);
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("stem_gain_db");
+        let old: Mixer = serde_json::from_value(old).unwrap();
+        assert_eq!(old.stem_gain_db, [0.0; 4]);
+        m.stem_gain_db = [f32::NAN, -500.0, 20.0, -3.0];
+        m.sanitize();
+        assert_eq!(m.stem_gain_db, [0.0, -144.0, 6.0, -3.0]);
+        let back: Mixer = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
 
     #[test]
     fn insert_state_round_trips_through_json() {

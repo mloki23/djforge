@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::ClipContent;
+use soundcraft_model::{ClipContent, STEMS};
 use std::collections::BTreeMap;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -25,49 +25,58 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
         for (index, playlist) in track.playlists.iter().enumerate() {
             let active = index == track.active_playlist;
             for clip in &playlist.clips {
-                let ClipContent::Audio { source, offset } = clip.content else { continue };
+                let ClipContent::Audio { source: own, offset } = clip.content else { continue };
                 clips += 1;
                 if active {
                     active_end = active_end.max(clip.end());
                 }
-                let metadata = sources.get(&source);
-                let audio = s.pool.get(source);
-                let mut add = |code: &str, message: &str| {
-                    issues.push(json!({"code": code, "message": message, "track": track.name, "track_id": track.id.0,
-                        "playlist": playlist.name, "active": active, "clip": clip.name, "clip_id": clip.id.0,
-                        "source_id": source.0, "path": metadata.map(|m| m.path.as_str())}));
-                };
-                if metadata.is_none() {
-                    add("missing_source", "Source metadata is missing. Reimport the audio and replace this clip.");
-                }
-                let Some(audio) = audio else {
-                    add(
-                        "unavailable_audio",
-                        "Audio is not loaded; this clip will be silent. Restore the media and reopen the session, or reimport it.",
-                    );
-                    continue;
-                };
-                if audio.buffer.sample_rate != s.sample_rate.hz() {
-                    add("sample_rate_mismatch", "Loaded audio differs from the session sample rate. Reimport it to convert to the session rate.");
-                }
-                if audio.buffer.channels.is_empty() || audio.frames() == 0 {
-                    add("empty_audio", "Loaded audio has no playable frames. Reimport a valid audio file.");
-                    continue;
-                }
-                if audio.buffer.channels.iter().any(|channel| channel.len() != audio.frames()) {
-                    add(
-                        "uneven_channels",
-                        "Loaded audio channels have different lengths. Reimport a valid audio file; bounds below use the shortest channel.",
-                    );
-                }
-                if !clip.stretch.is_finite() || clip.stretch <= 0.0 || clip.length <= 0 {
-                    add("invalid_clip", "Clip length or stretch is invalid. Replace this clip.");
-                }
-                let stretch = if clip.stretch.is_finite() && clip.stretch > 0.0 { clip.stretch } else { 1.0 };
-                // Match the mixer's last requested source sample, including elastic playback.
-                let last = offset as f64 + clip.length.saturating_sub(1).max(0) as f64 / stretch;
-                if offset < 0 || last >= audio.frames() as f64 {
-                    add("source_bounds", "Clip extends outside the loaded audio; part will be silent. Trim the clip or replace its source.");
+                // A split clip plays its stems, each read like its source, so each is checked too.
+                let stems = clip.stems.iter().flat_map(|set| STEMS.iter().zip(set.sources).map(|(name, id)| (Some(*name), id)));
+                for (stem, source) in std::iter::once((None, own)).chain(stems) {
+                    let metadata = sources.get(&source);
+                    let audio = s.pool.get(source);
+                    let mut add = |code: &str, message: &str| {
+                        issues.push(json!({"code": code, "message": message, "track": track.name, "track_id": track.id.0,
+                            "playlist": playlist.name, "active": active, "clip": clip.name, "clip_id": clip.id.0,
+                            "source_id": source.0, "stem": stem, "path": metadata.map(|m| m.path.as_str())}));
+                    };
+                    if metadata.is_none() {
+                        add("missing_source", "Source metadata is missing. Reimport the audio and replace this clip.");
+                    }
+                    let Some(audio) = audio else {
+                        add(
+                            "unavailable_audio",
+                            if stem.is_some() {
+                                "Stem audio is not loaded; this stem will be silent. Restore the stem cache and reopen the session, or split the clip again."
+                            } else {
+                                "Audio is not loaded; this clip will be silent. Restore the media and reopen the session, or reimport it."
+                            },
+                        );
+                        continue;
+                    };
+                    if audio.buffer.sample_rate != s.sample_rate.hz() {
+                        add("sample_rate_mismatch", "Loaded audio differs from the session sample rate. Reimport it to convert to the session rate.");
+                    }
+                    if audio.buffer.channels.is_empty() || audio.frames() == 0 {
+                        add("empty_audio", "Loaded audio has no playable frames. Reimport a valid audio file.");
+                        continue;
+                    }
+                    if audio.buffer.channels.iter().any(|channel| channel.len() != audio.frames()) {
+                        add(
+                            "uneven_channels",
+                            "Loaded audio channels have different lengths. Reimport a valid audio file; bounds below use the shortest channel.",
+                        );
+                    }
+                    // The clip itself is reported once, with its own source.
+                    if stem.is_none() && (!clip.stretch.is_finite() || clip.stretch <= 0.0 || clip.length <= 0) {
+                        add("invalid_clip", "Clip length or stretch is invalid. Replace this clip.");
+                    }
+                    let stretch = if clip.stretch.is_finite() && clip.stretch > 0.0 { clip.stretch } else { 1.0 };
+                    // Match the mixer's last requested source sample, including elastic playback.
+                    let last = offset as f64 + clip.length.saturating_sub(1).max(0) as f64 / stretch;
+                    if offset < 0 || last >= audio.frames() as f64 {
+                        add("source_bounds", "Clip extends outside the loaded audio; part will be silent. Trim the clip or replace its source.");
+                    }
                 }
             }
         }
@@ -75,7 +84,7 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
     Ok(json!({"audio_clips": clips, "active_audio_end_samples": active_end,
         "active_audio_end_seconds": (s.sample_rate.hz() != 0).then(|| active_end as f64 / f64::from(s.sample_rate.hz())),
         "issue_count": issues.len(), "healthy": issues.is_empty(), "issues": issues,
-        "scope": "All playlists; loaded audio availability and clip bounds only. Does not check files on disk, signal levels, plugins or routing."}))
+        "scope": "All playlists, the stems of split clips included; loaded audio availability and clip bounds only. Does not check files on disk, signal levels, plugins or routing."}))
 }
 
 #[cfg(test)]
@@ -117,6 +126,55 @@ mod tests {
         assert_eq!(r["issues"][0]["code"], "missing_source");
         assert_eq!(r["issues"][1]["code"], "unavailable_audio");
         assert_eq!(r["issues"][0]["active"], false);
+    }
+
+    #[test]
+    fn a_split_clip_reports_a_stem_that_is_missing_or_too_short() {
+        let mut e = crate::demo::demo_engine();
+        let s = e.session();
+        let clip = s.all_clips().find(|c| c.is_audio()).unwrap().clone();
+        let source = s.source(clip.source().unwrap()).unwrap().clone();
+        let audio = s.pool.get(source.id).unwrap().clone();
+        let s = e.session_mut();
+        let ids: Vec<SourceId> = (0..4).map(|_| SourceId(s.alloc())).collect();
+        for (i, id) in ids.iter().enumerate().take(3) {
+            s.sources.push(soundcraft_model::Source { id: *id, name: format!("{} ({})", source.name, STEMS[i]), ..source.clone() });
+        }
+        // Vocals and drums play; bass is one frame short; `other` has no file at all.
+        s.pool.insert(ids[0], audio.clone());
+        s.pool.insert(ids[1], audio.clone());
+        let short = AudioBuffer {
+            sample_rate: audio.buffer.sample_rate,
+            channels: audio.buffer.channels.iter().map(|c| c[..c.len() - 1].to_vec()).collect(),
+        };
+        s.pool.insert(ids[2], Arc::new(SourceAudio::new(short)));
+        let set = soundcraft_model::StemSet { key: "k".into(), sources: [ids[0], ids[1], ids[2], ids[3]] };
+        let id = clip.id;
+        s.find_clip_mut(id).unwrap().stems = Some(set);
+        // The clip reaches its source's last frame, so a stem one frame short is out of bounds.
+        let frames = i64::try_from(audio.frames()).unwrap();
+        let c = s.find_clip_mut(id).unwrap();
+        c.content = ClipContent::Audio { source: source.id, offset: 0 };
+        c.length = frames;
+        c.stretch = 1.0;
+        let r = check(&mut e);
+        let mine: Vec<(String, Value)> = r["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["clip_id"] == id.0)
+            .map(|i| (i["code"].as_str().unwrap().to_string(), i["stem"].clone()))
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                ("source_bounds".to_string(), json!("bass")),
+                ("missing_source".to_string(), json!("other")),
+                ("unavailable_audio".to_string(), json!("other"))
+            ],
+            "{r}"
+        );
+        assert_eq!(r["audio_clips"], e.session().all_clips().filter(|c| c.is_audio()).count());
     }
 
     #[test]

@@ -508,6 +508,7 @@ pub(crate) fn current_value(tr: &soundcraft_model::Track, param: &AutoParam) -> 
         AutoParam::Plugin { slot, param } => {
             tr.mixer.inserts.get(usize::from(*slot)).and_then(Option::as_ref).and_then(|i| i.params.get(param).copied()).unwrap_or(0.0)
         }
+        AutoParam::Stem(i) => tr.mixer.stem_gain_db.get(usize::from(*i)).copied().unwrap_or(0.0),
     }
 }
 
