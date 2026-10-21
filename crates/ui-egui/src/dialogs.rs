@@ -245,13 +245,26 @@ fn clear_message(s: &Session, clips: &[ClipId], sources: &[SourceId]) -> Option<
         (c, f) => format!("{} and {}", count(c.len(), "clip"), count(f.len(), "file")),
     };
     let mut text = format!("Remove {what} from the session?");
-    let used: Vec<(&str, usize)> =
-        files.iter().map(|f| (f.name.as_str(), s.clips_using(f.id).filter(|c| !listed.contains(&c.id)).count())).filter(|(_, n)| *n > 0).collect();
-    let n: usize = used.iter().map(|u| u.1).sum();
-    let users = if n == 1 {
-        "a clip on the timeline, which is removed too.".to_string()
-    } else {
-        format!("{n} clips on the timeline, which are removed too.")
+    // Clips playing a file go with it; split clips using it only as a stem stay, unsplit.
+    let ids: std::collections::BTreeSet<SourceId> = files.iter().map(|f| f.id).collect();
+    let effect = soundcraft_engine::cmd::clear_effect(s, &listed, &ids);
+    let used: Vec<(&str, (usize, usize))> =
+        files.iter().map(|f| (f.name.as_str(), effect.of_file(s, &listed, f.id))).filter(|(_, (r, u))| r + u > 0).collect();
+    let removed: usize = used.iter().map(|u| u.1.0).sum();
+    let unsplit: usize = used.iter().map(|u| u.1.1).sum();
+    let stems = |n: usize| if n == 1 { "its stems" } else { "their stems" };
+    let users = match (removed, unsplit) {
+        (1, 0) => "a clip on the timeline, which is removed too.".to_string(),
+        (n, 0) => format!("{n} clips on the timeline, which are removed too."),
+        (0, 1) => "a split clip on the timeline, which will lose its stems.".to_string(),
+        (0, u) => format!("{u} split clips on the timeline, which will lose their stems."),
+        (r, u) => format!(
+            "{} on the timeline: {} will be removed and {} will lose {}.",
+            count(r + u, "clip"),
+            count(r, "clip"),
+            count(u, "split clip"),
+            stems(u)
+        ),
     };
     match used.as_slice() {
         [] => {}
@@ -819,6 +832,32 @@ mod tests {
         assert_eq!(
             message(&d),
             "Remove 2 files from the session? They are used by 4 clips on the timeline, which are removed too. The files stay on disk."
+        );
+    }
+
+    #[test]
+    fn clearing_a_stem_file_says_its_split_clips_lose_their_stems() {
+        let mut e = soundcraft_engine::demo::demo_engine();
+        let hats = e.session().sources.iter().find(|f| f.name == "Hats").map(|f| f.id).unwrap();
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 480]] };
+        let vocals = soundcraft_engine::io::add_source(e.session_mut(), "vocals", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let snare = e.session().track_by_name("Snare").unwrap().clips()[0].id;
+        let stems = soundcraft_model::StemSet { key: "k".into(), sources: [vocals, hats, hats, hats] };
+        e.session_mut().find_clip_mut(snare).unwrap().stems = Some(stems);
+        let message = |d: &Dialogs| match &d.open {
+            Some(Dialog::ClearClips { message, .. }) => message.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut d = Dialogs::default();
+        assert!(d.open_clear(&e, vec![], vec![vocals]));
+        assert_eq!(
+            message(&d),
+            "Remove the file \"vocals\" from the session? It is used by a split clip on the timeline, which will lose its stems."
+        );
+        assert!(d.open_clear(&e, vec![], vec![hats]));
+        assert_eq!(
+            message(&d),
+            "Remove the file \"Hats\" from the session? It is used by 2 clips on the timeline: 1 clip will be removed and 1 split clip will lose its stems."
         );
     }
 }

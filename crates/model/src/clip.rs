@@ -249,15 +249,21 @@ impl Clip {
     /// Every audio source this clip plays or depends on: its source, then its stems (if split).
     /// Empty for MIDI and video clips.
     pub fn audio_sources(&self) -> impl Iterator<Item = SourceId> + '_ {
-        self.source().into_iter().chain(self.stems.iter().flat_map(|set| set.sources))
+        let stems = self.stems.iter().filter(|_| self.is_audio()).flat_map(|set| set.sources);
+        self.source().into_iter().chain(stems)
+    }
+
+    /// Forget the clip's stems: it plays its own audio again, every stem on.
+    pub fn unsplit(&mut self) {
+        self.stems = None;
+        self.stem_mask = all_stems();
     }
 
     /// Point an audio clip at other audio (a render, a replacement file). Stems belong to the
     /// audio they were split from, so new audio leaves the clip unsplit.
     pub fn set_audio(&mut self, source: SourceId, offset: Samples) {
         if self.source() != Some(source) {
-            self.stems = None;
-            self.stem_mask = all_stems();
+            self.unsplit();
         }
         self.content = ClipContent::Audio { source, offset };
     }
@@ -387,8 +393,8 @@ impl Clip {
         if !self.is_audio() || !self.warp.as_ref().is_some_and(WarpMap::is_usable) {
             self.warp = None;
         }
-        if !self.is_audio() {
-            self.stems = None;
+        if !self.is_audio() || self.stems.is_none() {
+            self.unsplit();
         }
         if let Some(set) = &mut self.stems {
             truncate_chars(&mut set.key, MAX_NAME_CHARS);
@@ -595,8 +601,9 @@ mod tests {
         assert_eq!(clip.audio_sources().collect::<Vec<_>>(), [SourceId(7)]);
         split(&mut clip);
         assert_eq!(clip.audio_sources().map(|s| s.0).collect::<Vec<_>>(), [7, 11, 12, 13, 14]);
-        let midi = Clip::midi(ClipId(2), "m", 0, 100, Sequence::default());
-        assert_eq!(midi.audio_sources().count(), 0);
+        let mut midi = Clip::midi(ClipId(2), "m", 0, 100, Sequence::default());
+        split(&mut midi);
+        assert_eq!(midi.audio_sources().count(), 0, "stems on a MIDI clip play nothing");
     }
 
     #[test]
@@ -625,12 +632,20 @@ mod tests {
     fn sanitize_drops_stems_from_clips_that_are_not_audio() {
         let mut clip = Clip::midi(ClipId(2), "m", 0, 100, Sequence::default());
         split(&mut clip);
+        clip.stem_mask = [false; 4];
         clip.sanitize();
         assert!(clip.stems.is_none());
+        assert_eq!(clip.stem_mask, [true; 4]);
         let mut audio = Clip::audio(ClipId(1), "a", SourceId(7), 0, 0, 100);
         split(&mut audio);
+        audio.stem_mask = [true, false, true, true];
         audio.sanitize();
         assert!(audio.stems.is_some());
+        assert_eq!(audio.stem_mask, [true, false, true, true]);
+        // A mask without stems masks nothing: an unsplit clip plays every stem's worth.
+        audio.stems = None;
+        audio.sanitize();
+        assert_eq!(audio.stem_mask, [true; 4]);
     }
 
     #[test]

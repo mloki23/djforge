@@ -1,7 +1,7 @@
 //! More Edit menu commands: Cut/Copy/Clear Special variants, Paste Special, selection helpers,
 //! Space Clips, Snap to, Copy/Move Selection to playlists, TCE, and automation coalesce/trim/glide.
 
-use super::more_util::{clip_db, render_stretched, replace_clip, set_clip_env, target_playlist};
+use super::more_util::{clip_db, refuse_split, render_stretched, replace_clip, set_clip_env, target_playlist};
 use super::*;
 use crate::edit as ops;
 use crate::{Clipboard, TransportRequest, cmd};
@@ -758,6 +758,7 @@ fn tce(e: &mut Engine, p: &Value) -> Result<Value> {
     let Some((t, c)) = ids.iter().find_map(|cid| e.session().find_clip(*cid).filter(|(_, c)| c.is_audio()).map(|(t, c)| (t, c.clone()))) else {
         return Err(bad(id, "select an audio clip"));
     };
+    refuse_split(e.session(), id, &[c.id])?;
     if c.time_locked || c.edit_locked {
         return Err(bad(id, "the clip is locked"));
     }

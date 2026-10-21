@@ -476,7 +476,11 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
                     *source = *n;
                 }
                 // Stems whose files did not all come along can't play: the clip plays its source.
-                c.stems = c.stems.take().and_then(|set| set.remapped(|x| map.get(&x.0).copied()));
+                match c.stems.as_ref().map(|set| set.remapped(|x| map.get(&x.0).copied())) {
+                    Some(Some(set)) => c.stems = Some(set),
+                    Some(None) => c.unsplit(),
+                    None => {}
+                }
             }
         }
         // The donor's source ids mean nothing here: remap the sample, or drop it when it didn't come along.

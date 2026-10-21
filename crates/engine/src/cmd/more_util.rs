@@ -138,6 +138,15 @@ fn max_render(s: &Session) -> Samples {
     s.sample_rate.samples(3600.0).min(soundcraft_dsp::offline::MAX_OFFLINE_SAMPLES as Samples)
 }
 
+/// Refuses `cmd` when one of `ids` is split into stems: it renders the clip's own audio, which
+/// would replace what the clip's stems and mask play (an acapella would become the full mix).
+pub fn refuse_split(s: &Session, cmd: &str, ids: &[soundcraft_model::ClipId]) -> Result<()> {
+    match ids.iter().filter_map(|id| s.find_clip(*id)).find(|(_, c)| c.stems.is_some()) {
+        Some((_, c)) => Err(bad(cmd, format!("`{}` is split into stems: remove the stems first (Remove Stems), then try again", c.name))),
+        None => Ok(()),
+    }
+}
+
 /// Render the audio a clip plays, time-stretched (pitch preserved) to `out_len` samples, into a new
 /// source. Returns `Ok(None)` for MIDI clips or missing audio.
 pub fn render_stretched(s: &mut Session, cmd: &str, c: &Clip, out_len: Samples) -> Result<Option<SourceId>> {

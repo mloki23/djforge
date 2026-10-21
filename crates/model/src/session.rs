@@ -586,6 +586,11 @@ impl Session {
             t.automation.retain(|l| !matches!(l.param, crate::AutoParam::Stem(i) if usize::from(i) >= crate::STEMS.len()));
             for l in &mut t.automation {
                 l.points.retain(|p| p.value.is_finite());
+                // Stem faders run -144..+6 dB, however the file wrote them.
+                if matches!(l.param, crate::AutoParam::Stem(_)) {
+                    let (lo, hi, _) = l.param.range();
+                    l.points.iter_mut().for_each(|p| p.value = p.value.clamp(lo, hi));
+                }
                 l.points.iter_mut().for_each(|p| bound(&mut p.at));
                 l.points.sort_by_key(|p| p.at);
             }
@@ -842,8 +847,15 @@ mod tests {
         let (mut s, t, _) = split_session();
         if let Some(tr) = s.track_mut(t) {
             tr.automation.push(crate::AutomationLane::new(crate::AutoParam::Stem(4)));
+            if let Some(lane) = tr.automation.first_mut() {
+                lane.points.push(crate::AutomationPoint { at: 60, value: 40.0 });
+                lane.points.push(crate::AutomationPoint { at: 70, value: -1e9 });
+            }
         }
         let back = Session::from_json(&s.to_json().unwrap()).unwrap();
-        assert_eq!(back.track(t).unwrap().automation.iter().map(|l| l.param.clone()).collect::<Vec<_>>(), [crate::AutoParam::Stem(2)]);
+        let lanes = &back.track(t).unwrap().automation;
+        assert_eq!(lanes.iter().map(|l| l.param.clone()).collect::<Vec<_>>(), [crate::AutoParam::Stem(2)]);
+        // Points written out of range are clamped to the fader's.
+        assert_eq!(lanes[0].points.iter().map(|p| p.value).collect::<Vec<_>>(), [0.0, -144.0, 6.0, -144.0]);
     }
 }

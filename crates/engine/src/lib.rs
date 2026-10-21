@@ -207,6 +207,8 @@ impl Engine {
         self.undo.clear();
         self.redo.clear();
         self.last_selection = None;
+        // Copied clips name the old session's sources and clips.
+        self.clipboard = Clipboard::default();
         self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }

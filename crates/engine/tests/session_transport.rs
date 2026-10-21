@@ -28,3 +28,15 @@ fn failed_new_session_keeps_the_current_transport() {
     assert_eq!(engine.transport, status);
     assert_eq!(engine.transport_requests, requests);
 }
+
+#[test]
+fn a_new_session_starts_with_an_empty_clipboard() {
+    // Copied clips name the old session's audio files and clip ids, which mean nothing in the next.
+    let mut engine = soundcraft_engine::demo::demo_engine();
+    let kick = engine.session().track_by_name("Kick").unwrap().id;
+    engine.execute("edit.copy", &json!({"tracks": [kick.0], "start": 0, "end": 480_000})).unwrap();
+    assert!(!engine.clipboard.tracks.is_empty());
+    engine.replace_session(Session::default());
+    assert!(engine.clipboard.tracks.is_empty() && engine.clipboard.length == 0);
+    assert!(engine.execute("edit.paste", &json!({})).is_err());
+}

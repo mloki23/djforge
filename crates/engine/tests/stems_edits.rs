@@ -246,3 +246,22 @@ fn moving_a_transition_keeps_every_rippled_clips_stems() {
     assert!(e.undo() && e.undo());
     assert_kept(&e, &set, 3, "undo");
 }
+
+#[test]
+fn stretch_renders_refuse_a_split_clip_and_change_nothing() {
+    // They render the clip's own audio, so a masked clip (an acapella) would become the full mix.
+    let (mut e, t, id, _) = split_deck();
+    e.session_mut().track_mut(t).unwrap().elastic = Some("polyphonic".into());
+    e.session_mut().find_clip_mut(id).unwrap().stretch = 1.5;
+    let c = e.session().find_clip(id).unwrap().1.clone();
+    let before = e.session().clone();
+    for (cmd, p) in [
+        ("clip.elastic_properties", json!({"clips": [id.0], "ratio": 1.5})),
+        ("clip.remove_pitch_shift", json!({"clips": [id.0]})),
+        ("edit.tce_to_timeline", json!({"clips": [id.0], "start": c.start, "end": c.end() + SR as i64})),
+    ] {
+        let err = e.execute(cmd, &p).unwrap_err().to_string();
+        assert!(err.contains("remove the stems first (Remove Stems), then try again"), "{cmd}: {err}");
+        assert!(*e.session() == before, "{cmd} changed the session");
+    }
+}

@@ -183,6 +183,7 @@ pub fn specs() -> Vec<CommandSpec> {
 fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
     let ratio = f64_or(p, "ratio", 1.0).clamp(0.05, 20.0);
+    super::more_util::refuse_split(e.session(), "clip.elastic_properties", &ids)?;
     let s = e.session_mut();
     let mut rendered = 0;
     for id in &ids {

@@ -160,7 +160,11 @@ pub fn import(e: &mut Engine, path: &str, first: Option<TrackId>, at: Samples) -
                 continue;
             }
             // Stems whose files are not all in the group can't play: the clip plays its source.
-            c.stems = c.stems.and_then(|set| set.remapped(|x| map.get(&x.0).copied()));
+            match c.stems.as_ref().map(|set| set.remapped(|x| map.get(&x.0).copied())) {
+                Some(Some(set)) => c.stems = Some(set),
+                Some(None) => c.unsplit(),
+                None => {}
+            }
             c.id = s.new_clip_id();
             c.start = at.saturating_add(scale(c.start.max(0)));
             c.length = scale(c.length);
@@ -250,7 +254,7 @@ mod tests {
         let r = e.execute("file.import_clip_groups", &json!({"path": path, "at": 40_000_000, "track": "Bass"})).unwrap();
         let id = soundcraft_model::ClipId(r["clips"][0].as_u64().unwrap());
         let c = e.session().find_clip(id).unwrap().1;
-        assert!(c.stems.is_none() && c.source().is_some_and(|x| e.session().pool.contains(x)));
+        assert!(c.stems.is_none() && c.stem_mask == [true; 4] && c.source().is_some_and(|x| e.session().pool.contains(x)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -12,6 +12,9 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// The advice for any problem with a stem file.
+const AGAIN: &str = "Remove the stems (Remove Stems) and split the clip again.";
+
 fn report(e: &mut Engine, _: &Value) -> Result<Value> {
     let s = e.session();
     let sources: BTreeMap<_, _> = s.sources.iter().map(|source| (source.id, source)).collect();
@@ -35,47 +38,59 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
                 for (stem, source) in std::iter::once((None, own)).chain(stems) {
                     let metadata = sources.get(&source);
                     let audio = s.pool.get(source);
-                    let mut add = |code: &str, message: &str| {
+                    // Stem files come from the stem cache: the fix is to split again, not reimport.
+                    let mut add = |code: &str, own: &str, of_stem: &str| {
+                        let message = if stem.is_some() { format!("{of_stem} {AGAIN}") } else { own.to_string() };
                         issues.push(json!({"code": code, "message": message, "track": track.name, "track_id": track.id.0,
                             "playlist": playlist.name, "active": active, "clip": clip.name, "clip_id": clip.id.0,
                             "source_id": source.0, "stem": stem, "path": metadata.map(|m| m.path.as_str())}));
                     };
                     if metadata.is_none() {
-                        add("missing_source", "Source metadata is missing. Reimport the audio and replace this clip.");
+                        add(
+                            "missing_source",
+                            "Source metadata is missing. Reimport the audio and replace this clip.",
+                            "Stem file metadata is missing.",
+                        );
                     }
                     let Some(audio) = audio else {
                         add(
                             "unavailable_audio",
-                            if stem.is_some() {
-                                "Stem audio is not loaded; this stem will be silent. Restore the stem cache and reopen the session, or split the clip again."
-                            } else {
-                                "Audio is not loaded; this clip will be silent. Restore the media and reopen the session, or reimport it."
-                            },
+                            "Audio is not loaded; this clip will be silent. Restore the media and reopen the session, or reimport it.",
+                            "Stem audio is not loaded; this stem will be silent.",
                         );
                         continue;
                     };
                     if audio.buffer.sample_rate != s.sample_rate.hz() {
-                        add("sample_rate_mismatch", "Loaded audio differs from the session sample rate. Reimport it to convert to the session rate.");
+                        add(
+                            "sample_rate_mismatch",
+                            "Loaded audio differs from the session sample rate. Reimport it to convert to the session rate.",
+                            "Stem audio differs from the session sample rate.",
+                        );
                     }
                     if audio.buffer.channels.is_empty() || audio.frames() == 0 {
-                        add("empty_audio", "Loaded audio has no playable frames. Reimport a valid audio file.");
+                        add("empty_audio", "Loaded audio has no playable frames. Reimport a valid audio file.", "Stem audio has no playable frames.");
                         continue;
                     }
                     if audio.buffer.channels.iter().any(|channel| channel.len() != audio.frames()) {
                         add(
                             "uneven_channels",
                             "Loaded audio channels have different lengths. Reimport a valid audio file; bounds below use the shortest channel.",
+                            "Stem audio channels have different lengths; bounds below use the shortest channel.",
                         );
                     }
                     // The clip itself is reported once, with its own source.
                     if stem.is_none() && (!clip.stretch.is_finite() || clip.stretch <= 0.0 || clip.length <= 0) {
-                        add("invalid_clip", "Clip length or stretch is invalid. Replace this clip.");
+                        add("invalid_clip", "Clip length or stretch is invalid. Replace this clip.", "");
                     }
                     let stretch = if clip.stretch.is_finite() && clip.stretch > 0.0 { clip.stretch } else { 1.0 };
                     // Match the mixer's last requested source sample, including elastic playback.
                     let last = offset as f64 + clip.length.saturating_sub(1).max(0) as f64 / stretch;
                     if offset < 0 || last >= audio.frames() as f64 {
-                        add("source_bounds", "Clip extends outside the loaded audio; part will be silent. Trim the clip or replace its source.");
+                        add(
+                            "source_bounds",
+                            "Clip extends outside the loaded audio; part will be silent. Trim the clip or replace its source.",
+                            "Clip extends outside the stem's loaded audio; part of this stem will be silent.",
+                        );
                     }
                 }
             }
@@ -174,6 +189,10 @@ mod tests {
             ],
             "{r}"
         );
+        for issue in r["issues"].as_array().unwrap().iter().filter(|i| i["clip_id"] == id.0) {
+            let message = issue["message"].as_str().unwrap();
+            assert!(message.ends_with("split the clip again.") && !message.contains("eimport"), "{issue}");
+        }
         assert_eq!(r["audio_clips"], e.session().all_clips().filter(|c| c.is_audio()).count());
     }
 

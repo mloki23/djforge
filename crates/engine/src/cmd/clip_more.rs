@@ -1,7 +1,7 @@
 //! More Clip menu commands: Regroup, Unloop, Clip Effects bypass/render, Conform to Tempo and
 //! Remove Pitch Shift.
 
-use super::more_util::{render_stretched, replace_clip};
+use super::more_util::{refuse_split, render_stretched, replace_clip};
 use super::*;
 use crate::cmd;
 use serde_json::json;
@@ -99,11 +99,15 @@ fn regroup(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"group": g, "clips": n}))
 }
 
+/// Whether `b` repeats `a`: the same loop, or the same material. Audio is the same only when it
+/// plays the same stems through the same mask too (an acapella doesn't repeat the full track).
 fn same_material(a: &Clip, b: &Clip) -> bool {
     a.length == b.length
         && (a.loop_id.is_some() && a.loop_id == b.loop_id
             || match (&a.content, &b.content) {
-                (ClipContent::Audio { source: s1, offset: o1 }, ClipContent::Audio { source: s2, offset: o2 }) => s1 == s2 && o1 == o2,
+                (ClipContent::Audio { source: s1, offset: o1 }, ClipContent::Audio { source: s2, offset: o2 }) => {
+                    s1 == s2 && o1 == o2 && a.stems == b.stems && a.stem_mask == b.stem_mask
+                }
                 (ClipContent::Midi { sequence: q1 }, ClipContent::Midi { sequence: q2 }) => q1 == q2,
                 (ClipContent::Video { source: s1, offset: o1 }, ClipContent::Video { source: s2, offset: o2 }) => s1 == s2 && o1 == o2,
                 _ => false,
@@ -261,6 +265,7 @@ fn conform(e: &mut Engine, p: &Value) -> Result<Value> {
 fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "clip.remove_pitch_shift";
     let ids = clip_ids_param(e, p);
+    refuse_split(e.session(), id, &ids)?;
     let s = e.session_mut();
     let mut n = 0;
     for cid in ids {
@@ -304,6 +309,25 @@ mod tests {
         let left: Vec<ClipId> = e.session().track(t).unwrap().clips().iter().map(|c| c.id).collect();
         assert_eq!(left, vec![ids[0], ids[3]]);
         assert!(e.execute("clip.unloop", &json!({"clip": ids[3].0})).is_err());
+    }
+
+    #[test]
+    fn unloop_keeps_a_neighbour_with_other_stems_or_another_mask() {
+        let (mut e, t, ids) = engine_with(&[(0, 100, 0), (100, 100, 0), (200, 100, 0)]);
+        let stems = soundcraft_model::StemSet { key: "k".into(), sources: [11, 12, 13, 14].map(SourceId) };
+        for id in &ids {
+            e.session_mut().find_clip_mut(*id).unwrap().stems = Some(stems.clone());
+        }
+        // The last one plays only the vocals: not a repeat of the full track.
+        e.session_mut().find_clip_mut(ids[2]).unwrap().stem_mask = [true, false, false, false];
+        e.execute("clip.unloop", &json!({"clip": ids[0].0})).unwrap();
+        let left: Vec<ClipId> = e.session().track(t).unwrap().clips().iter().map(|c| c.id).collect();
+        assert_eq!(left, vec![ids[0], ids[2]]);
+        // Unsplit, the same audio isn't the same material as the split clip either.
+        let (mut e, t, ids) = engine_with(&[(0, 100, 0), (100, 100, 0)]);
+        e.session_mut().find_clip_mut(ids[1]).unwrap().stems = Some(stems);
+        assert!(e.execute("clip.unloop", &json!({"clip": ids[0].0})).is_err());
+        assert_eq!(e.session().track(t).unwrap().clips().len(), 2);
     }
 
     /// A 100-sample MIDI clip with one note, on a fresh instrument-less MIDI track.
