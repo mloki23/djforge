@@ -29,8 +29,8 @@ pub mod record;
 pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
-use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, itu_stereo_fold, main_channels};
-use soundcraft_model::{ClipContent, Session, TrackId};
+use soundcraft_mix::{MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, itu_stereo_fold, main_channels};
+use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -474,8 +474,9 @@ struct Side {
     refused: HashSet<(TrackId, usize)>,
     garbage: BinRx,
     old_sessions: Option<Receiver<Arc<Session>>>,
-    /// Beat-locked clips whose warp player was sent: (track, clip id) -> (channels, sample rate).
-    prepared_warps: HashMap<(TrackId, u64), (usize, u32)>,
+    /// Warp players sent for beat-locked clips: (track, clip id, stem or source) -> (channels,
+    /// sample rate).
+    prepared_warps: HashMap<(TrackId, u64, PlayerStem), (usize, u32)>,
     /// The snapshot last sent (an extra reference, released here on the UI thread), while some
     /// of its warp players are still to be built.
     warps_for: Option<Arc<Session>>,
@@ -921,30 +922,34 @@ impl Side {
     /// Builds warp players for beat-locked clips the audio thread has no player for yet, so it
     /// never builds a stretcher mid-mix: at most `budget`, nearest the playhead first. When all
     /// are built, `warps_for` is cleared. Only clips the engine would play through a player are
-    /// built ([`soundcraft_mix::warp_clip_plays`]). Players are kept per track, so a clip moved to
-    /// another track gets a new one; a change of source channels or sample rate replaces it. A
-    /// clip played before its player arrives builds one on the audio thread (the fallback).
+    /// built ([`soundcraft_mix::warp_clip_plays`]). A split clip needs one player per stem
+    /// ([`soundcraft_mix::played_sources`]), each counting against `budget`; stems its mask or
+    /// faders silence get one too, so bringing them back never builds on the audio thread.
+    /// Players are kept per track, so a clip moved to another track gets a new one; a change of
+    /// source channels or sample rate replaces it. A clip played before its player arrives builds
+    /// one on the audio thread (the fallback).
     fn prepare_warps(&mut self, s: &Session, playhead: Samples, budget: usize) -> Vec<PreparedWarp> {
         let sr = s.sample_rate.hz();
         let mut live = HashSet::new();
         let mut todo = Vec::new();
         for t in &s.tracks {
             for c in t.clips().iter().filter(|c| soundcraft_mix::warp_clip_plays(t, c)) {
-                let ClipContent::Audio { source, .. } = &c.content else { continue };
-                let ch = s.pool.get(*source).map_or(0, |a| a.buffer.channels.len());
-                if ch == 0 {
-                    continue;
-                }
-                let key = (t.id, c.id.0);
-                live.insert(key);
-                if self.prepared_warps.get(&key) != Some(&(ch, sr)) {
-                    let r = c.range();
-                    let distance = if r.contains(playhead) {
-                        0
-                    } else {
-                        r.start.saturating_sub(playhead).saturating_abs().min(r.end.saturating_sub(playhead).saturating_abs())
-                    };
-                    todo.push((distance, t.id, c.id, ch));
+                for (stem, source) in soundcraft_mix::played_sources(c) {
+                    let ch = s.pool.get(source).map_or(0, |a| a.buffer.channels.len());
+                    if ch == 0 {
+                        continue;
+                    }
+                    let key = (t.id, c.id.0, stem);
+                    live.insert(key);
+                    if self.prepared_warps.get(&key) != Some(&(ch, sr)) {
+                        let r = c.range();
+                        let distance = if r.contains(playhead) {
+                            0
+                        } else {
+                            r.start.saturating_sub(playhead).saturating_abs().min(r.end.saturating_sub(playhead).saturating_abs())
+                        };
+                        todo.push((distance, t.id, c.id, stem, ch));
+                    }
                 }
             }
         }
@@ -957,10 +962,10 @@ impl Side {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(todo.len().min(budget));
-        for (_, track, clip, ch) in todo.into_iter().take(budget) {
+        for (_, track, clip, stem, ch) in todo.into_iter().take(budget) {
             // Remembered even when the build fails: retrying every frame would not help.
-            self.prepared_warps.insert((track, clip.0), (ch, sr));
-            out.extend(PreparedWarp::new(track, clip, ch, s.sample_rate.as_f64() as f32));
+            self.prepared_warps.insert((track, clip.0, stem), (ch, sr));
+            out.extend(PreparedWarp::new(track, clip, stem, ch, s.sample_rate.as_f64() as f32));
         }
         out
     }
@@ -1332,7 +1337,7 @@ mod tests {
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(st.mix.warp_players().count(), n as usize);
-        assert!(st.mix.warp_players().all(|(_, _, p)| p.is_prepared()));
+        assert!(st.mix.warp_players().all(|(_, _, _, p)| p.is_prepared()));
     }
 
     #[test]
@@ -1392,13 +1397,68 @@ mod tests {
         st.fill(&mut out, 2);
         let players: Vec<_> = st.mix.warp_players().collect();
         assert_eq!(players.len(), n, "one per playable clip, none for the muted or unusable one");
-        assert!(players.iter().all(|(_, _, p)| p.is_prepared()), "none built on the audio thread");
+        assert!(players.iter().all(|(_, _, _, p)| p.is_prepared()), "none built on the audio thread");
         // A sample-rate change replaces the engine; its players come back for dropping here.
         let mut s44 = (*s).clone();
         s44.sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
         tx.send(Cmd::Session(Arc::new(s44), Vec::new(), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.warps.try_iter().map(|w| w.len()).sum::<usize>(), n);
+    }
+
+    /// A split clip gets a player per stem, each counted against the batch, masked stems too;
+    /// none is built on the audio thread, and unsplitting sends the stems' players back.
+    #[test]
+    fn a_split_clip_gets_a_prepared_player_per_stem() {
+        use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, StemSet, TrackKind, WarpMap};
+        let mut s = soundcraft_model::Session::default();
+        for k in 900..905 {
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]; 2] };
+            s.pool.insert(SourceId(k), Arc::new(SourceAudio::new(buf)));
+        }
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let near = s.new_clip_id();
+        let mut c = Clip::audio(near, "split", SourceId(900), 0, 0, 48_000);
+        c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        c.stems = Some(StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+        c.stem_mask = [true, false, true, true];
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let far = s.new_clip_id();
+        let mut c = Clip::audio(far, "plain", SourceId(900), 0, 96_000, 48_000);
+        c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+        let mut side = Side::new(48_000.0, bin().1);
+        let first = side.prepare_warps(&s, 0, 4);
+        assert_eq!(
+            first.iter().map(|w| (w.clip(), w.stem())).collect::<Vec<_>>(),
+            (0..4).map(|k| (near, k)).collect::<Vec<_>>(),
+            "the split clip costs 4"
+        );
+        let rest = side.prepare_warps(&s, 0, 4);
+        assert_eq!(rest.iter().map(|w| (w.clip(), w.stem())).collect::<Vec<_>>(), [(far, soundcraft_mix::SOURCE_PLAYER)]);
+        tx.send(Cmd::Session(Arc::new(s.clone()), Vec::new(), first)).unwrap();
+        tx.send(Cmd::Warps(rest)).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 512];
+        st.fill(&mut out, 2);
+        assert_eq!(st.mix.warp_players().count(), 5);
+        assert!(st.mix.warp_players().all(|(_, _, _, p)| p.is_prepared()), "none built on the audio thread");
+        // Unsplit: the source needs a player again, and the four stem players come back.
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].stems = None;
+        let again = side.prepare_warps(&s, 0, 8);
+        assert_eq!(again.iter().map(|w| (w.clip(), w.stem())).collect::<Vec<_>>(), [(near, soundcraft_mix::SOURCE_PLAYER)]);
+        tx.send(Cmd::Session(Arc::new(s), Vec::new(), again)).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(grx.warps.try_iter().map(|w| w.len()).sum::<usize>(), 4);
     }
 
     #[test]

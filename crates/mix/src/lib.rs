@@ -63,7 +63,7 @@ use std::sync::Arc;
 
 mod warp;
 use warp::WarpPlayers;
-pub use warp::{PreparedWarp, WarpPlayer};
+pub use warp::{PlayerStem, PreparedWarp, SOURCE_PLAYER, WarpPlayer, played_sources};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -538,8 +538,9 @@ impl MixEngine {
                 continue;
             }
             let track = s.track(*id);
-            let plays = |cid: u64| track.is_some_and(|t| t.clips().iter().any(|c| c.id.0 == cid && warp_clip_plays(t, c)));
-            self.retired_warps.extend(st.warps.extract_if(|cid, _| !plays(*cid)).map(|(_, p)| p));
+            let plays =
+                |(cid, stem): (u64, PlayerStem)| track.is_some_and(|t| t.clips().iter().any(|c| c.id.0 == cid && warp_player_plays(t, c, stem)));
+            self.retired_warps.extend(st.warps.extract_if(|key, _| !plays(*key)).map(|(_, p)| p));
         }
     }
 
@@ -560,9 +561,9 @@ impl MixEngine {
         out
     }
 
-    /// The warp players in the strips, by track and clip id.
-    pub fn warp_players(&self) -> impl Iterator<Item = (TrackId, u64, &WarpPlayer)> {
-        self.strips.iter().flat_map(|(t, st)| st.warps.iter().map(move |(c, p)| (*t, *c, p)))
+    /// The warp players in the strips, by track, clip id and [`PlayerStem`].
+    pub fn warp_players(&self) -> impl Iterator<Item = (TrackId, u64, PlayerStem, &WarpPlayer)> {
+        self.strips.iter().flat_map(|(t, st)| st.warps.iter().map(move |((c, stem), p)| (*t, *c, *stem, p)))
     }
 
     /// True when handed-over warp players wait to be placed.
@@ -576,10 +577,10 @@ impl MixEngine {
     /// growing the retired list.
     pub fn place_pending_warps(&mut self, s: &Session) {
         for w in self.warp_inbox.drain(..) {
-            let plays = s.track(w.track).is_some_and(|t| t.clips().iter().any(|c| c.id == w.clip && warp_clip_plays(t, c)));
+            let plays = s.track(w.track).is_some_and(|t| t.clips().iter().any(|c| c.id == w.clip && warp_player_plays(t, c, w.stem)));
             match self.strips.get_mut(&w.track) {
                 Some(st) if plays => {
-                    if let Some(old) = st.warps.insert(w.clip.0, w.player) {
+                    if let Some(old) = st.warps.insert((w.clip.0, w.stem), w.player) {
                         self.retired_warps.push(old);
                     }
                 }
@@ -1044,7 +1045,7 @@ fn process_strip(
                     continue;
                 }
                 match clip_fx_params(s, clip.id.0) {
-                    None => render_any_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch, &mut strip.warps),
+                    None => render_any_clip(s, Some(t), clip, pos, frames, &mut strip.buf, &mut strip.scratch, &mut strip.warps),
                     Some(params) => {
                         let nch = strip.buf.len();
                         if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
@@ -1053,7 +1054,7 @@ fn process_strip(
                         for c in strip.clipbuf.iter_mut() {
                             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
                         }
-                        render_any_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch, &mut strip.warps);
+                        render_any_clip(s, Some(t), clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch, &mut strip.warps);
                         let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -1522,17 +1523,120 @@ pub fn warp_clip_plays(t: &Track, c: &Clip) -> bool {
     t.kind == TrackKind::Audio && !t.inactive && !c.muted && c.is_audio() && c.warp.as_ref().is_some_and(|w| w.is_usable())
 }
 
+/// True when `render` plays the warp player `stem` of clip `c` on track `t`: the clip plays
+/// through warp players ([`warp_clip_plays`]) and `stem` is one of its [`played_sources`].
+pub fn warp_player_plays(t: &Track, c: &Clip, stem: PlayerStem) -> bool {
+    warp_clip_plays(t, c) && played_sources(c).any(|(k, _)| k == stem)
+}
+
 /// Plays a clip: beat-locked through its warp player when it has a warp map, else directly.
-fn render_any_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], scratch: &mut [f32], warps: &mut WarpPlayers) {
-    if clip.warp.is_some() {
-        warp::render_warped(s, clip, pos, frames, buf, warps);
-    } else {
-        render_clip(s, clip, pos, frames, buf, scratch);
+///
+/// A split clip plays each stem its mask lets through instead of its source, scaled by the stem
+/// faders of `faders` (the track, with its `Stem` lanes) when given. `scratch` holds a stem's gain
+/// for the block and must be at least `frames` long (frames past it are silent). A stem silent
+/// for the whole block is not rendered; its warp player then restarts, as after a seek, when the
+/// stem comes back.
+#[allow(clippy::too_many_arguments)]
+fn render_any_clip(
+    s: &Session,
+    faders: Option<&Track>,
+    clip: &Clip,
+    pos: Samples,
+    frames: usize,
+    buf: &mut [Vec<f32>],
+    scratch: &mut [f32],
+    warps: &mut WarpPlayers,
+) {
+    let ClipContent::Audio { source, .. } = clip.content else { return };
+    let Some(set) = &clip.stems else {
+        render_source(s, clip, source, SOURCE_PLAYER, None, pos, frames, buf, warps);
+        return;
+    };
+    for (i, src) in set.sources.iter().enumerate() {
+        if !stem_gains(faders, clip, i, pos, frames, scratch) {
+            continue;
+        }
+        render_source(s, clip, *src, i as PlayerStem, Some(scratch), pos, frames, buf, warps);
     }
 }
 
-fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
-    let ClipContent::Audio { source, offset } = clip.content else { return };
+/// Plays `source` (the clip's own or a stem) with the clip's offset, warp, fades and gain.
+#[allow(clippy::too_many_arguments)]
+fn render_source(
+    s: &Session,
+    clip: &Clip,
+    source: soundcraft_model::SourceId,
+    stem: PlayerStem,
+    stem_gain: Option<&[f32]>,
+    pos: Samples,
+    frames: usize,
+    buf: &mut [Vec<f32>],
+    warps: &mut WarpPlayers,
+) {
+    if clip.warp.is_some() {
+        warp::render_warped(s, clip, source, stem, stem_gain, pos, frames, buf, warps);
+    } else {
+        render_clip(s, clip, source, stem_gain, pos, frames, buf);
+    }
+}
+
+/// Stem fader automation is read on a grid of this many timeline samples and interpolated (in
+/// linear gain) between, so playback and bounces of any block size get the same gain.
+const STEM_STEP: Samples = 64;
+
+/// Fills `out[..frames]` with the gain of stem `i` of split clip `clip` for the block at `pos`:
+/// the mask, times `db_to_gain(fader + Stem(i) lane)` (top +6 dB) when `faders` is given. False
+/// when the stem is silent for the whole block.
+fn stem_gains(faders: Option<&Track>, clip: &Clip, i: usize, pos: Samples, frames: usize, out: &mut [f32]) -> bool {
+    if !clip.stem_mask.get(i).copied().unwrap_or(false) {
+        return false;
+    }
+    let n = frames.min(out.len());
+    let Some(t) = faders else {
+        out.iter_mut().take(n).for_each(|g| *g = 1.0);
+        return n > 0;
+    };
+    let base = t.mixer.stem_gain_db.get(i).copied().unwrap_or(0.0);
+    let lane = if t.mixer.automation_mode.reads() {
+        t.lane(&AutoParam::Stem(u8::try_from(i).unwrap_or(u8::MAX))).filter(|l| !l.points.is_empty())
+    } else {
+        None
+    };
+    let Some(lane) = lane else {
+        let g = db_to_gain(base.min(6.0));
+        out.iter_mut().take(n).for_each(|x| *x = g);
+        return g != 0.0 && n > 0;
+    };
+    let gain = |at: Samples| db_to_gain((base + lane.value_at(at, 0.0)).min(6.0));
+    let mut any = false;
+    let mut k = 0usize;
+    while k < n {
+        let here = pos.saturating_add(k as i64);
+        let a = here.div_euclid(STEM_STEP).saturating_mul(STEM_STEP);
+        let (ga, gb) = (gain(a), gain(a.saturating_add(STEM_STEP)));
+        let end = usize::try_from(a.saturating_add(STEM_STEP).saturating_sub(pos)).unwrap_or(n).clamp(k + 1, n);
+        any |= ga != 0.0 || gb != 0.0;
+        for (j, x) in out.iter_mut().enumerate().take(end).skip(k) {
+            let f = pos.saturating_add(j as i64).saturating_sub(a) as f32 / STEM_STEP as f32;
+            *x = ga + (gb - ga) * f;
+        }
+        k = end;
+    }
+    any
+}
+
+/// Adds the plain (unwarped) clip's audio from `source` (its own or a stem), times `stem_gain`
+/// per frame of the block when given.
+fn render_clip(
+    s: &Session,
+    clip: &Clip,
+    source: soundcraft_model::SourceId,
+    stem_gain: Option<&[f32]>,
+    pos: Samples,
+    frames: usize,
+    buf: &mut [Vec<f32>],
+) {
+    let ClipContent::Audio { offset, .. } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
     let Some(audio) = s.pool.get(source) else { return };
@@ -1570,8 +1674,10 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
+                // Times exactly 1 for an unsplit clip, which leaves its audio bit-identical.
+                let sg = stem_gain.map_or(1.0, |sg| sg.get(k).copied().unwrap_or(0.0));
                 if let Some(d) = dst.get_mut(k) {
-                    *d += v * (g0 + (g1 - g0) * t);
+                    *d += v * (g0 + (g1 - g0) * t) * sg;
                 }
             }
             i = seg_end;
@@ -2282,11 +2388,16 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
     let mut scratch = Vec::new();
     let mut warps = WarpPlayers::new();
     for c in t.clips().iter().filter(|c| !c.muted && c.range().overlaps(&range)) {
+        if c.stems.is_some() && scratch.len() < len {
+            scratch.resize(len, 0.0);
+        }
+        // The clip as it sounds: a split clip's stem mask applies, the track's stem faders don't
+        // (they belong to the track, like its volume fader).
         match clip_fx_params(s, c.id.0) {
-            None => render_any_clip(s, c, range.start, len, &mut out, &mut scratch, &mut warps),
+            None => render_any_clip(s, None, c, range.start, len, &mut out, &mut scratch, &mut warps),
             Some(params) => {
                 let mut tmp = vec![vec![0.0f32; len]; out.len()];
-                render_any_clip(s, c, range.start, len, &mut tmp, &mut scratch, &mut warps);
+                render_any_clip(s, None, c, range.start, len, &mut tmp, &mut scratch, &mut warps);
                 let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
                 fx.configure(params);
                 let mut done = 0;
@@ -2325,7 +2436,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
                 1 => vec![0.0],
                 _ => vec![-1.0, 1.0],
             };
-            t.automation.retain(|l| matches!(l.param, AutoParam::Plugin { .. }));
+            t.automation.retain(|l| matches!(l.param, AutoParam::Plugin { .. } | AutoParam::Stem(_)));
             t.mixer.sends.iter_mut().for_each(|x| *x = None);
             t.mixer.surround = None;
         } else {
@@ -2502,10 +2613,10 @@ mod tests {
         c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
         let mut eng = MixEngine::new(48_000.0, 512);
-        eng.adopt_warps(vec![PreparedWarp::new(t, id, 1, 48_000.0).unwrap()]);
+        eng.adopt_warps(vec![PreparedWarp::new(t, id, SOURCE_PLAYER, 1, 48_000.0).unwrap()]);
         let mut out = vec![vec![0.0; 512]; 2];
         eng.render(&s, 0, 512, &mut out);
-        assert!(eng.strips.get(&t).and_then(|st| st.warps.get(&id.0)).is_some_and(|p| p.prepared));
+        assert!(eng.strips.get(&t).and_then(|st| st.warps.get(&(id.0, SOURCE_PLAYER))).is_some_and(|p| p.prepared));
         // The clip goes away: its player comes back for dropping off the audio thread.
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.clear();
         eng.retire_stale_warps(&s);
@@ -2523,18 +2634,18 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
         let mut eng = MixEngine::new(48_000.0, 512);
         let mut out = vec![vec![0.0; 512]; 2];
-        let player = || PreparedWarp::new(t, id, 1, 48_000.0).unwrap();
+        let player = || PreparedWarp::new(t, id, SOURCE_PLAYER, 1, 48_000.0).unwrap();
         // Two batches before a render merge into one inbox (the second has room for the first).
         // The newer player is told apart by its channel count.
         let mut batch = Vec::with_capacity(4);
-        batch.push(PreparedWarp::new(t, id, 2, 48_000.0).unwrap());
+        batch.push(PreparedWarp::new(t, id, SOURCE_PLAYER, 2, 48_000.0).unwrap());
         assert_eq!(eng.adopt_warps(vec![player()]).len(), 0);
         assert_eq!(eng.adopt_warps(batch).capacity(), 1, "the old inbox comes back to the host");
         eng.render(&s, 0, 512, &mut out);
         let retired = eng.take_retired_warps();
         assert_eq!(retired.iter().map(WarpPlayer::channels).collect::<Vec<_>>(), [1], "the older player is replaced");
-        assert_eq!(eng.warp_players().map(|(_, _, p)| p.channels()).collect::<Vec<_>>(), [2], "the newer one plays");
-        assert!(eng.warp_players().all(|(_, _, p)| p.is_prepared()));
+        assert_eq!(eng.warp_players().map(|(_, _, _, p)| p.channels()).collect::<Vec<_>>(), [2], "the newer one plays");
+        assert!(eng.warp_players().all(|(_, _, _, p)| p.is_prepared()));
         // A player for a muted clip is not placed.
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].muted = true;
         eng.adopt_warps(vec![player()]);
@@ -2544,6 +2655,42 @@ mod tests {
         eng.retire_stale_warps(&s);
         assert_eq!(eng.take_retired_warps().len(), 1);
         assert_eq!(eng.warp_players().count(), 0);
+    }
+
+    /// A split clip plays through one player per stem; splitting retires the source's player and
+    /// unsplitting retires the stems'.
+    #[test]
+    fn a_split_clip_has_a_warp_player_per_stem() {
+        let mut s = Session::default();
+        for k in 900..905 {
+            s.pool.insert(SourceId(k), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]] })));
+        }
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let id = s.new_clip_id();
+        let mut c = Clip::audio(id, "c", SourceId(900), 0, 0, 48_000);
+        c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        eng.adopt_warps(vec![PreparedWarp::new(t, id, SOURCE_PLAYER, 1, 48_000.0).unwrap()]);
+        eng.render(&s, 0, 512, &mut out);
+        let set = soundcraft_model::StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] };
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].stems = Some(set);
+        eng.retire_stale_warps(&s);
+        assert_eq!(eng.take_retired_warps().len(), 1, "split: the source's player goes");
+        // A player for the source is no longer placed.
+        let mut batch: Vec<_> = (0..4).map(|k| PreparedWarp::new(t, id, k, 1, 48_000.0).unwrap()).collect();
+        batch.push(PreparedWarp::new(t, id, SOURCE_PLAYER, 1, 48_000.0).unwrap());
+        eng.adopt_warps(batch);
+        eng.render(&s, 512, 512, &mut out);
+        assert_eq!(eng.take_retired_warps().len(), 1);
+        let mut stems: Vec<_> = eng.warp_players().map(|(_, c, k, p)| (c, k, p.is_prepared())).collect();
+        stems.sort_unstable();
+        assert_eq!(stems, (0..4).map(|k| (id.0, k, true)).collect::<Vec<_>>(), "one prepared player per stem");
+        assert!(out[0].iter().any(|x| x.abs() > 0.0));
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].stems = None;
+        eng.retire_stale_warps(&s);
+        assert_eq!(eng.take_retired_warps().len(), 4, "unsplit: the stems' players go");
     }
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {

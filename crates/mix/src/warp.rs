@@ -9,7 +9,7 @@
 //! `output_latency` (output frames). The player reads ahead by both, so the audio heard at
 //! timeline sample `t` is the source at [`soundcraft_model::WarpMap::source_at_time`].
 
-use soundcraft_model::{Clip, ClipContent, ClipId, Session, TrackId};
+use soundcraft_model::{Clip, ClipContent, ClipId, Session, SourceId, TrackId};
 use soundcraft_stretch::{Quality, Stretcher};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
@@ -31,8 +31,30 @@ pub struct WarpPlayer {
     out: Vec<Vec<f32>>,
 }
 
-/// Warp players by clip id.
-pub(crate) type WarpPlayers = HashMap<u64, WarpPlayer>;
+/// Which audio of a clip a warp player plays: a stem index (`STEMS` order) or
+/// [`SOURCE_PLAYER`], the clip's own source.
+pub type PlayerStem = u8;
+
+/// The [`PlayerStem`] of the player for an unsplit clip's source.
+pub const SOURCE_PLAYER: PlayerStem = u8::MAX;
+
+/// Warp players by clip id and [`PlayerStem`] (a split clip has one per stem).
+pub(crate) type WarpPlayers = HashMap<(u64, PlayerStem), WarpPlayer>;
+
+/// The audio a clip plays, one entry per warp player it needs: `(SOURCE_PLAYER, source)` for an
+/// unsplit audio clip, or `(i, stem source)` for each of a split clip's four stems. Empty for
+/// MIDI and video clips.
+pub fn played_sources(c: &Clip) -> impl Iterator<Item = (PlayerStem, SourceId)> + '_ {
+    let source = match (&c.content, &c.stems) {
+        (ClipContent::Audio { source, .. }, None) => Some((SOURCE_PLAYER, *source)),
+        _ => None,
+    };
+    let stems = match &c.content {
+        ClipContent::Audio { .. } => c.stems.as_ref(),
+        _ => None,
+    };
+    source.into_iter().chain(stems.into_iter().flat_map(|set| set.sources.iter().enumerate().map(|(i, s)| (i as PlayerStem, *s))))
+}
 
 /// Largest block a player handles at once; longer requests are split.
 const PLAYER_BLOCK: usize = 4096;
@@ -68,18 +90,25 @@ impl WarpPlayer {
 pub struct PreparedWarp {
     pub(crate) track: TrackId,
     pub(crate) clip: ClipId,
+    pub(crate) stem: PlayerStem,
     pub(crate) player: WarpPlayer,
 }
 
 impl PreparedWarp {
-    /// Builds the stretcher now (allocates; call off the audio thread).
-    pub fn new(track: TrackId, clip: ClipId, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
-        Some(PreparedWarp { track, clip, player: WarpPlayer::build(channels, sample_rate, true)? })
+    /// Builds the stretcher now (allocates; call off the audio thread). `stem` says which of
+    /// the clip's audio it plays (see [`played_sources`]).
+    pub fn new(track: TrackId, clip: ClipId, stem: PlayerStem, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
+        Some(PreparedWarp { track, clip, stem, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 
     /// The clip the player is for.
     pub fn clip(&self) -> ClipId {
         self.clip
+    }
+
+    /// Which of the clip's audio the player plays.
+    pub fn stem(&self) -> PlayerStem {
+        self.stem
     }
 }
 
@@ -95,21 +124,34 @@ fn fill_input(src: &[Vec<f32>], start: i64, n: usize, dst: &mut [Vec<f32>]) {
     }
 }
 
-/// Adds the warped clip's audio for `[pos, pos + frames)` into `buf`.
-pub(crate) fn render_warped(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], players: &mut WarpPlayers) {
-    let (ClipContent::Audio { source, .. }, Some(warp)) = (&clip.content, &clip.warp) else { return };
+/// Adds the warped clip's audio for `[pos, pos + frames)` into `buf`: `source` (the clip's own
+/// or one of its stems) through the player keyed `stem`, with the clip's offset, warp, fades and
+/// gain. `stem_gain`, when given, is a further gain per frame of the block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_warped(
+    s: &Session,
+    clip: &Clip,
+    source: SourceId,
+    stem: PlayerStem,
+    stem_gain: Option<&[f32]>,
+    pos: Samples,
+    frames: usize,
+    buf: &mut [Vec<f32>],
+    players: &mut WarpPlayers,
+) {
+    let (ClipContent::Audio { .. }, Some(warp)) = (&clip.content, &clip.warp) else { return };
     if !warp.is_usable() {
         return;
     }
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
-    let Some(audio) = s.pool.get(*source) else { return };
+    let Some(audio) = s.pool.get(source) else { return };
     let src = &audio.buffer.channels;
     if src.is_empty() {
         return;
     }
     let sr = s.sample_rate.as_f64() as f32;
-    let player = match players.entry(clip.id.0) {
+    let player = match players.entry((clip.id.0, stem)) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => match WarpPlayer::build(src.len(), sr, false) {
             Some(p) => e.insert(p),
@@ -164,8 +206,10 @@ pub(crate) fn render_warped(s: &Session, clip: &Clip, pos: Samples, frames: usiz
                 let Some(o) = player.out.get(ch % nout) else { continue };
                 for k in i..seg {
                     let g = g0 + (g1 - g0) * (k - i) as f32 / span;
+                    // Times exactly 1 for an unsplit clip, which leaves its audio bit-identical.
+                    let sg = stem_gain.map_or(1.0, |sg| sg.get(base + k).copied().unwrap_or(0.0));
                     if let (Some(d), Some(v)) = (dst.get_mut(base + k), o.get(k)) {
-                        *d += v * g;
+                        *d += v * g * sg;
                     }
                 }
             }
