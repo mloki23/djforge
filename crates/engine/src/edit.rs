@@ -418,7 +418,9 @@ pub fn heal(s: &mut Session, track: TrackId, range: Range) -> usize {
                 (ClipContent::Audio { source: a, offset: oa }, ClipContent::Audio { source: b, offset: ob }) => a == b && oa + prev.length == *ob,
                 _ => false,
             };
-            if contiguous && same && (prev.gain_db - c.gain_db).abs() < 1e-6 {
+            // Halves of a split clip heal; a split clip and an unsplit one play different audio.
+            let stems = prev.stems == c.stems && prev.stem_mask == c.stem_mask;
+            if contiguous && same && stems && (prev.gain_db - c.gain_db).abs() < 1e-6 {
                 prev.length += c.length;
                 prev.fade_out = c.fade_out;
                 healed += 1;

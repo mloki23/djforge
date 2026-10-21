@@ -193,7 +193,7 @@ fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
         let orig = warp_original(s, *id);
         let mut base = c.clone();
         if let Some((src, off, len)) = orig {
-            base.content = soundcraft_model::ClipContent::Audio { source: src, offset: off };
+            base.set_audio(src, off);
             base.length = len.max(1);
             base.stretch = 1.0;
         }
@@ -214,7 +214,7 @@ fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         s.edit.values.insert(key("ratio"), ratio);
         let mut nc = base;
-        nc.content = soundcraft_model::ClipContent::Audio { source: src, offset: 0 };
+        nc.set_audio(src, 0);
         nc.length = out_len;
         nc.stretch = 1.0;
         super::more_util::replace_clip(s, t, *id, nc);
@@ -233,7 +233,7 @@ fn remove_warp(e: &mut Engine, p: &Value) -> Result<Value> {
         if let Some(c) = s.find_clip_mut(*id) {
             c.stretch = 1.0;
             if let Some((src, off, len)) = orig {
-                c.content = soundcraft_model::ClipContent::Audio { source: src, offset: off };
+                c.set_audio(src, off);
                 c.length = len.max(1);
                 c.fade_out.len = c.fade_out.len.min(c.length);
                 n += 1;

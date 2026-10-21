@@ -4,7 +4,7 @@ use super::*;
 use crate::cmd;
 use serde_json::json;
 use soundcraft_audio_io::{AudioBuffer, FileFormat};
-use soundcraft_model::{Clip, ClipContent, TrackKind};
+use soundcraft_model::{Clip, TrackKind};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![cmd!(
@@ -115,7 +115,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         let src = crate::io::add_source(s, &new_name, buf, None, FileFormat::Wav);
         let mut nc: Clip = clip.clone();
         nc.name = new_name;
-        nc.content = ClipContent::Audio { source: src, offset: 0 };
+        nc.set_audio(src, 0);
         nc.length = i64::try_from(frames).unwrap_or(nc.length);
         // Invert and Duplicate are phase/copy operations. The clip's gain stays a clip gain,
         // the same way its fades stay editable. Other processes bake a new file at unity gain.
