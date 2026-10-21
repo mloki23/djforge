@@ -36,13 +36,16 @@ use soundcraft_model::{Session, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
 const BLOCK: usize = 512;
 
 /// Room for replaced snapshots on their way back; `update_session` empties it before each send.
 const OLD_SESSIONS: usize = 16;
+/// Warp rooms in flight back to the UI thread (one per snapshot or batch, drained every frame).
+/// The channel is bounded so sending never allocates on the audio thread.
+const ROOMS: usize = 64;
 
 /// The realtime audio thread marker lives in the mix engine, which carries it into the strips it
 /// renders on worker threads; the cpal callbacks here set it.
@@ -178,6 +181,8 @@ struct AudioState {
     /// Retired plugin instances and warp players go back to the UI thread to be dropped there.
     garbage: Bin,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+    /// A spent warp room the full `rooms` channel refused, sent again on the next callback.
+    room_backlog: Option<WarpRoom>,
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -186,8 +191,9 @@ struct Bin {
     warps: Sender<Vec<WarpPlayer>>,
     /// Emptied warp-player batches, so their buffers are freed off the audio thread too.
     batches: Sender<Vec<PreparedWarp>>,
-    /// Replaced warp tables and retired lists (with the players that no longer play).
-    rooms: Sender<WarpRoom>,
+    /// Replaced warp tables and retired lists (with the players that no longer play). Bounded:
+    /// see [`ROOMS`].
+    rooms: SyncSender<WarpRoom>,
 }
 
 /// The UI-thread ends of a [`Bin`].
@@ -202,7 +208,7 @@ fn bin() -> (Bin, BinRx) {
     let (ptx, prx) = channel();
     let (wtx, wrx) = channel();
     let (btx, brx) = channel();
-    let (rtx, rrx) = channel();
+    let (rtx, rrx) = sync_channel(ROOMS);
     (Bin { plugins: ptx, warps: wtx, batches: btx, rooms: rtx }, BinRx { plugins: prx, warps: wrx, batches: brx, rooms: rrx })
 }
 
@@ -215,10 +221,17 @@ const WARP_BATCH: usize = 8;
 const WARP_IDLE_BATCH: usize = 2;
 
 /// A snapshot command, with a warp room sized for the snapshot's players (built here, off the
-/// audio thread).
-fn session_cmd(s: Arc<Session>, instances: Vec<PreparedInstance>, warps: Vec<PreparedWarp>) -> Cmd {
-    let room = WarpRoom::for_session(&s, warps.len());
+/// audio thread) and for retiring the batch's replaced players plus `stale` more (players of
+/// clips and tracks the snapshot no longer has).
+fn session_cmd_retiring(s: Arc<Session>, instances: Vec<PreparedInstance>, warps: Vec<PreparedWarp>, stale: usize) -> Cmd {
+    let room = WarpRoom::for_session(&s, warps.len().saturating_add(stale));
     Cmd::Session(s, instances, warps, room)
+}
+
+/// [`session_cmd_retiring`] with nothing known to have gone.
+#[cfg(test)]
+fn session_cmd(s: Arc<Session>, instances: Vec<PreparedInstance>, warps: Vec<PreparedWarp>) -> Cmd {
+    session_cmd_retiring(s, instances, warps, 0)
 }
 
 /// A command with more warp players for the current snapshot, and room to retire as many.
@@ -241,6 +254,7 @@ impl AudioState {
         AudioState {
             garbage,
             old_sessions: None,
+            room_backlog: None,
             fold: fold_gains(&session),
             rx,
             shared,
@@ -290,8 +304,7 @@ impl AudioState {
                         let _ = tx.try_send(old);
                     }
                     // The snapshot's warp tables and retired list, sized on the UI thread, so
-                    // placing and retiring its players never grows them here.
-                    self.mix.ensure_synced(&self.session);
+                    // syncing to it, placing and retiring its players never grows them here.
                     self.adopt_room(room);
                 }
                 Cmd::Warps(warps, room) => {
@@ -347,7 +360,34 @@ impl AudioState {
     /// Hands the engine a warp room; the storage it replaces goes back to be freed off this thread.
     fn adopt_room(&mut self, room: WarpRoom) {
         let spent = self.mix.adopt_room(&self.session, room);
-        let _ = self.garbage.rooms.send(spent);
+        self.return_room(spent);
+    }
+
+    /// Sends a spent room back to be freed on the UI thread, without allocating: a bare one is
+    /// dropped here (it frees nothing), and one the full channel refuses waits for the next
+    /// callback. Only when one is already waiting is a room freed here, as a last resort.
+    fn return_room(&mut self, room: WarpRoom) {
+        if room.is_bare() {
+            return;
+        }
+        self.flush_rooms();
+        match self.garbage.rooms.try_send(room) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(room)) => {
+                if self.room_backlog.is_none() {
+                    self.room_backlog = Some(room);
+                }
+            }
+        }
+    }
+
+    /// Sends the room waiting from an earlier callback, if the channel has room now.
+    fn flush_rooms(&mut self) {
+        if let Some(room) = self.room_backlog.take()
+            && let Err(TrySendError::Full(room)) = self.garbage.rooms.try_send(room)
+        {
+            self.room_backlog = Some(room);
+        }
     }
 
     /// Hands warp players to the engine; the emptied batch goes back to be freed off this thread.
@@ -359,6 +399,7 @@ impl AudioState {
     }
 
     fn send_garbage(&mut self) {
+        self.flush_rooms();
         let g = self.mix.take_retired();
         if !g.is_empty() {
             let _ = self.garbage.plugins.send(g);
@@ -512,6 +553,11 @@ struct Side {
     /// The snapshot last sent (an extra reference, released here on the UI thread), while some
     /// of its warp players are still to be built.
     warps_for: Option<Arc<Session>>,
+    /// Players the last `prepare_warps` forgot (their clip or track is gone): the audio thread
+    /// may retire that many, so the snapshot's room is sized for them.
+    stale_warps: usize,
+    /// Players whose build failed, warned about once; they are retried.
+    failed_warps: HashSet<(TrackId, u64, PlayerStem)>,
 }
 
 impl Side {
@@ -526,6 +572,8 @@ impl Side {
             old_sessions: None,
             prepared_warps: HashMap::new(),
             warps_for: None,
+            stale_warps: 0,
+            failed_warps: HashSet::new(),
         }
     }
 
@@ -544,6 +592,13 @@ impl Side {
         if let Some(rx) = &self.old_sessions {
             rx.try_iter().for_each(drop);
         }
+    }
+
+    /// A batch of the players still missing for the clips nearest `at` (see `Player::play`).
+    fn prepare_around(&mut self, at: Samples) -> Option<Cmd> {
+        let s = self.warps_for.clone()?;
+        let warps = self.prepare_warps(&s, at, WARP_BATCH);
+        (!warps.is_empty()).then(|| warps_cmd(warps))
     }
 
     fn return_old_sessions(&mut self, tx: &Sender<Cmd>) {
@@ -764,8 +819,9 @@ impl Player {
         let instances = side.prepare(&s);
         side.warps_for = Some(Arc::clone(&s));
         let warps = side.prepare_warps(&s, self.position(), WARP_BATCH);
+        let stale = side.stale_warps;
         // Sent under the lock, so a batch from `idle` can't overtake the snapshot it belongs to.
-        let _ = self.tx.send(session_cmd(s, instances, warps));
+        let _ = self.tx.send(session_cmd_retiring(s, instances, warps, stale));
         drop(side);
     }
 
@@ -835,6 +891,7 @@ impl Player {
 
     /// Start playback at `from`, stopping at `end`, or looping `looped`.
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        self.prepare_around(from);
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Play { from, end, looped });
@@ -849,12 +906,22 @@ impl Player {
         let _ = self.tx.send(Cmd::Recording(on));
     }
 
+    /// Sends the warp players still missing for the clips nearest `at` ahead of a transport
+    /// command that jumps there, so split clips play their stems from the first block.
+    fn prepare_around(&self, at: Samples) {
+        let mut side = self.side();
+        if let Some(cmd) = side.prepare_around(at) {
+            let _ = self.tx.send(cmd);
+        }
+    }
+
     pub fn stop(&self) {
         self.shared.playing.store(false, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Stop);
     }
 
     pub fn locate(&self, at: Samples) {
+        self.prepare_around(at);
         self.shared.position.store(at, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Locate(at));
     }
@@ -992,18 +1059,35 @@ impl Side {
                 }
             }
         }
+        let before = self.prepared_warps.len();
         self.prepared_warps.retain(|k, _| live.contains(k));
+        self.stale_warps = before - self.prepared_warps.len();
+        self.failed_warps.retain(|k| live.contains(k));
         todo.sort_unstable_by_key(|x| (x.0, x.1, x.2));
-        if todo.len() <= budget {
-            self.warps_for = None;
-        }
+        let all = todo.len() <= budget;
+        let mut failed = false;
         let mut out = Vec::new();
         for (_, track, clip, missing) in todo.into_iter().take(budget) {
             for (stem, source, ch) in missing {
-                // Remembered even when the build fails: retrying every frame would not help.
-                self.prepared_warps.insert((track, clip.0, stem), (source, ch, sr));
-                out.extend(PreparedWarp::new(track, clip, stem, ch, s.sample_rate.as_f64() as f32));
+                let key = (track, clip.0, stem);
+                match PreparedWarp::new(track, clip, stem, ch, s.sample_rate.as_f64() as f32) {
+                    Some(w) => {
+                        self.prepared_warps.insert(key, (source, ch, sr));
+                        self.failed_warps.remove(&key);
+                        out.push(w);
+                    }
+                    None => {
+                        // Not remembered, so it is tried again (a stem would stay silent).
+                        failed = true;
+                        if self.failed_warps.insert(key) {
+                            log::warn!("could not build a time-stretch player for clip {} (stem {stem}); retrying", clip.0);
+                        }
+                    }
+                }
             }
+        }
+        if all && !failed {
+            self.warps_for = None;
         }
         out
     }
@@ -1513,6 +1597,128 @@ mod tests {
         tx.send(session_cmd(Arc::new(s), Vec::new(), again)).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(returned(&grx), 4);
+    }
+
+    /// Adds a stereo audio track with `n` split, warped clips a second apart from `at` (pool
+    /// sources 900..904 must exist). Returns the track and clip ids.
+    fn add_split_track(s: &mut Session, n: i64, at: i64) -> (TrackId, Vec<soundcraft_model::ClipId>) {
+        use soundcraft_model::{ChannelFormat, Clip, SourceId, StemSet, TrackKind, WarpMap};
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let mut ids = Vec::new();
+        for k in 0..n {
+            let id = s.new_clip_id();
+            let mut c = Clip::audio(id, "split", SourceId(900), 0, at + k * 48_000, 48_000);
+            c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+            c.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+            ids.push(id);
+        }
+        (t, ids)
+    }
+
+    fn stem_pool() -> Session {
+        let mut s = Session::default();
+        for k in 900..905 {
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]; 2] };
+            s.pool.insert(soundcraft_model::SourceId(k), Arc::new(soundcraft_model::SourceAudio::new(buf)));
+        }
+        s
+    }
+
+    fn audio_state(gtx: Bin) -> (Sender<Cmd>, AudioState) {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        (tx, AudioState::new(rx, shared, Arc::new(Session::default()), 48_000.0, gtx))
+    }
+
+    /// Spent warp rooms go back over a bounded channel: when the UI thread falls behind, the
+    /// audio thread keeps the room it could not send and sends it on a later callback rather
+    /// than allocating or freeing; a room holding no storage is not sent at all.
+    #[test]
+    fn a_full_room_channel_keeps_the_room_and_retries() {
+        let mut s = stem_pool();
+        add_split_track(&mut s, 1, 0);
+        let s = Arc::new(s);
+        let (gtx, grx) = bin();
+        let (tx, mut st) = audio_state(gtx);
+        let mut out = vec![0.0f32; 256];
+        for _ in 0..ROOMS + 3 {
+            tx.send(session_cmd(Arc::clone(&s), Vec::new(), Vec::new())).unwrap();
+            st.fill(&mut out, 2);
+        }
+        assert_eq!(grx.rooms.try_iter().count(), ROOMS, "the channel is full");
+        assert!(st.room_backlog.is_some(), "one room waits");
+        st.fill(&mut out, 2);
+        assert_eq!(grx.rooms.try_iter().count(), 1, "and is sent once there is room");
+        assert!(st.room_backlog.is_none());
+        tx.send(warps_cmd(Vec::new())).unwrap();
+        st.fill(&mut out, 2);
+        assert_eq!(grx.rooms.try_iter().count(), 0, "a bare room is not sent");
+    }
+
+    /// Deleting a track and re-splitting a clip in one snapshot retires 9 players (8 with the
+    /// track, 1 replaced): the snapshot's room was sized for them on the UI thread, so the
+    /// retired list comes back at exactly that size, never grown on the audio thread.
+    #[test]
+    fn deleting_a_track_and_re_splitting_never_grows_the_retired_list() {
+        let mut s = stem_pool();
+        let (gone, _) = add_split_track(&mut s, 2, 0);
+        let (kept, _) = add_split_track(&mut s, 1, 0);
+        let (gtx, grx) = bin();
+        let (tx, mut st) = audio_state(gtx);
+        let mut side = Side::new(48_000.0, bin().1);
+        let warps = side.prepare_warps(&s, 0, WARP_BATCH);
+        assert_eq!(warps.len(), 12);
+        tx.send(session_cmd_retiring(Arc::new(s.clone()), Vec::new(), warps, side.stale_warps)).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 256];
+        st.fill(&mut out, 2);
+        assert_eq!(st.mix.warp_players().count(), 12);
+        s.tracks.retain(|t| t.id != gone);
+        if let Some(set) = &mut s.track_mut(kept).unwrap().playlist_mut().unwrap().clips[0].stems {
+            set.sources[1] = soundcraft_model::SourceId(900);
+        }
+        let warps = side.prepare_warps(&s, 0, WARP_BATCH);
+        assert_eq!((warps.len(), side.stale_warps), (1, 8));
+        tx.send(session_cmd_retiring(Arc::new(s), Vec::new(), warps, side.stale_warps)).unwrap();
+        st.fill(&mut out, 2);
+        let retired: Vec<_> = grx.warps.try_iter().collect();
+        assert_eq!(retired.iter().map(|w| (w.len(), w.capacity())).collect::<Vec<_>>(), [(9, 9)]);
+        assert_eq!(st.mix.warp_players().count(), 4);
+    }
+
+    /// Locating (or playing) far from the playhead first sends the players of the split clips
+    /// there, so they play their stems from the first block.
+    #[test]
+    fn a_locate_prepares_the_clips_at_the_target_first() {
+        let mut s = stem_pool();
+        let (_, ids) = add_split_track(&mut s, 12, 0);
+        let s = Arc::new(s);
+        let (gtx, _grx) = bin();
+        let (tx, mut st) = audio_state(gtx);
+        let mut side = Side::new(48_000.0, bin().1);
+        side.warps_for = Some(Arc::clone(&s));
+        let first = side.prepare_warps(&s, 0, WARP_BATCH);
+        tx.send(session_cmd(Arc::clone(&s), Vec::new(), first)).unwrap();
+        let far = ids[11];
+        let at = 11 * 48_000 + 1_000;
+        // As `Player::locate` does it.
+        if let Some(cmd) = side.prepare_around(at) {
+            tx.send(cmd).unwrap();
+        }
+        tx.send(Cmd::Locate(at)).unwrap();
+        tx.send(Cmd::Play { from: at, end: None, looped: None }).unwrap();
+        let mut out = vec![0.0f32; 256];
+        st.fill(&mut out, 2);
+        let mut there: Vec<_> = st.mix.warp_players().filter(|(_, c, _, _)| *c == far.0).map(|(_, _, k, p)| (k, p.is_prepared())).collect();
+        there.sort_unstable();
+        assert_eq!(there, (0..4).map(|k| (k, true)).collect::<Vec<_>>());
+        assert!(out.iter().any(|x| x.abs() > 0.0), "the stems play from the first block");
     }
 
     /// Twelve split clips on one track need 48 players: the room sent with the snapshot holds

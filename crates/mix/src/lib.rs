@@ -529,13 +529,21 @@ impl MixEngine {
     }
 
     /// Gives the strips warp tables built off the audio thread, sized for every player the
-    /// snapshot `s` needs, and the retired list room for `WarpRoom`'s count, so placing players
-    /// and retiring them for that snapshot never grows a table or list here. Call after
-    /// `ensure_synced(s)`. Each strip's players that still play move into its new table; the
-    /// old tables, holding the players that no longer play, and the old retired list come back
-    /// in the returned room, for the host to drop off the audio thread. Neither allocates nor
-    /// frees.
+    /// snapshot `s` needs, and a retired list sized for the players `room` was told may retire,
+    /// so syncing to `s` (a deleted track's players retire), placing players and retiring them
+    /// never grows a table or list here. The retired list is installed first, holding what was
+    /// already retired, then the engine syncs to `s` (`ensure_synced`). Each strip's players that
+    /// still play move into its new table; the old tables, holding the players that no longer
+    /// play, and the old retired list come back in the returned room, for the host to drop off
+    /// the audio thread. Neither allocates nor frees, apart from what `sync` does for a changed
+    /// structure (plugin slots, buffers).
     pub fn adopt_room(&mut self, s: &Session, mut room: WarpRoom) -> WarpRoom {
+        let free = room.retired.capacity() - room.retired.len();
+        if free >= self.retired_warps.len() && room.retired.capacity() > self.retired_warps.capacity() {
+            room.retired.append(&mut self.retired_warps);
+            std::mem::swap(&mut self.retired_warps, &mut room.retired);
+        }
+        self.ensure_synced(s);
         for (id, table) in room.tables.iter_mut() {
             let Some(st) = self.strips.get_mut(id) else { continue };
             let track = s.track(*id);
@@ -552,9 +560,6 @@ impl MixEngine {
                 table.insert(k, p);
             }
             std::mem::swap(&mut st.warps, table);
-        }
-        if self.retired_warps.is_empty() && room.retired.capacity() > self.retired_warps.capacity() {
-            std::mem::swap(&mut self.retired_warps, &mut room.retired);
         }
         room
     }

@@ -145,6 +145,12 @@ impl WarpRoom {
         WarpRoom { tables: Vec::new(), retired: Vec::with_capacity(retire) }
     }
 
+    /// True when the room owns no heap storage, so dropping it frees nothing (the audio thread
+    /// may drop it rather than send it back).
+    pub fn is_bare(&self) -> bool {
+        self.tables.capacity() == 0 && self.retired.capacity() == 0
+    }
+
     /// The players a room handed back still holds (those that no longer played).
     pub fn players(&self) -> usize {
         self.tables.iter().map(|(_, t)| t.len()).sum::<usize>() + self.retired.len()
