@@ -227,7 +227,7 @@ fn same_name(a: &str, b: &str) -> bool {
 }
 
 /// The 64-bit FNV-1a hash of `bytes`.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
@@ -1120,7 +1120,7 @@ fn tagged(
 }
 
 /// The current date and time, `YYYY-MM-DD HH:MM UTC`.
-fn utc_now() -> String {
+pub(crate) fn utc_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
     // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).

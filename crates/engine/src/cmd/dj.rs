@@ -352,7 +352,7 @@ const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How a run of the sidecar ended.
 #[derive(Debug)]
-enum Sidecar {
+pub(crate) enum Sidecar {
     /// It exited, and its output was read.
     Ran(std::process::Output),
     /// It ran past its limit and was killed.
@@ -365,7 +365,7 @@ enum Sidecar {
 
 /// Runs `command` (stdout and stderr captured) and returns its output; kills it when it runs
 /// longer than `limit` or `stop` says so (checked every 20 ms).
-fn output_within(command: &mut std::process::Command, limit: std::time::Duration, stop: &dyn Fn() -> bool) -> std::io::Result<Sidecar> {
+pub(crate) fn output_within(command: &mut std::process::Command, limit: std::time::Duration, stop: &dyn Fn() -> bool) -> std::io::Result<Sidecar> {
     use std::io::Read as _;
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;

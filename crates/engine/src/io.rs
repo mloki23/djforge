@@ -1986,6 +1986,69 @@ pub fn live_span(start: Samples, pass: Option<Samples>, punch: Option<Range>, le
     Some((origin, span.intersect(&punch.unwrap_or(span))?))
 }
 
+// ─── Stem cache folders ───────────────────────────────────────────────────────────────────────
+
+/// Everything directly in folder `dir` (files, folders and links alike), inside the automation
+/// read root when there is one; unsorted. Errors name the folder.
+pub(crate) fn list_entries(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let dir = dir.as_ref();
+    crate::file_access::check_read(dir).map_err(EngineError::Io)?;
+    let entries = std::fs::read_dir(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
+    Ok(entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+}
+
+/// The size in bytes of the regular file at `path`, inside the automation read root when there
+/// is one; `None` when there is no such file.
+pub(crate) fn file_len(path: impl AsRef<Path>) -> Option<u64> {
+    let path = path.as_ref();
+    crate::file_access::check_read(path).ok()?;
+    std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
+}
+
+/// Renames `from` (a file or a folder) to `to` on the same drive, both inside the automation
+/// write root when there is one.
+pub(crate) fn rename_path(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    crate::file_access::check_write(from).map_err(EngineError::Io)?;
+    crate::file_access::check_write(to).map_err(EngineError::Io)?;
+    std::fs::rename(from, to).map_err(|err| EngineError::Io(format!("{} -> {}: {err}", from.display(), to.display())))
+}
+
+/// Removes whatever is at `path` (a file, a link, or a folder and everything in it), inside the
+/// automation write root when there is one. Links are removed, never followed. Returns how many
+/// files went and their bytes; nothing at `path` is `(0, 0)`.
+pub(crate) fn remove_tree(path: impl AsRef<Path>) -> Result<(usize, u64)> {
+    /// Files and bytes under folder `dir`, not following links.
+    fn count(dir: &Path) -> (usize, u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+        entries.filter_map(|e| e.ok()).fold((0, 0), |(n, b), e| match std::fs::symlink_metadata(e.path()) {
+            Ok(m) if m.is_dir() => {
+                let (n2, b2) = count(&e.path());
+                (n + n2, b.saturating_add(b2))
+            }
+            Ok(m) => (n + 1, b.saturating_add(m.len())),
+            Err(_) => (n, b),
+        })
+    }
+    let path = path.as_ref();
+    crate::file_access::check_write(path).map_err(EngineError::Io)?;
+    let err = |err: std::io::Error| EngineError::Io(format!("{}: {err}", path.display()));
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(err(e)),
+    };
+    if meta.is_dir() {
+        let counted = count(path);
+        std::fs::remove_dir_all(path).map_err(err)?;
+        Ok(counted)
+    } else {
+        // A link to a folder on Windows is removed as a folder.
+        std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path)).map_err(err)?;
+        Ok((1, meta.len()))
+    }
+}
+
 #[cfg(test)]
 mod record_tests {
     use super::*;

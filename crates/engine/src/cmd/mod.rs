@@ -29,6 +29,7 @@ pub(crate) mod prep;
 mod query;
 pub(crate) mod sampler;
 mod setup_more;
+pub mod stems;
 mod surround;
 mod tab;
 mod track;
