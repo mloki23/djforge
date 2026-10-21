@@ -1465,7 +1465,7 @@ mod tests {
         let near = s.new_clip_id();
         let mut c = Clip::audio(near, "split", SourceId(900), 0, 0, 48_000);
         c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
-        c.stems = Some(StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+        c.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
         c.stem_mask = [true, false, true, true];
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
         let far = s.new_clip_id();
@@ -1531,7 +1531,7 @@ mod tests {
             let id = s.new_clip_id();
             let mut c = Clip::audio(id, "split", SourceId(900), 0, k * 48_000, 48_000);
             c.warp = WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
-            c.stems = Some(StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+            c.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
             s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
         }
         let shared = Arc::new(Shared {

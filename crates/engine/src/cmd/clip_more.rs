@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn unloop_keeps_a_neighbour_with_other_stems_or_another_mask() {
         let (mut e, t, ids) = engine_with(&[(0, 100, 0), (100, 100, 0), (200, 100, 0)]);
-        let stems = soundcraft_model::StemSet { key: "k".into(), sources: [11, 12, 13, 14].map(SourceId) };
+        let stems = soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: [11, 12, 13, 14].map(SourceId) };
         for id in &ids {
             e.session_mut().find_clip_mut(*id).unwrap().stems = Some(stems.clone());
         }

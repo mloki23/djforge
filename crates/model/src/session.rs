@@ -795,7 +795,7 @@ mod tests {
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
         let cid = s.new_clip_id();
         let mut c = Clip::audio(cid, "c", SourceId(7), 0, 10, 100);
-        c.stems = Some(crate::StemSet { key: "k".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
+        c.stems = Some(crate::StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
         c.stem_mask = [false, true, true, true];
         if let Some(tr) = s.track_mut(t) {
             tr.mixer.stem_gain_db[2] = -6.0;

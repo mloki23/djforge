@@ -1641,18 +1641,20 @@ fn stem_lane(t: &Track, i: usize) -> Option<&soundcraft_model::AutomationLane> {
 }
 
 /// Fills `out[..frames]` with the gain of stem `i` of split clip `clip` for the block at `pos`:
-/// the mask, times `db_to_gain(stem_db_at)` (top +6 dB) when `faders` is given. False when the
-/// stem is silent for the whole block.
+/// the mask, times `db_to_gain(stem_db_at)` (top +6 dB) when `faders` is given, times the
+/// set's [`StemSet::scale`](soundcraft_model::StemSet::scale) (the stems are stored with
+/// headroom). False when the stem is silent for the whole block.
 fn stem_gains(faders: Option<&Track>, clip: &Clip, i: usize, pos: Samples, frames: usize, out: &mut [f32]) -> bool {
     if !clip.stem_mask.get(i).copied().unwrap_or(false) {
         return false;
     }
+    let scale = clip.stems.as_ref().map_or(1.0, |set| set.scale());
     let n = frames.min(out.len());
     let Some(t) = faders else {
-        out.iter_mut().take(n).for_each(|g| *g = 1.0);
+        out.iter_mut().take(n).for_each(|g| *g = scale);
         return n > 0;
     };
-    let gain = |at: Samples| db_to_gain(stem_db_at(t, i, at).min(6.0));
+    let gain = |at: Samples| db_to_gain(stem_db_at(t, i, at).min(6.0)) * scale;
     if stem_lane(t, i).is_none() {
         let g = gain(pos);
         out.iter_mut().take(n).for_each(|x| *x = g);
@@ -2726,7 +2728,7 @@ mod tests {
         let mut out = vec![vec![0.0; 512]; 2];
         eng.adopt_warps(vec![PreparedWarp::new(t, id, SOURCE_PLAYER, 1, 48_000.0).unwrap()]);
         eng.render(&s, 0, 512, &mut out);
-        let set = soundcraft_model::StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] };
+        let set = soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] };
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0].stems = Some(set);
         eng.retire_stale_warps(&s);
         assert_eq!(eng.take_retired_warps().len(), 1, "split: the source's player goes");
@@ -2757,7 +2759,11 @@ mod tests {
             let id = s.new_clip_id();
             let mut c = Clip::audio(id, "c", SourceId(900), 0, k * 48_000, 48_000);
             c.warp = soundcraft_model::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
-            c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+            c.stems = Some(soundcraft_model::StemSet {
+                scale_log2: 0,
+                key: "k".into(),
+                sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)],
+            });
             s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
             ids.push(id);
         }

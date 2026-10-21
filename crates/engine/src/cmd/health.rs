@@ -163,7 +163,7 @@ mod tests {
             channels: audio.buffer.channels.iter().map(|c| c[..c.len() - 1].to_vec()).collect(),
         };
         s.pool.insert(ids[2], Arc::new(SourceAudio::new(short)));
-        let set = soundcraft_model::StemSet { key: "k".into(), sources: [ids[0], ids[1], ids[2], ids[3]] };
+        let set = soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: [ids[0], ids[1], ids[2], ids[3]] };
         let id = clip.id;
         s.find_clip_mut(id).unwrap().stems = Some(set);
         // The clip reaches its source's last frame, so a stem one frame short is out of bounds.

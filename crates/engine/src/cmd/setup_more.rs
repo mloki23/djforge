@@ -621,7 +621,7 @@ mod tests {
         let audio = s.pool.get(kick.source().unwrap()).unwrap().buffer.clone();
         let stems = soundcraft_model::STEMS.map(|name| crate::io::add_source(s, name, audio.clone(), None, soundcraft_audio_io::FileFormat::Wav));
         let c = s.find_clip_mut(kick.id).unwrap();
-        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: stems });
+        c.stems = Some(soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: stems });
         c.stem_mask = [false, true, true, false];
         crate::io::save_session(&mut donor, &path).unwrap();
         let mut e = Engine::default();

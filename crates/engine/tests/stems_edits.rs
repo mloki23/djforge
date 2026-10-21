@@ -34,7 +34,7 @@ fn stems_of(s: &mut Session, src: SourceId, shared: bool) -> StemSet {
             soundcraft_engine::io::add_source(s, soundcraft_model::STEMS[i], buf, None, FileFormat::Wav)
         }
     });
-    StemSet { key: "0123456789abcdef-1000-htdemucs".into(), sources }
+    StemSet { scale_log2: 0, key: "0123456789abcdef-1000-htdemucs".into(), sources }
 }
 
 /// A 128 bpm session with one deck: a 20 s source and a beat-locked clip of it over bars 2..10,

@@ -842,7 +842,7 @@ mod tests {
         let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 480]] };
         let vocals = soundcraft_engine::io::add_source(e.session_mut(), "vocals", buf, None, soundcraft_audio_io::FileFormat::Wav);
         let snare = e.session().track_by_name("Snare").unwrap().clips()[0].id;
-        let stems = soundcraft_model::StemSet { key: "k".into(), sources: [vocals, hats, hats, hats] };
+        let stems = soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: [vocals, hats, hats, hats] };
         e.session_mut().find_clip_mut(snare).unwrap().stems = Some(stems);
         let message = |d: &Dialogs| match &d.open {
             Some(Dialog::ClearClips { message, .. }) => message.clone(),

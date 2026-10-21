@@ -81,7 +81,7 @@ fn session(source: SourceId, split: bool, warped: bool, extra: &[(SourceId, Vec<
         c.warp = Some(warp());
     }
     if split {
-        c.stems = Some(StemSet { key: "k".into(), sources: STEM_IDS });
+        c.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: STEM_IDS });
     }
     s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
     (s, t, id)
@@ -288,6 +288,30 @@ fn a_bounce_of_a_split_clip_equals_playback() {
         let bounce = render_range(&s, Range::new(0, total as i64), 1024);
         assert!(peak(&bounce) > 0.1);
         assert_eq!(play(&s, total, block), bounce, "warped {warped}, playback blocks of {block}");
+    }
+}
+
+/// Stems stored with headroom (`scale_log2` 1: each at half level) play back at the source's
+/// level, in playback, bounces and clip renders, plain and warped.
+#[test]
+fn stems_stored_with_headroom_play_at_the_source_level() {
+    let half: Vec<(SourceId, Vec<Vec<f32>>)> =
+        STEM_IDS.into_iter().zip(stems()).map(|(id, ch)| (id, ch.into_iter().map(|c| c.into_iter().map(|x| x * 0.5).collect()).collect())).collect();
+    for (warped, bpm, tol) in [(false, 128.0, 1e-5), (true, 120.0, 1e-4)] {
+        let (whole, wt, _) = session(S, false, warped, &[]);
+        let (mut split, t, _) = session(S, true, warped, &half);
+        clip_mut(&mut split, t).stems.as_mut().unwrap().scale_log2 = 1;
+        let (whole, split) = (at_tempo(whole, bpm), at_tempo(split, bpm));
+        let want = render(&whole);
+        assert!(peak(&want) > 0.1);
+        let d = max_diff(&render(&split), &want);
+        assert!(d <= tol, "warped {warped}: bounce {d}");
+        let total = (LEN + 4_000) as usize;
+        let d = max_diff(&play(&split, total, 1024), &play(&whole, total, 1024));
+        assert!(d <= tol, "warped {warped}: playback {d}");
+        let r = Range::new(0, LEN + 4_000);
+        let d = max_diff(&render_clips(&split, t, r), &render_clips(&whole, wt, r));
+        assert!(d <= tol, "warped {warped}: clip render {d}");
     }
 }
 

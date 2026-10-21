@@ -2005,6 +2005,14 @@ pub(crate) fn file_len(path: impl AsRef<Path>) -> Option<u64> {
     std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
 }
 
+/// When whatever is at `path` (not following a link) was last modified, inside the automation
+/// read root when there is one; `None` when that can't be learned.
+pub(crate) fn modified(path: impl AsRef<Path>) -> Option<std::time::SystemTime> {
+    let path = path.as_ref();
+    crate::file_access::check_read(path).ok()?;
+    std::fs::symlink_metadata(path).ok()?.modified().ok()
+}
+
 /// Renames `from` (a file or a folder) to `to` on the same drive, both inside the automation
 /// write root when there is one.
 pub(crate) fn rename_path(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {

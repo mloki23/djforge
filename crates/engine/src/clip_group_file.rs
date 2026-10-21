@@ -232,7 +232,7 @@ mod tests {
             crate::io::add_source(s, soundcraft_model::STEMS[i], b, None, soundcraft_audio_io::FileFormat::Wav)
         });
         let c = s.find_clip_mut(kick.id).unwrap();
-        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: stems });
+        c.stems = Some(soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: stems });
         c.stem_mask = [true, false, false, false];
         e.execute("file.export_clip_groups", &json!({"path": path, "clips": [kick.id.0]})).unwrap();
         let r = e.execute("file.import_clip_groups", &json!({"path": path, "at": 30_000_000, "track": "Bass"})).unwrap();

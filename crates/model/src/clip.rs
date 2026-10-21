@@ -103,6 +103,10 @@ pub struct StemSet {
     /// The stem cache entry the files came from.
     pub key: String,
     pub sources: [SourceId; 4],
+    /// The stems are stored at 2^-`scale_log2` of their level (headroom, so loud stems never
+    /// clip in the files); playback multiplies them back by 2^`scale_log2`.
+    #[serde(default)]
+    pub scale_log2: u8,
 }
 
 impl StemSet {
@@ -110,7 +114,12 @@ impl StemSet {
     /// None when any stem has no counterpart, since a split clip needs all four.
     pub fn remapped(&self, map: impl Fn(SourceId) -> Option<SourceId>) -> Option<StemSet> {
         let [v, d, b, o] = self.sources.map(map);
-        Some(StemSet { key: self.key.clone(), sources: [v?, d?, b?, o?] })
+        Some(StemSet { key: self.key.clone(), sources: [v?, d?, b?, o?], scale_log2: self.scale_log2 })
+    }
+
+    /// The gain that brings the stored stems back to their level: 2^`scale_log2` (at most 2^30).
+    pub fn scale(&self) -> f32 {
+        f32::from(2u16).powi(i32::from(self.scale_log2.min(30)))
     }
 }
 
@@ -573,7 +582,8 @@ mod tests {
     }
 
     fn split(clip: &mut Clip) {
-        clip.stems = Some(StemSet { key: "00ff-1234-htdemucs".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
+        clip.stems =
+            Some(StemSet { scale_log2: 0, key: "00ff-1234-htdemucs".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
     }
 
     #[test]
@@ -593,6 +603,17 @@ mod tests {
         clip.stem_mask = [true, false, false, true];
         let back: Clip = serde_json::from_str(&serde_json::to_string(&clip).unwrap()).unwrap();
         assert_eq!(back, clip);
+    }
+
+    #[test]
+    fn stems_split_before_headroom_load_at_unit_scale() {
+        let old = r#"{"key":"k","sources":[11,12,13,14]}"#;
+        let set: StemSet = serde_json::from_str(old).unwrap();
+        assert_eq!((set.scale_log2, set.scale()), (0, 1.0));
+        let set = StemSet { scale_log2: 3, ..set };
+        assert_eq!(set.scale(), 8.0);
+        assert_eq!(set.remapped(Some).unwrap().scale_log2, 3);
+        assert_eq!(StemSet { scale_log2: 255, ..set }.scale(), 2f32.powi(30));
     }
 
     #[test]

@@ -175,7 +175,7 @@ mod tests {
         let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 4_800]] };
         let stems = soundcraft_model::STEMS.map(|n| crate::io::add_source(s, n, buf.clone(), None, FileFormat::Wav));
         let c = s.find_clip_mut(clips[0]).unwrap();
-        c.stems = Some(soundcraft_model::StemSet { key: "k".into(), sources: stems });
+        c.stems = Some(soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: stems });
         c.stem_mask = [true, false, false, false];
         (f, clips[0], stems)
     }
@@ -204,7 +204,7 @@ mod tests {
         let (f, _, stems) = split_kick(&mut e);
         // Another clip (not using the kick) shares the drums stem.
         let other = e.session().all_clips().find(|c| c.is_audio() && c.source() != Some(f)).unwrap().id;
-        let shared = soundcraft_model::StemSet { key: "k2".into(), sources: [stems[1]; 4] };
+        let shared = soundcraft_model::StemSet { scale_log2: 0, key: "k2".into(), sources: [stems[1]; 4] };
         e.session_mut().find_clip_mut(other).unwrap().stems = Some(shared);
         let err = e.execute("clip.clear", &json!({"sources": [f]})).unwrap_err().to_string();
         assert!(err.contains("3 clips will be removed"), "{err}");
