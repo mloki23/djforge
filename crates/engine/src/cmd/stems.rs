@@ -16,7 +16,9 @@
 //! **File access.** The source is read under the automation roots like any file a command names.
 //! The cache's own files (inside its root only) are the app's own folder: they are read and
 //! written through [`cache_io`], outside the roots, so an MCP session confined to a music folder
-//! can still split.
+//! can still split. So the root must never come from a command's arguments: it is
+//! [`default_root`] (or a test's temporary folder), and the stem WAVs a runner returns are read
+//! only from inside the split's own temporary folder.
 
 use crate::io;
 use serde_json::{Value, json};
@@ -47,8 +49,6 @@ const MAX_SCALE_LOG2: u8 = 30;
 const INDEX: &str = "stems.json";
 /// How the temporary folders of splits under way are named.
 const TMP_PREFIX: &str = ".tmp-";
-/// A temporary folder of another process this old is swept even if that process seems to run.
-const STALE: Duration = Duration::from_secs(60 * 60);
 /// The WSL python with Demucs when `DJFORGE_DEMUCS_PYTHON` is not set.
 const DEFAULT_PYTHON: &str = "~/mixforge-wsl/venv/bin/python";
 /// Shortest time Demucs is given over one file.
@@ -89,6 +89,8 @@ impl std::fmt::Debug for StemCache {
 
 impl StemCache {
     /// The cache in folder `root`, needing [`MIN_FREE`] bytes free on its drive for a split.
+    /// The cache's files are read and written outside the automation roots, so `root` must be
+    /// the app's own folder ([`default_root`]), never one taken from a command's arguments.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), min_free: MIN_FREE, free_space: Arc::new(free_space) }
     }
@@ -152,7 +154,8 @@ impl StemCache {
     }
 
     /// Creates the root with its marker, and sweeps the temporary folders other processes left
-    /// behind (their process is gone, or they are over an hour old).
+    /// behind: only when their process is known to be gone. One whose process id was reused
+    /// stays until [`clear`].
     fn prepare(&self) -> Result<(), String> {
         cache_io(|| {
             io::make_dir(&self.root).map_err(|e| e.to_string())?;
@@ -162,8 +165,9 @@ impl StemCache {
             }
             for entry in io::list_entries(&self.root).map_err(|e| e.to_string())? {
                 let Some(pid) = entry.file_name().and_then(|n| n.to_str()).and_then(tmp_pid) else { continue };
-                let old = io::modified(&entry).and_then(|m| m.elapsed().ok()).is_some_and(|age| age > STALE);
-                if pid != std::process::id() && (old || !pid_running(pid)) {
+                // A live split's folder doesn't change while Demucs writes deep inside it, so its
+                // age says nothing: only a gone process lets it go.
+                if pid != std::process::id() && !pid_running(pid) {
                     let _ = io::remove_tree(&entry);
                 }
             }
@@ -247,6 +251,20 @@ impl Drop for TempDir {
     }
 }
 
+/// `path` for comparing: absolute with `.` and `..` resolved by name, without Windows' `\\?\`
+/// prefix or a trailing separator, and in lower case on Windows.
+fn path_key(path: &Path) -> String {
+    let text = super::prep::normalise(path).to_string_lossy().into_owned();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).trim_end_matches(['/', '\\']);
+    if cfg!(windows) { text.to_lowercase() } else { text.to_string() }
+}
+
+/// Whether `path` is inside folder `dir` (not `dir` itself), by name.
+fn inside(path: &Path, dir: &Path) -> bool {
+    let (p, d) = (path_key(path), path_key(dir));
+    p.strip_prefix(&d).is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
 /// The headroom, in powers of two, a source peaking at `peak` gets: enough to bring it to full
 /// scale or under, and one more.
 fn headroom(peak: f32) -> u8 {
@@ -305,6 +323,10 @@ pub fn split(cache: &StemCache, source_path: &Path, runner: &StemRunner, stop: &
         })?;
         let wavs = runner(&input, &out, stop)?;
         cancelled()?;
+        // The stems are read outside the automation roots, so only from this split's folder.
+        if let Some(stray) = wavs.iter().find(|w| !inside(w, &tmp.0)) {
+            return Err(format!("{}: not in the split's folder {}; the stems were not read", stray.display(), tmp.0.display()));
+        }
         match cache_io(|| store_stems(&tmp.0, &wavs, rate, channels, frames, &cancelled))? {
             Some(stems) => break stems,
             None if !retried && scale_log2 < MAX_SCALE_LOG2 => {
@@ -543,13 +565,12 @@ fn run_demucs(input: &Path, out: &Path, stop: &dyn Fn() -> bool) -> Result<[Path
     // The split's folder name is unique, and every process Demucs runs names it.
     let tag =
         input.parent().and_then(Path::file_name).and_then(|n| n.to_str()).ok_or_else(|| format!("{}: not in a split's folder", input.display()))?;
-    let unicode = |p: &Path| p.to_str().map(str::to_string).ok_or_else(|| format!("{}: not a Unicode path", p.display()));
     let args = ["-m", "demucs", "-n", MODEL, "--float32", "--clip-mode", "none"];
     let mut command = if cfg!(windows) {
         let line = format!(
             "out=\"$(wslpath -u {})\" && in=\"$(wslpath -u {})\" && exec timeout --kill-after={KILL_AFTER_SECS} {} {} {} -o \"$out\" \"$in\"",
-            bash_word(&unicode(out)?),
-            bash_word(&unicode(input)?),
+            bash_word(&for_wslpath(out)?),
+            bash_word(&for_wslpath(input)?),
             limit.as_secs(),
             bash_word(&python),
             args.join(" "),
@@ -588,8 +609,7 @@ fn run_demucs(input: &Path, out: &Path, stop: &dyn Fn() -> bool) -> Result<[Path
         let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
         lines.get(lines.len().saturating_sub(5)..).unwrap_or_default().join("\n")
     };
-    // `timeout` exits 124 when it stopped Demucs.
-    if ran.status.code() == Some(124) {
+    if timed_out(ran.status.code()) {
         return Err(format!("Demucs timed out after {minutes} minutes"));
     }
     if !ran.status.success() {
@@ -602,6 +622,22 @@ fn run_demucs(input: &Path, out: &Path, stop: &dyn Fn() -> bool) -> Result<[Path
         return Err(format!("Demucs wrote no {}: {}", missing.display(), tail()));
     }
     Ok(paths)
+}
+
+/// Whether an exit code is `timeout`'s for a command it stopped: 124 when Demucs ended on its
+/// signal, 137 when it had to be killed.
+fn timed_out(code: Option<i32>) -> bool {
+    matches!(code, Some(124 | 137))
+}
+
+/// The Windows path `path` as `wslpath -u` takes it: without a `\\?\` prefix. A `\\?\UNC\`
+/// network path is refused.
+fn for_wslpath(path: &Path) -> Result<String, String> {
+    let text = path.to_str().ok_or_else(|| format!("{}: not a Unicode path", path.display()))?;
+    if text.starts_with(r"\\?\UNC\") {
+        return Err(format!("{}: Demucs in WSL can't reach a network path", path.display()));
+    }
+    Ok(text.strip_prefix(r"\\?\").unwrap_or(text).to_string())
 }
 
 /// Kills every process (in WSL on Windows) whose command line names the split folder `tag`;
@@ -632,7 +668,8 @@ fn is_top(path: &Path) -> bool {
 }
 
 /// Empties the stem cache: removes the entries (folders named like keys) and the temporary
-/// folders of splits (`.tmp-<key>-<pid>-<n>`, except this process's splits under way) directly
+/// folders of splits (`.tmp-<key>-<pid>-<n>`, except splits under way: this process's, and
+/// another process's while it runs) directly
 /// in its root, and nothing else. A folder without the cache's [`MARKER`], or a drive's root, is
 /// refused. Links are removed, never followed. Returns the files removed and their bytes.
 pub fn clear(cache: &StemCache) -> Result<(usize, u64), String> {
@@ -647,11 +684,12 @@ pub fn clear(cache: &StemCache) -> Result<(usize, u64), String> {
         if !io::path_exists(root.join(MARKER)) {
             return Err(format!("{}: not a stem cache (it has no {MARKER} file); nothing was removed", root.display()));
         }
-        let busy = running().clone();
+        let busy: Vec<String> = running().iter().map(|p| path_key(p)).collect();
         let (mut files, mut bytes, mut failed) = (0, 0u64, Vec::new());
         for entry in io::list_entries(root).map_err(|e| e.to_string())? {
             let Some(name) = entry.file_name().and_then(|n| n.to_str()) else { continue };
-            if !(is_key(name) || tmp_pid(name).is_some()) || busy.contains(&entry) {
+            let live = |pid: u32| if pid == std::process::id() { busy.contains(&path_key(&entry)) } else { pid_running(pid) };
+            if !(is_key(name) || tmp_pid(name).is_some_and(|pid| !live(pid))) {
                 continue;
             }
             match io::remove_tree(&entry) {
@@ -721,6 +759,37 @@ mod tests {
         assert_eq!(bash_word(r"C:\Users\it's here"), r"'C:\Users\it'\''s here'");
         assert_eq!(bash_word("~/venv/bin/python"), "~/'venv/bin/python'");
         assert_eq!(bash_word("$(rm -rf /)"), "'$(rm -rf /)'");
+    }
+
+    #[test]
+    fn timeout_exits_count_as_timed_out() {
+        assert!(timed_out(Some(124)) && timed_out(Some(137)));
+        assert!(!timed_out(Some(1)) && !timed_out(Some(0)) && !timed_out(None));
+    }
+
+    #[test]
+    fn wslpath_gets_paths_without_the_verbatim_prefix() {
+        assert_eq!(for_wslpath(Path::new(r"\\?\C:\t\x.wav")).unwrap(), r"C:\t\x.wav");
+        assert_eq!(for_wslpath(Path::new(r"C:\it's\x.wav")).unwrap(), r"C:\it's\x.wav");
+        assert!(for_wslpath(Path::new(r"\\?\UNC\server\share\x.wav")).is_err());
+    }
+
+    #[test]
+    fn inside_compares_by_name() {
+        let tmp = std::env::temp_dir().join("c").join(".tmp-x");
+        assert!(inside(&tmp.join("out").join("a.wav"), &tmp));
+        assert!(!inside(&tmp, &tmp));
+        assert!(!inside(&tmp.join("..").join("y.wav"), &tmp));
+        assert!(!inside(&std::env::temp_dir().join("c").join(".tmp-xy").join("a.wav"), &tmp));
+        let mut trailing = tmp.clone().into_os_string();
+        trailing.push(std::path::MAIN_SEPARATOR_STR);
+        assert!(inside(&tmp.join("a.wav"), Path::new(&trailing)));
+        if cfg!(windows) {
+            let upper = PathBuf::from(tmp.display().to_string().to_uppercase());
+            assert!(inside(&tmp.join("a.wav"), &upper));
+            let verbatim = PathBuf::from(format!(r"\\?\{}", tmp.display()));
+            assert!(inside(&verbatim.join("a.wav"), &tmp));
+        }
     }
 
     #[test]

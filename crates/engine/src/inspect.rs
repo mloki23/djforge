@@ -28,7 +28,7 @@ fn clip_json(e: &Engine, c: &Clip) -> Value {
     }
     if let Some(set) = &c.stems {
         let sources: serde_json::Map<String, Value> = STEMS.iter().zip(set.sources).map(|(n, id)| ((*n).to_string(), json!(id))).collect();
-        v["stems"] = json!({"key": set.key, "sources": sources});
+        v["stems"] = json!({"key": set.key, "scale_log2": set.scale_log2, "sources": sources});
         v["stem_mask"] = json!(STEMS.iter().zip(c.stem_mask).filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>());
     }
     if !c.gain_env.is_empty() {
@@ -182,11 +182,11 @@ mod tests {
         let mut e = crate::demo::demo_engine();
         let id = e.session().all_clips().find(|c| c.is_audio()).unwrap().id;
         let c = e.session_mut().find_clip_mut(id).unwrap();
-        c.stems = Some(soundcraft_model::StemSet { scale_log2: 0, key: "k".into(), sources: [11, 12, 13, 14].map(soundcraft_model::SourceId) });
+        c.stems = Some(soundcraft_model::StemSet { scale_log2: 3, key: "k".into(), sources: [11, 12, 13, 14].map(soundcraft_model::SourceId) });
         c.stem_mask = [false, true, true, true];
         let c = e.session().find_clip(id).unwrap().1;
         let v = clip_json(&e, c);
-        assert_eq!(v["stems"], json!({"key": "k", "sources": {"vocals": 11, "drums": 12, "bass": 13, "other": 14}}));
+        assert_eq!(v["stems"], json!({"key": "k", "scale_log2": 3, "sources": {"vocals": 11, "drums": 12, "bass": 13, "other": 14}}));
         assert_eq!(v["stem_mask"], json!(["drums", "bass", "other"]));
     }
 }

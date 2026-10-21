@@ -79,7 +79,7 @@ fn mixforge(path: &str, stop: &dyn Fn() -> bool) -> std::result::Result<Value, S
 
 /// `p` made absolute with `.` and `..` resolved by name (not by following links), in the
 /// platform's own separators.
-fn normalise(p: &Path) -> PathBuf {
+pub(crate) fn normalise(p: &Path) -> PathBuf {
     let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let mut out = PathBuf::new();
     for c in abs.components() {

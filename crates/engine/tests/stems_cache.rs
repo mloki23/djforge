@@ -150,6 +150,25 @@ fn index(c: &StemCache, got: &StemFiles) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(c.root().join(&got.key).join("stems.json")).unwrap()).unwrap()
 }
 
+/// A process id that is never running: not a multiple of 4, so never a Windows process id (and
+/// unlikely elsewhere).
+const GONE: u32 = 2_000_000_003;
+/// A process that always runs: System on Windows, init elsewhere.
+const LIVE: u32 = if cfg!(windows) { 4 } else { 1 };
+
+/// Sets the folder's modification time two hours back.
+fn make_old(dir: &Path) {
+    let ok = if cfg!(windows) {
+        let script = format!("(Get-Item -LiteralPath '{}').LastWriteTime = (Get-Date).AddHours(-2)", dir.display());
+        std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).status().unwrap().success()
+    } else {
+        std::process::Command::new("touch").args(["-d", "2 hours ago"]).arg(dir).status().unwrap().success()
+    };
+    assert!(ok);
+    let age = std::fs::metadata(dir).unwrap().modified().unwrap().elapsed().unwrap();
+    assert!(age > std::time::Duration::from_secs(3_600), "{age:?}");
+}
+
 #[test]
 fn a_miss_stores_four_flacs_at_the_source_rate_that_sum_to_the_source() {
     let dir = scratch("miss");
@@ -429,16 +448,19 @@ fn clear_removes_only_cache_entries() {
     let got = stems::split(&c, &src, &fake(&Arc::new(AtomicUsize::new(0)), 0), &never).unwrap();
     let root = c.root();
     let entry_bytes: u64 = std::fs::read_dir(root.join(&got.key)).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
-    std::fs::create_dir_all(root.join(".tmp-0123456789abcdef-1-htdemucs-9-0/out")).unwrap();
-    std::fs::write(root.join(".tmp-0123456789abcdef-1-htdemucs-9-0/out/x.wav"), [0u8; 10]).unwrap();
+    std::fs::create_dir_all(root.join(".tmp-0123456789abcdef-1-htdemucs-2000000003-0/out")).unwrap();
+    std::fs::write(root.join(".tmp-0123456789abcdef-1-htdemucs-2000000003-0/out/x.wav"), [0u8; 10]).unwrap();
     std::fs::write(root.join("notes.txt"), "mine").unwrap();
     std::fs::create_dir_all(root.join("mine")).unwrap();
     std::fs::write(root.join("mine/a.flac"), "keep").unwrap();
-    for kept in ["0123456789abcdef-1-other", ".tmp-mine", ".tmp-0123456789abcdef-1-htdemucs-9"] {
+    let live = format!(".tmp-0123456789abcdef-1-htdemucs-{LIVE}-0");
+    for kept in ["0123456789abcdef-1-other", ".tmp-mine", ".tmp-0123456789abcdef-1-htdemucs-9", &live] {
         std::fs::create_dir_all(root.join(kept)).unwrap();
     }
     assert_eq!(stems::clear(&c).unwrap(), (6, entry_bytes + 10));
-    assert_eq!(names(root), [".tmp-0123456789abcdef-1-htdemucs-9", ".tmp-mine", "0123456789abcdef-1-other", "mine", "notes.txt"]);
+    let mut want = vec![".tmp-0123456789abcdef-1-htdemucs-9", &live, ".tmp-mine", "0123456789abcdef-1-other", "mine", "notes.txt"];
+    want.sort_unstable();
+    assert_eq!(names(root), want);
     assert_eq!(std::fs::read_to_string(root.join("mine/a.flac")).unwrap(), "keep");
     assert!(root.join(MARKER).is_file());
     assert_eq!(stems::clear(&c).unwrap(), (0, 0));
@@ -486,6 +508,40 @@ fn clear_removes_a_link_but_not_what_it_points_at() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The runner's stems must be inside the split's own folder: a path elsewhere is never read.
+#[test]
+fn stems_outside_the_split_folder_are_refused() {
+    let dir = scratch("outside");
+    let src = source(&dir, 48_000, 2, 0.2, 1.0);
+    let c = cache(&dir);
+    let elsewhere = dir.join("elsewhere");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inner = fake(&calls, 0);
+    let (e2, e3) = (elsewhere.clone(), elsewhere.clone());
+    let straying: StemRunner = Arc::new(move |i: &Path, o: &Path, s: &dyn Fn() -> bool| {
+        let paths = inner(i, o, s)?;
+        std::fs::create_dir_all(&e2).unwrap();
+        Ok(paths.map(|p| {
+            let to = e2.join(p.file_name().unwrap());
+            std::fs::copy(&p, &to).unwrap();
+            to
+        }))
+    });
+    let err = stems::split(&c, &src, &straying, &never).unwrap_err();
+    assert!(err.contains("not in the split's folder"), "{err}");
+    // `..` back out of the folder is outside too.
+    let dotdot: StemRunner = Arc::new(move |i: &Path, o: &Path, s: &dyn Fn() -> bool| {
+        fake(&Arc::new(AtomicUsize::new(0)), 0)(i, o, s)?;
+        let back = o.join("..").join("..").join("..").join("elsewhere");
+        Ok(STEMS.map(|n| back.join(format!("{n}.wav"))))
+    });
+    assert!(e3.join("vocals.wav").is_file());
+    let err = stems::split(&c, &src, &dotdot, &never).unwrap_err();
+    assert!(err.contains("not in the split's folder"), "{err}");
+    assert!(names(c.root()).is_empty(), "{:?}", names(c.root()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Clearing the cache while a split runs leaves that split's temporary folder alone, so the
 /// split still finishes.
 #[test]
@@ -494,7 +550,13 @@ fn clear_skips_a_split_under_way() {
     let src = source(&dir, 48_000, 2, 0.2, 1.0);
     let c = cache(&dir);
     let inner = fake(&Arc::new(AtomicUsize::new(0)), 0);
-    let c2 = c.clone();
+    // The same root spelled another way: a trailing separator, and upper case on Windows.
+    let mut spelled = c.root().display().to_string();
+    if cfg!(windows) {
+        spelled = spelled.to_uppercase();
+    }
+    spelled.push(std::path::MAIN_SEPARATOR);
+    let c2 = StemCache::new(spelled);
     let clearing: StemRunner = Arc::new(move |i: &Path, o: &Path, s: &dyn Fn() -> bool| {
         assert_eq!(stems::clear(&c2).unwrap(), (0, 0));
         assert!(i.is_file());
@@ -512,15 +574,18 @@ fn leftovers_of_a_gone_process_are_swept() {
     let dir = scratch("sweep");
     let src = source(&dir, 48_000, 2, 0.2, 1.0);
     let c = cache(&dir);
-    // Not a multiple of 4, so never a Windows process id (and unlikely elsewhere).
-    let gone = c.root().join(".tmp-0123456789abcdef-1-htdemucs-2000000003-0");
+    let gone = c.root().join(format!(".tmp-0123456789abcdef-1-htdemucs-{GONE}-0"));
     let ours = c.root().join(format!(".tmp-0123456789abcdef-1-htdemucs-{}-999", std::process::id()));
-    for d in [&gone, &ours] {
+    // Another process's split under way, started long ago (a long track): never swept.
+    let live = c.root().join(format!(".tmp-0123456789abcdef-1-htdemucs-{LIVE}-0"));
+    for d in [&gone, &ours, &live] {
         std::fs::create_dir_all(d.join("out")).unwrap();
     }
+    make_old(&live);
     stems::split(&c, &src, &fake(&Arc::new(AtomicUsize::new(0)), 0), &never).unwrap();
     assert!(!gone.exists());
     assert!(ours.is_dir());
+    assert!(live.is_dir());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
