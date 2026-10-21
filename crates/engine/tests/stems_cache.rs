@@ -609,15 +609,20 @@ fn cancelling_the_real_runner_leaves_no_demucs_running() {
     let dir = scratch("real-cancel");
     let src = loud_source(&dir, 60.0);
     let c = StemCache::new(dir.join("cache")).with_free_space(0, Arc::new(|_: &Path| None));
-    let started = std::time::Instant::now();
-    let stop_at = std::time::Duration::from_secs(12);
-    let err = stems::split(&c, &src, &stems::demucs_runner(), &|| started.elapsed() > stop_at).unwrap_err();
-    eprintln!("stopped after {:.1} s: {err}", started.elapsed().as_secs_f64());
-    assert_eq!(err, CANCELLED);
     let pgrep = || {
         let out = std::process::Command::new("wsl").args(["-e", "pgrep", "-af", "demucs"]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    let started = std::time::Instant::now();
+    let stop_at = std::time::Duration::from_secs(12);
+    // What runs at the moment of the stop: Demucs must have started for the check to mean much.
+    let running = std::sync::OnceLock::new();
+    let stop = || started.elapsed() > stop_at && !running.get_or_init(pgrep).is_empty();
+    let err = stems::split(&c, &src, &stems::demucs_runner(), &stop).unwrap_err();
+    eprintln!("stopped after {:.1} s: {err}", started.elapsed().as_secs_f64());
+    eprintln!("running when stopped: {:?}", running.get());
+    assert_eq!(err, CANCELLED);
+    assert!(running.get().is_some_and(|r| r.contains("demucs")), "{running:?}");
     let mut left = pgrep();
     for _ in 0..10 {
         if left.is_empty() {
