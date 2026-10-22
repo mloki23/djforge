@@ -1628,7 +1628,7 @@ const STEM_STEP: Samples = 64;
 /// The stem fader of `t` for stem `i` at `at`, in dB: its `Stem(i)` lane when that has points
 /// and the track reads automation (outside Write, where the fader is what's written), else the
 /// fader, like [`volume_db_at`]. A non-finite value counts as 0 dB.
-fn stem_db_at(t: &Track, i: usize, at: Samples) -> f32 {
+pub fn stem_db_at(t: &Track, i: usize, at: Samples) -> f32 {
     let base = finite_or(t.mixer.stem_gain_db.get(i).copied().unwrap_or(0.0), 0.0);
     stem_lane(t, i).map_or(base, |l| finite_or(l.value_at(at, base), base))
 }
@@ -1638,7 +1638,7 @@ fn finite_or(v: f32, d: f32) -> f32 {
 }
 
 /// The `Stem(i)` lane of `t` that [`stem_db_at`] reads, if any.
-fn stem_lane(t: &Track, i: usize) -> Option<&soundcraft_model::AutomationLane> {
+pub fn stem_lane(t: &Track, i: usize) -> Option<&soundcraft_model::AutomationLane> {
     if !t.mixer.automation_mode.reads() || t.mixer.automation_mode == soundcraft_model::AutomationMode::Write {
         return None;
     }

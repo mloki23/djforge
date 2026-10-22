@@ -77,9 +77,9 @@ pub fn holds_quit(app: &mut SoundApp) -> bool {
 /// ones, `dj.import_set`, and starting either job again (`prep.tracks`, `dj.split_stems`). A
 /// prep refuses to write over the audio of the session it started in (a snapshot of its source
 /// files), and a split is applied to the session it started in, so neither a file it may
-/// replace nor another session may come in meanwhile; attaching stems (`dj.attach_stems`) or
-/// emptying the stem cache (`dj.clear_stem_cache`) waits for the split too. Playback, editing
-/// and mixing go on. True when refused; the status line says why.
+/// replace nor another session may come in meanwhile. A split also holds back emptying the stem
+/// cache it writes into (`dj.clear_stem_cache`). Playback, editing and mixing go on. True when
+/// refused; the status line says why.
 pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
     let job = if app.prep.is_some() {
         "prep"
@@ -90,8 +90,10 @@ pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
     };
     let read_only = soundcraft_engine::find_command(id).is_some_and(|c| !c.journal && !c.undoable && !c.view);
     let refused = ((id.starts_with("file.") || id.starts_with("session.")) && !read_only)
-        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems" | "dj.attach_stems" | "dj.clear_stem_cache");
+        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems")
+        || (id == "dj.clear_stem_cache" && app.split.is_some());
     if refused {
+        let job = if id == "dj.clear_stem_cache" { "stem split" } else { job };
         app.ui.status = format!("Wait for the {job} to finish (or cancel it)");
         log::warn!("{id}: {}", app.ui.status);
     }

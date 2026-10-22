@@ -880,14 +880,20 @@ fn clear_stem_cache(e: &mut Engine, _: &Value) -> crate::Result<Value> {
 /// `dj.clear_stem_cache` on `cache` (the app's own, or a test's): refused while the session
 /// names a file in a known stem cache.
 pub fn clear_stem_cache_in(e: &Engine, cache: &StemCache) -> crate::Result<Value> {
-    if live_split(cache.root()) {
-        return Err(super::bad(CLEAR, "a split into stems is under way: wait for it to finish (or cancel it), then clear the stem cache"));
-    }
-    if let Some(why) = cache_users(e.session()) {
-        return Err(super::bad(CLEAR, format!("the session uses cached stems: {why}; or close the session")));
+    if let Some(why) = clear_stem_cache_refusal(e, cache) {
+        return Err(super::bad(CLEAR, why));
     }
     let (files, bytes) = clear(cache).map_err(EngineError::Io)?;
     Ok(json!({"files": files, "bytes": bytes}))
+}
+
+/// Why `dj.clear_stem_cache` on `cache` would be refused now, if it would: a split into it is
+/// under way, or the session plays cached stems. Lets a confirm say so before asking.
+pub fn clear_stem_cache_refusal(e: &Engine, cache: &StemCache) -> Option<String> {
+    if live_split(cache.root()) {
+        return Some("a split into stems is under way: wait for it to finish (or cancel it), then clear the stem cache".into());
+    }
+    cache_users(e.session()).map(|why| format!("the session uses cached stems: {why}; or close the session"))
 }
 
 /// What in `s` plays a file in a known stem cache, and what to do about it; `None` when nothing.
@@ -1018,6 +1024,30 @@ struct Prepared {
     paths: [PathBuf; 4],
     scale_log2: u8,
     loaded: Loaded,
+    /// `loaded`, each fitted on the worker to the length its clip's source had then (a stem
+    /// resampled to the session's rate can end a few frames off), so applying doesn't copy it.
+    fitted: Fitted,
+}
+
+/// Stems a split fitted to its source's length: `None` where a stem needed no fitting or
+/// couldn't be fitted.
+type Fitted = [Option<Arc<SourceAudio>>; 4];
+
+/// `loaded` fitted to `frames` frames of `channels` channels, where a stem was resampled to
+/// `rate` and ends within [`LENGTH_SLACK`] frames of that.
+fn fit(loaded: &Loaded, rate: u32, frames: u64, channels: usize) -> Fitted {
+    let fit_one = |(audio, file_rate): &(Arc<SourceAudio>, u32)| {
+        let len = audio.buffer.frames() as u64;
+        if *file_rate == rate || len == frames || len.abs_diff(frames) > LENGTH_SLACK as u64 || audio.buffer.num_channels() != channels {
+            return None;
+        }
+        let mut buffer = audio.buffer.clone();
+        let n = usize::try_from(frames).ok()?;
+        buffer.channels.iter_mut().for_each(|c| c.resize(n, 0.0));
+        Some(Arc::new(SourceAudio::new(buffer)))
+    };
+    let [a, b, c, d] = loaded;
+    [fit_one(a), fit_one(b), fit_one(c), fit_one(d)]
 }
 
 thread_local! {
@@ -1182,13 +1212,19 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
     }
     // Stems the session plays already (another clip of the file split before) are reused.
     let reused: Vec<Option<SourceId>> = paths.iter().map(|p| stem_source(s, p, rate, frames, channels, scale_log2)).collect();
+    // Stems the worker fitted to this length already, when they are the ones used below.
+    let pre_fitted = prepared.as_ref().map(|x| x.fitted.clone());
+    let mut from_prepared = false;
     let loaded = if reused.iter().all(Option::is_some) {
         None
     } else {
         let gone = paths.iter().all(|p| !cache_io(|| io::path_exists(p)));
         let fresh = |l: &Loaded| l.iter().zip(&paths).all(|((a, _), p)| a.buffer.sample_rate == rate && (gone || io::decoded_unchanged(a, p)));
         Some(match prepared.filter(|x| x.paths == paths && fresh(&x.loaded)) {
-            Some(x) => x.loaded,
+            Some(x) => {
+                from_prepared = true;
+                x.loaded
+            }
             None => load_stems(&paths, rate).map_err(|m| {
                 let removed = match cache.remove(key) {
                     Ok(()) => "they were removed from the stem cache, so splitting again makes them anew",
@@ -1214,8 +1250,11 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
             )));
         }
         // Resampled stems can end a few frames off the resampled source.
+        let ready = pre_fitted.as_ref().filter(|_| from_prepared).and_then(|f| f.get(i).cloned().flatten());
         let audio = if len == frames {
             audio
+        } else if let Some(ready) = ready.filter(|f| f.buffer.frames() as u64 == frames && f.buffer.num_channels() == channels) {
+            ready
         } else {
             let mut buffer = audio.buffer.clone();
             let n = usize::try_from(frames).unwrap_or(usize::MAX);
@@ -1327,6 +1366,7 @@ pub struct Split {
     cache: StemCache,
     files: StemFiles,
     loaded: Loaded,
+    fitted: Fitted,
     started: std::time::Instant,
 }
 
@@ -1361,6 +1401,7 @@ impl Split {
             paths: self.files.paths.clone(),
             scale_log2: self.files.scale_log2,
             loaded: self.loaded.clone(),
+            fitted: self.fitted.clone(),
         }
     }
 
@@ -1423,6 +1464,7 @@ pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner)
     // The roots in force now also apply when the split is applied.
     let roots = crate::file_access::current();
     let rate = s.sample_rate.hz();
+    let (frames, channels) = s.source(src).map_or((0, 0), |x| (x.frames, usize::from(x.channels)));
     use_root(cache.root());
     let shared = Arc::new(SplitShared { cancel: AtomicBool::new(false), stage: Mutex::new(DECODING) });
     let started = std::time::Instant::now();
@@ -1440,6 +1482,7 @@ pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner)
                 roots: roots.clone(),
                 cache,
                 files,
+                fitted: fit(&loaded, rate, frames, channels),
                 loaded,
                 started,
                 live: None,

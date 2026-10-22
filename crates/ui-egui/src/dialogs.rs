@@ -27,7 +27,7 @@ pub enum Dialog {
     Session { frame_rate: String, bit_depth: String },
     ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
     SaveChanges { then: (String, Value) },
-    ClearStemCache { message: String }, // DJ › Clear Stem Cache: what the cache holds
+    ClearStemCache { message: String, refused: bool }, // DJ › Clear Stem Cache: what it holds, or why not now
 }
 
 #[derive(Default)]
@@ -608,10 +608,15 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::ClearStemCache { message } => {
+                Dialog::ClearStemCache { message, refused } => {
                     ui.set_max_width(360.0);
                     ui.label(message.as_str());
-                    if buttons(ui, "Clear", false) {
+                    if *refused {
+                        ui.separator();
+                        if ui.button("OK").clicked() || enter {
+                            keep = false;
+                        }
+                    } else if buttons(ui, "Clear", false) {
                         action = Some(("dj.clear_stem_cache".into(), json!({})));
                     }
                 }
@@ -669,7 +674,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             crate::prep::start(app, &params);
         } else if cmd == "dj.clear_stem_cache" {
             // On the app's stem cache, which tests point elsewhere.
-            crate::stems::clear(app);
+            let _ = crate::stems::clear(app);
         } else {
             match app.run(&cmd, params) {
                 Ok(v) if cmd == "file.export_clips" => {

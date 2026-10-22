@@ -2401,7 +2401,7 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
     }
 }
 
-fn automation_id(p: &AutoParam) -> String {
+pub(crate) fn automation_id(p: &AutoParam) -> String {
     match p {
         AutoParam::Volume => "volume".into(),
         AutoParam::Pan(0) => "pan".into(),

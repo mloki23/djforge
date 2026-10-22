@@ -3,6 +3,7 @@
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold};
+use crate::widgets::db_text;
 use egui::{Align2, Color32, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_engine::cmd::stems;
@@ -23,34 +24,46 @@ const MAX_DB: f32 = 6.0;
 /// clip, so the strips' rows line up).
 pub(crate) const FADERS_H: f32 = 104.0;
 
-/// Starts splitting `clip` into stems (`dj.split_stems`) in `app.stem_cache` with
-/// `app.stem_runner`: the checks are made here (a refusal goes to the status line), the split
-/// runs on another thread and [`step`] applies it.
-pub fn start(app: &mut SoundApp, clip: ClipId) {
-    if crate::prep::refuses_command(app, "dj.split_stems") {
-        return;
+/// Starts `dj.split_stems` for `params` (`{clip}`) in `app.stem_cache` with `app.stem_runner`,
+/// from the clip menu or `app.run` (agents, scripts): the checks are made here, the split runs
+/// on another thread and [`step`] applies it. Returns `{clip, started: true}`, or
+/// `{clip, already: true, key}` when the clip is split already; a refusal also goes to the
+/// status line.
+pub fn start(app: &mut SoundApp, params: &Value) -> Result<Value, String> {
+    let r = start_job(app, params);
+    if let Err(e) = &r {
+        app.ui.status.clone_from(e);
+        log::warn!("dj.split_stems: {e}");
     }
-    let cache = match &app.stem_cache {
-        Ok(cache) => cache.clone(),
-        Err(e) => {
-            app.ui.status = format!("No stem cache: {e}");
-            log::warn!("dj.split_stems: {}", app.ui.status);
-            return;
-        }
-    };
+    r
+}
+
+fn start_job(app: &mut SoundApp, params: &Value) -> Result<Value, String> {
+    if crate::prep::refuses_command(app, "dj.split_stems") {
+        return Err(app.ui.status.clone());
+    }
+    let cache = app.stem_cache.clone().map_err(|e| format!("No stem cache: {e}"))?;
     let runner = std::sync::Arc::clone(&app.stem_runner);
-    match stems::split_job_in(&app.engine, &json!({"clip": clip.0}), cache, runner) {
-        Ok(Some(job)) => app.split = Some(job),
-        Ok(None) => app.ui.status = format!("{} is split already", clip_name(app.engine.session(), clip)),
-        Err(e) => {
-            app.ui.status = e.to_string();
-            log::warn!("dj.split_stems: {e}");
+    match stems::split_job_in(&app.engine, params, cache, runner).map_err(|e| e.to_string())? {
+        Some(job) => {
+            let clip = job.clip();
+            app.split = Some(job);
+            app.split_generation = app.session_generation;
+            Ok(json!({"clip": clip.0, "started": true}))
+        }
+        None => {
+            let clip = params.get("clip").and_then(Value::as_u64).map(ClipId);
+            let s = app.engine.session();
+            let key = clip.and_then(|c| s.find_clip(c)).and_then(|(_, c)| c.stems.as_ref()).map(|set| set.key.clone());
+            app.ui.status = format!("{} is split already", clip.map_or_else(String::new, |c| clip_name(s, c)));
+            Ok(json!({"clip": clip.map(|c| c.0), "already": true, "key": key}))
         }
     }
 }
 
-/// Applies the split once it has ended (as one undoable `dj.attach_stems`). Called from
-/// `logic`, which eframe keeps calling while a repaint is requested.
+/// Applies the split once it has ended (as one undoable `dj.attach_stems`), unless the session
+/// it started in was replaced meanwhile. Called from `logic`, which eframe keeps calling while a
+/// repaint is requested.
 pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
     let Some(job) = &mut app.split else { return };
     let Some(result) = job.poll() else {
@@ -59,8 +72,13 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
     };
     let name = clip_name(app.engine.session(), job.clip());
     app.split = None;
-    app.ui.status = match result.and_then(|split| split.apply(&mut app.engine)) {
-        Ok(v) => status(&v, &name),
+    let same_session = app.split_generation == app.session_generation;
+    app.ui.status = match result {
+        Ok(_) if !same_session => "The stem split ended after its session was closed: nothing was changed".into(),
+        Ok(split) => match split.apply(&mut app.engine) {
+            Ok(v) => status(&v, &name),
+            Err(e) => e.to_string(),
+        },
         Err(e) if e.to_string() == stems::CANCELLED => "Stem split cancelled".into(),
         Err(e) => e.to_string(),
     };
@@ -128,7 +146,7 @@ pub(crate) fn clip_menu(app: &mut SoundApp, ui: &mut Ui, clip: ClipId) {
         let busy = app.prep.is_some() || app.split.is_some();
         let resp = ui.add_enabled(!busy, egui::Button::new("Split into Stems"));
         if resp.clicked() {
-            start(app, clip);
+            let _ = start(app, &json!({"clip": clip.0}));
         }
         resp.on_disabled_hover_text("Wait for the running job to finish");
         return;
@@ -209,9 +227,10 @@ fn title(name: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-/// Whether `track` is an audio track with a split clip: only those show stem faders.
+/// Whether `track` is an audio track with a split clip in its playing playlist: only those
+/// show stem faders.
 pub fn has_split(track: &Track) -> bool {
-    track.kind == TrackKind::Audio && track.playlists.iter().flat_map(|p| p.clips.iter()).any(|c| c.stems.is_some())
+    track.kind == TrackKind::Audio && track.clips().iter().any(|c| c.stems.is_some())
 }
 
 /// Whether any track shows stem faders.
@@ -221,6 +240,9 @@ pub(crate) fn any_split(s: &Session) -> bool {
 
 /// Sets stem `i` of `track` to `db` (`mix.stem_gain`), merged into one undo step per drag.
 pub fn set_gain(app: &mut SoundApp, track: TrackId, i: usize, db: f32) {
+    let start_db = app.engine.session().track(track).and_then(|t| t.mixer.stem_gain_db.get(i).copied()).unwrap_or(0.0);
+    // A gesture, so Touch/Latch/Write record the move into the `stem:*` lane while playing.
+    app.gesture = Some(crate::Gesture::Fader { track, start_db, stem: u8::try_from(i).ok() });
     let params = json!({"track": track.0, "stem": STEMS.get(i).copied().unwrap_or_default(), "db": db});
     let _ = app.engine.execute_merged("mix.stem_gain", &params, &format!("stem:{}:{i}", track.0));
 }
@@ -260,22 +282,43 @@ pub(crate) fn faders(app: &mut SoundApp, ui: &mut Ui, track: &Track, sec: Rect) 
     let cw = (sec.width() - 4.0) / 4.0;
     for (i, ((letter, name), db)) in LETTERS.iter().zip(STEMS).zip(track.mixer.stem_gain_db).enumerate() {
         let col = Rect::from_min_size(pos2(sec.min.x + 2.0 + i as f32 * cw, sec.min.y), vec2(cw, sec.height()));
-        let p = ui.painter();
+        let p = ui.painter().clone();
         p.text(pos2(col.center().x, col.min.y + 7.0), Align2::CENTER_CENTER, *letter, bold(9.0), t.text_dim);
         let area = Rect::from_min_max(pos2(col.min.x, col.min.y + 14.0), pos2(col.max.x, col.max.y - 21.0));
         let slot = Rect::from_center_size(area.center(), vec2(3.0, area.height() - 6.0));
         p.rect_filled(slot, 1.0, t.fader_track);
         let zero = slot.max.y - slot.height() * pos_of(0.0);
         p.hline(slot.min.x - 4.0..=slot.max.x + 4.0, zero, Stroke::new(1.0, t.text_dim.gamma_multiply(0.6)));
-        let y = slot.max.y - slot.height() * pos_of(db);
         let muted = db <= SILENT_DB;
+        if !muted {
+            // Un-muted (here or anywhere else): no level is waiting to be restored.
+            app.stem_unmute.remove(&(id, i));
+        }
+        // A `stem:*` lane the track reads overrides the fader: the cap shows the lane's value
+        // at the playhead, dimmed, with an "A".
+        let automated = soundcraft_mix::stem_lane(track, i).is_some();
+        let shown = if automated { soundcraft_mix::stem_db_at(track, i, app.position()) } else { db };
+        let y = slot.max.y - slot.height() * pos_of(shown);
         let cap = Rect::from_center_size(pos2(slot.center().x, y), vec2((cw - 6.0).clamp(6.0, 16.0), 6.0));
-        p.rect_filled(cap, 1.5, if muted { Color32::from_gray(90) } else { Color32::from_gray(210) });
+        let face = match (automated, muted) {
+            (true, _) => Color32::from_gray(130).gamma_multiply(0.8),
+            (false, true) => Color32::from_gray(90),
+            (false, false) => Color32::from_gray(210),
+        };
+        p.rect_filled(cap, 1.5, face);
         p.hline(cap.x_range(), y, Stroke::new(1.0, Color32::from_gray(30)));
+        if automated {
+            p.text(pos2(col.max.x - 1.0, col.min.y + 1.0), Align2::RIGHT_TOP, "A", bold(8.0), t.auto_read);
+        }
         let resp = ui.interact(area, ui.id().with(("stem_fader", id.0, i)), Sense::click_and_drag());
         let label = format!("{} {name} stem", track.name);
-        resp.widget_info(|| egui::WidgetInfo::slider(true, f64::from(db), &label));
-        let resp = resp.on_hover_text(format!("{} {}: {} dB (double-click: 0 dB)", track.name, title(name), crate::widgets::db_text(db)));
+        resp.widget_info(|| egui::WidgetInfo::slider(true, f64::from(shown), &label));
+        let hover = if automated {
+            format!("{} {}: {} dB, automated by the stem:{name} lane (the fader is {} dB)", track.name, title(name), db_text(shown), db_text(db))
+        } else {
+            format!("{} {}: {} dB (double-click: 0 dB)", track.name, title(name), db_text(db))
+        };
+        let resp = resp.on_hover_text(hover);
         if resp.double_clicked() {
             set_gain(app, id, i, 0.0);
         } else if resp.dragged() {
@@ -297,19 +340,23 @@ pub(crate) fn faders(app: &mut SoundApp, ui: &mut Ui, track: &Track, sec: Rect) 
     }
 }
 
-/// DJ › Clear Stem Cache...: asks first, saying what the cache holds.
+/// DJ › Clear Stem Cache...: asks first, saying what the cache holds, or says why it can't
+/// be cleared now (a split into it runs, or the session plays its stems).
 pub fn ask_clear(app: &mut SoundApp) {
     if crate::prep::refuses_command(app, "dj.clear_stem_cache") {
         return;
     }
-    let message = match &app.stem_cache {
-        Ok(cache) => clear_message(stems::stem_cache_size(cache)),
+    let (message, refused) = match &app.stem_cache {
+        Ok(cache) => match stems::clear_stem_cache_refusal(&app.engine, cache) {
+            Some(why) => (format!("The stem cache can't be cleared now: {why}."), true),
+            None => (clear_message(stems::stem_cache_size(cache)), false),
+        },
         Err(e) => {
             app.ui.status = format!("No stem cache: {e}");
             return;
         }
     };
-    app.dialogs.open = Some(crate::dialogs::Dialog::ClearStemCache { message });
+    app.dialogs.open = Some(crate::dialogs::Dialog::ClearStemCache { message, refused });
 }
 
 /// The Clear Stem Cache question for a cache of `size` (files, bytes).
@@ -334,22 +381,24 @@ pub(crate) fn bytes_text(bytes: u64) -> String {
     }
 }
 
-/// Runs Clear Stem Cache (`dj.clear_stem_cache`) on `app.stem_cache` after the confirm.
-pub fn clear(app: &mut SoundApp) {
+/// Runs Clear Stem Cache (`dj.clear_stem_cache`) on `app.stem_cache`: after the confirm, or
+/// from `app.run`. Returns `{files, bytes}`; the status line says what was freed, or why not.
+pub fn clear(app: &mut SoundApp) -> Result<Value, String> {
     if crate::prep::refuses_command(app, "dj.clear_stem_cache") {
-        return;
+        return Err(app.ui.status.clone());
     }
     let result = match &app.stem_cache {
         Ok(cache) => stems::clear_stem_cache_in(&app.engine, cache).map_err(|e| e.to_string()),
         Err(e) => Err(format!("No stem cache: {e}")),
     };
-    app.ui.status = match result {
+    app.ui.status = match &result {
         Ok(v) => format!("Cleared the stem cache: {} file(s), {}", v["files"], bytes_text(v["bytes"].as_u64().unwrap_or(0))),
         Err(e) => {
             log::warn!("dj.clear_stem_cache: {e}");
-            e
+            e.clone()
         }
     };
+    result
 }
 
 #[cfg(test)]

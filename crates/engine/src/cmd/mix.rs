@@ -256,6 +256,9 @@ fn stem_gain(e: &mut Engine, p: &Value) -> Result<Value> {
     let db = p.get("db").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(CMD, "`db` required: a number, -144..6"))? as f32;
     let (lo, hi, _) = AutoParam::Stem(0).range();
     let db = db.clamp(lo, hi);
+    if let Some(t) = tracks.iter().filter_map(|t| e.session().track(*t)).find(|t| t.kind != soundcraft_model::TrackKind::Audio) {
+        return Err(bad(CMD, format!("`{}` is not an audio track: only audio tracks play stems", t.name)));
+    }
     let s = e.session_mut();
     for t in &tracks {
         if let Some(g) = s.track_mut(*t).and_then(|tr| tr.mixer.stem_gain_db.get_mut(i)) {
@@ -789,6 +792,7 @@ mod tests {
     fn stem_faders_are_set_by_name_or_index_clamped_and_undoable() {
         let (mut e, t) = tone_session(&[]);
         let stems = |e: &Engine| e.session().track(t).unwrap().mixer.stem_gain_db;
+        let bus = e.session_mut().add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("Bus"));
         let r = e.execute("mix.stem_gain", &json!({"track": t.0, "stem": "bass", "db": -6.5})).unwrap();
         assert_eq!(r, json!({"stem": "bass", "db": -6.5}));
         assert_eq!(stems(&e), [0.0, 0.0, -6.5, 0.0]);
@@ -804,6 +808,7 @@ mod tests {
             (json!({"track": t.0, "db": 0.0}), "`stem` required"),
             (json!({"track": t.0, "stem": "bass"}), "`db` required"),
             (json!({"track": t.0, "stem": "bass", "db": "loud"}), "`db` required"),
+            (json!({"track": bus.0, "stem": "bass", "db": -3.0}), "not an audio track"),
         ] {
             let err = e.execute("mix.stem_gain", &p).unwrap_err().to_string();
             assert!(err.contains(why), "{p}: {err}");

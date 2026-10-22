@@ -39,6 +39,16 @@ const KNOWN_UNREACHED: &[&str] = &[
     "view.sub_counter",
 ];
 
+/// Commands the UI reaches without a menu, shortcut or widget naming them: each one is run by
+/// another UI path, given here.
+const REACHED_INDIRECTLY: &[(&str, &str)] = &[
+    // The clip menu's Split into Stems starts a background split (stems::start); when it ends,
+    // Split::apply runs dj.attach_stems on the session as one undo step.
+    ("dj.attach_stems", "applied by the split the clip menu's Split into Stems starts"),
+    // The clip menu starts it as a background job rather than running the blocking command.
+    ("dj.split_stems", "the clip menu's Split into Stems runs it as a background job"),
+];
+
 fn ui_source() -> String {
     fn walk(dir: &Path, out: &mut String) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -82,7 +92,10 @@ fn every_command_has_a_ui_path() {
         if !c.journal || c.view {
             continue;
         }
-        let reached = in_menus.contains(c.id) || c.shortcut.is_some() || src.contains(&format!("\"{}\"", c.id));
+        let reached = in_menus.contains(c.id)
+            || c.shortcut.is_some()
+            || src.contains(&format!("\"{}\"", c.id))
+            || REACHED_INDIRECTLY.iter().any(|(id, _)| *id == c.id);
         let known = KNOWN_UNREACHED.contains(&c.id);
         if !reached && !known {
             unreached.push(c.id);
@@ -92,6 +105,10 @@ fn every_command_has_a_ui_path() {
     }
     assert!(unreached.is_empty(), "commands with no menu, shortcut or UI reference: {unreached:?}");
     assert!(stale.is_empty(), "now reachable, remove from KNOWN_UNREACHED: {stale:?}");
+    for (id, why) in REACHED_INDIRECTLY {
+        assert!(command_specs().iter().any(|c| c.id == *id), "{id} ({why}) is not a command");
+        assert!(!KNOWN_UNREACHED.contains(id), "{id} is listed as reached and as unreached");
+    }
 }
 
 #[test]

@@ -4,7 +4,10 @@
 //! Nothing here runs Demucs or touches the app's real stem cache.
 
 use egui::{Event, Modifiers, PointerButton, Pos2, pos2, vec2};
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
 use serde_json::json;
 use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions, FileFormat, decode, encode};
 use soundcraft_engine::cmd::stems::{StemCache, StemRunner};
@@ -217,7 +220,7 @@ fn while_a_split_runs_file_commands_and_other_jobs_wait_and_escape_cancels_it() 
     ] {
         assert_eq!(h.state_mut().run(id, params).unwrap_err(), "Wait for the stem split to finish (or cancel it)", "{id}");
     }
-    soundcraft_ui_egui::stems::start(h.state_mut(), b);
+    let _ = soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": b.0}));
     assert_eq!(h.state().ui.status, "Wait for the stem split to finish (or cancel it)");
     // Editing goes on.
     assert!(h.state_mut().run("edit.select_none", json!({})).is_ok());
@@ -239,7 +242,7 @@ fn a_quit_cancels_the_split_and_waits_for_it() {
     let mut h = harness(&dir, (0.35, 0.36), gated(started_tx, go_rx));
     let a = clip_of(&h, "a");
     assert!(!soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
-    soundcraft_ui_egui::stems::start(h.state_mut(), a);
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": a.0})).unwrap();
     started.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
     assert!(h.state().split.as_ref().is_some_and(|j| j.cancelling()));
@@ -258,7 +261,7 @@ fn stem_faders_show_on_split_tracks_only_and_set_the_stem_params() {
     h.run_steps(3);
     assert!(h.query_by_label("a vocals stem").is_none(), "no faders before a split");
     let clip = clip_of(&h, "a");
-    soundcraft_ui_egui::stems::start(h.state_mut(), clip);
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": clip.0})).unwrap();
     step_until_split(&mut h);
     h.run_steps(3);
     for stem in STEMS {
@@ -349,38 +352,195 @@ fn clear_stem_cache_asks_with_the_size_and_clears_only_on_confirm() {
     let mut h = harness(&dir, (0.41, 0.42), fake(&calls));
     assert!(menus::ui_aliases().iter().any(|(path, id)| *path == "DJ > Clear Stem Cache..." && *id == "dj.clear_stem_cache"));
     let a = clip_of(&h, "a");
-    soundcraft_ui_egui::stems::start(h.state_mut(), a);
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": a.0})).unwrap();
     step_until_split(&mut h);
     let entries = |dir: &Path| std::fs::read_dir(dir.join("cache")).unwrap().filter(|e| e.as_ref().unwrap().path().is_dir()).count();
     assert_eq!(entries(&dir), 1);
 
-    menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
-    let message = match &h.state().dialogs.open {
-        Some(Dialog::ClearStemCache { message }) => message.clone(),
+    let dialog = |h: &Harness<'_, SoundApp>| match &h.state().dialogs.open {
+        Some(Dialog::ClearStemCache { message, refused }) => (message.clone(), *refused),
         other => panic!("{other:?}"),
     };
+    // The session plays the cached stems: the dialog says why it can't clear, and offers no Clear.
+    menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
+    let (message, refused) = dialog(&h);
+    assert!(refused && message.contains("uses cached stems"), "{message}");
+    h.run_steps(2);
+    assert!(h.query_by_label("Clear").is_none());
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    assert!(h.state().dialogs.open.is_none());
+    assert_eq!(entries(&dir), 1);
+
+    soundcraft_ui_egui::stems::remove(h.state_mut(), a);
+    menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
+    let (message, refused) = dialog(&h);
     // Four FLACs and their stems.json.
-    assert!(message.starts_with("Delete every cached stem: ") && message.contains(" in 5 file(s)?"), "{message}");
+    assert!(!refused && message.starts_with("Delete every cached stem: ") && message.contains(" in 5 file(s)?"), "{message}");
     h.run_steps(2);
     h.get_by_label("Cancel").click();
     h.run_steps(2);
     assert!(h.state().dialogs.open.is_none());
     assert_eq!(entries(&dir), 1, "Cancel cleared the cache");
 
-    // The session still plays the cached stems: refused, nothing removed.
-    menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
-    h.run_steps(2);
-    h.get_by_label("Clear").click();
-    h.run_steps(2);
-    assert!(h.state().ui.status.contains("uses cached stems"), "{}", h.state().ui.status);
-    assert_eq!(entries(&dir), 1);
-
-    soundcraft_ui_egui::stems::remove(h.state_mut(), a);
     menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
     h.run_steps(2);
     h.get_by_label("Clear").click();
     h.run_steps(2);
     assert!(h.state().ui.status.starts_with("Cleared the stem cache: 5 file(s)"), "{}", h.state().ui.status);
     assert_eq!(entries(&dir), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn agents_split_in_the_background_and_clear_the_apps_cache() {
+    let dir = scratch("agent");
+    let calls = Arc::new(AtomicUsize::new(0));
+    // The app's cache and runner are scratch ones before anything runs.
+    let mut h = harness(&dir, (0.43, 0.44), fake(&calls));
+    let a = clip_of(&h, "a");
+    let started = h.state_mut().run("dj.split_stems", json!({"clip": a.0})).unwrap();
+    assert_eq!(started, json!({"clip": a.0, "started": true}));
+    assert!(h.state().split.is_some(), "the split runs in the background");
+    step_until_split(&mut h);
+    assert!(split(&h, a));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the app's runner split it");
+    let again = h.state_mut().run("dj.split_stems", json!({"clip": a.0})).unwrap();
+    assert_eq!(again["already"], true);
+    let err = h.state_mut().run("dj.clear_stem_cache", json!({})).unwrap_err();
+    assert!(err.contains("uses cached stems"), "{err}");
+    soundcraft_ui_egui::stems::remove(h.state_mut(), a);
+    let cleared = h.state_mut().run("dj.clear_stem_cache", json!({})).unwrap();
+    assert_eq!(cleared["files"], 5, "the app's scratch cache was cleared");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_split_whose_session_was_replaced_is_not_applied() {
+    let dir = scratch("replaced");
+    let (started_tx, started) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel();
+    let mut h = harness(&dir, (0.45, 0.46), gated(started_tx, go_rx));
+    let a = clip_of(&h, "a");
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": a.0})).unwrap();
+    started.recv_timeout(Duration::from_secs(60)).unwrap();
+    // Not through `run` (which refuses it): the session is replaced anyway.
+    h.state_mut().engine.replace_session(soundcraft_engine::model::Session::default());
+    h.run_steps(1);
+    go.send(()).unwrap();
+    step_until_split(&mut h);
+    assert!(h.state().ui.status.contains("after its session was closed"), "{}", h.state().ui.status);
+    assert!(h.state().engine.session().tracks.is_empty());
+    assert!(!h.state().engine.can_undo());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_automated_stem_fader_shows_its_lane_and_touch_records_stem_moves() {
+    let dir = scratch("automated");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut h = harness(&dir, (0.47, 0.48), fake(&calls));
+    let clip = clip_of(&h, "a");
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": clip.0})).unwrap();
+    step_until_split(&mut h);
+    let a = track(&h, "a");
+    let app = h.state_mut();
+    app.run("window.mix", json!({})).unwrap();
+    app.run("automation.set_point", json!({"track": a.0, "param": "stem:bass", "at": 0, "value": -20.0})).unwrap();
+    h.run_steps(3);
+    let shown = |h: &Harness<'_, SoundApp>, stem: &str| h.get_by_label(&format!("a {stem} stem")).accesskit_node().numeric_value();
+    // The lane, not the fader (0 dB), sets the bass: the control shows the lane's value.
+    assert_eq!(shown(&h, "bass"), Some(-20.0));
+    assert_eq!(shown(&h, "drums"), Some(0.0));
+
+    // Touch records a stem fader move into its lane while playing.
+    h.state_mut().run("mix.automation_mode", json!({"track": a.0, "mode": "touch"})).unwrap();
+    h.state_mut().run("transport.play", json!({})).unwrap();
+    h.run_steps(2);
+    let r = h.get_by_label("a vocals stem").rect();
+    let top = pos2(r.center().x, r.min.y + r.height() * 0.1);
+    h.drag_at(top);
+    h.run_steps(1);
+    for k in 1..=6 {
+        h.hover_at(pos2(top.x, top.y + 6.0 * k as f32));
+        h.state_mut().engine.transport.position += 4_800;
+        h.run_steps(1);
+    }
+    h.drop_at(pos2(top.x, top.y + 36.0));
+    h.run_steps(2);
+    h.state_mut().run("transport.stop", json!({})).unwrap();
+    h.run_steps(2);
+    let s = h.state().engine.session();
+    let points = s.track(a).unwrap().lane(&soundcraft_engine::model::AutoParam::Stem(0)).map_or(0, |l| l.points.len());
+    assert!(points >= 2, "{points} stem:vocals points recorded");
+    let drums = s.track(a).unwrap().lane(&soundcraft_engine::model::AutoParam::Stem(1));
+    assert!(drums.is_none_or(|l| l.points.is_empty()), "an untouched stem is not written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stem_unmuted_elsewhere_forgets_its_old_level() {
+    let dir = scratch("forget");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut h = harness(&dir, (0.49, 0.50), fake(&calls));
+    let clip = clip_of(&h, "a");
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": clip.0})).unwrap();
+    step_until_split(&mut h);
+    let a = track(&h, "a");
+    h.state_mut().run("window.mix", json!({})).unwrap();
+    let gain = |h: &mut Harness<'_, SoundApp>, db: f64| {
+        h.state_mut().run("mix.stem_gain", json!({"track": a.0, "stem": "drums", "db": db})).unwrap();
+        h.run_steps(2);
+    };
+    gain(&mut h, -9.0);
+    h.get_by_label("a drums stem mute").click();
+    h.run_steps(2);
+    // Un-muted and muted again by commands: the -9 dB is stale.
+    gain(&mut h, -3.0);
+    gain(&mut h, -144.0);
+    h.get_by_label("a drums stem mute").click();
+    h.run_steps(2);
+    assert_eq!(h.state().engine.session().track(a).unwrap().mixer.stem_gain_db[1], 0.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_running_prep_does_not_hold_back_clear_stem_cache() {
+    let dir = scratch("prep-clear");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut h = harness(&dir, (0.51, 0.52), fake(&calls));
+    // A prep of one fixture that waits in its analysis until told to go on.
+    let src = dir.join("set");
+    std::fs::create_dir_all(&src).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../audio-io/tests/fixtures/mp3/cbr64_44k_mono.mp3");
+    std::fs::copy(fixture, src.join("one.mp3")).unwrap();
+    let (reached_tx, reached) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+    let analyse: soundcraft_engine::cmd::PrepAnalyse = Arc::new(move |_: &str, _: &dyn Fn() -> bool| {
+        reached_tx.lock().unwrap().send(()).unwrap();
+        go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
+        Err::<serde_json::Value, String>("no analysis here".into())
+    });
+    let s = soundcraft_engine::model::Session::default();
+    let out = dir.join("out");
+    let job = soundcraft_engine::cmd::prep_start(&s, src.to_str().unwrap(), Some(out.to_str().unwrap()), -14.0, -1.0, analyse).unwrap();
+    h.state_mut().prep = Some(job);
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    // Splitting waits for the prep; clearing the (scratch) cache doesn't.
+    let clip = clip_of(&h, "a");
+    let err = h.state_mut().run("dj.split_stems", json!({"clip": clip.0})).unwrap_err();
+    assert_eq!(err, "Wait for the prep to finish (or cancel it)");
+    let cleared = h.state_mut().run("dj.clear_stem_cache", json!({})).unwrap();
+    assert_eq!(cleared["files"], 0);
+    menus::invoke_menu(h.state_mut(), "dj.clear_stem_cache", "DJ > Clear Stem Cache...");
+    assert!(matches!(&h.state().dialogs.open, Some(Dialog::ClearStemCache { refused: false, .. })));
+    go.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(120);
+    while h.state().prep.is_some() {
+        assert!(Instant::now() < until, "the prep never ended");
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

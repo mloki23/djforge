@@ -285,7 +285,7 @@ pub enum Gesture {
     Fade { clip: soundcraft_model::ClipId, track: TrackId, fade_in: bool, to: Samples },
     FadeCurve { clip: soundcraft_model::ClipId, fade_in: bool, curvature: f32, anchor: (f32, f32), height: f32 },
     Scrub { last: Samples },
-    Fader { track: TrackId, start_db: f32 },
+    Fader { track: TrackId, start_db: f32, stem: Option<u8> }, // a mixer fader drag; `stem`: that stem's fader
     ClipGain { clip: soundcraft_model::ClipId, track: TrackId, pos: f32, anchor: (f32, f32), fine: bool, fader_bottom: egui::Pos2 },
     Pencil { track: TrackId, points: Vec<(Samples, f32)> },
     MidiClip { track: TrackId, from: Samples, to: Samples },
@@ -363,8 +363,8 @@ pub struct SoundApp {
     pub quit_requested: bool,
     /// Reset floating-window positions next frame (Window › Arrange).
     pub arrange_request: bool,
-    /// Tracks whose automation was touched during this pass (Touch/Latch writing).
-    touched: std::collections::HashSet<TrackId>,
+    /// The tracks' faders (volume, stems) touched during this pass (Touch/Latch writing).
+    touched: std::collections::HashSet<(TrackId, soundcraft_model::AutoParam)>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     pub frame_ms: f32,
@@ -392,6 +392,10 @@ pub struct SoundApp {
     pub stem_runner: soundcraft_engine::cmd::stems::StemRunner,
     /// The level each muted stem fader had, restored when it is un-muted.
     pub(crate) stem_unmute: HashMap<(TrackId, usize), f32>,
+    /// Counts replaced sessions, so a split started in one is never applied to another.
+    pub(crate) session_generation: u64,
+    /// The session generation the running split started in.
+    pub(crate) split_generation: u64,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -474,6 +478,8 @@ impl SoundApp {
             stem_cache: soundcraft_engine::cmd::stems::StemCache::at_default(),
             stem_runner: soundcraft_engine::cmd::stems::demucs_runner(),
             stem_unmute: HashMap::new(),
+            session_generation: 0,
+            split_generation: 0,
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -494,6 +500,14 @@ impl SoundApp {
         }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
+        }
+        // Splits run in the background, and both use the app's stem cache (and Demucs runner),
+        // also when an agent or a script asks.
+        if id == "dj.split_stems" {
+            return stems::start(self, &params);
+        }
+        if id == "dj.clear_stem_cache" {
+            return stems::clear(self);
         }
         if id.starts_with("session.save") || id.starts_with("file.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
@@ -993,12 +1007,13 @@ impl SoundApp {
         }
     }
 
-    /// While playing, record volume automation from fader positions for tracks in Write mode, and
-    /// for Touch/Latch tracks whose fader is (or, for Latch, was) being moved. Each point replaces the
+    /// While playing, record automation from fader positions: the volume fader, and on tracks
+    /// with split clips the four stem faders (`stem:*` lanes). Tracks in Write mode write them
+    /// all; in Touch/Latch, the fader being (or, for Latch, once) moved. Each point replaces the
     /// automation since the previous one, and Stop writes a last point. A pass and whatever is
     /// dragged during it, its fader included, are one undo step.
     fn write_automation(&mut self, ctx: &egui::Context) {
-        use soundcraft_model::AutomationMode as M;
+        use soundcraft_model::{AutoParam, AutomationMode as M};
         const PASS: &str = "automation_pass";
         let playing = self.is_playing();
         let may_write =
@@ -1015,33 +1030,40 @@ impl SoundApp {
         }
         let from = std::mem::replace(&mut self.last_write_at, if playing { pos } else { i64::MIN });
         let dragging = ctx.input(|i| i.pointer.any_down());
-        let fader_track = match &self.gesture {
-            Some(Gesture::Fader { track, .. }) => Some(*track),
+        let fader = match &self.gesture {
+            Some(Gesture::Fader { track, stem, .. }) => Some((*track, stem.map_or(AutoParam::Volume, AutoParam::Stem))),
             _ => None,
         };
-        let writes: Vec<(TrackId, f32)> = self
-            .engine
-            .session()
-            .tracks
-            .iter()
-            .filter_map(|t| {
-                let m = t.mixer.automation_mode;
-                let touched_now = dragging && fader_track == Some(t.id);
-                let write = match m {
+        let mut writes: Vec<(TrackId, AutoParam, f32)> = Vec::new();
+        for t in &self.engine.session().tracks {
+            let mode = t.mixer.automation_mode;
+            if !matches!(mode, M::Write | M::Touch | M::Latch | M::TouchLatch) {
+                continue;
+            }
+            let mut faders = vec![(AutoParam::Volume, t.mixer.volume_db)];
+            if stems::has_split(t) {
+                faders.extend(t.mixer.stem_gain_db.iter().zip(0u8..).map(|(db, i)| (AutoParam::Stem(i), *db)));
+            }
+            for (param, value) in faders {
+                let key = (t.id, param);
+                let touched_now = dragging && fader.as_ref() == Some(&key);
+                let write = match mode {
                     M::Write => true,
                     M::Touch => touched_now,
-                    M::Latch | M::TouchLatch => touched_now || self.touched.contains(&t.id),
-                    _ => false,
+                    _ => touched_now || self.touched.contains(&key),
                 };
-                write.then_some((t.id, t.mixer.volume_db))
-            })
-            .collect();
-        for (t, v) in writes {
-            self.touched.insert(t);
-            let mut point = serde_json::json!({"track": t.0, "param": "volume", "at": pos, "value": v});
+                if write {
+                    writes.push((key.0, key.1, value));
+                }
+            }
+        }
+        for (t, param, v) in writes {
+            let id = edit_window::automation_id(&param);
+            let mut point = serde_json::json!({"track": t.0, "param": id, "at": pos, "value": v});
             if from != i64::MIN {
                 point["from"] = from.into();
             }
+            self.touched.insert((t, param));
             let _ = self.engine.execute_merged("automation.set_point", &point, PASS);
         }
         if !playing {
@@ -1084,6 +1106,10 @@ impl SoundApp {
                     self.gesture = None;
                     self.touched.clear();
                     self.last_write_at = i64::MIN;
+                    // A split started in the old session is never applied to this one, and the
+                    // muted stem faders' levels belong to the old one's tracks.
+                    self.session_generation = self.session_generation.wrapping_add(1);
+                    self.stem_unmute.clear();
                     self.edit_layout.follow_hold = false;
                     self.meters.clear();
                     self.main_meter = MeterDisplay::default();
@@ -1216,7 +1242,6 @@ impl SoundApp {
         self.apply_editor_edits();
         bounce::step(self, ctx);
         prep::step(self, ctx);
-        stems::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
@@ -1230,6 +1255,8 @@ impl SoundApp {
         self.watch_input();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
+        // After the transport, which notes a replaced session.
+        stems::step(self, ctx);
         if self.engine.revision != self.last_rev {
             self.last_rev = self.engine.revision;
             if let Some(p) = &self.player {
