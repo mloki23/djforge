@@ -457,7 +457,10 @@ fn clear_removes_only_cache_entries() {
     for kept in ["0123456789abcdef-1-other", ".tmp-mine", ".tmp-0123456789abcdef-1-htdemucs-9", &live] {
         std::fs::create_dir_all(root.join(kept)).unwrap();
     }
+    // The size counts the finished entries: what Clear Stem Cache frees of the stems.
+    assert_eq!(stems::stem_cache_size(&c).unwrap(), (5, entry_bytes));
     assert_eq!(stems::clear(&c).unwrap(), (6, entry_bytes + 10));
+    assert_eq!(stems::stem_cache_size(&c).unwrap(), (0, 0));
     let mut want = vec![".tmp-0123456789abcdef-1-htdemucs-9", &live, ".tmp-mine", "0123456789abcdef-1-other", "mine", "notes.txt"];
     want.sort_unstable();
     assert_eq!(names(root), want);
@@ -466,6 +469,7 @@ fn clear_removes_only_cache_entries() {
     assert_eq!(stems::clear(&c).unwrap(), (0, 0));
     // A cache never used is empty.
     assert_eq!(stems::clear(&StemCache::new(dir.join("nowhere"))).unwrap(), (0, 0));
+    assert_eq!(stems::stem_cache_size(&StemCache::new(dir.join("nowhere"))).unwrap(), (0, 0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

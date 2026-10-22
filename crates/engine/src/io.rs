@@ -2076,18 +2076,6 @@ pub(crate) fn rename_path(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Resul
 /// automation write root when there is one. Links are removed, never followed. Returns how many
 /// files went and their bytes; nothing at `path` is `(0, 0)`.
 pub(crate) fn remove_tree(path: impl AsRef<Path>) -> Result<(usize, u64)> {
-    /// Files and bytes under folder `dir`, not following links.
-    fn count(dir: &Path) -> (usize, u64) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
-        entries.filter_map(|e| e.ok()).fold((0, 0), |(n, b), e| match std::fs::symlink_metadata(e.path()) {
-            Ok(m) if m.is_dir() => {
-                let (n2, b2) = count(&e.path());
-                (n + n2, b.saturating_add(b2))
-            }
-            Ok(m) => (n + 1, b.saturating_add(m.len())),
-            Err(_) => (n, b),
-        })
-    }
     let path = path.as_ref();
     crate::file_access::check_write(path).map_err(EngineError::Io)?;
     let err = |err: std::io::Error| EngineError::Io(format!("{}: {err}", path.display()));
@@ -2097,7 +2085,7 @@ pub(crate) fn remove_tree(path: impl AsRef<Path>) -> Result<(usize, u64)> {
         Err(e) => return Err(err(e)),
     };
     if meta.is_dir() {
-        let counted = count(path);
+        let counted = count_tree(path);
         std::fs::remove_dir_all(path).map_err(err)?;
         Ok(counted)
     } else {
@@ -2105,6 +2093,27 @@ pub(crate) fn remove_tree(path: impl AsRef<Path>) -> Result<(usize, u64)> {
         std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path)).map_err(err)?;
         Ok((1, meta.len()))
     }
+}
+
+/// Files and bytes under folder `dir`, not following links.
+fn count_tree(dir: &Path) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    entries.filter_map(|e| e.ok()).fold((0, 0), |(n, b), e| match std::fs::symlink_metadata(e.path()) {
+        Ok(m) if m.is_dir() => {
+            let (n2, b2) = count_tree(&e.path());
+            (n + n2, b.saturating_add(b2))
+        }
+        Ok(m) => (n + 1, b.saturating_add(m.len())),
+        Err(_) => (n, b),
+    })
+}
+
+/// The files under folder `path` and their bytes (links not followed), inside the automation
+/// read root when there is one; `(0, 0)` when there is nothing there.
+pub(crate) fn tree_size(path: impl AsRef<Path>) -> Result<(usize, u64)> {
+    let path = path.as_ref();
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    Ok(count_tree(path))
 }
 
 #[cfg(test)]

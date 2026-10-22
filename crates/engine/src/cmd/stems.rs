@@ -1451,6 +1451,30 @@ fn is_top(path: &Path) -> bool {
     !path.components().any(|c| matches!(c, Component::Normal(_)))
 }
 
+/// The cached stems in `cache` (its entries, not the folders of splits under way): how many
+/// files and their bytes, what [`clear`] would remove of them. `(0, 0)` when there is no cache.
+pub fn stem_cache_size(cache: &StemCache) -> Result<(usize, u64), String> {
+    cache_io(|| {
+        if !io::path_exists(&cache.root) {
+            return Ok((0, 0));
+        }
+        let (mut files, mut bytes) = (0, 0u64);
+        for entry in io::list_entries(&cache.root).map_err(|e| e.to_string())? {
+            if entry.file_name().and_then(|n| n.to_str()).is_some_and(is_key) {
+                let (n, b) = io::tree_size(&entry).map_err(|e| e.to_string())?;
+                files += n;
+                bytes = bytes.saturating_add(b);
+            }
+        }
+        Ok((files, bytes))
+    })
+}
+
+/// [`stem_cache_size`] of the stem cache at [`default_root`].
+pub fn default_stem_cache_size() -> Result<(usize, u64), String> {
+    stem_cache_size(&StemCache::at_default()?)
+}
+
 /// Empties the stem cache: removes the entries (folders named like keys) and the temporary
 /// folders of splits (`.tmp-<key>-<pid>-<n>`, except splits under way: this process's, and
 /// another process's while it runs) directly
