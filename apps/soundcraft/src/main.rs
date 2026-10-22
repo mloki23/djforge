@@ -250,7 +250,13 @@ fn main() -> eframe::Result {
         }
     }
 
-    let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
+    let mut engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
+    // The app's own stem cache: splits go there and sessions read their stems from it. Only the
+    // app's entry points set it up, so nothing else (no test) can reach it.
+    match soundcraft_engine::cmd::stems::StemCache::at_default() {
+        Ok(cache) => engine.set_stems(cache, soundcraft_engine::cmd::stems::demucs_runner()),
+        Err(e) => log::warn!("no stem cache: {e}"),
+    }
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

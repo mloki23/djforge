@@ -385,11 +385,6 @@ pub struct SoundApp {
     pub prep_quit: bool,
     /// The Split into Stems run in progress, on its own thread.
     pub split: Option<soundcraft_engine::cmd::stems::SplitJob>,
-    /// Where Split into Stems caches stems and Clear Stem Cache empties (an error when the app's
-    /// cache folder can't be found). Tests point it at a scratch folder.
-    pub stem_cache: Result<soundcraft_engine::cmd::stems::StemCache, String>,
-    /// Demucs for Split into Stems; tests swap in a fake so no sidecar runs.
-    pub stem_runner: soundcraft_engine::cmd::stems::StemRunner,
     /// The level each muted stem fader had, restored when it is un-muted.
     pub(crate) stem_unmute: HashMap<(TrackId, usize), f32>,
     /// Counts replaced sessions, so a split started in one is never applied to another.
@@ -475,8 +470,6 @@ impl SoundApp {
             prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
             prep_quit: false,
             split: None,
-            stem_cache: soundcraft_engine::cmd::stems::StemCache::at_default(),
-            stem_runner: soundcraft_engine::cmd::stems::demucs_runner(),
             stem_unmute: HashMap::new(),
             session_generation: 0,
             split_generation: 0,
@@ -1008,8 +1001,9 @@ impl SoundApp {
     }
 
     /// While playing, record automation from fader positions: the volume fader, and on tracks
-    /// with split clips the four stem faders (`stem:*` lanes). Tracks in Write mode write them
-    /// all; in Touch/Latch, the fader being (or, for Latch, once) moved. Each point replaces the
+    /// with split clips the four stem faders (`stem:*` lanes). Tracks in Write mode write the
+    /// volume throughout and a stem fader while it is moved; in Touch/Latch, the fader being
+    /// (or, for Latch, once) moved. Each point replaces the
     /// automation since the previous one, and Stop writes a last point. A pass and whatever is
     /// dragged during it, its fader included, are one undo step.
     fn write_automation(&mut self, ctx: &egui::Context) {
@@ -1048,7 +1042,9 @@ impl SoundApp {
                 let key = (t.id, param);
                 let touched_now = dragging && fader.as_ref() == Some(&key);
                 let write = match mode {
-                    M::Write => true,
+                    // Write rides the volume throughout; a stem lane only while its fader is
+                    // moved, so hand-drawn stem lanes survive a Write pass.
+                    M::Write => !matches!(key.1, AutoParam::Stem(_)) || touched_now,
                     M::Touch => touched_now,
                     _ => touched_now || self.touched.contains(&key),
                 };

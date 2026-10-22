@@ -98,7 +98,7 @@ fn main() -> ExitCode {
 fn info(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else { return fail("info FILE") };
     if path.ends_with(".scraft") {
-        let mut e = Engine::default();
+        let mut e = with_stems(Engine::default());
         match soundcraft_engine::io::open_session_checked(&mut e, path) {
             Ok(report) => warn_media(&report),
             Err(err) => return fail(err),
@@ -198,16 +198,26 @@ fn warn_media(report: &soundcraft_engine::io::OpenReport) {
     }
 }
 
+/// `e` with the app's stem cache and Demucs set up (splits go there, and sessions read their
+/// stems from it), when its folder can be found.
+fn with_stems(mut e: Engine) -> Engine {
+    match soundcraft_engine::cmd::stems::StemCache::at_default() {
+        Ok(cache) => e.set_stems(cache, soundcraft_engine::cmd::stems::demucs_runner()),
+        Err(err) => eprintln!("note: no stem cache: {err}"),
+    }
+    e
+}
+
 fn load_engine(args: &[String]) -> Result<Engine, String> {
     if let Some(p) = arg_value(args, "--in") {
-        let mut e = Engine::default();
+        let mut e = with_stems(Engine::default());
         let report = soundcraft_engine::io::open_session_checked(&mut e, &p).map_err(|e| e.to_string())?;
         warn_media(&report);
         Ok(e)
     } else if args.iter().any(|a| a == "--demo" || a == "--sample") {
-        Ok(soundcraft_engine::demo::demo_engine())
+        Ok(with_stems(soundcraft_engine::demo::demo_engine()))
     } else {
-        Ok(Engine::default())
+        Ok(with_stems(Engine::default()))
     }
 }
 
@@ -440,7 +450,7 @@ fn mcp(args: &[String]) -> ExitCode {
         s.serve(stdin.lock(), stdout.lock())
     } else {
         // `--demo` is the operator's own choice, made before the roots come into force.
-        let e = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
+        let e = with_stems(if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() });
         let mut h = Headless::new(e);
         if let Some(roots) = roots {
             // Every thread of this process, not only the server's: nothing reaches past the roots.

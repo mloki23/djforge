@@ -24,7 +24,8 @@ const MAX_DB: f32 = 6.0;
 /// clip, so the strips' rows line up).
 pub(crate) const FADERS_H: f32 = 104.0;
 
-/// Starts `dj.split_stems` for `params` (`{clip}`) in `app.stem_cache` with `app.stem_runner`,
+/// Starts `dj.split_stems` for `params` (`{clip}`) in the engine's stem cache with its runner
+/// (`Engine::set_stems`: the desktop app sets the real ones, tests a scratch cache),
 /// from the clip menu or `app.run` (agents, scripts): the checks are made here, the split runs
 /// on another thread and [`step`] applies it. Returns `{clip, started: true}`, or
 /// `{clip, already: true, key}` when the clip is split already; a refusal also goes to the
@@ -42,9 +43,7 @@ fn start_job(app: &mut SoundApp, params: &Value) -> Result<Value, String> {
     if crate::prep::refuses_command(app, "dj.split_stems") {
         return Err(app.ui.status.clone());
     }
-    let cache = app.stem_cache.clone().map_err(|e| format!("No stem cache: {e}"))?;
-    let runner = std::sync::Arc::clone(&app.stem_runner);
-    match stems::split_job_in(&app.engine, params, cache, runner).map_err(|e| e.to_string())? {
+    match stems::split_job(&app.engine, params).map_err(|e| e.to_string())? {
         Some(job) => {
             let clip = job.clip();
             app.split = Some(job);
@@ -346,13 +345,13 @@ pub fn ask_clear(app: &mut SoundApp) {
     if crate::prep::refuses_command(app, "dj.clear_stem_cache") {
         return;
     }
-    let (message, refused) = match &app.stem_cache {
-        Ok(cache) => match stems::clear_stem_cache_refusal(&app.engine, cache) {
+    let (message, refused) = match app.engine.stems().map(|x| &x.cache) {
+        Some(cache) => match stems::clear_stem_cache_refusal(&app.engine, cache) {
             Some(why) => (format!("The stem cache can't be cleared now: {why}."), true),
             None => (clear_message(stems::stem_cache_size(cache)), false),
         },
-        Err(e) => {
-            app.ui.status = format!("No stem cache: {e}");
+        None => {
+            app.ui.status = "No stem cache is set up".into();
             return;
         }
     };
@@ -381,16 +380,13 @@ pub(crate) fn bytes_text(bytes: u64) -> String {
     }
 }
 
-/// Runs Clear Stem Cache (`dj.clear_stem_cache`) on `app.stem_cache`: after the confirm, or
+/// Runs Clear Stem Cache (`dj.clear_stem_cache`) on the engine's stem cache: after the confirm, or
 /// from `app.run`. Returns `{files, bytes}`; the status line says what was freed, or why not.
 pub fn clear(app: &mut SoundApp) -> Result<Value, String> {
     if crate::prep::refuses_command(app, "dj.clear_stem_cache") {
         return Err(app.ui.status.clone());
     }
-    let result = match &app.stem_cache {
-        Ok(cache) => stems::clear_stem_cache_in(&app.engine, cache).map_err(|e| e.to_string()),
-        Err(e) => Err(format!("No stem cache: {e}")),
-    };
+    let result = app.engine.execute("dj.clear_stem_cache", &json!({})).map_err(|e| e.to_string());
     app.ui.status = match &result {
         Ok(v) => format!("Cleared the stem cache: {} file(s), {}", v["files"], bytes_text(v["bytes"].as_u64().unwrap_or(0))),
         Err(e) => {

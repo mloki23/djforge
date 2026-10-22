@@ -270,8 +270,10 @@ fn a_reopened_session_keeps_its_stems_playable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A stem file gone when the session reopens: the clip plays its own audio (not silence), and
+/// the open report says so.
 #[test]
-fn a_stem_file_gone_on_reopen_shows_in_the_health_report() {
+fn a_stem_file_gone_on_reopen_unsplits_the_clip_and_says_so() {
     const LEVEL: f64 = 0.93;
     let dir = scratch("health");
     let path = source(&dir, "track.wav", LEVEL);
@@ -283,10 +285,12 @@ fn a_stem_file_gone_on_reopen_shows_in_the_health_report() {
     std::fs::remove_file(c.root().join(&key).join("drums.flac")).unwrap();
     let mut r = Engine::default();
     let opened = run(&mut r, "session.open", json!({"path": set_path}));
-    assert!(opened["missing"].to_string().contains("drums.flac"), "{opened}");
+    let missing = opened["missing"].to_string();
+    assert!(missing.contains("drums.flac"), "{opened}");
+    assert!(missing.contains("track: stems missing — the clip plays its own audio; split it again"), "{opened}");
+    assert!(stems_of(&r, a).is_none());
     let health = run(&mut r, "session.audio_health", json!({}));
-    let issues: Vec<&Value> = health["issues"].as_array().unwrap().iter().filter(|i| i["stem"] == "drums").collect();
-    assert!(!issues.is_empty() && issues.iter().all(|i| i["code"] == "unavailable_audio"), "{health}");
+    assert_eq!(health["healthy"], true, "{health}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -523,6 +527,7 @@ fn crafted_stem_paths_are_matched_by_where_they_lead() {
     let key = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
     let set_path = dir.join("music").join("Set.scraft");
     run(&mut e, "session.save_as", json!({"path": set_path}));
+    let set = stems_of(&e, a).unwrap();
     let entry = c.root().join(&key);
     let elsewhere = dir.join("elsewhere").join(&key);
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -545,10 +550,11 @@ fn crafted_stem_paths_are_matched_by_where_they_lead() {
     let roots = AutomationRoots::new(Some(&dir.join("music")), Some(&dir.join("music"))).unwrap();
     let mut r = Engine::default();
     let opened = confine(roots.as_ref(), || r.execute("session.open", &json!({"path": set_path}))).unwrap();
-    let missing = opened["missing"].as_array().unwrap();
-    assert_eq!(missing.len(), 1, "{opened}");
-    assert!(missing[0].as_str().unwrap().contains("outside the read root") && missing[0].as_str().unwrap().contains("elsewhere"), "{opened}");
-    let set = stems_of(&r, a).unwrap();
+    let missing: Vec<&str> = opened["missing"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let outside: Vec<&&str> = missing.iter().filter(|m| m.contains("outside the read root")).collect();
+    assert!(outside.len() == 1 && outside[0].contains("elsewhere"), "{opened}");
+    // The bass didn't load, so both clips play their own audio.
+    assert_eq!(missing.iter().filter(|m| m.contains("stems missing")).count(), 2, "{opened}");
     let loaded: Vec<bool> = set.sources.iter().map(|id| r.session().pool.get(*id).is_some()).collect();
     assert_eq!(loaded, [true, true, false, true], "vocals, drums, bass, other");
     let _ = std::fs::remove_dir_all(&dir);
@@ -851,11 +857,51 @@ fn a_split_under_way_keeps_its_cache_and_survives_its_entry_going() {
     let set = stems_of(&e, a).unwrap();
     assert!(set.sources.iter().all(|id| e.session().pool.get(*id).is_some_and(|x| x.frames() == RATE as usize)));
     assert!(!under_way(&e).contains("under way"));
-    // Dropping a job ends it too.
+    // A cancelled job, once ended, holds the cache no more.
     run(&mut e, "edit.undo", json!({}));
     let job = stems::split_job_in(&e, &json!({"clip": a.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), LEVEL)).unwrap().unwrap();
-    drop(job);
+    job.cancel();
+    let _ = job.wait();
     assert!(stems::clear_stem_cache_in(&e, &c).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dropping a job stops its split (Demucs sees the stop), and the cache stays in use until the
+/// split's thread has ended.
+#[test]
+fn a_dropped_split_stops_and_holds_its_cache_until_it_ends() {
+    const LEVEL: f64 = 0.74;
+    let dir = scratch("dropped");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (e, a, _) = two_decks(&path);
+    let c = cache(&dir);
+    let (stopped_tx, stopped) = std::sync::mpsc::channel();
+    let (go_tx, go) = std::sync::mpsc::channel::<()>();
+    let (stopped_tx, go) = (std::sync::Mutex::new(stopped_tx), std::sync::Mutex::new(go));
+    let waits: StemRunner = Arc::new(move |_: &Path, _: &Path, stop: &dyn Fn() -> bool| {
+        let started = std::time::Instant::now();
+        while !stop() {
+            assert!(started.elapsed().as_secs() < 30, "never stopped");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stopped_tx.lock().unwrap().send(()).unwrap();
+        // Still running: the cache is still in use.
+        let _ = go.lock().unwrap().recv_timeout(std::time::Duration::from_secs(30));
+        Err(CANCELLED.to_string())
+    });
+    let job = stems::split_job_in(&e, &json!({"clip": a.0}), c.clone(), waits).unwrap().unwrap();
+    while job.progress().stage != SEPARATING {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    drop(job);
+    stopped.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+    assert!(stems::clear_stem_cache_in(&e, &c).unwrap_err().to_string().contains("under way"));
+    go_tx.send(()).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while stems::clear_stem_cache_in(&e, &c).is_err() {
+        assert!(std::time::Instant::now() < until, "the split's thread never ended");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -925,5 +971,28 @@ fn masks_and_copy_names_are_tidy() {
     let two = new_track(&mut e, "Two");
     let r = run(&mut e, "dj.stem_copy", json!({"clip": first.0, "track": two, "mask": ["drums", "bass", "other"]}));
     assert_eq!(r["name"], "track (instrumental)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An engine nobody set a stem cache on splits nothing and clears nothing: no test, no agent and
+/// no hostile command can reach the app's real stem cache.
+#[test]
+fn without_a_stem_cache_split_and_clear_refuse() {
+    const LEVEL: f64 = 0.73;
+    let dir = scratch("no-cache");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    assert!(e.stems().is_none());
+    for (cmd, p) in [("dj.clear_stem_cache", json!({})), ("dj.split_stems", json!({"clip": a.0}))] {
+        let refused = err(&mut e, cmd, p);
+        assert!(refused.contains("no stem cache is set up"), "{cmd}: {refused}");
+    }
+    assert!(stems::split_job(&e, &json!({"clip": a.0})).err().unwrap().to_string().contains("no stem cache is set up"));
+    assert!(stems_of(&e, a).is_none());
+    // Set up, the engine splits into its own cache.
+    let c = cache(&dir);
+    e.set_stems(c.clone(), fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    let r = run(&mut e, "dj.split_stems", json!({"clip": a.0}));
+    assert!(c.root().join(r["key"].as_str().unwrap()).is_dir(), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }

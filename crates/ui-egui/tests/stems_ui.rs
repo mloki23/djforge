@@ -92,8 +92,7 @@ fn harness(dir: &Path, levels: (f32, f32), runner: StemRunner) -> Harness<'stati
     for (name, level) in [("a", levels.0), ("b", levels.1)] {
         app.run("file.import_audio", json!({"path": source(dir, name, level)})).unwrap();
     }
-    app.stem_cache = Ok(cache(dir));
-    app.stem_runner = runner;
+    app.engine.set_stems(cache(dir), runner);
     let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).with_max_steps(1_000).build_ui_state(
         |ui, app: &mut SoundApp| {
             app.logic(&ui.ctx().clone());
@@ -475,6 +474,52 @@ fn an_automated_stem_fader_shows_its_lane_and_touch_records_stem_moves() {
     assert!(points >= 2, "{points} stem:vocals points recorded");
     let drums = s.track(a).unwrap().lane(&soundcraft_engine::model::AutoParam::Stem(1));
     assert!(drums.is_none_or(|l| l.points.is_empty()), "an untouched stem is not written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Write pass rides the volume but writes a stem lane only while its fader moves: the
+/// hand-drawn bass lane survives, the moved vocals fader is recorded.
+#[test]
+fn write_mode_leaves_untouched_stem_lanes_alone() {
+    let dir = scratch("write");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut h = harness(&dir, (0.53, 0.54), fake(&calls));
+    let clip = clip_of(&h, "a");
+    soundcraft_ui_egui::stems::start(h.state_mut(), &json!({"clip": clip.0})).unwrap();
+    step_until_split(&mut h);
+    let a = track(&h, "a");
+    let app = h.state_mut();
+    app.run("window.mix", json!({})).unwrap();
+    for (at, v) in [(0, -20.0), (12_000, -6.0)] {
+        app.run("automation.set_point", json!({"track": a.0, "param": "stem:bass", "at": at, "value": v})).unwrap();
+    }
+    let bass = |h: &Harness<'_, SoundApp>| h.state().engine.session().track(a).unwrap().lane(&soundcraft_engine::model::AutoParam::Stem(2)).cloned();
+    let drawn = bass(&h);
+    h.state_mut().run("mix.automation_mode", json!({"track": a.0, "mode": "write"})).unwrap();
+    h.state_mut().run("transport.play", json!({})).unwrap();
+    h.run_steps(2);
+    let r = h.get_by_label("a vocals stem").rect();
+    let top = pos2(r.center().x, r.min.y + r.height() * 0.1);
+    h.drag_at(top);
+    h.run_steps(1);
+    for k in 1..=6 {
+        h.hover_at(pos2(top.x, top.y + 6.0 * k as f32));
+        h.state_mut().engine.transport.position += 4_800;
+        h.run_steps(1);
+    }
+    h.drop_at(pos2(top.x, top.y + 36.0));
+    h.run_steps(2);
+    h.state_mut().engine.transport.position += 4_800;
+    h.run_steps(2);
+    h.state_mut().run("transport.stop", json!({})).unwrap();
+    h.run_steps(2);
+    assert_eq!(bass(&h), drawn, "the drawn bass lane is untouched");
+    let s = h.state().engine.session();
+    let t = s.track(a).unwrap();
+    let points = |p: soundcraft_engine::model::AutoParam| t.lane(&p).map_or(0, |l| l.points.len());
+    assert!(points(soundcraft_engine::model::AutoParam::Stem(0)) >= 2, "the moved vocals fader is written");
+    assert!(points(soundcraft_engine::model::AutoParam::Volume) >= 2, "Write rides the volume");
+    assert_eq!(points(soundcraft_engine::model::AutoParam::Stem(1)), 0, "drums untouched");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

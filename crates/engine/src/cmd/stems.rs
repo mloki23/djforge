@@ -697,7 +697,7 @@ pub fn specs() -> Vec<super::CommandSpec> {
             "Split into Stems",
             [],
             None,
-            "{clip} — splits the audio file of the clip's source (it must be a readable file path; save a recorded take first) into vocals, drums, bass and other with Demucs `htdemucs`, cached by the file's content in the app's stem cache (a cached file is not split again), then gives the clip, and every other unsplit clip of the same source, the four stems in one undo step. Waits for Demucs (seconds to minutes when the file is not cached yet). Returns {clip, key, hit, scale_log2, clips: [ids given the stems], skipped: [{clip, key}: clips of the source already split from other stems], seconds}, or {clip, already: true, key} when the clip is split already",
+            "{clip} — splits the audio file of the clip's source (it must be a readable file path; save a recorded take first) into vocals, drums, bass and other with Demucs `htdemucs`, cached by the file's content in the app's stem cache (a cached file is not split again), then gives the clip, and every other unsplit clip of the same source, the four stems in one undo step. Waits for Demucs (seconds to minutes when the file is not cached yet). Returns {clip, key, hit, scale_log2, clips: [ids given the stems], skipped: [{clip, key}: clips of the source already split from other stems], seconds}, or {clip, already: true, key} when the clip is split already. Through the running app (its control channel) it starts a background job instead and returns {clip, started: true}: poll the clip (inspect it) until it has stems before using them. Refused when no stem cache is set up",
             super::always,
             split_stems
         ),
@@ -873,7 +873,7 @@ fn unsplit_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
 }
 
 fn clear_stem_cache(e: &mut Engine, _: &Value) -> crate::Result<Value> {
-    let cache = StemCache::at_default().map_err(|m| super::bad(CLEAR, m))?;
+    let cache = setup(e, CLEAR)?.cache;
     clear_stem_cache_in(e, &cache)
 }
 
@@ -970,22 +970,32 @@ fn used() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
 }
 
 /// Notes that a split uses the cache at `root`.
-fn use_root(root: &Path) {
+pub(crate) fn use_root(root: &Path) {
     let key = path_key(root);
     let mut roots = used();
     roots.retain(|r| path_key(r) != key);
     roots.insert(0, root.to_path_buf());
 }
 
-/// The caches stems are read from: those splits used here, most recent first, then the default.
+/// The caches stems are read from: those set up on an engine ([`Engine::set_stems`]) or used by
+/// a split here, most recent first. Never a cache nobody set up, not even [`default_root`].
 fn known_roots() -> Vec<PathBuf> {
-    let mut roots = used().clone();
-    if let Ok(root) = default_root()
-        && !roots.iter().any(|r| path_key(r) == path_key(&root))
-    {
-        roots.push(root);
-    }
-    roots
+    used().clone()
+}
+
+/// The stem cache and Demucs runner an engine splits with ([`Engine::set_stems`]).
+#[derive(Clone)]
+pub struct StemSetup {
+    pub cache: StemCache,
+    pub runner: StemRunner,
+}
+
+/// Why a split or a clear can't run on an engine without a stem cache.
+const NO_CACHE: &str = "no stem cache is set up";
+
+/// The engine's stem cache and runner, or the refusal of `cmd` without them.
+fn setup(e: &Engine, cmd: &str) -> crate::Result<StemSetup> {
+    e.stems().cloned().ok_or_else(|| super::bad(cmd, NO_CACHE))
 }
 
 /// `path` with `.` and `..` resolved by name, when that names a stem in a known stem cache:
@@ -1321,8 +1331,8 @@ fn split_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
     if let Some(set) = audio_clip(e.session(), clip, SPLIT)?.0.stems.as_ref() {
         return Ok(already(clip, &set.key));
     }
-    let cache = StemCache::at_default().map_err(|m| super::bad(SPLIT, m))?;
-    let Some(job) = split_job_in(e, p, cache, demucs_runner())? else {
+    let StemSetup { cache, runner } = setup(e, SPLIT)?;
+    let Some(job) = split_job_in(e, p, cache, runner)? else {
         // Checked above: the clip is not split.
         return Err(EngineError::Internal(SPLIT.into(), "the clip was split already".into()));
     };
@@ -1362,7 +1372,7 @@ pub struct Split {
     /// The automation roots in force when the split started.
     roots: Option<Arc<crate::file_access::AutomationRoots>>,
     /// Marks the split under way until it is applied or dropped.
-    live: Option<LiveSplit>,
+    live: Option<Arc<LiveSplit>>,
     cache: StemCache,
     files: StemFiles,
     loaded: Loaded,
@@ -1422,7 +1432,7 @@ pub struct SplitJob {
     shared: Arc<SplitShared>,
     clip: ClipId,
     /// Marks the split under way; handed to its [`Split`].
-    live: Option<LiveSplit>,
+    live: Option<Arc<LiveSplit>>,
     state: SplitState,
 }
 
@@ -1431,11 +1441,11 @@ enum SplitState {
     Ended(Option<Box<Result<Split, String>>>),
 }
 
-/// Starts the split `dj.split_stems` makes for `p`, in the stem cache at [`default_root`] with
-/// Demucs: see [`split_job_in`].
+/// Starts the split `dj.split_stems` makes for `p`, in the engine's stem cache with its runner
+/// ([`Engine::set_stems`]; refused without them): see [`split_job_in`].
 pub fn split_job(e: &Engine, p: &Value) -> crate::Result<Option<SplitJob>> {
-    let cache = StemCache::at_default().map_err(|m| super::bad(SPLIT, m))?;
-    split_job_in(e, p, cache, demucs_runner())
+    let StemSetup { cache, runner } = setup(e, SPLIT)?;
+    split_job_in(e, p, cache, runner)
 }
 
 /// Starts the split `dj.split_stems` makes for `p` (`{clip}`) in `cache`, separating with
@@ -1460,7 +1470,9 @@ pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner)
     };
     let name = c.name.clone();
     let origin = Origin::of(s, src, &file);
-    let live = LiveSplit::new(cache.root());
+    // Held by the job, its result and the worker, so the cache counts as in use until all end.
+    let live = Arc::new(LiveSplit::new(cache.root()));
+    let worker_live = Arc::clone(&live);
     // The roots in force now also apply when the split is applied.
     let roots = crate::file_access::current();
     let rate = s.sample_rate.hz();
@@ -1471,6 +1483,7 @@ pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner)
     let work = {
         let shared = Arc::clone(&shared);
         move || {
+            let _live = worker_live;
             if let Some((audio, file)) = check
                 && !io::file_holds(&audio, &file)
             {
@@ -1550,6 +1563,13 @@ fn joined(handle: std::thread::JoinHandle<Result<Split, String>>) -> Result<Spli
 /// A split's error as the engine reports it.
 fn failed(msg: String) -> EngineError {
     if msg == CANCELLED { EngineError::Io(CANCELLED.to_string()) } else { EngineError::Io(format!("{SPLIT}: {msg}")) }
+}
+
+impl Drop for SplitJob {
+    /// A job dropped before it ended stops its split (Demucs is killed).
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl SplitJob {
@@ -1633,11 +1653,6 @@ pub fn stem_cache_size(cache: &StemCache) -> Result<(usize, u64), String> {
         }
         Ok((files, bytes))
     })
-}
-
-/// [`stem_cache_size`] of the stem cache at [`default_root`].
-pub fn default_stem_cache_size() -> Result<(usize, u64), String> {
-    stem_cache_size(&StemCache::at_default()?)
 }
 
 /// Empties the stem cache: removes the entries (folders named like keys) and the temporary
@@ -1790,6 +1805,42 @@ mod tests {
     #[test]
     fn this_process_is_running() {
         assert!(pid_running(std::process::id()));
+    }
+
+    /// No test anywhere in the workspace builds the app's real stem cache: the incident of a
+    /// test run emptying it must never repeat. Only the apps' entry points call `at_default`.
+    #[test]
+    fn no_test_reaches_the_real_stem_cache() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() && !matches!(name.as_str(), "target" | ".git" | "node_modules") {
+                    walk(&path, out);
+                } else if name.ends_with(".rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let mut files = Vec::new();
+        for top in ["crates", "apps"] {
+            walk(&root.join(top), &mut files);
+        }
+        assert!(files.len() > 50, "{}", files.len());
+        let forbidden = ["at_default(", "StemCache::new(default_root", "StemCache::new(stems::default_root", "default_stem_cache"];
+        let mut offenders = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let in_tests_dir = f.components().any(|c| c.as_os_str() == "tests");
+            let test_code = if in_tests_dir { text.as_str() } else { text.split_once("#[cfg(test)]").map_or("", |(_, t)| t) };
+            for word in forbidden {
+                if test_code.lines().any(|l| l.contains(word) && !l.trim_start().starts_with("//") && !l.contains("let forbidden")) {
+                    offenders.push(format!("{}: {word}", f.display()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "tests must use a temporary stem cache: {offenders:#?}");
     }
 
     #[test]

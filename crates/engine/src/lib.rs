@@ -139,6 +139,9 @@ pub struct Engine {
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
     /// Kept out of the document so selecting never marks the session modified.
     pub last_selection: Option<(soundcraft_time::Range, Vec<TrackId>)>,
+    /// The stem cache and Demucs runner splits use: none until the app sets them up
+    /// ([`Engine::set_stems`]), so nothing (no test, no hostile command) reaches a real cache.
+    stems: Option<cmd::stems::StemSetup>,
 }
 
 impl Default for Engine {
@@ -171,7 +174,21 @@ impl Engine {
             merge_hold: None,
             messages: Vec::new(),
             last_selection: None,
+            stems: None,
         }
+    }
+
+    /// Splits into stems go into `cache` through `runner`, and sessions may read stems from
+    /// `cache` (a known stem cache). Only the app's entry points call this, with
+    /// `StemCache::at_default()`; tests give a temporary cache.
+    pub fn set_stems(&mut self, cache: cmd::stems::StemCache, runner: cmd::stems::StemRunner) {
+        cmd::stems::use_root(cache.root());
+        self.stems = Some(cmd::stems::StemSetup { cache, runner });
+    }
+
+    /// The stem cache and runner set up for this engine, if any.
+    pub fn stems(&self) -> Option<&cmd::stems::StemSetup> {
+        self.stems.as_ref()
     }
 
     pub fn session(&self) -> &Session {

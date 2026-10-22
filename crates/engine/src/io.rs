@@ -1505,6 +1505,13 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
         }
     }
     missing.extend(relink_videos(&mut s, links));
+    // A split clip whose stems didn't all load plays its own audio, and says so.
+    for c in s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).flat_map(|p| p.clips.iter_mut()) {
+        if c.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !s.pool.contains(*id))) {
+            c.unsplit();
+            missing.push(format!("{}: stems missing — the clip plays its own audio; split it again", c.name));
+        }
+    }
     s.folder = Some(dir);
     e.replace_session(s);
     e.path = Some(path.to_string());
