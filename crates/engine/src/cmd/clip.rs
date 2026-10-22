@@ -183,7 +183,17 @@ pub fn specs() -> Vec<CommandSpec> {
 fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
     let ratio = f64_or(p, "ratio", 1.0).clamp(0.05, 20.0);
-    super::more_util::refuse_split(e.session(), "clip.elastic_properties", &ids)?;
+    // Only clips on an Elastic track are rendered; elsewhere the ratio is just set, which a
+    // split clip takes like any other.
+    let s = e.session();
+    let rendered: Vec<ClipId> = ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            s.find_clip(*id).is_some_and(|(t, c)| c.is_audio() && s.track(t).and_then(|x| x.elastic.as_deref()).is_some_and(|a| a != "varispeed"))
+        })
+        .collect();
+    super::more_util::refuse_split(s, "clip.elastic_properties", &rendered)?;
     let s = e.session_mut();
     let mut rendered = 0;
     for id in &ids {

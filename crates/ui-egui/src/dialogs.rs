@@ -244,10 +244,15 @@ fn clear_message(s: &Session, clips: &[ClipId], sources: &[SourceId]) -> Option<
         ([], f) => count(f.len(), "file"),
         (c, f) => format!("{} and {}", count(c.len(), "clip"), count(f.len(), "file")),
     };
-    let mut text = format!("Remove {what} from the session?");
-    // Clips playing a file go with it; split clips using it only as a stem stay, unsplit.
+    // Clips playing a file go with it, and so do their stem files no other clip uses; split
+    // clips using it only as a stem stay, unsplit.
     let ids: std::collections::BTreeSet<SourceId> = files.iter().map(|f| f.id).collect();
     let effect = soundcraft_engine::cmd::clear_effect(s, &listed, &ids);
+    let stem_files = match effect.stem_files.len() {
+        0 => String::new(),
+        n => format!(" and {}", count(n, "stem file")),
+    };
+    let mut text = format!("Remove {what}{stem_files} from the session?");
     let used: Vec<(&str, (usize, usize))> =
         files.iter().map(|f| (f.name.as_str(), effect.of_file(s, &listed, f.id))).filter(|(_, (r, u))| r + u > 0).collect();
     let removed: usize = used.iter().map(|u| u.1.0).sum();
@@ -854,6 +859,16 @@ mod tests {
             message(&d),
             "Remove the file \"vocals\" from the session? It is used by a split clip on the timeline, which will lose its stems."
         );
+        // Clearing a split clip's own file takes its stem files too, and says so.
+        let kick = e.session().sources.iter().find(|f| f.name == "Kick").map(|f| f.id).unwrap();
+        let kick_clip = e.session().clips_using(kick).next().unwrap().id;
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 480]] };
+        let bass = soundcraft_engine::io::add_source(e.session_mut(), "bass", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let own = soundcraft_model::StemSet { scale_log2: 0, key: "k2".into(), sources: [bass; 4] };
+        e.session_mut().find_clip_mut(kick_clip).unwrap().stems = Some(own);
+        assert!(d.open_clear(&e, vec![], vec![kick]));
+        assert!(message(&d).starts_with("Remove the file \"Kick\" and 1 stem file from the session?"), "{}", message(&d));
+        e.session_mut().find_clip_mut(kick_clip).unwrap().unsplit();
         assert!(d.open_clear(&e, vec![], vec![hats]));
         assert_eq!(
             message(&d),

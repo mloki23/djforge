@@ -57,11 +57,13 @@ pub fn clear_effect(s: &Session, clips: &BTreeSet<ClipId>, sources: &BTreeSet<So
     let removed: BTreeSet<ClipId> = s.all_clips().filter(|c| clips.contains(&c.id) || own_cleared(c)).map(|c| c.id).collect();
     let unsplit: BTreeSet<ClipId> =
         s.all_clips().filter(|c| !removed.contains(&c.id) && c.audio_sources().skip(1).any(|f| sources.contains(&f))).map(|c| c.id).collect();
-    // What the clips left on the timeline still play: unsplit clips keep only their own file.
+    // What the clips left on the timeline still play (unsplit clips keep only their own file),
+    // and the Samplers' samples.
     let used: BTreeSet<SourceId> = s
         .all_clips()
         .filter(|c| !removed.contains(&c.id))
         .flat_map(|c| c.audio_sources().take(if unsplit.contains(&c.id) { 1 } else { usize::MAX }))
+        .chain(s.tracks.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)))
         .collect();
     let stem_files = s
         .all_clips()
@@ -97,6 +99,10 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
         let mut what = Vec::new();
         if removed > 0 {
             what.push(format!("{} will be removed", plural(removed, "clip")));
+        }
+        let stems = effect.stem_files.len();
+        if removed > 0 && stems > 0 {
+            what.push(format!("{} will go with {}", plural(stems, "stem file"), if removed == 1 { "it" } else { "them" }));
         }
         if unsplit > 0 {
             what.push(format!("{} will lose {}", plural(unsplit, "split clip"), if unsplit == 1 { "its stems" } else { "their stems" }));
@@ -207,12 +213,28 @@ mod tests {
         let shared = soundcraft_model::StemSet { scale_log2: 0, key: "k2".into(), sources: [stems[1]; 4] };
         e.session_mut().find_clip_mut(other).unwrap().stems = Some(shared);
         let err = e.execute("clip.clear", &json!({"sources": [f]})).unwrap_err().to_string();
-        assert!(err.contains("3 clips will be removed"), "{err}");
+        assert!(err.contains("3 clips will be removed and 3 stem files will go with them"), "{err}");
         let r = e.execute("clip.clear", &json!({"sources": [f], "with_clips": true})).unwrap();
         assert_eq!(r, json!({"clips": 3, "sources": 4, "unsplit": 0}));
         let s = e.session();
         assert_eq!([0, 1, 2, 3].map(|i| s.source(stems[i]).is_some()), [false, true, false, false]);
         assert!(s.find_clip(other).unwrap().1.stems.is_some());
+    }
+
+    #[test]
+    fn a_stem_file_a_sampler_plays_is_never_taken_with_its_clip() {
+        let mut e = crate::demo::demo_engine();
+        let (f, _, stems) = split_kick(&mut e);
+        let s = e.session_mut();
+        let t = s.add_track(soundcraft_model::TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, Some("Sampler"));
+        let mut sampler = soundcraft_model::Insert::new("sampler");
+        sampler.sample = Some(stems[2]);
+        s.track_mut(t).unwrap().instrument = Some(sampler);
+        assert_eq!(clear_effect(e.session(), &BTreeSet::new(), &BTreeSet::from([f])).stem_files, BTreeSet::from([stems[0], stems[1], stems[3]]));
+        let r = e.execute("clip.clear", &json!({"sources": [f], "with_clips": true})).unwrap();
+        assert_eq!(r["sources"], 4);
+        let s = e.session();
+        assert!(s.source(stems[2]).is_some() && s.pool.contains(stems[2]), "the Sampler's sample stays");
     }
 
     #[test]

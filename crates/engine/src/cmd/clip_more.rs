@@ -265,7 +265,14 @@ fn conform(e: &mut Engine, p: &Value) -> Result<Value> {
 fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "clip.remove_pitch_shift";
     let ids = clip_ids_param(e, p);
-    refuse_split(e.session(), id, &ids)?;
+    // Only a stretched clip is rendered.
+    let s = e.session();
+    let rendered: Vec<ClipId> = ids
+        .iter()
+        .copied()
+        .filter(|c| s.find_clip(*c).is_some_and(|(_, c)| c.is_audio() && c.stretch.is_finite() && (c.stretch - 1.0).abs() >= 1e-9))
+        .collect();
+    refuse_split(s, id, &rendered)?;
     let s = e.session_mut();
     let mut n = 0;
     for cid in ids {

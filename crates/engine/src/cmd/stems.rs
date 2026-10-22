@@ -710,7 +710,172 @@ pub fn specs() -> Vec<super::CommandSpec> {
             super::always,
             attach_stems
         ),
+        crate::cmd!(
+            "clip.stem_mask",
+            "Stem Mask",
+            [],
+            None,
+            "{clip, mask: [\"vocals\" | \"drums\" | \"bass\" | \"other\", ...]} — the stems a split clip plays (at least one); the others are silent on this clip only. Returns {clip, mask}",
+            super::always,
+            stem_mask
+        ),
+        crate::cmd!(
+            "dj.stem_copy",
+            "Copy Stems to Track",
+            [],
+            None,
+            "{clip, track, mask: [stem names]} — copies a split clip to audio track `track` at the same start, beat-locked like it, playing only the stems in `mask`; named with \" (acapella)\" (vocals only), \" (instrumental)\" (all but vocals) or \" (stems)\". Refused when it would overlap a clip on that track. Returns {clip: the copy, track, name, mask}",
+            super::always,
+            stem_copy
+        ),
+        crate::cmd!(
+            "clip.unsplit_stems",
+            "Remove Stems",
+            [],
+            None,
+            "{clip} — the clip, and every clip of the same track split from the same stems (stem copies too), play their own audio again; the four stem files leave the session when nothing else uses them (they stay in the stem cache). Returns {clips: [ids], sources: stem files removed}",
+            super::always,
+            unsplit_stems
+        ),
+        crate::cmd!(
+            noundo "dj.clear_stem_cache",
+            "Clear Stem Cache",
+            [],
+            None,
+            "{} — deletes every cached stem in the app's stem cache (nothing else there or anywhere). Refused while the open session uses cached stems: remove them first (clip.unsplit_stems) or close the session. Not undoable. Returns {files, bytes}",
+            super::always,
+            clear_stem_cache
+        ),
     ]
+}
+
+const MASK: &str = "clip.stem_mask";
+const COPY: &str = "dj.stem_copy";
+const UNSPLIT: &str = "clip.unsplit_stems";
+const CLEAR: &str = "dj.clear_stem_cache";
+
+/// `mask` from `p`: stem names, at least one.
+fn mask_param(p: &Value, cmd: &str) -> crate::Result<[bool; 4]> {
+    let names = p
+        .get("mask")
+        .and_then(Value::as_array)
+        .ok_or_else(|| super::bad(cmd, "`mask` required: the stems to play, from \"vocals\", \"drums\", \"bass\" and \"other\""))?;
+    let mut mask = [false; 4];
+    for name in names {
+        let i = name.as_str().and_then(|n| STEMS.iter().position(|s| s.eq_ignore_ascii_case(n.trim())));
+        let i = i.ok_or_else(|| super::bad(cmd, format!("{name} is not a stem: use \"vocals\", \"drums\", \"bass\" or \"other\"")))?;
+        if let Some(on) = mask.get_mut(i) {
+            *on = true;
+        }
+    }
+    if !mask.contains(&true) {
+        return Err(super::bad(cmd, "the mask is empty: name at least one stem"));
+    }
+    Ok(mask)
+}
+
+/// The names of the stems `mask` plays.
+fn mask_names(mask: [bool; 4]) -> Vec<&'static str> {
+    STEMS.iter().zip(mask).filter(|(_, on)| *on).map(|(n, _)| *n).collect()
+}
+
+/// The split clip `clip`: refused when it isn't split.
+fn split_clip<'a>(s: &'a Session, clip: ClipId, cmd: &str) -> crate::Result<(soundcraft_model::TrackId, &'a soundcraft_model::Clip)> {
+    let (t, c) = s.find_clip(clip).ok_or_else(|| super::bad(cmd, format!("no clip {}", clip.0)))?;
+    if c.stems.is_none() {
+        return Err(super::bad(cmd, format!("`{}` is not split: split the clip into stems first", c.name)));
+    }
+    Ok((t, c))
+}
+
+fn stem_mask(e: &mut Engine, p: &Value) -> crate::Result<Value> {
+    let clip = super::clip_id(p, MASK)?;
+    let mask = mask_param(p, MASK)?;
+    split_clip(e.session(), clip, MASK)?;
+    if let Some(c) = e.session_mut().find_clip_mut(clip) {
+        c.stem_mask = mask;
+    }
+    Ok(json!({"clip": clip.0, "mask": mask_names(mask)}))
+}
+
+fn stem_copy(e: &mut Engine, p: &Value) -> crate::Result<Value> {
+    let clip = super::clip_id(p, COPY)?;
+    let mask = mask_param(p, COPY)?;
+    let track = super::track_param(e, COPY, p, "track")?.ok_or_else(|| super::bad(COPY, "`track` required: the audio track to copy to"))?;
+    let s = e.session();
+    let (_, c) = split_clip(s, clip, COPY)?;
+    let t = s.track(track).ok_or_else(|| super::bad(COPY, format!("no track {}", track.0)))?;
+    if t.kind != soundcraft_model::TrackKind::Audio {
+        return Err(super::bad(COPY, format!("`{}` is not an audio track", t.name)));
+    }
+    if let Some(o) = t.clips().iter().find(|o| o.range().overlaps(&c.range())) {
+        return Err(super::bad(COPY, format!("the copy would overlap `{}` on `{}`; move it or choose another track", o.name, t.name)));
+    }
+    let suffix = match mask {
+        [true, false, false, false] => " (acapella)",
+        [false, true, true, true] => " (instrumental)",
+        _ => " (stems)",
+    };
+    let mut copy = c.clone();
+    copy.name = format!("{}{suffix}", c.name);
+    copy.stem_mask = mask;
+    copy.group = None;
+    copy.loop_id = None;
+    let s = e.session_mut();
+    copy.id = s.new_clip_id();
+    let (id, name) = (copy.id, copy.name.clone());
+    crate::edit::place_clip(s, track, copy);
+    Ok(json!({"clip": id.0, "track": track.0, "name": name, "mask": mask_names(mask)}))
+}
+
+fn unsplit_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
+    let clip = super::clip_id(p, UNSPLIT)?;
+    let s = e.session();
+    let (_, c) = split_clip(s, clip, UNSPLIT)?;
+    let (Some(src), Some(set)) = (c.source(), c.stems.clone()) else {
+        return Err(super::bad(UNSPLIT, format!("clip {} is not an audio clip", clip.0)));
+    };
+    let shared = same_track(s, src);
+    let ours = |c: &soundcraft_model::Clip| c.source().is_some_and(|x| shared.contains(&x)) && c.stems.as_ref() == Some(&set);
+    let s = e.session_mut();
+    let mut clips = Vec::new();
+    for c in s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).flat_map(|p| p.clips.iter_mut()) {
+        if ours(c) {
+            c.unsplit();
+            clips.push(c.id.0);
+        }
+    }
+    // The stem files go when no clip or Sampler plays them any more.
+    let used: Vec<SourceId> = s
+        .all_clips()
+        .flat_map(soundcraft_model::Clip::audio_sources)
+        .chain(s.tracks.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)))
+        .collect();
+    let gone: Vec<SourceId> = set.sources.iter().copied().filter(|id| !used.contains(id)).collect();
+    s.sources.retain(|x| !gone.contains(&x.id));
+    for id in &gone {
+        s.pool.remove(*id);
+    }
+    s.edit.selected_sources.retain(|x| !gone.contains(x));
+    Ok(json!({"clips": clips, "sources": gone.len()}))
+}
+
+fn clear_stem_cache(e: &mut Engine, _: &Value) -> crate::Result<Value> {
+    let cache = StemCache::at_default().map_err(|m| super::bad(CLEAR, m))?;
+    clear_stem_cache_in(e, &cache)
+}
+
+/// `dj.clear_stem_cache` on `cache` (the app's own, or a test's): refused while the session
+/// names a file in a known stem cache.
+pub fn clear_stem_cache_in(e: &Engine, cache: &StemCache) -> crate::Result<Value> {
+    if let Some(src) = e.session().sources.iter().find(|x| cached_stem(Path::new(&x.path)).is_some()) {
+        return Err(super::bad(
+            CLEAR,
+            format!("the session uses cached stems (`{}`): remove the stems from clips first (Remove Stems) or close the session", src.name),
+        ));
+    }
+    let (files, bytes) = clear(cache).map_err(EngineError::Io)?;
+    Ok(json!({"files": files, "bytes": bytes}))
 }
 
 /// The caches splits used in this process, most recent first: with [`default_root`], the only
@@ -949,16 +1114,7 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
         .collect();
     let sources = <[SourceId; 4]>::try_from(ids).map_err(|_| EngineError::Internal(ATTACH.into(), "not four stems".into()))?;
     let set = StemSet { key: key.to_string(), sources, scale_log2 };
-    // Every clip of the same track: the source itself, the same audio (the file imported again
-    // in place), or the same file by name (imported again and resampled to the session's rate).
-    let audio = s.pool.get(src).cloned();
-    let file = file_of(s, src).map(|f| path_key(&f));
-    let same = |id: SourceId| {
-        id == src
-            || audio.as_ref().is_some_and(|a| s.pool.get(id).is_some_and(|b| Arc::ptr_eq(a, b)))
-            || file.as_ref().is_some_and(|f| file_of(s, id).is_some_and(|g| path_key(&g) == *f))
-    };
-    let shared: Vec<SourceId> = s.sources.iter().map(|x| x.id).filter(|id| !sources.contains(id) && same(*id)).collect();
+    let shared: Vec<SourceId> = same_track(s, src).into_iter().filter(|id| !sources.contains(id)).collect();
     let (mut clips, mut skipped) = (Vec::new(), Vec::new());
     for c in s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).flat_map(|p| p.clips.iter_mut()) {
         if !c.source().is_some_and(|id| shared.contains(&id)) {
@@ -974,6 +1130,20 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
         }
     }
     Ok(json!({"clip": clip.0, "key": key, "scale_log2": scale_log2, "clips": clips, "skipped": skipped}))
+}
+
+/// The sources of `s` that are the same track as `src`: `src` itself, the same audio (the file
+/// imported again in place), or the same file by name (imported again and resampled to the
+/// session's rate).
+fn same_track(s: &Session, src: SourceId) -> Vec<SourceId> {
+    let audio = s.pool.get(src).cloned();
+    let file = file_of(s, src).map(|f| path_key(&f));
+    let same = |id: SourceId| {
+        id == src
+            || audio.as_ref().is_some_and(|a| s.pool.get(id).is_some_and(|b| Arc::ptr_eq(a, b)))
+            || file.as_ref().is_some_and(|f| file_of(s, id).is_some_and(|g| path_key(&g) == *f))
+    };
+    s.sources.iter().map(|x| x.id).filter(|id| same(*id)).collect()
 }
 
 fn split_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
