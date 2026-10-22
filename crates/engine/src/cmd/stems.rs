@@ -970,6 +970,18 @@ impl Origin {
     }
 }
 
+/// Whether source `id`'s audio is what its file holds now: a file referenced in place unchanged
+/// since it was decoded or saved (or, changed, still decoding to the same audio). A copy (not
+/// saved, or resampled) can't be compared and counts.
+fn plays_its_file(s: &Session, id: SourceId) -> bool {
+    let Some(src) = s.source(id) else { return false };
+    if src.unsaved {
+        return true;
+    }
+    let (Some(audio), Some(file)) = (s.pool.get(id), file_of(s, id)) else { return false };
+    (src.file_len != 0 && io::saved_stamp(&file) == (src.file_len, src.file_modified_ms)) || io::decodes_unchanged(audio, &file)
+}
+
 /// The file source `id` of `s` plays, by name: absolute, or in the session's folder once saved.
 fn file_of(s: &Session, id: SourceId) -> Option<PathBuf> {
     let src = s.source(id)?;
@@ -990,7 +1002,10 @@ fn stem_source(s: &Session, path: &Path, rate: u32, frames: u64, channels: usize
     s.sources.iter().find_map(|x| {
         let audio = s.pool.get(x.id)?;
         let fits = audio.buffer.sample_rate == rate && audio.buffer.frames() as u64 == frames && audio.buffer.num_channels() == channels;
-        (fits && Path::new(&x.path).is_absolute() && path_key(Path::new(&x.path)) == want).then_some(x.id)
+        let named = Path::new(&x.path).is_absolute() && path_key(Path::new(&x.path)) == want;
+        // A stem referenced in place must still be what the file holds (an entry made again
+        // holds new stems at the same path).
+        (fits && named && (x.unsaved || io::decoded_unchanged(audio, path))).then_some(x.id)
     })
 }
 
@@ -1055,6 +1070,12 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
     let (frames, channels, name) = (source.frames, usize::from(source.channels), source.name.clone());
     // The stems must be this clip's file's: known when the clip still plays the audio its split
     // started from, else checked by hashing the file.
+    if !plays_its_file(s, src) {
+        return Err(super::bad(
+            ATTACH,
+            format!("`{name}` no longer plays what its file holds (the file changed since it was imported); import it again to split it"),
+        ));
+    }
     if !prepared.as_ref().is_some_and(|x| x.origin.matches(s, src)) {
         let file = source_file(s, src, ATTACH)?;
         if key_of(&io::read_file(&file)?) != key {
@@ -1115,12 +1136,23 @@ fn attach(e: &mut Engine, clip: ClipId, key: &str, prepared: Option<Prepared>) -
     let sources = <[SourceId; 4]>::try_from(ids).map_err(|_| EngineError::Internal(ATTACH.into(), "not four stems".into()))?;
     let set = StemSet { key: key.to_string(), sources, scale_log2 };
     let shared: Vec<SourceId> = same_track(s, src).into_iter().filter(|id| !sources.contains(id)).collect();
+    // A clip joined by its file's name gets the stems only when its audio is the file split:
+    // the same width and length, and what the file holds now.
+    let fits = |id: SourceId| {
+        id == src
+            || s.source(id).is_some_and(|x| usize::from(x.channels) == channels && x.frames.abs_diff(frames) <= LENGTH_SLACK as u64)
+                && plays_its_file(s, id)
+    };
+    let unfit: Vec<SourceId> = shared.iter().copied().filter(|id| !fits(*id)).collect();
     let (mut clips, mut skipped) = (Vec::new(), Vec::new());
     for c in s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).flat_map(|p| p.clips.iter_mut()) {
         if !c.source().is_some_and(|id| shared.contains(&id)) {
             continue;
         }
         match &c.stems {
+            None if c.source().is_some_and(|id| unfit.contains(&id)) => {
+                skipped.push(json!({"clip": c.id.0, "reason": "its audio is not what the split file holds now"}));
+            }
             None => {
                 c.stems = Some(set.clone());
                 clips.push(c.id.0);
@@ -1189,6 +1221,8 @@ impl SplitShared {
 pub struct Split {
     clip: ClipId,
     origin: Origin,
+    /// The automation roots in force when the split started.
+    roots: Option<Arc<crate::file_access::AutomationRoots>>,
     cache: StemCache,
     files: StemFiles,
     loaded: Loaded,
@@ -1212,7 +1246,9 @@ impl Split {
         let params = json!({"clip": self.clip.0, "key": self.files.key});
         let prepared = self.prepared();
         PREPARED.with(|p| *p.borrow_mut() = Some(prepared));
-        let attached = e.execute(ATTACH, &params);
+        // Under the automation roots in force when the split started (when there were any), so
+        // a split an agent started never reads more when the app applies it.
+        let attached = crate::file_access::confine(self.roots.as_ref(), || e.execute(ATTACH, &params));
         PREPARED.with(|p| p.borrow_mut().take());
         Ok(self.report(attached?))
     }
@@ -1265,14 +1301,32 @@ pub fn split_job_in(e: &Engine, p: &Value, cache: StemCache, runner: StemRunner)
         return Ok(None);
     }
     let file = source_file(s, src, SPLIT)?;
+    if !plays_its_file(s, src) {
+        return Err(super::bad(
+            SPLIT,
+            format!("`{}` no longer plays what its file holds (the file changed since it was imported); import it again to split it", c.name),
+        ));
+    }
     let origin = Origin::of(s, src, &file);
+    // The roots in force now also apply when the split is applied.
+    let roots = crate::file_access::current();
     let rate = s.sample_rate.hz();
     use_root(cache.root());
     let shared = Arc::new(SplitShared { cancel: AtomicBool::new(false), stage: Mutex::new(DECODING) });
     let started = std::time::Instant::now();
     let work = {
         let shared = Arc::clone(&shared);
-        move || separate(&cache, &file, &runner, &shared, rate).map(|(files, loaded)| Split { clip, origin, cache, files, loaded, started })
+        move || {
+            separate(&cache, &file, &runner, &shared, rate).map(|(files, loaded)| Split {
+                clip,
+                origin,
+                roots: roots.clone(),
+                cache,
+                files,
+                loaded,
+                started,
+            })
+        }
     };
     let ended = |r| Ok(Some(SplitJob { shared: Arc::clone(&shared), clip, state: SplitState::Ended(Some(Box::new(r))) }));
     if cfg!(target_arch = "wasm32") {

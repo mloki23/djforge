@@ -725,3 +725,76 @@ fn only_renders_are_refused_on_a_split_clip() {
     assert!(err(&mut e, "clip.elastic_properties", json!({"clips": [a.0], "ratio": 2.0})).contains("Remove Stems"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Gives the file at `p` a modification time an hour ahead, so a rewrite within the file
+/// system's time resolution still counts as a change.
+fn touch_later(p: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(later)).unwrap();
+}
+
+/// A file replaced on disk between two imports: the clip of the old audio shares the file's name
+/// with the new one, but not its audio, so it doesn't get the new file's stems (it is reported)
+/// and can't be split itself until it is imported again.
+#[test]
+fn a_clip_of_a_replaced_file_never_gets_the_new_files_stems() {
+    const LEVEL: f64 = 0.82;
+    let dir = scratch("replaced");
+    let path = source(&dir, "track.wav", LEVEL);
+    let mut e = Engine::default();
+    let import = |e: &mut Engine| ClipId(run(e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    let old = import(&mut e);
+    // Same name, same length, other audio.
+    let replaced = source(&dir, "track.wav", 0.5);
+    touch_later(&replaced);
+    let new = import(&mut e);
+    let c = cache(&dir);
+    let r = split(&mut e, new, &c, &fake(&Arc::new(AtomicUsize::new(0)), 0.5));
+    assert_eq!(r["clips"], json!([new.0]), "{r}");
+    assert_eq!(r["skipped"], json!([{"clip": old.0, "reason": "its audio is not what the split file holds now"}]));
+    assert!(stems_of(&e, old).is_none());
+    let refused = stems::split_job_in(&e, &json!({"clip": old.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), 0.5)).err().unwrap().to_string();
+    assert!(refused.contains("no longer plays what its file holds"), "{refused}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stems cached again at the same key (the entry cleared, Demucs giving other output) are new
+/// files at the old paths: a later split loads them instead of reusing the session's older stems.
+#[test]
+fn stems_made_again_at_the_same_key_are_loaded_not_reused() {
+    const LEVEL: f64 = 0.81;
+    let dir = scratch("remade");
+    let path = source(&dir, "track.wav", LEVEL);
+    let mut e = Engine::default();
+    let import = |e: &mut Engine| ClipId(run(e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    let first = import(&mut e);
+    let c = cache(&dir);
+    let key = split(&mut e, first, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
+    let second = import(&mut e);
+    c.remove(&key).unwrap();
+    // This Demucs puts all of the vocals in "other" and leaves the vocals silent.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let swapped: StemRunner = {
+        let inner = fake(&calls, LEVEL);
+        Arc::new(move |input: &Path, out: &Path, stop: &dyn Fn() -> bool| {
+            let paths = inner(input, out, stop)?;
+            let read = |p: &Path| decode(&std::fs::read(p).unwrap(), Some("wav")).unwrap().1;
+            let (vocals, mut other) = (read(&paths[0]), read(&paths[3]));
+            for (o, v) in other.channels.iter_mut().zip(&vocals.channels) {
+                o.iter_mut().zip(v).for_each(|(o, v)| *o += v);
+            }
+            let silent = AudioBuffer { sample_rate: vocals.sample_rate, channels: vec![vec![0.0; vocals.frames()]; vocals.num_channels()] };
+            std::fs::write(&paths[0], float_wav(&silent)).unwrap();
+            std::fs::write(&paths[3], float_wav(&other)).unwrap();
+            Ok(paths)
+        })
+    };
+    let r = split(&mut e, second, &c, &swapped);
+    assert_eq!((r["key"].as_str(), r["hit"].as_bool(), calls.load(Ordering::SeqCst)), (Some(key.as_str()), Some(false), 1), "{r}");
+    let (old, new) = (stems_of(&e, first).unwrap(), stems_of(&e, second).unwrap());
+    assert_ne!(old.sources, new.sources, "new stem sources");
+    let s = e.session();
+    let peak = |id: SourceId| s.pool.get(id).unwrap().buffer.channels.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(peak(old.sources[0]) > 0.01 && peak(new.sources[0]) == 0.0, "the second clip plays the new, silent vocals");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -174,7 +174,7 @@ pub(crate) fn decoded_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
 /// time changed (a retag, a copy back), true when `p` still decodes to exactly `audio`: the
 /// stamp is then renewed. A file found to hold other audio is not decoded again until its stamp
 /// changes once more (autosave asks every second).
-fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
+pub(crate) fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
     let (key, stamp) = (file_key(p), file_stamp(p));
     let Some((k, s, differs)) = decoded_source(audio) else { return false };
     if k != key {
