@@ -1,0 +1,15 @@
+# Stage 4 gate B: the stage 1 transition with the bass swap done on the bass STEMS instead of the
+# EQ shelf (append to tools/dj/transition.cmds; clips 3 = Mental Atmosphere on track 2,
+# 6 = I Feel Love on track 5). Same timing as Marty's approved bass_swap.cmds:
+# bars 238-254: I Feel Love fades in and its bass stem builds (-40 dB -> 0) to hit on bar 254;
+# bars 254-262: Mental Atmosphere's bass stem goes out (0 -> -40 dB, then off), and it fades out.
+dj.nudge {"clip": 6, "beats": -0.16564117734652098}
+dj.split_stems {"clip": 3}
+dj.split_stems {"clip": 6}
+automation.set_point {"track": 5, "param": "stem:bass", "at": "bars_beats:238|1|000", "value": -40}
+automation.set_point {"track": 5, "param": "stem:bass", "at": "bars_beats:254|1|000", "value": 0}
+automation.set_point {"track": 2, "param": "stem:bass", "at": "bars_beats:254|1|000", "value": 0}
+automation.set_point {"track": 2, "param": "stem:bass", "at": "bars_beats:262|1|000", "value": -40}
+automation.set_point {"track": 2, "param": "stem:bass", "at": "bars_beats:262|2|000", "value": -144}
+edit.fades_create {"clip": 6, "side": "in", "length": 1319088, "shape": "equal power"}
+edit.fades_create {"clip": 3, "side": "out", "length": 2065739, "shape": "equal power"}

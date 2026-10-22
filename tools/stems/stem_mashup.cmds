@@ -1,0 +1,9 @@
+# Stage 4 gate C: a mashup - I Feel Love's acapella over Mental Atmosphere's instrumental
+# (append to tools/dj/transition.cmds; render --start 400 --end 460 = bars ~230-266).
+# Mental Atmosphere's vocals are off for the whole excerpt; I Feel Love plays vocals only.
+dj.nudge {"clip": 6, "beats": -0.16564117734652098}
+dj.split_stems {"clip": 3}
+dj.split_stems {"clip": 6}
+clip.stem_mask {"clip": 6, "mask": ["vocals"]}
+mix.stem_gain {"tracks": [2], "stem": "vocals", "db": -144}
+edit.fades_create {"clip": 6, "side": "in", "length": 164886, "shape": "equal power"}
