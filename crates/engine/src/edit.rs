@@ -200,6 +200,11 @@ pub fn paste(s: &mut Session, track: TrackId, at: Samples, clips: &[Clip], lengt
         let mut nc = c.clone();
         nc.id = s.new_clip_id();
         nc.start += at;
+        // Stems that left the session since the copy (Remove Stems, Clear) can't play: the
+        // pasted clip plays its own audio.
+        if nc.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| s.source(*id).is_none() || !s.pool.contains(*id))) {
+            nc.unsplit();
+        }
         ids.push(nc.id);
         place_clip(s, track, nc);
     }

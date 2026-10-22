@@ -189,16 +189,40 @@ pub(crate) fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
     }
     #[cfg(test)]
     REDECODES.with(|n| n.set(n.get() + 1));
+    match decodes_to(audio, p) {
+        Some(true) => {
+            remember_decoded(audio, p);
+            true
+        }
+        // Only a file that decoded, to other audio, is remembered as differing: one that could
+        // not be read now is asked again next time.
+        Some(false) => {
+            remember_differs(audio, now);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether the file at `p` decodes to exactly `audio` (at its rate); `None` when it can't be
+/// read or decoded.
+fn decodes_to(audio: &Arc<SourceAudio>, p: &Path) -> Option<bool> {
     let ext = p.extension().and_then(|x| x.to_str());
-    let again = read_file(p).ok().and_then(|bytes| decode_source(&bytes, ext, audio.buffer.sample_rate).ok());
-    let same = again.is_some_and(|a| {
-        let (x, y) = (&a.buffer.channels, &audio.buffer.channels);
-        x.len() == y.len() && x.iter().zip(y).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.to_bits() == b.to_bits()))
-    });
+    let again = decode_source(&read_file(p).ok()?, ext, audio.buffer.sample_rate).ok()?;
+    let (x, y) = (&again.buffer.channels, &audio.buffer.channels);
+    Some(x.len() == y.len() && x.iter().zip(y).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.to_bits() == b.to_bits())))
+}
+
+/// Whether the file at `p` holds `audio`: [`decodes_unchanged`] when `audio` is known to have
+/// been decoded from it; otherwise (a recorded take, audio this app wrote) by decoding it, and
+/// then remembered as decoded from it.
+pub(crate) fn file_holds(audio: &Arc<SourceAudio>, p: &Path) -> bool {
+    if decoded_source(audio).is_some_and(|(k, _, _)| k == file_key(p)) {
+        return decodes_unchanged(audio, p);
+    }
+    let same = decodes_to(audio, p) == Some(true);
     if same {
         remember_decoded(audio, p);
-    } else {
-        remember_differs(audio, now);
     }
     same
 }
@@ -3093,6 +3117,37 @@ mod in_place_tests {
         open_session(&mut r, &path).unwrap();
         let out = r.execute("file.relink_audio", &json!({"dir": dir.join("New")})).unwrap();
         assert_eq!(out["missing"].as_array().unwrap().len(), 1, "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod decoded_tests {
+    use super::*;
+
+    /// A file that could not be decoded once (caught mid-write) is not remembered as other
+    /// audio: once it holds the audio again, at the same size and time, it decodes to it.
+    #[test]
+    fn a_file_that_failed_to_decode_is_asked_again() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-redecode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.wav");
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![(0..4_800).map(|i| (i % 50) as f32 / 100.0).collect()] };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+        let bytes = soundcraft_audio_io::encode(&buf, &opts).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let audio = Arc::new(SourceAudio::new(buf));
+        remember_decoded(&audio, &path);
+        let at = std::time::SystemTime::now() + std::time::Duration::from_secs(7_200);
+        let write_at = |b: &[u8]| {
+            std::fs::write(&path, b).unwrap();
+            std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(at)).unwrap();
+        };
+        write_at(&vec![0xAB; bytes.len()]);
+        assert!(!decodes_unchanged(&audio, &path), "garbage doesn't decode");
+        write_at(&bytes);
+        assert!(decodes_unchanged(&audio, &path), "the same size and time, asked again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

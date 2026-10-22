@@ -671,11 +671,11 @@ fn stem_copies_are_named_for_their_mask_and_never_overlap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Remove Stems unsplits the clip, every clip of the track split from the same stems (the copies
-/// too), and drops the four stem files; the cache can then be cleared, which it refuses while the
-/// session uses cached stems.
+/// Remove Stems unsplits the clip and every clip of the track split from the same stems that
+/// plays all four; a mashup copy (a mask) keeps its stems and their files, until it is unsplit
+/// itself. The cache can then be cleared, which it refuses while the session uses cached stems.
 #[test]
-fn remove_stems_then_clear_the_cache() {
+fn remove_stems_keeps_mashup_copies_then_clear_the_cache() {
     const LEVEL: f64 = 0.84;
     let dir = scratch("unsplit");
     let path = source(&dir, "track.wav", LEVEL);
@@ -685,16 +685,22 @@ fn remove_stems_then_clear_the_cache() {
     let vocals = new_track(&mut e, "Vocals");
     let copy = ClipId(run(&mut e, "dj.stem_copy", json!({"clip": a.0, "track": vocals, "mask": ["vocals"]}))["clip"].as_u64().unwrap());
     let refused = stems::clear_stem_cache_in(&e, &c).unwrap_err().to_string();
-    assert!(refused.contains("remove the stems from clips first") && refused.contains("close the session"), "{refused}");
+    assert!(refused.contains("3 split clips") && refused.contains("(Remove Stems)") && refused.contains("close the session"), "{refused}");
     assert!(c.root().join(&key).exists());
     assert!(err(&mut e, "clip.unsplit_stems", json!({"clip": 999_999})).contains("no clip"));
     let r = run(&mut e, "clip.unsplit_stems", json!({"clip": b.0}));
-    assert_eq!((r["clips"].clone(), r["sources"].as_u64()), (json!([a.0, b.0, copy.0]), Some(4)), "{r}");
+    assert_eq!((r["clips"].clone(), r["kept"].clone(), r["sources"].as_u64()), (json!([a.0, b.0]), json!([copy.0]), Some(0)), "{r}");
     assert_eq!(e.undo_history().last().map(String::as_str), Some("Remove Stems"));
-    for id in [a, b, copy] {
+    for id in [a, b] {
         let clip = e.session().all_clips().find(|x| x.id == id).unwrap().clone();
         assert_eq!((clip.stems, clip.stem_mask), (None, [true; 4]));
     }
+    assert_eq!(stems_of(&e, copy).map(|s| s.key), Some(key.clone()), "the acapella keeps its stems");
+    assert_eq!(stem_sources(&e), 4);
+    assert!(stems::clear_stem_cache_in(&e, &c).unwrap_err().to_string().contains("1 split clip "));
+    // Asked for itself, the copy goes back to its audio, and the stem files leave.
+    let r = run(&mut e, "clip.unsplit_stems", json!({"clip": copy.0}));
+    assert_eq!((r["clips"].clone(), r["kept"].clone(), r["sources"].as_u64()), (json!([copy.0]), json!([]), Some(4)), "{r}");
     assert_eq!(stem_sources(&e), 0);
     assert!(err(&mut e, "clip.unsplit_stems", json!({"clip": a.0})).contains("split the clip into stems first"));
     let cleared = stems::clear_stem_cache_in(&e, &c).unwrap();
@@ -702,7 +708,7 @@ fn remove_stems_then_clear_the_cache() {
     assert!(!c.root().join(&key).exists());
     // Undo brings the stems back (the files are gone from the cache, the audio is in memory).
     run(&mut e, "edit.undo", json!({}));
-    assert_eq!((stems_of(&e, a).map(|s| s.key), stem_sources(&e)), (Some(key), 4));
+    assert_eq!((stems_of(&e, copy).map(|s| s.key), stem_sources(&e)), (Some(key), 4));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -753,7 +759,9 @@ fn a_clip_of_a_replaced_file_never_gets_the_new_files_stems() {
     assert_eq!(r["clips"], json!([new.0]), "{r}");
     assert_eq!(r["skipped"], json!([{"clip": old.0, "reason": "its audio is not what the split file holds now"}]));
     assert!(stems_of(&e, old).is_none());
-    let refused = stems::split_job_in(&e, &json!({"clip": old.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), 0.5)).err().unwrap().to_string();
+    // Only decoding the file tells, so the split's worker refuses.
+    let job = stems::split_job_in(&e, &json!({"clip": old.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), 0.5)).unwrap().unwrap();
+    let refused = job.wait().err().unwrap().to_string();
     assert!(refused.contains("no longer plays what its file holds"), "{refused}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -796,5 +804,126 @@ fn stems_made_again_at_the_same_key_are_loaded_not_reused() {
     let s = e.session();
     let peak = |id: SourceId| s.pool.get(id).unwrap().buffer.channels.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
     assert!(peak(old.sources[0]) > 0.01 && peak(new.sources[0]) == 0.0, "the second clip plays the new, silent vocals");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A split clip copied, then unsplit (Remove Stems takes its stem files out of the session),
+/// pastes as its own audio: stems that left the session can't play.
+#[test]
+fn a_paste_of_a_clip_whose_stems_left_plays_its_own_audio() {
+    const LEVEL: f64 = 0.79;
+    let dir = scratch("paste");
+    let path = source(&dir, "track.wav", LEVEL);
+    let mut e = Engine::default();
+    let a = ClipId(run(&mut e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    let full = mix(&e);
+    split(&mut e, a, &cache(&dir), &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    let t = e.session().find_clip(a).unwrap().0.0;
+    run(&mut e, "clip.stem_mask", json!({"clip": a.0, "mask": ["vocals"]}));
+    run(&mut e, "edit.copy", json!({"tracks": [t], "start": 0, "end": RATE}));
+    run(&mut e, "clip.unsplit_stems", json!({"clip": a.0}));
+    run(&mut e, "edit.clear", json!({"tracks": [t], "start": 0, "end": RATE}));
+    run(&mut e, "edit.paste", json!({"tracks": [t], "at": 0}));
+    let pasted = e.session().track(soundcraft_engine::model::TrackId(t)).unwrap().clips()[0].clone();
+    assert_eq!((pasted.stems, pasted.stem_mask), (None, [true; 4]));
+    assert!(mix(&e) == full, "the full source plays");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// While a split is under way (until its result is applied or dropped), its cache is not
+/// cleared; a finished split whose entry went meanwhile still attaches the stems it loaded.
+#[test]
+fn a_split_under_way_keeps_its_cache_and_survives_its_entry_going() {
+    const LEVEL: f64 = 0.78;
+    let dir = scratch("live");
+    let path = source(&dir, "track.wav", LEVEL);
+    let (mut e, a, _) = two_decks(&path);
+    let c = cache(&dir);
+    let job = stems::split_job_in(&e, &json!({"clip": a.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), LEVEL)).unwrap().unwrap();
+    let under_way = |e: &Engine| stems::clear_stem_cache_in(e, &c).err().map(|x| x.to_string()).unwrap_or_default();
+    assert!(under_way(&e).contains("a split into stems is under way"));
+    let done = job.wait().unwrap();
+    assert!(under_way(&e).contains("a split into stems is under way"), "until it is applied");
+    // Gone from the cache (another app cleared it): the loaded stems still attach.
+    c.remove(&done.files().key).unwrap();
+    let r = done.apply(&mut e).unwrap();
+    assert_eq!(r["clips"].as_array().map(Vec::len), Some(2), "{r}");
+    let set = stems_of(&e, a).unwrap();
+    assert!(set.sources.iter().all(|id| e.session().pool.get(*id).is_some_and(|x| x.frames() == RATE as usize)));
+    assert!(!under_way(&e).contains("under way"));
+    // Dropping a job ends it too.
+    run(&mut e, "edit.undo", json!({}));
+    let job = stems::split_job_in(&e, &json!({"clip": a.0}), c.clone(), fake(&Arc::new(AtomicUsize::new(0)), LEVEL)).unwrap().unwrap();
+    drop(job);
+    assert!(stems::clear_stem_cache_in(&e, &c).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A recorded take (a file the app wrote, its audio added as decoded, no size recorded) splits:
+/// whether it still plays its file is learned by decoding it.
+#[test]
+fn a_recorded_take_splits() {
+    const LEVEL: f64 = 0.77;
+    let dir = scratch("take");
+    let path = source(&dir, "take.wav", LEVEL);
+    let mut e = Engine::default();
+    let (_, buf) = decode(&std::fs::read(&path).unwrap(), Some("wav")).unwrap();
+    let s = e.session_mut();
+    let t = s.add_track(soundcraft_engine::model::TrackKind::Audio, soundcraft_engine::model::ChannelFormat::Stereo, Some("Take"));
+    let src = soundcraft_engine::io::add_source(s, "take", buf, Some(&path.to_string_lossy()), soundcraft_audio_io::FileFormat::Wav);
+    s.sources.iter_mut().for_each(|x| x.unsaved = false);
+    let id = s.new_clip_id();
+    soundcraft_engine::edit::place_clip(s, t, soundcraft_engine::model::Clip::audio(id, "take", src, 0, 0, i64::from(RATE)));
+    let r = split(&mut e, id, &cache(&dir), &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    assert_eq!(r["clips"], json!([id.0]), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The refusal says what to do about each thing that holds cached stems.
+#[test]
+fn clearing_the_cache_says_what_holds_it() {
+    const LEVEL: f64 = 0.76;
+    let dir = scratch("holders");
+    let path = source(&dir, "track.wav", LEVEL);
+    let mut e = Engine::default();
+    let a = ClipId(run(&mut e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    let c = cache(&dir);
+    split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    let stems = stems_of(&e, a).unwrap().sources;
+    let s = e.session_mut();
+    let sampler = s.add_track(soundcraft_engine::model::TrackKind::Instrument, soundcraft_engine::model::ChannelFormat::Stereo, Some("Pads"));
+    let mut ins = soundcraft_engine::model::Insert::new("sampler");
+    ins.sample = Some(stems[1]);
+    s.track_mut(sampler).unwrap().instrument = Some(ins);
+    let why = stems::clear_stem_cache_in(&e, &c).unwrap_err().to_string();
+    assert!(why.contains("1 split clip — remove the stems from them first (Remove Stems)"), "{why}");
+    assert!(why.contains("the Sampler on `Pads` plays a stem file — change the Sampler's sample"), "{why}");
+    e.session_mut().track_mut(sampler).unwrap().instrument = None;
+    // The clip unsplit, but its stem files kept in the Clip List.
+    e.session_mut().find_clip_mut(a).unwrap().unsplit();
+    let why = stems::clear_stem_cache_in(&e, &c).unwrap_err().to_string();
+    assert!(why.contains("4 stem files left in the Clip List — Clip List › Clear those files"), "{why}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mask given as a word is refused plainly; the same mask again changes nothing; a copy of a
+/// copy is named for its own mask once.
+#[test]
+fn masks_and_copy_names_are_tidy() {
+    const LEVEL: f64 = 0.75;
+    let dir = scratch("tidy");
+    let path = source(&dir, "track.wav", LEVEL);
+    let mut e = Engine::default();
+    let a = ClipId(run(&mut e, "file.import_audio", json!({"path": path}))["imported"][0]["clip"].as_u64().unwrap());
+    split(&mut e, a, &cache(&dir), &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
+    assert!(err(&mut e, "clip.stem_mask", json!({"clip": a.0, "mask": "vocals"})).contains("`mask` must be an array of stem names"));
+    let undo = e.undo_history().len();
+    run(&mut e, "clip.stem_mask", json!({"clip": a.0, "mask": ["vocals", "drums", "bass", "other"]}));
+    assert_eq!(e.undo_history().len(), undo, "no change, no undo step");
+    let one = new_track(&mut e, "One");
+    let first = ClipId(run(&mut e, "dj.stem_copy", json!({"clip": a.0, "track": one, "mask": ["vocals"]}))["clip"].as_u64().unwrap());
+    let two = new_track(&mut e, "Two");
+    let r = run(&mut e, "dj.stem_copy", json!({"clip": first.0, "track": two, "mask": ["drums", "bass", "other"]}));
+    assert_eq!(r["name"], "track (instrumental)");
     let _ = std::fs::remove_dir_all(&dir);
 }

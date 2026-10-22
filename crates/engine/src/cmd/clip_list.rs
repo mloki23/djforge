@@ -100,7 +100,14 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
         if removed > 0 {
             what.push(format!("{} will be removed", plural(removed, "clip")));
         }
-        let stems = effect.stem_files.len();
+        // The stem files of this file's own clips that go with them.
+        let stems = s
+            .all_clips()
+            .filter(|c| c.source() == Some(f.id) && effect.removed.contains(&c.id))
+            .flat_map(|c| c.audio_sources().skip(1))
+            .filter(|x| effect.stem_files.contains(x))
+            .collect::<BTreeSet<_>>()
+            .len();
         if removed > 0 && stems > 0 {
             what.push(format!("{} will go with {}", plural(stems, "stem file"), if removed == 1 { "it" } else { "them" }));
         }
@@ -219,6 +226,21 @@ mod tests {
         let s = e.session();
         assert_eq!([0, 1, 2, 3].map(|i| s.source(stems[i]).is_some()), [false, true, false, false]);
         assert!(s.find_clip(other).unwrap().1.stems.is_some());
+    }
+
+    #[test]
+    fn the_refusal_counts_only_the_stem_files_of_that_files_clips() {
+        let mut e = crate::demo::demo_engine();
+        let (f, _, _) = split_kick(&mut e);
+        let hats = e.session().sources.iter().find(|x| x.name == "Hats").unwrap().id;
+        let err = e.execute("clip.clear", &json!({"sources": [f, hats]})).unwrap_err().to_string();
+        if err.contains("`Hats`") {
+            assert!(!err.contains("stem file"), "{err}");
+        } else {
+            assert!(err.contains("and 4 stem files will go with them"), "{err}");
+        }
+        let err = e.execute("clip.clear", &json!({"sources": [hats]})).unwrap_err().to_string();
+        assert!(!err.contains("stem file"), "{err}");
     }
 
     #[test]
