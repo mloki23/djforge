@@ -98,6 +98,7 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Nudge Selected Clip Earlier (5 ms)", "dj.nudge"),
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
+    ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
 ];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
@@ -467,6 +468,11 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
     if id == "audiosuite.process" {
         let p = params_for(path, id);
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);
+        return;
+    }
+    if id == "dj.clear_stem_cache" {
+        // Asks first, showing what the app's stem cache holds.
+        crate::stems::ask_clear(app);
         return;
     }
     if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {

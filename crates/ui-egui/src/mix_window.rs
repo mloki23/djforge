@@ -377,6 +377,15 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         }
         y += 54.0;
     }
+    // Stem faders: on tracks with split clips, and the room for them on every strip so the rows
+    // line up.
+    if crate::stems::any_split(&session) {
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, crate::stems::FADERS_H));
+        if crate::stems::has_split(track) {
+            crate::stems::faders(app, ui, track, sec);
+        }
+        y = sec.max.y + 4.0;
+    }
     // Rec / Input / Solo / Mute.
     let bw = (inner_w - 6.0) / 2.0;
     let mut row = ui.new_child(

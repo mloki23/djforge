@@ -1380,8 +1380,9 @@ fn view_label(v: &str) -> String {
     }
 }
 
-fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
-    let id = track.id.0;
+/// The views a track's view selector offers before its plugins' parameters: an audio track's
+/// include its four stem fader lanes, which act on its split clips.
+fn view_options(track: &Track) -> Vec<&'static str> {
     let mut opts: Vec<&str> = Vec::new();
     if track.kind.is_midi() {
         opts.extend(["notes", "regions", "blocks"]);
@@ -1389,7 +1390,15 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
         opts.extend(["waveform", "blocks", "clip_gain", "playlists"]);
     }
     opts.extend(["volume", "pan", "mute"]);
-    for o in opts {
+    if track.kind == TrackKind::Audio {
+        opts.extend(["stem:vocals", "stem:drums", "stem:bass", "stem:other"]);
+    }
+    opts
+}
+
+fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
+    let id = track.id.0;
+    for o in view_options(track) {
         if ui.selectable_label(track.view == o, view_label(o)).clicked() {
             let _ = app.run("track.view", json!({"track": id, "view": o}));
         }
@@ -2555,6 +2564,7 @@ fn clip_context_menu(app: &mut SoundApp, ui: &mut Ui, clip: Option<ClipId>) {
         let _ = app.run("edit.select", json!({"clips": ids}));
         let _ = app.run("edit.clear", json!({}));
     }
+    crate::stems::clip_menu(app, ui, c);
 }
 
 /// Next follow state after observing one frame: `(hold, follow_to)`.
@@ -3896,5 +3906,20 @@ mod tests {
         let points = s.track_by_name("Kick").and_then(|t| t.lane(&param)).map(|l| l.points.clone()).unwrap_or_default();
         assert_eq!(points.len(), 1, "status: {}", h.state().ui.status);
         assert!((points[0].value + 12.0).abs() < 0.01, "{}", points[0].value);
+    }
+
+    #[test]
+    fn audio_tracks_offer_the_stem_fader_lanes() {
+        let mut s = Session::default();
+        let audio = s.add_track(TrackKind::Audio, soundcraft_model::ChannelFormat::Stereo, Some("Deck"));
+        let aux = s.add_track(TrackKind::Aux, soundcraft_model::ChannelFormat::Stereo, Some("Bus"));
+        let labels: Vec<String> = view_options(s.track(audio).unwrap()).into_iter().map(view_label).collect();
+        for stem in ["stem vocals", "stem drums", "stem bass", "stem other"] {
+            assert!(labels.iter().any(|l| l == stem), "{stem}: {labels:?}");
+        }
+        assert!(view_options(s.track(aux).unwrap()).iter().all(|o| !o.starts_with("stem:")));
+        for o in view_options(s.track(audio).unwrap()).iter().filter(|o| o.starts_with("stem:")) {
+            assert_eq!(automation_id(&AutoParam::parse(o).unwrap()), *o);
+        }
     }
 }

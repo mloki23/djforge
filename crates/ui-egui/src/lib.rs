@@ -26,6 +26,7 @@ pub mod sampler_window;
 pub mod score_editor;
 pub mod shortcuts;
 pub mod spot;
+pub mod stems;
 pub mod theme;
 pub mod toolbar;
 pub mod video_track;
@@ -380,8 +381,17 @@ pub struct SoundApp {
     pub prep_root: Option<std::path::PathBuf>,
     /// mixforge's analysis for Prep Tracks; tests swap in a fake so no sidecar runs.
     pub prep_analyse: soundcraft_engine::cmd::PrepAnalyse,
-    /// A quit waits for the running prep to stop ([`prep::holds_quit`]).
+    /// A quit waits for the running prep or stem split to stop ([`prep::holds_quit`]).
     pub prep_quit: bool,
+    /// The Split into Stems run in progress, on its own thread.
+    pub split: Option<soundcraft_engine::cmd::stems::SplitJob>,
+    /// Where Split into Stems caches stems and Clear Stem Cache empties (an error when the app's
+    /// cache folder can't be found). Tests point it at a scratch folder.
+    pub stem_cache: Result<soundcraft_engine::cmd::stems::StemCache, String>,
+    /// Demucs for Split into Stems; tests swap in a fake so no sidecar runs.
+    pub stem_runner: soundcraft_engine::cmd::stems::StemRunner,
+    /// The level each muted stem fader had, restored when it is un-muted.
+    pub(crate) stem_unmute: HashMap<(TrackId, usize), f32>,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -460,6 +470,10 @@ impl SoundApp {
             prep_root: soundcraft_engine::cmd::prep_default_root().ok(),
             prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
             prep_quit: false,
+            split: None,
+            stem_cache: soundcraft_engine::cmd::stems::StemCache::at_default(),
+            stem_runner: soundcraft_engine::cmd::stems::demucs_runner(),
+            stem_unmute: HashMap::new(),
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -1202,6 +1216,7 @@ impl SoundApp {
         self.apply_editor_edits();
         bounce::step(self, ctx);
         prep::step(self, ctx);
+        stems::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;

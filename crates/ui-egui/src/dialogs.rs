@@ -27,6 +27,7 @@ pub enum Dialog {
     Session { frame_rate: String, bit_depth: String },
     ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
     SaveChanges { then: (String, Value) },
+    ClearStemCache { message: String }, // DJ › Clear Stem Cache: what the cache holds
 }
 
 #[derive(Default)]
@@ -56,6 +57,7 @@ impl Dialogs {
             Dialog::Session { .. } => "session",
             Dialog::ScoreSetup { .. } => "score_setup",
             Dialog::SaveChanges { .. } => "save_changes",
+            Dialog::ClearStemCache { .. } => "clear_stem_cache",
         })
     }
 
@@ -300,6 +302,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     crate::prep::show(app, ctx);
+    crate::stems::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
     let mut keep = true;
     let mut action: Option<(String, Value)> = None;
@@ -323,6 +326,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         Dialog::ScoreSetup { .. } => "Score Setup",
         Dialog::SaveChanges { then } if then.0 == "session.revert" => "Revert to Saved",
         Dialog::SaveChanges { .. } => "Unsaved Changes",
+        Dialog::ClearStemCache { .. } => "Clear Stem Cache",
     }
     .to_string();
     let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -604,6 +608,13 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
+                Dialog::ClearStemCache { message } => {
+                    ui.set_max_width(360.0);
+                    ui.label(message.as_str());
+                    if buttons(ui, "Clear", false) {
+                        action = Some(("dj.clear_stem_cache".into(), json!({})));
+                    }
+                }
                 Dialog::SaveChanges { then } => {
                     let name = &app.engine.session().name;
                     let revert = then.0 == "session.revert";
@@ -656,6 +667,9 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         keep = false;
         if cmd == "prep.tracks" {
             crate::prep::start(app, &params);
+        } else if cmd == "dj.clear_stem_cache" {
+            // On the app's stem cache, which tests point elsewhere.
+            crate::stems::clear(app);
         } else {
             match app.run(&cmd, params) {
                 Ok(v) if cmd == "file.export_clips" => {
