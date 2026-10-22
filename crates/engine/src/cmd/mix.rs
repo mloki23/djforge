@@ -83,6 +83,15 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"db": db}))
         }),
         cmd!(
+            "mix.stem_gain",
+            "Set Stem Fader",
+            [],
+            None,
+            "{tracks?, stem: vocals|drums|bass|other | 0..3, db: -144..6} — the track's stem fader (`stem:<name>` when automated); it scales that stem of the split clips playing on the track, and unsplit clips ignore it",
+            has_selection,
+            stem_gain
+        ),
+        cmd!(
             "mix.automation_mode",
             "Automation Mode",
             [],
@@ -230,6 +239,30 @@ fn volume(e: &mut Engine, p: &Value) -> Result<Value> {
         set_grouped(s, *t, "volume", |tr| tr.mixer.volume_db = if tr.id == *t { new } else { (tr.mixer.volume_db + d).clamp(-144.0, 12.0) });
     }
     Ok(json!({"tracks": tracks.len()}))
+}
+
+/// `mix.stem_gain`: sets one stem fader (by name or index) on the tracks.
+fn stem_gain(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "mix.stem_gain";
+    let tracks = tracks_required(e, CMD, p)?;
+    let stem = p.get("stem").ok_or_else(|| bad(CMD, "`stem` required: \"vocals\", \"drums\", \"bass\" or \"other\""))?;
+    let i = match stem {
+        Value::String(name) => soundcraft_model::STEMS.iter().position(|s| s.eq_ignore_ascii_case(name.trim())),
+        other => other.as_u64().and_then(|i| usize::try_from(i).ok()).filter(|i| *i < soundcraft_model::STEMS.len()),
+    };
+    let (i, name) = i
+        .and_then(|i| soundcraft_model::STEMS.get(i).map(|n| (i, *n)))
+        .ok_or_else(|| bad(CMD, format!("{stem} is not a stem: use \"vocals\", \"drums\", \"bass\" or \"other\"")))?;
+    let db = p.get("db").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(CMD, "`db` required: a number, -144..6"))? as f32;
+    let (lo, hi, _) = AutoParam::Stem(0).range();
+    let db = db.clamp(lo, hi);
+    let s = e.session_mut();
+    for t in &tracks {
+        if let Some(g) = s.track_mut(*t).and_then(|tr| tr.mixer.stem_gain_db.get_mut(i)) {
+            *g = db;
+        }
+    }
+    Ok(json!({"stem": name, "db": db}))
 }
 
 fn pan(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -750,6 +783,32 @@ mod tests {
     fn convert(e: &mut Engine, t: TrackId, start: i64, end: i64) {
         e.session_mut().edit.selection = Range::new(start, end);
         e.execute("automation.volume_to_clip_gain", &json!({"track": t.0, "start": start, "end": end})).unwrap();
+    }
+
+    #[test]
+    fn stem_faders_are_set_by_name_or_index_clamped_and_undoable() {
+        let (mut e, t) = tone_session(&[]);
+        let stems = |e: &Engine| e.session().track(t).unwrap().mixer.stem_gain_db;
+        let r = e.execute("mix.stem_gain", &json!({"track": t.0, "stem": "bass", "db": -6.5})).unwrap();
+        assert_eq!(r, json!({"stem": "bass", "db": -6.5}));
+        assert_eq!(stems(&e), [0.0, 0.0, -6.5, 0.0]);
+        assert_eq!(e.undo_label(), Some("Set Stem Fader"));
+        e.execute("mix.stem_gain", &json!({"tracks": [t.0], "stem": 0, "db": 20.0})).unwrap();
+        e.execute("mix.stem_gain", &json!({"track": t.0, "stem": "Other", "db": -500.0})).unwrap();
+        assert_eq!(stems(&e), [6.0, 0.0, -6.5, -144.0]);
+        assert!(e.undo());
+        assert_eq!(stems(&e), [6.0, 0.0, -6.5, 0.0]);
+        for (p, why) in [
+            (json!({"track": t.0, "stem": "piano", "db": 0.0}), "not a stem"),
+            (json!({"track": t.0, "stem": 4, "db": 0.0}), "not a stem"),
+            (json!({"track": t.0, "db": 0.0}), "`stem` required"),
+            (json!({"track": t.0, "stem": "bass"}), "`db` required"),
+            (json!({"track": t.0, "stem": "bass", "db": "loud"}), "`db` required"),
+        ] {
+            let err = e.execute("mix.stem_gain", &p).unwrap_err().to_string();
+            assert!(err.contains(why), "{p}: {err}");
+        }
+        assert_eq!(stems(&e), [6.0, 0.0, -6.5, 0.0]);
     }
 
     #[test]
