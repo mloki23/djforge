@@ -236,7 +236,7 @@ const MAX_TAG: usize = 64 << 20;
 
 /// The leading ID3v2 tag of the file at `path` (nothing else of the file is read); empty when it
 /// has none.
-fn tag_head(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn tag_head(path: &Path) -> Result<Vec<u8>> {
     let head = crate::io::read_head(path, 10)?;
     let [b'I', b'D', b'3', major, _, flags, size @ ..] = head.as_slice() else { return Ok(Vec::new()) };
     let footer = if *major == 4 && flags & 0x10 != 0 { 10 } else { 0 };
@@ -335,7 +335,7 @@ pub fn run(
 }
 
 /// A prep run whose checks all passed and whose output folder exists: what it reads and writes.
-struct Plan {
+pub(crate) struct Plan {
     started: std::time::Instant,
     /// When it started, for the report.
     date: String,
@@ -355,7 +355,6 @@ impl Plan {
     /// Every refusal and check of `prep.tracks`, then `out` made: nothing else is written yet.
     /// Without `out`, the copies go to `<root>/<name>` (`root` default: [`default_root`]).
     fn new(s: &Session, source: &str, out: Option<&str>, root: Option<&Path>, target_lufs: f64, ceiling: f64) -> Result<Self> {
-        let started = std::time::Instant::now();
         if !(target_lufs.is_finite() && ceiling.is_finite()) {
             return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
         }
@@ -367,6 +366,16 @@ impl Plan {
                 None => default_root()?.join(&name),
             }),
         };
+        Self::for_files(s, source, files, out, target_lufs, ceiling)
+    }
+
+    /// A run prepping `files` (absolute, normalised) into `out` with every check of `prep.tracks`
+    /// made and `out` made; the report names `source`.
+    pub(crate) fn for_files(s: &Session, source: &str, files: Vec<PathBuf>, out: PathBuf, target_lufs: f64, ceiling: f64) -> Result<Self> {
+        let started = std::time::Instant::now();
+        if !(target_lufs.is_finite() && ceiling.is_finite()) {
+            return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
+        }
         let (dests, mut earlier) = destinations(s, &files, &out)?;
         // Listings of copies still in `out` are kept, also those of tracks not in this set.
         earlier.retain(|u| crate::io::path_exists(out.join(&u.name)));
@@ -381,11 +390,16 @@ impl Plan {
         Ok(Self { started, date, source: source.to_string(), out, target_lufs, ceiling, files, dests, earlier, session_files })
     }
 
+    /// Where each file's copy goes, in the order of the files.
+    pub(crate) fn dests(&self) -> &[PathBuf] {
+        &self.dests
+    }
+
     /// Preps the tracks one at a time (so only one track's audio is in memory), noting each in
     /// `shared` and stopping before the next once it is cancelled. The report is rewritten before
     /// each copy is written (listing it) and after each track, so whenever the run stops (a quit,
     /// a crash) it lists every copy prep wrote; the last write adds the totals.
-    fn prep(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> Result<Value> {
+    pub(crate) fn prep(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> Result<Value> {
         let (target_lufs, ceiling) = (self.target_lufs, self.ceiling);
         let report_path = self.out.join(REPORT);
         let write_report = |text: String| crate::io::replace_file_refusing(&self.session_files, &report_path, text.as_bytes());
@@ -551,9 +565,9 @@ pub struct PrepProgress {
 
 /// What a running prep and the job watching it share.
 #[derive(Debug, Default)]
-struct Shared {
-    cancel: AtomicBool,
-    progress: Mutex<PrepProgress>,
+pub(crate) struct Shared {
+    pub(crate) cancel: AtomicBool,
+    pub(crate) progress: Mutex<PrepProgress>,
 }
 
 impl Shared {

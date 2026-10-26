@@ -167,6 +167,56 @@ pub fn has_prep_note(bytes: &[u8]) -> bool {
         .any(|f| f.content().extended_text().is_some_and(|x| x.description == PREP_DESCRIPTION))
 }
 
+/// The tags an export lists a track by. Each is `None` when missing or blank.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TagBasics {
+    /// `TIT2`.
+    pub title: Option<String>,
+    /// `TPE1`.
+    pub artist: Option<String>,
+    /// `TALB`.
+    pub album: Option<String>,
+    /// `TKEY`, as written (Mixed In Key's Camelot `8A`, or a key name).
+    pub key: Option<String>,
+    /// `TBPM`, when it is a finite number.
+    pub bpm: Option<f64>,
+}
+
+/// The title, artist, album, key and BPM in the ID3v2 tag at the start of `bytes` (an MP3, or
+/// only its tag). The tag is walked as [`fill`] walks it and only those frames are decoded;
+/// one that can't be read is left out, and without a readable tag all are `None`. A frame
+/// holding several values gives its first.
+pub fn read_basic(bytes: &[u8]) -> TagBasics {
+    let mut out = TagBasics::default();
+    if !bytes.starts_with(b"ID3") {
+        return out;
+    }
+    let Ok(tag) = OldTag::parse(bytes) else { return out };
+    let text = |raw: &[u8]| {
+        let t = decode(tag.major, raw).ok().and_then(|f| f.content().text().map(str::to_owned)).unwrap_or_default();
+        t.split('\0').next().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned)
+    };
+    for raw in tag.frames.iter().filter_map(|r| tag.body.get(r.clone())) {
+        let slot = match raw.get(..4).unwrap_or_default() {
+            b"TIT2" => &mut out.title,
+            b"TPE1" => &mut out.artist,
+            b"TALB" => &mut out.album,
+            b"TKEY" => &mut out.key,
+            b"TBPM" => {
+                if out.bpm.is_none() {
+                    out.bpm = text(raw).and_then(|t| t.parse::<f64>().ok()).filter(|b| b.is_finite());
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = text(raw);
+        }
+    }
+    out
+}
+
 const UNSYNC: u8 = 0x80;
 const EXTENDED: u8 = 0x40;
 const FOOTER: u8 = 0x10;
@@ -829,6 +879,37 @@ mod tests {
         ) {
             let src = raw_tag(major, 0, &raw_frame(&id, flags, &content));
             let _ = fill(&src, &prep("p"));
+            let _ = read_basic(&src);
         }
+    }
+
+    #[test]
+    fn read_basic_reads_the_listing_tags_of_either_version() {
+        for version in [Version::Id3v23, Version::Id3v24] {
+            let mut t = library_tag(Some("8A"));
+            t.set_title("Title");
+            t.set_artist("Artist");
+            t.set_album("Album");
+            t.set_text("TBPM", "128");
+            let b = read_basic(&tagged(&t, version));
+            let want = TagBasics {
+                title: Some("Title".into()),
+                artist: Some("Artist".into()),
+                album: Some("Album".into()),
+                key: Some("8A".into()),
+                bpm: Some(128.0),
+            };
+            assert_eq!(b, want, "{version:?}");
+        }
+        // Blank or missing frames, no tag, a broken tag, and an unparsable BPM read as nothing.
+        let mut t = Tag::with_version(Version::Id3v23);
+        t.set_title("  ");
+        t.set_text("TBPM", "fast");
+        assert_eq!(read_basic(&tagged(&t, Version::Id3v23)), TagBasics::default());
+        assert_eq!(read_basic(audio()), TagBasics::default());
+        assert_eq!(read_basic(b"ID3  "), TagBasics::default());
+        // What prep fills reads back.
+        let (filled, _) = fill(audio(), &prep("p")).unwrap();
+        assert_eq!(read_basic(&filled).key.as_deref(), Some("4B"));
     }
 }

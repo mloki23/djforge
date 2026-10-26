@@ -1,12 +1,15 @@
 //! Exporting a DJ set for playing out: the set's tracks in order, each file's bar grid and its
 //! cues in the file's own time ([`collect`]), and the set's Rekordbox XML ([`rekordbox`]).
 
-// Used by `dj.export_set`, which comes with the job that runs the export.
+// Some of a track's fields are for the Mixxx and stem exports still to come.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::dj::recipe::{bar_at_or_after, bar_sample};
+use serde_json::{Value, json};
 use soundcraft_model::{Clip, ClipId, Session, Source, SourceId, StemSet, Transition, WarpMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 #[path = "export_rekordbox.rs"]
 pub(crate) mod rekordbox;
@@ -238,6 +241,378 @@ fn grid(w: &WarpMap, b0: f64, frames: f64, sr: f64) -> Vec<f64> {
         }
     }
     out
+}
+
+// ─── dj.export_set ──────────────────────────────────────────────────────────────────────────────
+
+const CMD: &str = "dj.export_set";
+/// How the export report starts: an existing one is replaced only when it starts so.
+const REPORT_HEADER: &str = "djforge set export: ";
+/// What an exported Rekordbox XML holds: an existing one is replaced only when it does.
+const XML_MARK: &str = "<PRODUCT Name=\"djforge\"";
+/// The targets an export can write.
+const TARGETS: [&str; 2] = ["rekordbox", "mixxx"];
+/// Prep's loudness target and true-peak ceiling for the copies.
+const TARGET_LUFS: f64 = -14.0;
+const CEILING: f64 = -1.0;
+/// How to bring the XML into Rekordbox.
+const REKORDBOX_STEPS: &str =
+    "Rekordbox › Preferences › Advanced › rekordbox xml: choose this file; then drag the playlist into your collection; then export to USB.";
+
+pub fn specs() -> Vec<super::CommandSpec> {
+    vec![crate::cmd!(
+        noundo "dj.export_set",
+        "Export Set",
+        [],
+        None,
+        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt. Mixxx and stem files come later and are reported as skipped. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
+        super::always,
+        export_set
+    )]
+}
+
+fn export_set(e: &mut crate::Engine, p: &Value) -> crate::Result<Value> {
+    export_job(e, p)?.wait()
+}
+
+/// What `dj.export_set` was asked for.
+struct Request {
+    rekordbox: bool,
+    mixxx: bool,
+    stems: bool,
+    out: Option<PathBuf>,
+}
+
+fn request(p: &Value) -> crate::Result<Request> {
+    let targets: Vec<&str> = match p.get("targets") {
+        None | Some(Value::Null) => TARGETS.to_vec(),
+        Some(v) => v
+            .as_array()
+            .and_then(|a| a.iter().map(|t| t.as_str().filter(|t| TARGETS.contains(t))).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| super::bad(CMD, "`targets` must be a list of \"rekordbox\" and \"mixxx\""))?,
+    };
+    let stems = match p.get("stems") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| super::bad(CMD, "`stems` must be true or false"))?,
+    };
+    let out = match p.get("out") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().filter(|o| !o.is_empty()).ok_or_else(|| super::bad(CMD, "`out` must be a folder path"))?),
+    };
+    Ok(Request {
+        rekordbox: targets.contains(&"rekordbox"),
+        mixxx: targets.contains(&"mixxx"),
+        stems,
+        out: out.map(|o| super::prep::normalise(Path::new(o))),
+    })
+}
+
+/// `name` made safe as a file name: characters Windows refuses dropped, ends trimmed of spaces
+/// and dots; "set" when nothing is left.
+fn file_name(name: &str) -> String {
+    let kept: String = name.chars().filter(|c| !c.is_control() && !"<>:\"/\\|?*".contains(*c)).collect();
+    let kept = kept.trim_matches(|c: char| c == ' ' || c == '.');
+    if kept.is_empty() { "set".to_string() } else { kept.to_string() }
+}
+
+/// How far an export got.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportProgress {
+    /// "prep", then "rekordbox", then "done".
+    pub stage: &'static str,
+    /// Tracks prepped (during "prep").
+    pub done: usize,
+    pub total: usize,
+    /// The file name of the track being prepped now.
+    pub current: Option<String>,
+}
+
+/// What a running export and the job watching it share: prep's progress and cancel, and the
+/// stage.
+#[derive(Debug, Default)]
+struct Shared {
+    prep: super::prep::Shared,
+    stage: Mutex<&'static str>,
+}
+
+impl Shared {
+    fn stage(&self, stage: &'static str) {
+        *self.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+    }
+}
+
+/// One track of the export, with what it needs after prep: where its copy goes and its length.
+struct Item {
+    track: ExportTrack,
+    copy: PathBuf,
+    total_secs: f64,
+}
+
+/// An export whose checks all passed and whose folder exists.
+struct Export {
+    name: String,
+    out: PathBuf,
+    xml: PathBuf,
+    report: PathBuf,
+    request: Request,
+    plan: super::prep::Plan,
+    items: Vec<Item>,
+    session_files: crate::io::SourceFiles,
+}
+
+/// A `dj.export_set` run on its own thread: how far it got, a cancel that stops prep before its
+/// next track (nothing more is written then), and its result.
+pub struct ExportJob {
+    shared: Arc<Shared>,
+    out: PathBuf,
+    state: JobState,
+}
+
+enum JobState {
+    Running(std::thread::JoinHandle<crate::Result<Value>>),
+    Ended(Option<crate::Result<Value>>),
+}
+
+/// Starts the run `dj.export_set` does for `p`: every check is made, and the folder created,
+/// before this returns; prep and the writing happen on another thread.
+pub fn export_job(e: &crate::Engine, p: &Value) -> crate::Result<ExportJob> {
+    export_job_in(e, p, None, super::prep::mixforge_analysis())
+}
+
+/// [`export_job`] into `<root>/<session name>` when `p` gives no `out` (`root` default: prep's
+/// [`super::prep::default_root`]), with mixforge's analysis for prep given by `analyse`.
+pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse: super::prep::Analyse) -> crate::Result<ExportJob> {
+    let request = request(p)?;
+    let s = e.session();
+    let tracks = collect(s).map_err(|m| super::bad(CMD, m))?;
+    let name = file_name(&s.name);
+    let out = match &request.out {
+        Some(o) => o.clone(),
+        None => super::prep::normalise(&match root {
+            Some(r) => r.join(&name),
+            None => super::prep::default_root()?.join(&name),
+        }),
+    };
+    let files: Vec<PathBuf> = tracks.iter().map(|t| super::prep::normalise(&t.path)).collect();
+    let (xml, report) = (out.join(format!("{name}.rekordbox.xml")), out.join(format!("{name}.export.txt")));
+    // The export's own files, before prep makes the folder: only earlier exports are replaced.
+    for (path, mark) in [(&xml, XML_MARK), (&report, REPORT_HEADER)] {
+        crate::io::refuse_source_file(s, path)?;
+        crate::file_access::check_write(path).map_err(crate::EngineError::Io)?;
+        if crate::io::path_exists(path) {
+            let ours = crate::io::read_text(path).is_ok_and(|t| if mark == REPORT_HEADER { t.starts_with(mark) } else { t.contains(mark) });
+            if !ours {
+                return Err(super::bad(CMD, format!("{}: exists and is not an earlier export; move it or choose another `out`", path.display())));
+            }
+        }
+    }
+    let plan = super::prep::Plan::for_files(s, &format!("set {}", s.name), files, out.clone(), TARGET_LUFS, CEILING)?;
+    let sr = s.sample_rate.as_f64();
+    let items = tracks
+        .into_iter()
+        .zip(plan.dests().iter().cloned())
+        .map(|(track, copy)| {
+            let total_secs = s.source(track.source).map_or(0.0, |x| x.frames as f64 / sr);
+            Item { track, copy, total_secs }
+        })
+        .collect();
+    let export = Export { name, out: out.clone(), xml, report, request, plan, items, session_files: crate::io::SourceFiles::of(s) };
+    Ok(spawn(export, analyse, out))
+}
+
+/// Runs `export` on another thread.
+fn spawn(export: Export, analyse: super::prep::Analyse, out: PathBuf) -> ExportJob {
+    let shared = Arc::new(Shared::default());
+    shared.stage("prep");
+    let ended = |r| ExportJob { shared: Arc::clone(&shared), out: out.clone(), state: JobState::Ended(Some(r)) };
+    if cfg!(target_arch = "wasm32") {
+        return ended(export.run(&*analyse, &shared));
+    }
+    let export = Arc::new(export);
+    let roots = crate::file_access::current();
+    let (worker, worker_shared) = (Arc::clone(&export), Arc::clone(&shared));
+    let work = move || {
+        let run = || worker.run(&*analyse, &worker_shared);
+        match &roots {
+            Some(r) => crate::file_access::confine(Some(r), run),
+            None => crate::file_access::unconfined(run),
+        }
+    };
+    match std::thread::Builder::new().name("export-set".into()).spawn(work) {
+        Ok(handle) => ExportJob { shared: Arc::clone(&shared), out: out.clone(), state: JobState::Running(handle) },
+        Err(_) => ended(Err(crate::EngineError::Internal(CMD.into(), "no thread to export on".into()))),
+    }
+}
+
+impl ExportJob {
+    /// How far it got.
+    pub fn progress(&self) -> ExportProgress {
+        let stage = *self.shared.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let p = self.shared.prep.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        ExportProgress { stage, done: p.done, total: p.total, current: p.current }
+    }
+
+    /// Stops prep before its next track; nothing is written after it.
+    pub fn cancel(&self) {
+        self.shared.prep.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether it was cancelled.
+    pub fn cancelling(&self) -> bool {
+        self.shared.prep.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The folder it writes to.
+    pub fn out(&self) -> &Path {
+        &self.out
+    }
+
+    /// The result (what `dj.export_set` returns) once the run ended, given once; `None` before.
+    pub fn poll(&mut self) -> Option<crate::Result<Value>> {
+        if let JobState::Running(handle) = &self.state
+            && !handle.is_finished()
+        {
+            return None;
+        }
+        match std::mem::replace(&mut self.state, JobState::Ended(None)) {
+            JobState::Running(handle) => Some(joined(handle)),
+            JobState::Ended(r) => r,
+        }
+    }
+
+    /// Waits for the run to end and gives its result.
+    pub fn wait(mut self) -> crate::Result<Value> {
+        match std::mem::replace(&mut self.state, JobState::Ended(None)) {
+            JobState::Running(handle) => joined(handle),
+            JobState::Ended(r) => r.unwrap_or_else(|| Err(crate::EngineError::Internal(CMD.into(), "the result was taken already".into()))),
+        }
+    }
+}
+
+fn joined(handle: std::thread::JoinHandle<crate::Result<Value>>) -> crate::Result<Value> {
+    handle.join().unwrap_or_else(|p| Err(crate::EngineError::Internal(CMD.into(), crate::panic_message(&*p))))
+}
+
+/// One exported track's outcome.
+struct Done {
+    file: String,
+    path: PathBuf,
+    prep: String,
+    title: String,
+    grid_bars: usize,
+    cues: usize,
+    doubts: Vec<String>,
+}
+
+impl Export {
+    /// Preps the files, then writes the Rekordbox XML and the report. A cancelled prep ends it
+    /// with nothing more written.
+    fn run(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> crate::Result<Value> {
+        let prep = self.plan.prep(analyse, &shared.prep)?;
+        let rows = prep.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
+        if prep.get("cancelled").and_then(Value::as_bool).unwrap_or(false) {
+            shared.stage("done");
+            return Ok(json!({"root": self.out, "cancelled": true, "rekordbox": null, "report": null, "prep": prep}));
+        }
+        shared.stage("rekordbox");
+        let mut rb = Vec::with_capacity(self.items.len());
+        let mut done = Vec::with_capacity(self.items.len());
+        for (i, item) in self.items.iter().enumerate() {
+            let t = &item.track;
+            let mut doubts = t.doubts.clone();
+            let row = rows.get(i);
+            let status = row.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("failed").to_string();
+            // The prepped copy when prep wrote one; the original (never written) otherwise.
+            let path = if matches!(status.as_str(), "ok" | "not_adjusted") {
+                item.copy.clone()
+            } else {
+                let why: Vec<&str> = row
+                    .and_then(|r| r.get("doubts"))
+                    .and_then(Value::as_array)
+                    .map(|d| d.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                doubts.push(format!("prep {status} ({}); exported the original", why.join("; ")));
+                t.path.clone()
+            };
+            let tags = if path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3")) {
+                super::prep::tag_head(&path).map(|h| soundcraft_audio_io::mp3tags::read_basic(&h)).unwrap_or_default()
+            } else {
+                soundcraft_audio_io::mp3tags::TagBasics::default()
+            };
+            let stem = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let title = tags.title.clone().unwrap_or_else(|| stem.clone());
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match rekordbox::file_url(&path) {
+                Some(location) => rb.push(rekordbox::RbTrack {
+                    path: path.clone(),
+                    location,
+                    name: title.clone(),
+                    artist: tags.artist.clone().unwrap_or_default(),
+                    album: tags.album.clone().unwrap_or_default(),
+                    size: crate::io::file_len(&path).unwrap_or(0),
+                    total_secs: item.total_secs,
+                    tonality: tags.key.clone().unwrap_or_default(),
+                    grid: t.grid.clone(),
+                    cues: t.cues.clone(),
+                }),
+                None if self.request.rekordbox => doubts.push("its path has no file:// URL; left out of the Rekordbox XML".into()),
+                None => {}
+            }
+            done.push(Done { file, path, prep: status, title, grid_bars: t.grid.len(), cues: t.cues.len(), doubts });
+        }
+
+        let rekordbox = if self.request.rekordbox {
+            let xml = rekordbox::rekordbox_xml(&self.name, &rb);
+            match crate::io::replace_file_refusing(&self.session_files, &self.xml, xml.as_bytes()) {
+                Ok(()) => json!(self.xml),
+                Err(err) => json!({"error": err.to_string()}),
+            }
+        } else {
+            Value::Null
+        };
+        let mixxx = if self.request.mixxx { json!({"skipped": "Mixxx export is not set up"}) } else { json!({"skipped": "not requested"}) };
+        let stems = if self.request.stems { json!({"skipped": "stem files are not written yet"}) } else { json!([]) };
+
+        let text = self.report_text(&rekordbox, &mixxx, &stems, &done);
+        crate::io::replace_file_refusing(&self.session_files, &self.report, text.as_bytes())?;
+        shared.stage("done");
+        let tracks: Vec<Value> = done
+            .iter()
+            .map(|d| json!({"file": d.file, "path": d.path, "title": d.title, "prep": d.prep, "grid_bars": d.grid_bars, "cues": d.cues, "doubts": d.doubts}))
+            .collect();
+        Ok(json!({
+            "root": self.out,
+            "rekordbox": rekordbox,
+            "report": self.report,
+            "mixxx": mixxx,
+            "stems": stems,
+            "tracks": tracks,
+            "prep": prep,
+            "cancelled": false,
+        }))
+    }
+
+    /// The export report: what was written for each target, a line per track with its doubts,
+    /// and the Rekordbox import steps.
+    fn report_text(&self, rekordbox: &Value, mixxx: &Value, stems: &Value, done: &[Done]) -> String {
+        let said = |v: &Value| match v {
+            Value::Null => "not requested".to_string(),
+            Value::String(p) => p.clone(),
+            Value::Array(a) if a.is_empty() => "not requested".to_string(),
+            other => other.get("skipped").or_else(|| other.get("error")).and_then(Value::as_str).map_or_else(|| other.to_string(), str::to_string),
+        };
+        let mut out = format!("{REPORT_HEADER}{}\n{}\nfolder: {}\n\n", self.name, super::prep::utc_now(), self.out.display());
+        out.push_str(&format!("Rekordbox: {}\nMixxx: {}\nStem files: {}\n\n", said(rekordbox), said(mixxx), said(stems)));
+        for (i, d) in done.iter().enumerate() {
+            let doubts = if d.doubts.is_empty() { String::new() } else { format!("  | {}", d.doubts.join("; ")) };
+            let line = format!("{:>2}  {}  prep {}  {} bars  {} cues{doubts}\n", i + 1, d.file, d.prep, d.grid_bars, d.cues);
+            out.extend(line.chars().filter(|c| *c == '\n' || !c.is_control()));
+        }
+        if rekordbox.is_string() {
+            out.push_str(&format!("\nTo use the Rekordbox XML: {REKORDBOX_STEPS}\n"));
+        }
+        out
+    }
 }
 
 #[cfg(test)]

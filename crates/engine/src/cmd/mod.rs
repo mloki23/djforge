@@ -43,6 +43,7 @@ mod vst3;
 mod zoom_toggle;
 
 pub use clip_list::{ClearEffect, clear_effect};
+pub use export::{ExportJob, ExportProgress, export_job, export_job_in};
 pub use file::bounce_job;
 pub use prep::{
     Analyse as PrepAnalyse, PrepJob, PrepProgress, default_root as prep_default_root, mixforge_analysis as prep_mixforge_analysis, prep_job,
@@ -147,6 +148,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(zoom_toggle::specs());
         v.extend(dj::specs());
         v.extend(prep::specs());
+        v.extend(export::specs());
         v.extend(stems::specs());
         v
     })
