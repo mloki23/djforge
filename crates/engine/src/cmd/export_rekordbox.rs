@@ -8,7 +8,11 @@ use std::path::{Path, PathBuf};
 /// One track of the collection.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RbTrack {
+    /// The file, for its kind.
     pub path: PathBuf,
+    /// Its `file://` URL ([`file_url`]): a path without one can't be listed, so the caller
+    /// decides what to do about it.
+    pub location: String,
     pub name: String,
     pub artist: String,
     pub album: String,
@@ -26,10 +30,9 @@ pub(crate) struct RbTrack {
 /// Hot cue colours (red, green, blue) for A..D: green, yellow, red, orange.
 const HOT_CUE_RGB: [(u8, u8, u8); 4] = [(40, 226, 20), (180, 190, 4), (230, 40, 40), (224, 100, 27)];
 
-/// The Rekordbox XML of a playlist `set_name` holding `tracks` in order. A track whose path has
-/// no `file://` URL ([`file_url`]) is left out, since Rekordbox couldn't find it.
+/// The Rekordbox XML of a playlist `set_name` holding all of `tracks`, in order.
 pub(crate) fn rekordbox_xml(set_name: &str, tracks: &[RbTrack]) -> String {
-    let listed: Vec<(&RbTrack, String)> = tracks.iter().filter_map(|t| file_url(&t.path).map(|u| (t, u))).collect();
+    let listed: Vec<(&RbTrack, &String)> = tracks.iter().map(|t| (t, &t.location)).collect();
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DJ_PLAYLISTS Version=\"1.0.0\">\n");
     let _ = writeln!(x, "  <PRODUCT Name=\"djforge\" Version=\"{}\" Company=\"\"/>", env!("CARGO_PKG_VERSION"));
@@ -96,9 +99,9 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Whole seconds of a length (0 for a non-finite or negative one).
+/// Whole seconds of a length, cut like Rekordbox (0 for a non-finite or negative one).
 fn whole_secs(secs: f64) -> u64 {
-    if secs.is_finite() && secs > 0.0 { secs.round().min(u64::MAX as f64) as u64 } else { 0 }
+    if secs.is_finite() && secs > 0.0 { secs.floor().min(u64::MAX as f64) as u64 } else { 0 }
 }
 
 /// Rekordbox's file kind from the extension.
@@ -148,13 +151,24 @@ fn tempos(grid: &[f64]) -> Vec<(f64, f64)> {
     out
 }
 
-/// `path` as a Rekordbox `Location` URL: `file://localhost/C:/...` for a drive path,
-/// `file://server/share/...` for a UNC one (both also in their `\\?\` forms), and
-/// `file://localhost/...` for an absolute Unix path; every byte of the UTF-8 path but unreserved
-/// characters and the separators is percent-encoded. `None` for a relative path, a device path,
-/// or one that isn't UTF-8.
+/// `path` as a Rekordbox `Location` URL; every byte of the UTF-8 path but unreserved characters
+/// and the separators is percent-encoded.
+/// - A Windows drive path: `file://localhost/C:/...`; a UNC one (`\\server\share\...`):
+///   `file://server/share/...`; both also in their `\\?\` forms. Windows paths are recognised
+///   by their form (a drive letter, or a leading `\\`; on Windows a leading `//` too), and only
+///   in them is `\` a separator.
+/// - An absolute Unix path: `file://localhost/...` (leading slashes taken as one).
+///
+/// `None` for a relative path, a device path, or one that isn't UTF-8.
 pub(crate) fn file_url(path: &Path) -> Option<String> {
-    let p = path.to_str()?.replace('\\', "/");
+    let p = path.to_str()?;
+    let drive = |b: &[u8]| matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    let windows = p.starts_with(r"\\") || drive(p.as_bytes()) || (cfg!(windows) && p.starts_with("//"));
+    if !windows {
+        let rest = p.strip_prefix('/')?.trim_start_matches('/');
+        return (!rest.is_empty()).then(|| format!("file://localhost/{}", encode(rest)));
+    }
+    let p = p.replace('\\', "/");
     let (host, drive, rest) =
         if let Some(unc) = p.strip_prefix("//?/UNC/").or_else(|| p.strip_prefix("//").filter(|r| !r.starts_with("?/") && !r.starts_with("./"))) {
             let (server, rest) = unc.split_once('/')?;
@@ -165,7 +179,6 @@ pub(crate) fn file_url(path: &Path) -> Option<String> {
                 [d, b':', b'/', ..] if d.is_ascii_alphabetic() => {
                     ("localhost".to_string(), format!("{}:/", char::from(*d).to_ascii_uppercase()), local.get(3..)?.to_string())
                 }
-                [b'/', ..] if !p.starts_with("//") => ("localhost".to_string(), String::new(), local.get(1..)?.to_string()),
                 _ => return None,
             }
         };
@@ -266,6 +279,7 @@ mod tests {
         vec![
             RbTrack {
                 path: PathBuf::from(r"C:\Music\Set\a b.mp3"),
+                location: file_url(Path::new(r"C:\Music\Set\a b.mp3")).unwrap(),
                 name: "A".into(),
                 artist: "Artist".into(),
                 album: String::new(),
@@ -284,6 +298,7 @@ mod tests {
             },
             RbTrack {
                 path: PathBuf::from(r"C:\Music\Set\b.flac"),
+                location: file_url(Path::new(r"C:\Music\Set\b.flac")).unwrap(),
                 name: "Tom & \"Jerry\" <live> it's\u{1}\t\n".into(),
                 artist: String::new(),
                 album: "Al'bum".into(),
@@ -315,7 +330,7 @@ mod tests {
             ("Album", ""),
             ("Kind", "MP3 File"),
             ("Size", "1234567"),
-            ("TotalTime", "313"),
+            ("TotalTime", "312"),
             ("AverageBpm", "128.00"),
             ("Tonality", "8A"),
             ("Location", "file://localhost/C:/Music/Set/a%20b.mp3"),
@@ -383,17 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn a_track_without_a_url_is_left_out() {
-        let mut t = tracks();
-        t[0].path = PathBuf::from("Audio Files/a.wav");
-        let root = parse(&rekordbox_xml("set", &t));
-        let coll = root.kid("COLLECTION");
-        assert_eq!((coll.attr("Entries"), coll.kids("TRACK").len()), ("1", 1));
-        assert_eq!(coll.kids("TRACK")[0].attr("TrackID"), "1");
-        assert_eq!(root.kid("PLAYLISTS").kid("NODE").kid("NODE").kids("TRACK").len(), 1);
-    }
-
-    #[test]
     fn file_urls_percent_encode_utf8_and_keep_the_drive() {
         let url = |p: &str| file_url(Path::new(p));
         assert_eq!(url(r"C:\Users\marty\Music\a b.mp3").as_deref(), Some("file://localhost/C:/Users/marty/Music/a%20b.mp3"));
@@ -409,6 +413,11 @@ mod tests {
         assert_eq!(url(r"\\nas\music\a b.mp3").as_deref(), Some("file://nas/music/a%20b.mp3"));
         assert_eq!(url(r"\\?\UNC\nas\music\a.mp3").as_deref(), Some("file://nas/music/a.mp3"));
         assert_eq!(url("/home/m/a b.mp3").as_deref(), Some("file://localhost/home/m/a%20b.mp3"));
+        // In a Unix path a backslash is part of the name.
+        assert_eq!(url(r"/home/m/a\b.mp3").as_deref(), Some("file://localhost/home/m/a%5Cb.mp3"));
+        // A leading `//` is UNC only on Windows.
+        let want = if cfg!(windows) { "file://nas/music/a.mp3" } else { "file://localhost/nas/music/a.mp3" };
+        assert_eq!(url("//nas/music/a.mp3").as_deref(), Some(want));
         for bad in ["a.mp3", "Audio Files/a.mp3", r"C:a.mp3", r"\\.\COM1", r"\\nas", r"\\?\Volume{x}\a.mp3", "", r"C:\"] {
             assert_eq!(url(bad), None, "{bad}");
         }
