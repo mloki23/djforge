@@ -79,7 +79,7 @@ pub(crate) fn bar_sample(s: &Session, bar: i64) -> Samples {
 }
 
 /// The first bar starting at or after timeline sample `at`.
-fn bar_at_or_after(s: &Session, at: Samples) -> i64 {
+pub(crate) fn bar_at_or_after(s: &Session, at: Samples) -> i64 {
     let bb = s.tempo.bar_beat_at(at, s.sample_rate);
     if bar_sample(s, bb.bar) < at { bb.bar.saturating_add(1) } else { bb.bar }
 }
