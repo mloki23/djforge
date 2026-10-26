@@ -327,6 +327,7 @@ pub(crate) fn add_file_source(s: &mut Session, name: &str, path: &Path, audio: A
         unsaved: !in_place,
         file_len,
         file_modified_ms,
+        origin: None,
     });
     s.pool.insert(id, audio);
     id
@@ -416,6 +417,7 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         unsaved: true,
         file_len: 0,
         file_modified_ms: 0,
+        origin: None,
     });
     s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
     id
@@ -468,6 +470,9 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     }
     if let Some(sx) = s.sources.last_mut() {
         sx.unsaved = !in_place;
+        // The file it came from, for exports that want the original rather than the session's
+        // copy of it.
+        sx.origin = path.map(|p| crate::cmd::prep::normalise(Path::new(p)).to_string_lossy().into_owned());
         if let Some(bwf) = info.bwf.as_ref() {
             sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);
         }
@@ -1641,6 +1646,10 @@ fn relink_to(e: &mut Engine, src: SourceId, file: &Path, audio: Arc<SourceAudio>
     if let Some(x) = s.sources.iter_mut().find(|x| x.id == src) {
         x.path = file.to_string_lossy().into_owned();
         x.unsaved = false;
+        // A session's own copy is not where the audio came from.
+        if !in_audio_files(file) {
+            x.origin = Some(crate::cmd::prep::normalise(file).to_string_lossy().into_owned());
+        }
     }
 }
 
@@ -2819,6 +2828,21 @@ mod in_place_tests {
     }
 
     #[test]
+    fn a_resampled_import_remembers_the_file_it_came_from() {
+        let dir = folder("origin-48k");
+        let (wav, _) = library_wav(&dir.join("Library"), 44_100);
+        let mut e = session_at(48_000);
+        e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
+        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        save_session(&mut e, &path).unwrap();
+        let reopened = reopen(&path);
+        let src = &reopened.session().sources[0];
+        assert!(src.path.starts_with("Audio Files/"));
+        assert_eq!(src.origin.as_deref().map(Path::new), Some(Path::new(&wav)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_edit_of_referenced_audio_is_saved_into_the_session_and_leaves_the_file_alone() {
         let dir = folder("in-place-edit");
         let (wav, audio) = library_wav(&dir.join("Library"), 44_100);
@@ -3052,6 +3076,7 @@ mod in_place_tests {
         assert_eq!(out["relinked"].as_array().unwrap().len(), 1, "{out}");
         assert!(out["missing"].as_array().unwrap().is_empty());
         assert_eq!(Path::new(&r.session().sources[0].path), moved.join("1A - 128 - track.wav"));
+        assert_eq!(r.session().sources[0].origin.as_deref().map(Path::new), Some(moved.join("1A - 128 - track.wav").as_path()));
         assert_eq!(first_audio(&r), audio);
         // Saved again, it references the file where it now is.
         let again = dir.join("Again/Again.scraft").to_string_lossy().into_owned();

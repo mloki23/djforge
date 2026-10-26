@@ -29,6 +29,10 @@ pub struct Source {
     /// The file's modification time then, in milliseconds since 1970 (0 = unknown).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub file_modified_ms: u64,
+    /// The absolute path of the user file it was imported from, kept when the session saves a
+    /// copy of it (`None`: made in the session, a stem, or from a session older than this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 fn is_zero(x: &u64) -> bool {

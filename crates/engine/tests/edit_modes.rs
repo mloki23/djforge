@@ -16,6 +16,7 @@ fn source(id: u64, frames: u64) -> Source {
         unsaved: false,
         file_len: 0,
         file_modified_ms: 0,
+        origin: None,
     }
 }
 
