@@ -35,6 +35,8 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
 rayon = "1"
 proptest = "1"
+# Tests only: parse the exported Rekordbox XML back.
+quick-xml = "0.41"
 
 # audio
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }

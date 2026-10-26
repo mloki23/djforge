@@ -1,5 +1,5 @@
 //! Exporting a DJ set for playing out: the set's tracks in order, each file's bar grid and its
-//! cues in the file's own time ([`collect`]).
+//! cues in the file's own time ([`collect`]), and the set's Rekordbox XML ([`rekordbox`]).
 
 // Used by `dj.export_set`, which comes with the job that runs the export.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -8,6 +8,9 @@ use super::dj::recipe::{bar_at_or_after, bar_sample};
 use soundcraft_model::{Clip, ClipId, Session, SourceId, StemSet, Transition, WarpMap};
 use soundcraft_time::Samples;
 use std::path::PathBuf;
+
+#[path = "export_rekordbox.rs"]
+pub(crate) mod rekordbox;
 
 /// One track of an exported set: a source file with its bar grid and cues, in seconds of the
 /// decoded file.

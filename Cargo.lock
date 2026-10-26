@@ -3680,6 +3680,7 @@ dependencies = [
  "craft-docpath",
  "log",
  "proptest",
+ "quick-xml",
  "serde",
  "serde_json",
  "soundcraft-au-host",
