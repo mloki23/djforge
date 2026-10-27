@@ -77,6 +77,17 @@ pub fn stored_path(stored: &str, session: &Path) -> std::result::Result<PathBuf,
     Ok(path)
 }
 
+/// [`stored_path`] for a session whose relative paths point into `folder` (where it was opened
+/// or last saved). Without a folder (never saved) a relative path is refused rather than taken
+/// from the working directory, and so are network and device paths.
+pub(crate) fn stored_path_in(stored: &str, folder: Option<&Path>) -> std::result::Result<PathBuf, String> {
+    match folder {
+        // The document's folder is what counts; its file name doesn't.
+        Some(f) => stored_path(stored, &f.join("session.scraft")),
+        None => craft_docpath::resolve_absolute(stored, None).map_err(|why| format!("not opened: {why}")),
+    }
+}
+
 // ─── Audio referenced in place ────────────────────────────────────────────────────────────────
 //
 // An imported file that plays as decoded is referenced where it is rather than copied into the
@@ -328,6 +339,8 @@ pub(crate) fn add_file_source(s: &mut Session, name: &str, path: &Path, audio: A
         file_len,
         file_modified_ms,
         origin: None,
+        origin_len: 0,
+        origin_modified_ms: 0,
     });
     s.pool.insert(id, audio);
     id
@@ -418,6 +431,8 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         file_len: 0,
         file_modified_ms: 0,
         origin: None,
+        origin_len: 0,
+        origin_modified_ms: 0,
     });
     s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
     id
@@ -473,6 +488,8 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
         // The file it came from, for exports that want the original rather than the session's
         // copy of it.
         sx.origin = path.map(|p| crate::cmd::prep::normalise(Path::new(p)).to_string_lossy().into_owned());
+        // How it was then, so an export can tell when it changed since.
+        (sx.origin_len, sx.origin_modified_ms) = path.map_or((0, 0), |p| saved_stamp(Path::new(p)));
         if let Some(bwf) = info.bwf.as_ref() {
             sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);
         }
@@ -511,6 +528,12 @@ pub fn import_video_bytes(e: &mut Engine, path: &str, bytes: Vec<u8>, at: Sample
     let movie = soundcraft_video::Movie::open(Arc::clone(&bytes)).map(|m| m.info().clone());
     let audio_name = format!("{stem} audio.{}", if ext == "mov" { "mp4" } else { ext.as_str() });
     let audio = import_audio_bytes(e, &audio_name, &bytes, Some(path), None, at);
+    // Its audio came out of the movie: there is no audio file it was imported from.
+    if let Some(src) = audio.as_ref().ok().and_then(|a| a.get("source")).and_then(Value::as_u64)
+        && let Some(x) = e.session_mut().sources.iter_mut().find(|x| x.id.0 == src)
+    {
+        (x.origin, x.origin_len, x.origin_modified_ms) = (None, 0, 0);
+    }
     let info = match (movie, &audio) {
         (Ok(info), _) => info,
         (Err(verr), Ok(a)) => {
@@ -1649,6 +1672,7 @@ fn relink_to(e: &mut Engine, src: SourceId, file: &Path, audio: Arc<SourceAudio>
         // A session's own copy is not where the audio came from.
         if !in_audio_files(file) {
             x.origin = Some(crate::cmd::prep::normalise(file).to_string_lossy().into_owned());
+            (x.origin_len, x.origin_modified_ms) = saved_stamp(file);
         }
     }
 }

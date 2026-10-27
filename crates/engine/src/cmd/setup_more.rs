@@ -437,6 +437,12 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
     for src in needed.iter().filter_map(|sid| other.source(*sid)) {
         let mut ns = src.clone();
         ns.id = SourceId(s.alloc());
+        // The file it was imported from is a path that session names too: kept only when it
+        // could be opened.
+        ns.origin = ns.origin.as_deref().and_then(|o| crate::io::stored_path(o, Path::new(&path)).ok()).map(|p| p.to_string_lossy().into_owned());
+        if ns.origin.is_none() {
+            (ns.origin_len, ns.origin_modified_ms) = (0, 0);
+        }
         match crate::io::stored_path(&src.path, Path::new(&path)) {
             Ok(abs) => {
                 ns.path = abs.to_string_lossy().into_owned();
@@ -607,6 +613,35 @@ mod tests {
         assert!(e.session().pool.get(src).is_some());
         assert_eq!(e.session().track_by_name("Keys").unwrap().clips().len(), 1);
         assert!(e.execute("file.import_session_data", &json!({"path": path, "tracks": ["Nope"]})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file another session's audio was imported from is a path that session names: one on
+    /// another computer is not taken over; a local one is, with its stamps.
+    #[test]
+    fn import_session_data_takes_over_only_origins_it_could_open() {
+        let dir = std::env::temp_dir().join(format!("sc-import-origins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let local = dir.join("kick.wav");
+        let mut donor = crate::demo::demo_engine();
+        let s = donor.session_mut();
+        let (kick, snare) =
+            (s.track_by_name("Kick").unwrap().clips()[0].source().unwrap(), s.track_by_name("Snare").unwrap().clips()[0].source().unwrap());
+        for (id, origin) in [(kick, local.to_string_lossy().into_owned()), (snare, r"\\attacker\share\snare.wav".to_string())] {
+            let x = s.sources.iter_mut().find(|x| x.id == id).unwrap();
+            (x.origin, x.origin_len, x.origin_modified_ms) = (Some(origin), 7, 9);
+        }
+        crate::io::save_session(&mut donor, &path).unwrap();
+        let mut e = Engine::default();
+        e.execute("file.import_session_data", &json!({"path": path, "tracks": ["Kick", "Snare"]})).unwrap();
+        let s = e.session();
+        let of = |name: &str| s.source(s.track_by_name(name).unwrap().clips()[0].source().unwrap()).unwrap();
+        let k = of("Kick");
+        assert_eq!((k.origin.as_deref().map(Path::new), k.origin_len, k.origin_modified_ms), (Some(local.as_path()), 7, 9));
+        let k = of("Snare");
+        assert_eq!((k.origin.as_deref(), k.origin_len, k.origin_modified_ms), (None, 0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

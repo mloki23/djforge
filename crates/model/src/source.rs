@@ -33,6 +33,12 @@ pub struct Source {
     /// copy of it (`None`: made in the session, a stem, or from a session older than this).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Size in bytes of `origin` when it was imported or relinked (0 = unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub origin_len: u64,
+    /// `origin`'s modification time then, in milliseconds since 1970 (0 = unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub origin_modified_ms: u64,
 }
 
 fn is_zero(x: &u64) -> bool {

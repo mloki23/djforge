@@ -21,6 +21,9 @@ pub(crate) struct ExportTrack {
     pub source: SourceId,
     /// The file exported: the one the audio was imported from when it is still there.
     pub path: PathBuf,
+    /// Whether `path` is a file that may be read (else nothing reads it: it is not prepped and
+    /// not sent to Mixxx).
+    pub found: bool,
     pub title: String,
     pub artist: String,
     /// File seconds of each bar's downbeat, strictly increasing, over the whole file.
@@ -55,7 +58,15 @@ const DISAGREE_SECS: f64 = 0.005;
 /// Session beats in a bar: export needs 4/4 throughout.
 const BEATS_PER_BAR: f64 = 4.0;
 /// The doubt of a track exported from the session's own copy of its audio.
-pub(crate) const SESSION_COPY: &str = "exported the session's copy (resampled); re-import the track to export its original";
+pub(crate) const SESSION_COPY: &str = "exported the session's copy";
+/// What the session's copy of an imported file is.
+const RESAMPLED: &str = "(resampled when it was imported); re-import the track to export its original";
+/// What the session's copy of audio with no file it was imported from is.
+const SESSION_AUDIO: &str = "(the set plays audio made or edited in the session, such as a recording, a rendered effect or consolidated clips; or the session is older than exports)";
+/// The doubt of an original that changed since it was imported.
+const CHANGED: &str = "the original changed since import; exported the session's audio";
+/// Extensions of movies: the audio of a movie has no audio file of its own to export.
+const MOVIES: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "mpg", "mpeg"];
 
 /// The set in session `s`, from its DJ transitions: the files their clips play, one track per
 /// file in the order its first clip starts, each with its bar grid and cues in file seconds.
@@ -97,6 +108,7 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
         key: PathBuf,
         path: PathBuf,
         source: &'a Source,
+        found: bool,
         doubts: Vec<String>,
         clips: Vec<(&'a Clip, &'a WarpMap)>,
     }
@@ -105,12 +117,12 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
         let c = s.find_clip(id).map(|(_, c)| c).ok_or_else(|| format!("clip {} of a transition is not on its track's active playlist", id.0))?;
         let w = c.warp.as_ref().filter(|w| w.is_usable() && c.is_audio()).ok_or_else(|| format!("clip {} is not beat-locked", id.0))?;
         let src = c.source().and_then(|x| s.source(x)).ok_or_else(|| format!("clip {} has no source", id.0))?;
-        let (path, doubt) = file_of(s, src);
+        let (path, doubts, found) = file_of(s, src);
         let key = crate::io::file_key(&path);
         match files.iter_mut().find(|f| f.key == key) {
             Some(f) if f.clips.iter().any(|(k, _)| k.id == id) => {}
             Some(f) => f.clips.push((c, w)),
-            None => files.push(File { key, path, source: src, doubts: doubt.into_iter().collect(), clips: vec![(c, w)] }),
+            None => files.push(File { key, path, source: src, found, doubts, clips: vec![(c, w)] }),
         }
     }
     for f in &mut files {
@@ -190,6 +202,7 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
         out.push(ExportTrack {
             source: f.source.id,
             path: f.path,
+            found: f.found,
             title: String::new(),
             artist: String::new(),
             grid,
@@ -203,23 +216,64 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
     Ok(out)
 }
 
-/// The file to export for source `src`, and a doubt about it: the file it was imported from
-/// when that is still there and readable; else its own file when that is a user's file
-/// referenced in place; else the session's copy of it (with a doubt); else (with a doubt) the
-/// path it should be at.
-fn file_of(s: &Session, src: &Source) -> (PathBuf, Option<String>) {
-    let exists = |p: &Path| crate::io::file_len(p).is_some();
-    if let Some(origin) = src.origin.as_deref().map(PathBuf::from).filter(|p| p.is_absolute() && exists(p)) {
-        return (origin, None);
+/// The file to export for source `src`, the doubts about it, and whether it was found. Every path
+/// the session names goes through [`crate::io::stored_path_in`] first (only local files or the
+/// session's own share; relative paths only from a saved session's folder): a path refused there
+/// is never read.
+///
+/// The file it was imported from when that is still there, unchanged since (its size and date
+/// as recorded) and not a movie; else its own file (a user's file referenced in place, or the
+/// session's copy, with a doubt); else (with a doubt) the path it should be at, unread.
+fn file_of(s: &Session, src: &Source) -> (PathBuf, Vec<String>, bool) {
+    let resolve = |p: &str| crate::io::stored_path_in(p, s.folder.as_deref());
+    let mut doubts = Vec::new();
+    let is_movie = |p: &str| Path::new(p).extension().and_then(|x| x.to_str()).is_some_and(|x| MOVIES.iter().any(|m| x.eq_ignore_ascii_case(m)));
+    let origin = match src.origin.as_deref().filter(|o| !is_movie(o)) {
+        None => None,
+        Some(o) => match resolve(o) {
+            Ok(p) => Some(p),
+            Err(why) => {
+                doubts.push(format!("the file it was imported from ({o}) is {why}"));
+                None
+            }
+        },
+    };
+    let mut changed = false;
+    if let Some(p) = origin.as_ref().filter(|p| crate::io::file_found(p)) {
+        let (len, ms) = crate::io::saved_stamp(p);
+        changed = (src.origin_len != 0 && len != src.origin_len) || (src.origin_modified_ms != 0 && ms != 0 && ms != src.origin_modified_ms);
+        if !changed {
+            return (p.clone(), doubts, true);
+        }
     }
     let stored = Path::new(&src.path);
-    let full = if stored.is_absolute() { stored.to_path_buf() } else { s.folder.as_deref().map_or_else(|| stored.to_path_buf(), |f| f.join(stored)) };
-    if exists(&full) {
-        let in_place = stored.is_absolute() && !crate::io::in_audio_files(stored);
-        return (full, (!in_place).then(|| SESSION_COPY.to_string()));
+    match resolve(&src.path) {
+        Ok(full) if crate::io::file_found(&full) => {
+            let in_place = stored.is_absolute() && !crate::io::in_audio_files(stored);
+            if changed {
+                let same = origin.as_ref().is_some_and(|o| crate::io::file_key(o) == crate::io::file_key(&full));
+                doubts.push(if same {
+                    "the file changed since it was imported; its grid and cues may no longer fit".to_string()
+                } else {
+                    CHANGED.to_string()
+                });
+            } else if !in_place {
+                doubts.push(format!("{SESSION_COPY} {}", if src.origin.is_some() { RESAMPLED } else { SESSION_AUDIO }));
+            }
+            (full, doubts, true)
+        }
+        resolved => {
+            let at = match &resolved {
+                Ok(full) => full.display().to_string(),
+                Err(why) => format!("{}, {why}", src.path),
+            };
+            doubts.push(format!("no audio file found for `{}` (at {at}); relink it (File > Relink Audio) and export again", src.name));
+            // A refused absolute path (another computer's share, a device) is not named as the
+            // track's file; a relative one names no place, so it stays as the track's identity.
+            let path = origin.or_else(|| resolved.ok()).unwrap_or_else(|| PathBuf::from(if stored.is_relative() { &src.path } else { &src.name }));
+            (path, doubts, false)
+        }
     }
-    let missing = format!("no audio file found for `{}` (at {}); relink it (File > Relink Audio) and export again", src.name, full.display());
-    (src.origin.as_deref().map_or(full, PathBuf::from), Some(missing))
 }
 
 /// File seconds of every bar of a file of `frames` pool samples at rate `sr` whose clip plays
@@ -414,7 +468,8 @@ fn request(p: &Value) -> crate::Result<Request> {
         Some(v) => v
             .as_array()
             .and_then(|a| a.iter().map(|t| t.as_str().filter(|t| TARGETS.contains(t))).collect::<Option<Vec<_>>>())
-            .ok_or_else(|| super::bad(CMD, "`targets` must be a list of \"rekordbox\" and \"mixxx\""))?,
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| super::bad(CMD, "`targets` must be a list of \"rekordbox\" and \"mixxx\", not empty"))?,
     };
     let stems = match p.get("stems") {
         None | Some(Value::Null) => false,
@@ -433,11 +488,30 @@ fn request(p: &Value) -> crate::Result<Request> {
 }
 
 /// `name` made safe as a file name: characters Windows refuses dropped, ends trimmed of spaces
-/// and dots; "set" when nothing is left.
+/// and dots, and `_` after a name Windows reserves for a device (`CON`, `nul.txt`); "set" when
+/// nothing is left.
 fn file_name(name: &str) -> String {
     let kept: String = name.chars().filter(|c| !c.is_control() && !"<>:\"/\\|?*".contains(*c)).collect();
     let kept = kept.trim_matches(|c: char| c == ' ' || c == '.');
-    if kept.is_empty() { "set".to_string() } else { kept.to_string() }
+    if kept.is_empty() {
+        return "set".to_string();
+    }
+    let (base, rest) = kept.split_at(kept.find('.').unwrap_or(kept.len()));
+    let upper = base.trim_end().to_ascii_uppercase();
+    let numbered = |p: &str| upper.strip_prefix(p).is_some_and(|n| n.len() == 1 && n.bytes().all(|b| (b'1'..=b'9').contains(&b)));
+    if ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str()) || numbered("COM") || numbered("LPT") {
+        format!("{base}_{rest}")
+    } else {
+        kept.to_string()
+    }
+}
+
+/// Why the export can't replace `path`: it exists and is not an earlier export (its text has
+/// `mark`: at the start for the report, anywhere for the XML).
+fn foreign(path: &Path, mark: &str) -> Option<String> {
+    let ours = || crate::io::read_text(path).is_ok_and(|t| if mark == REPORT_HEADER { t.starts_with(mark) } else { t.contains(mark) });
+    (crate::io::path_exists(path) && !ours())
+        .then(|| format!("{}: exists and is not an earlier export; move it or choose another `out`", path.display()))
 }
 
 /// How far an export got.
@@ -466,10 +540,11 @@ impl Shared {
     }
 }
 
-/// One track of the export, with what it needs after prep: where its copy goes and its length.
+/// One track of the export, with what it needs after prep: where its copy goes (with its row
+/// of prep's report) or why prep left it out, and its length.
 struct Item {
     track: ExportTrack,
-    copy: PathBuf,
+    copy: Result<(PathBuf, usize), String>,
     total_secs: f64,
 }
 
@@ -520,29 +595,40 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
             None => super::prep::default_root()?.join(&name),
         }),
     };
-    let files: Vec<PathBuf> = tracks.iter().map(|t| super::prep::normalise(&t.path)).collect();
+    // Only files that were found are prepped: nothing reads a path that is missing or refused.
+    let files: Vec<PathBuf> = tracks.iter().filter(|t| t.found).map(|t| super::prep::normalise(&t.path)).collect();
     let (xml, report) = (out.join(format!("{name}.rekordbox.xml")), out.join(format!("{name}.export.txt")));
     // The export's own files, before prep makes the folder: only earlier exports are replaced.
     for (path, mark) in [(&xml, XML_MARK), (&report, REPORT_HEADER)] {
         crate::io::refuse_source_file(s, path)?;
         crate::file_access::check_write(path).map_err(crate::EngineError::Io)?;
-        if crate::io::path_exists(path) {
-            let ours = crate::io::read_text(path).is_ok_and(|t| if mark == REPORT_HEADER { t.starts_with(mark) } else { t.contains(mark) });
-            if !ours {
-                return Err(super::bad(CMD, format!("{}: exists and is not an earlier export; move it or choose another `out`", path.display())));
-            }
+        if let Some(why) = foreign(path, mark) {
+            return Err(super::bad(CMD, why));
         }
     }
-    let plan = super::prep::Plan::for_files(s, &format!("set {}", s.name), files, out.clone(), TARGET_LUFS, CEILING)?;
+    let (plan, refused) = super::prep::Plan::for_files_except(s, &format!("set {}", s.name), files, out.clone(), TARGET_LUFS, CEILING)?;
     let sr = s.sample_rate.as_f64();
-    let items = tracks
-        .into_iter()
-        .zip(plan.dests().iter().cloned())
-        .map(|(track, copy)| {
-            let total_secs = s.source(track.source).map_or(0.0, |x| x.frames as f64 / sr);
-            Item { track, copy, total_secs }
-        })
-        .collect();
+    // Prep's rows and copies are those of the files it kept, in order.
+    let (mut file, mut row) = (0, 0);
+    let mut items = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let copy = if !track.found {
+            Err("its file was not found".to_string())
+        } else {
+            let at = file;
+            file += 1;
+            match refused.iter().find(|(i, _)| *i == at) {
+                Some((_, why)) => Err(format!("prep refused it: {why}")),
+                None => {
+                    let r = row;
+                    row += 1;
+                    plan.dests().get(r).cloned().map(|d| (d, r)).ok_or_else(|| "prep has no copy for it".to_string())
+                }
+            }
+        };
+        let total_secs = s.source(track.source).map_or(0.0, |x| x.frames as f64 / sr);
+        items.push(Item { track, copy, total_secs });
+    }
     let export = Export {
         name,
         out: out.clone(),
@@ -655,14 +741,25 @@ impl Export {
         let mut rb = Vec::with_capacity(self.items.len());
         let mut done = Vec::with_capacity(self.items.len());
         let mut mixxx_plan = Vec::with_capacity(self.items.len());
-        for (i, item) in self.items.iter().enumerate() {
+        for item in &self.items {
             let t = &item.track;
             let mut doubts = t.doubts.clone();
-            let row = rows.get(i);
-            let status = row.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("failed").to_string();
+            let (row, copy) = match &item.copy {
+                Ok((copy, r)) => (rows.get(*r), Some(copy)),
+                Err(_) => (None, None),
+            };
+            let status = match &item.copy {
+                Err(_) => "not prepped".to_string(),
+                Ok(_) => row.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("failed").to_string(),
+            };
             // The prepped copy when prep wrote one; the original (never written) otherwise.
-            let path = if matches!(status.as_str(), "ok" | "not_adjusted") {
-                item.copy.clone()
+            let path = if let (Some(copy), true) = (copy, matches!(status.as_str(), "ok" | "not_adjusted")) {
+                copy.clone()
+            } else if let Err(why) = &item.copy {
+                if t.found {
+                    doubts.push(format!("{why}; exported the original"));
+                }
+                t.path.clone()
             } else {
                 let why: Vec<&str> = row
                     .and_then(|r| r.get("doubts"))
@@ -696,7 +793,9 @@ impl Export {
                 None if self.request.rekordbox => doubts.push("its path has no file:// URL; left out of the Rekordbox XML".into()),
                 None => {}
             }
-            if self.request.mixxx {
+            if self.request.mixxx && !t.found {
+                doubts.push("left out of the Mixxx export: its file was not found".into());
+            } else if self.request.mixxx {
                 match mixxx_track(t, &path, &title, tags.artist.as_deref(), tags.key.as_deref()) {
                     Ok(entry) => mixxx_plan.push(entry),
                     Err(why) => doubts.push(format!("left out of the Mixxx export: {why}")),
@@ -707,9 +806,13 @@ impl Export {
 
         let rekordbox = if self.request.rekordbox {
             let xml = rekordbox::rekordbox_xml(&self.name, &rb);
-            match crate::io::replace_file_refusing(&self.session_files, &self.xml, xml.as_bytes()) {
-                Ok(()) => json!(self.xml),
-                Err(err) => json!({"error": err.to_string()}),
+            // Checked again: a file may have taken its place since the export started.
+            match foreign(&self.xml, XML_MARK) {
+                Some(why) => json!({"error": why}),
+                None => match crate::io::replace_file_refusing(&self.session_files, &self.xml, xml.as_bytes()) {
+                    Ok(()) => json!(self.xml),
+                    Err(err) => json!({"error": err.to_string()}),
+                },
             }
         } else {
             Value::Null
@@ -726,7 +829,14 @@ impl Export {
         let stems = if self.request.stems { json!({"skipped": "stem files are not written yet"}) } else { json!([]) };
 
         let text = self.report_text(&rekordbox, &mixxx, &stems, &done);
-        crate::io::replace_file_refusing(&self.session_files, &self.report, text.as_bytes())?;
+        // What was written stands when the report can't be: the result says why.
+        let report = match foreign(&self.report, REPORT_HEADER) {
+            Some(why) => json!({"error": why}),
+            None => match crate::io::replace_file_refusing(&self.session_files, &self.report, text.as_bytes()) {
+                Ok(()) => json!(self.report),
+                Err(err) => json!({"error": err.to_string()}),
+            },
+        };
         shared.stage("done");
         let tracks: Vec<Value> = done
             .iter()
@@ -735,7 +845,7 @@ impl Export {
         Ok(json!({
             "root": self.out,
             "rekordbox": rekordbox,
-            "report": self.report,
+            "report": report,
             "mixxx": mixxx,
             "stems": stems,
             "tracks": tracks,
@@ -1067,6 +1177,54 @@ mod tests {
         assert_eq!(trimmed.len(), grid.len());
         assert!(on_downbeats(&trimmed), "{trimmed:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file a source was imported from is a path the session names, so it goes through
+    /// `stored_path` like every other: one on another computer's share, a relative one in a
+    /// session never saved (not taken from the working directory) and a device are refused with
+    /// a doubt, are not the track's file, and nothing reads them.
+    #[test]
+    fn origins_the_session_may_not_open_are_refused_with_a_doubt() {
+        let (mut e, clips) = set();
+        let origins = [r"\\attacker\share\a.mp3", "a.mp3", r"\\.\PhysicalDrive0"];
+        let s = e.session_mut();
+        assert!(s.folder.is_none());
+        for (clip, origin) in clips.iter().zip(origins) {
+            let id = s.find_clip(*clip).unwrap().1.source().unwrap();
+            s.sources.iter_mut().find(|x| x.id == id).unwrap().origin = Some(origin.into());
+        }
+        for (t, origin) in collect(e.session()).unwrap().iter().zip(origins) {
+            let doubt = format!("the file it was imported from ({origin}) is not opened");
+            assert!(t.doubts.iter().any(|d| d.starts_with(&doubt)), "{:?}", t.doubts);
+            assert!(!t.found && !t.path.to_string_lossy().contains(origin), "{}", t.path.display());
+        }
+    }
+
+    /// The audio of a movie has no audio file of its own: a movie origin is passed over quietly.
+    #[test]
+    fn a_movie_is_not_exported_as_a_track() {
+        let (mut e, [a, _, _]) = set();
+        let s = e.session_mut();
+        let id = s.find_clip(a).unwrap().1.source().unwrap();
+        s.sources.iter_mut().find(|x| x.id == id).unwrap().origin = Some(r"C:\films\movie.mp4".into());
+        let t = &collect(e.session()).unwrap()[0];
+        assert!(!t.path.to_string_lossy().contains("movie") && t.doubts.iter().all(|d| !d.contains("movie")), "{:?}", t);
+    }
+
+    #[test]
+    fn names_windows_reserves_get_an_underscore() {
+        for (name, want) in [
+            ("CON", "CON_"),
+            ("nul.txt", "nul_.txt"),
+            ("Com1", "Com1_"),
+            ("LPT9.set", "LPT9_.set"),
+            ("COM10", "COM10"),
+            ("Console", "Console"),
+            ("a<b>", "ab"),
+            (" . ", "set"),
+        ] {
+            assert_eq!(file_name(name), want, "{name}");
+        }
     }
 
     #[test]

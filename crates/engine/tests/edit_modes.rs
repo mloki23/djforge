@@ -17,6 +17,8 @@ fn source(id: u64, frames: u64) -> Source {
         file_len: 0,
         file_modified_ms: 0,
         origin: None,
+        origin_len: 0,
+        origin_modified_ms: 0,
     }
 }
 

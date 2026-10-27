@@ -866,6 +866,8 @@ mod tests {
             file_len: 0,
             file_modified_ms: 0,
             origin: None,
+            origin_len: 0,
+            origin_modified_ms: 0,
         });
         let id = s.new_clip_id();
         if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {

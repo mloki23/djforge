@@ -211,7 +211,7 @@ fn a_saved_and_reopened_set_still_exports_the_original_files() {
     }
     let out = export(&r, &dir.join("old"), analysis());
     let doubts = out["tracks"][0]["doubts"].to_string();
-    assert!(doubts.contains("exported the session's copy (resampled)"), "{doubts}");
+    assert!(doubts.contains("exported the session's copy (the set plays audio made or edited in the session"), "{doubts}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -246,7 +246,7 @@ fn bad_requests_and_foreign_files_are_refused() {
     let dir = scratch("refused");
     let e = set(&dir.join("lib"));
     let root = dir.join("prepped");
-    for p in [json!({"targets": ["traktor"]}), json!({"targets": "rekordbox"}), json!({"stems": "yes"}), json!({"out": 3})] {
+    for p in [json!({"targets": ["traktor"]}), json!({"targets": "rekordbox"}), json!({"targets": []}), json!({"stems": "yes"}), json!({"out": 3})] {
         assert!(export_job_in(&e, &p, Some(&root), analysis()).is_err(), "{p}");
     }
     assert!(export_job_in(&Engine::default(), &json!({}), Some(&root), analysis()).is_err());
@@ -257,5 +257,135 @@ fn bad_requests_and_foreign_files_are_refused() {
     let err = export_job_in(&e, &json!({}), Some(&root), analysis()).err().unwrap().to_string();
     assert!(err.contains("is not an earlier export"), "{err}");
     assert_eq!(std::fs::read_to_string(out.join("test set.rekordbox.xml")).unwrap(), "mine");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An original edited after it was imported is not the audio the set's grid was made on: the
+/// session's own copy of it is exported, with a doubt.
+#[test]
+fn an_original_changed_since_import_exports_the_session_s_audio() {
+    let dir = scratch("changed");
+    let lib = dir.join("lib");
+    let mut e = set(&lib);
+    let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+    soundcraft_engine::io::save_session(&mut e, &path).unwrap();
+    // Unchanged, the original is exported.
+    let r = export(&e, &dir.join("before"), analysis());
+    assert_eq!(Path::new(r["tracks"][0]["path"].as_str().unwrap()), dir.join("before/Set/a.wav"));
+    assert!(r["tracks"][0]["doubts"].as_array().unwrap().is_empty(), "{r}");
+    let r = export(&e, &dir.join("prepped"), analysis());
+    let copy = PathBuf::from(r["tracks"][0]["path"].as_str().unwrap());
+    assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(lib.join("a.wav")).unwrap());
+
+    // Edited (a second longer): the session's copy in Set/Audio Files is what is prepped.
+    let buf = AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.2; 31 * 44_100]] };
+    std::fs::write(lib.join("a.wav"), encode(&buf, &EncodeOptions::default()).unwrap()).unwrap();
+    let r = export(&e, &dir.join("after"), analysis());
+    let doubts = r["tracks"][0]["doubts"].to_string();
+    assert!(doubts.contains("the original changed since import; exported the session's audio"), "{doubts}");
+    let copy = PathBuf::from(r["tracks"][0]["path"].as_str().unwrap());
+    let session_copy = e.session().sources.iter().find(|s| s.path.starts_with("Audio Files/")).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(dir.join("Set").join(&session_copy.path)).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file prep refuses on its own doesn't stop the export: two tracks named alike in different
+/// folders, or a foreign file of a track's name in the export folder. The first of the alike is
+/// prepped; the refused ones are exported as their originals, never written, with the reason.
+#[test]
+fn a_file_prep_refuses_is_exported_as_its_original() {
+    let dir = scratch("refused-file");
+    let lib = dir.join("lib");
+    let mp3 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../audio-io/tests/fixtures/mp3/cbr128_44k_stereo.mp3");
+    let mut e = Engine::default();
+    e.session_mut().name = "test set".into();
+    e.session_mut().tempo.set_tempo(0, 120.0).unwrap();
+    let mut clips = Vec::new();
+    for (folder, bar) in [("x", 1), ("y", 2)] {
+        let path = lib.join(folder).join("Intro.mp3");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(&mp3, &path).unwrap();
+        let beats: Vec<f64> = (0..21).map(|k| k as f64 * 0.1).collect();
+        let r = e.execute("dj.load_warped", &json!({"path": path, "beats": beats, "at_bar": bar})).unwrap();
+        clips.push(r["clip"].as_u64().unwrap());
+    }
+    e.execute("dj.transition", &json!({"out_clip": clips[0], "in_clip": clips[1], "entry_bar": 3, "build_bars": 1, "out_bars": 1})).unwrap();
+    let root = dir.join("prepped");
+    let r = export(&e, &root, analysis());
+    let out = root.join("test set");
+    let rows = r["tracks"].as_array().unwrap();
+    assert_eq!(rows.iter().map(|t| t["prep"].as_str().unwrap()).collect::<Vec<_>>(), ["ok", "not prepped"], "{r}");
+    assert_eq!(Path::new(rows[1]["path"].as_str().unwrap()), lib.join("y/Intro.mp3"));
+    let doubts = rows[1]["doubts"].to_string();
+    assert!(doubts.contains("prep refused it: another track of the set has the name `Intro.mp3`"), "{doubts}");
+    let xml = std::fs::read_to_string(out.join("test set.rekordbox.xml")).unwrap();
+    let locations: Vec<PathBuf> = collection(&xml).iter().map(|t| url_path(t.attr("Location"))).collect();
+    assert_eq!(locations, vec![out.join("Intro.mp3"), lib.join("y/Intro.mp3")]);
+    assert_eq!(std::fs::read(lib.join("y/Intro.mp3")).unwrap(), std::fs::read(&mp3).unwrap());
+
+    // A file of b's name that prep didn't write: b is exported as its original; a still preps.
+    let dir2 = scratch("foreign-copy");
+    let e = set(&dir2.join("lib"));
+    let out = dir2.join("prepped/test set");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("b.mp3"), "mine").unwrap();
+    let r = export(&e, &dir2.join("prepped"), analysis());
+    let rows = r["tracks"].as_array().unwrap();
+    assert_eq!(rows[0]["prep"], "not_adjusted", "{r}");
+    assert_eq!(Path::new(rows[1]["path"].as_str().unwrap()), dir2.join("lib/b.mp3"));
+    assert!(rows[1]["doubts"].to_string().contains("exists and is not a prep copy"), "{r}");
+    assert_eq!(std::fs::read_to_string(out.join("b.mp3")).unwrap(), "mine");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// A file that takes the XML's or the report's name while the export runs is not replaced: the
+/// result says why, and the rest of the result stands.
+#[test]
+fn files_that_appear_during_the_export_are_not_replaced() {
+    let dir = scratch("appeared");
+    let e = set(&dir.join("lib"));
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (seen, going) = (Arc::clone(&started), Arc::clone(&go));
+    let analyse: PrepAnalyse = Arc::new(move |_: &str, _: &dyn Fn() -> bool| {
+        if !going.load(std::sync::atomic::Ordering::SeqCst) {
+            seen.wait();
+            while !going.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(json!({"camelot": "8A", "bpm": 120.0}))
+    });
+    let root = dir.join("prepped");
+    let job = export_job_in(&e, &json!({"targets": ["rekordbox"]}), Some(&root), analyse).unwrap();
+    started.wait();
+    let out = root.join("test set");
+    for f in ["test set.rekordbox.xml", "test set.export.txt"] {
+        std::fs::write(out.join(f), "mine").unwrap();
+    }
+    go.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = job.wait().unwrap();
+    for (key, f) in [("rekordbox", "test set.rekordbox.xml"), ("report", "test set.export.txt")] {
+        assert!(r[key]["error"].as_str().unwrap().contains("is not an earlier export"), "{r}");
+        assert_eq!(std::fs::read_to_string(out.join(f)).unwrap(), "mine");
+    }
+    assert_eq!(r["tracks"].as_array().unwrap().len(), 2, "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The audio of an imported movie has no audio file of its own: its source remembers none.
+#[test]
+fn a_movie_s_audio_remembers_no_original() {
+    let dir = scratch("movie");
+    let movie = dir.join("clip.mp4");
+    let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 48_000]] };
+    let bytes = encode(&buf, &EncodeOptions::default()).unwrap();
+    std::fs::write(&movie, &bytes).unwrap();
+    let mut e = Engine::default();
+    let r = soundcraft_engine::io::import_video_bytes(&mut e, &movie.to_string_lossy(), bytes, 0).unwrap();
+    assert!(r["audio"].is_object(), "{r}");
+    let src = &e.session().sources[0];
+    assert_eq!((src.origin.as_deref(), src.origin_len, src.origin_modified_ms), (None, 0, 0));
     let _ = std::fs::remove_dir_all(&dir);
 }

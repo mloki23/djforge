@@ -264,21 +264,56 @@ fn refuse_sources(files: &[PathBuf], out: &Path, dests: &[PathBuf]) -> Result<()
 /// land on a source or a session's audio, and every file already there is earlier prep output.
 /// Also returns the copies the earlier report in `out` lists without a note.
 fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathBuf>, Vec<Unnoted>)> {
-    let mut names: HashMap<String, &Path> = HashMap::new();
-    let mut dests = Vec::with_capacity(files.len());
-    for f in files {
-        crate::file_access::check_read(f).map_err(EngineError::Io)?;
-        let name = f.file_name().and_then(|n| n.to_str()).ok_or_else(|| bad(CMD, format!("{}: not a file name", f.display())))?;
-        let lower = name.to_lowercase();
-        if lower == REPORT {
-            return Err(bad(CMD, format!("{}: is named like the report; rename it", f.display())));
-        }
-        if let Some(other) = names.insert(lower, f) {
-            return Err(bad(CMD, format!("two tracks share the name `{name}` ({} and {}); neither can be written", other.display(), f.display())));
-        }
-        dests.push(out.join(name));
+    let (dests, earlier, refused) = checked_destinations(s, files, out, false)?;
+    match refused.into_iter().next() {
+        Some((_, why)) => Err(bad(CMD, why)),
+        None => Ok((dests.into_iter().flatten().collect(), earlier)),
     }
-    refuse_sources(files, out, &dests)?;
+}
+
+/// [`destinations`], one per file (`None` for a file refused). Problems of one file are refused
+/// per file (index and why) when `lenient`, and fail the whole run otherwise; problems of the run
+/// (`out` is a source's folder, the report there is not prep's) always fail it.
+fn checked_destinations(
+    s: &Session,
+    files: &[PathBuf],
+    out: &Path,
+    lenient: bool,
+) -> Result<(Vec<Option<PathBuf>>, Vec<Unnoted>, Vec<(usize, String)>)> {
+    let mut names: HashMap<String, &Path> = HashMap::new();
+    let mut dests: Vec<Option<PathBuf>> = Vec::with_capacity(files.len());
+    let mut refused: Vec<(usize, String)> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let one = || -> std::result::Result<(String, String), String> {
+            crate::file_access::check_read(f)?;
+            let name = f.file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{}: not a file name", f.display()))?;
+            let lower = name.to_lowercase();
+            if lower == REPORT {
+                return Err(format!("{}: is named like the report; rename it", f.display()));
+            }
+            if let Some(other) = names.get(&lower) {
+                return Err(if lenient {
+                    format!("another track of the set has the name `{name}` ({}); rename one", other.display())
+                } else {
+                    format!("two tracks share the name `{name}` ({} and {}); neither can be written", other.display(), f.display())
+                });
+            }
+            Ok((name.to_string(), lower))
+        };
+        let checked = one().map(|(name, lower)| {
+            names.insert(lower, f.as_path());
+            out.join(name)
+        });
+        match checked {
+            Ok(d) => dests.push(Some(d)),
+            Err(why) => {
+                dests.push(None);
+                refused.push((i, why));
+            }
+        }
+    }
+    let kept: Vec<PathBuf> = dests.iter().flatten().cloned().collect();
+    refuse_sources(files, out, &kept)?;
     // Only earlier prep output may be replaced: a copy carrying prep's note, or one the earlier
     // report there lists (by exact name, size and hash) as written without it.
     let report = out.join(REPORT);
@@ -289,34 +324,41 @@ fn destinations(s: &Session, files: &[PathBuf], out: &Path) -> Result<(Vec<PathB
     } else {
         Vec::new()
     };
-    for d in &dests {
-        if !crate::io::path_exists(d) {
-            continue;
-        }
-        let unreadable = |err: EngineError| bad(CMD, format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display()));
-        // Only the tag is read to look for the note: copies can be large.
-        let head = tag_head(d).map_err(unreadable)?;
-        let name = d.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
-        let ours = if mp3 && mp3tags::has_prep_note(&head) {
-            true
-        } else {
-            let listed: Vec<&Unnoted> = earlier.iter().filter(|u| same_name(&u.name, name)).collect();
-            !listed.is_empty() && {
-                let bytes = crate::io::read_file(d).map_err(unreadable)?;
-                listed.iter().any(|u| u.is(&bytes))
+    for (i, slot) in dests.iter_mut().enumerate() {
+        let Some(d) = slot.as_ref() else { continue };
+        let usable = || -> std::result::Result<(), String> {
+            if crate::io::path_exists(d) {
+                let unreadable = |err: EngineError| format!("{}: exists and can't be read ({err}); move it or choose another `out`", d.display());
+                // Only the tag is read to look for the note: copies can be large.
+                let head = tag_head(d).map_err(unreadable)?;
+                let name = d.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                let mp3 = d.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
+                let ours = if mp3 && mp3tags::has_prep_note(&head) {
+                    true
+                } else {
+                    let listed: Vec<&Unnoted> = earlier.iter().filter(|u| same_name(&u.name, name)).collect();
+                    !listed.is_empty() && {
+                        let bytes = crate::io::read_file(d).map_err(unreadable)?;
+                        listed.iter().any(|u| u.is(&bytes))
+                    }
+                };
+                if !ours {
+                    return Err(format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display()));
+                }
             }
+            crate::io::refuse_source_file(s, d).map_err(|err| err.to_string())?;
+            crate::file_access::check_write(d)
         };
-        if !ours {
-            return Err(bad(CMD, format!("{}: exists and is not a prep copy; move it or choose another `out`", d.display())));
+        if let Err(why) = usable() {
+            *slot = None;
+            refused.push((i, why));
         }
     }
-    for d in dests.iter().chain([&report]) {
-        crate::io::refuse_source_file(s, d)?;
-        crate::file_access::check_write(d).map_err(EngineError::Io)?;
-    }
+    crate::io::refuse_source_file(s, &report)?;
+    crate::file_access::check_write(&report).map_err(EngineError::Io)?;
     crate::file_access::check_write(out).map_err(EngineError::Io)?;
-    Ok((dests, earlier))
+    refused.sort_by_key(|(i, _)| *i);
+    Ok((dests, earlier, refused))
 }
 
 /// Preps the tracks of `source` (a mixforge plan.json or a folder of MP3s) into `out` (default:
@@ -372,11 +414,46 @@ impl Plan {
     /// A run prepping `files` (absolute, normalised) into `out` with every check of `prep.tracks`
     /// made and `out` made; the report names `source`.
     pub(crate) fn for_files(s: &Session, source: &str, files: Vec<PathBuf>, out: PathBuf, target_lufs: f64, ceiling: f64) -> Result<Self> {
-        let started = std::time::Instant::now();
         if !(target_lufs.is_finite() && ceiling.is_finite()) {
             return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
         }
-        let (dests, mut earlier) = destinations(s, &files, &out)?;
+        let (dests, earlier) = destinations(s, &files, &out)?;
+        Self::with(s, source, files, dests, earlier, out, target_lufs, ceiling)
+    }
+
+    /// [`Self::for_files`] leaving out the files prep refuses on their own (a name another file
+    /// of the set has, a foreign file of that name in `out`, a file outside the folders it may
+    /// read): those come back as (index in `files`, why). Only a problem of the whole run fails.
+    pub(crate) fn for_files_except(
+        s: &Session,
+        source: &str,
+        files: Vec<PathBuf>,
+        out: PathBuf,
+        target_lufs: f64,
+        ceiling: f64,
+    ) -> Result<(Self, Vec<(usize, String)>)> {
+        if !(target_lufs.is_finite() && ceiling.is_finite()) {
+            return Err(bad(CMD, "`target_lufs` and `ceiling` must be numbers"));
+        }
+        let (dests, earlier, refused) = checked_destinations(s, &files, &out, true)?;
+        let (files, dests): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().zip(dests).filter_map(|(f, d)| d.map(|d| (f, d))).unzip();
+        Ok((Self::with(s, source, files, dests, earlier, out, target_lufs, ceiling)?, refused))
+    }
+
+    /// The run of `files` into `dests` once their checks passed: `out` made and compared with the
+    /// sources again.
+    #[allow(clippy::too_many_arguments)]
+    fn with(
+        s: &Session,
+        source: &str,
+        files: Vec<PathBuf>,
+        dests: Vec<PathBuf>,
+        mut earlier: Vec<Unnoted>,
+        out: PathBuf,
+        target_lufs: f64,
+        ceiling: f64,
+    ) -> Result<Self> {
+        let started = std::time::Instant::now();
         // Listings of copies still in `out` are kept, also those of tracks not in this set.
         earlier.retain(|u| crate::io::path_exists(out.join(&u.name)));
         crate::io::make_dir(&out)?;
