@@ -88,6 +88,11 @@ const MOVIES: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "mp
 /// file played twice gets its later mix points as memory cues. A cue outside the file is left
 /// out with a doubt.
 ///
+/// Timeline: a clip's warp map holds mixforge's beat times, used as they are, so these file
+/// seconds are on mixforge's timeline (its decoder, pedalboard, starts 1105 samples later than a
+/// gapless decoder on Marty's MP3s): the timeline mixforge's Mixxx exporter expects. Nothing is
+/// converted here; Rekordbox's timeline is checked against real files in the stage 5 gate.
+///
 /// Refused: a session without transitions, with a meter other than 4/4, or a transition clip
 /// that is missing or not beat-locked.
 pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
@@ -344,19 +349,27 @@ fn run_mixforge_mixxx(plan: &Value, set: &str) -> std::result::Result<Value, Str
     }
     let out = match super::dj::output_fed(&mut command, Some(input), MIXXX_TIMEOUT, &|| false) {
         Ok(super::dj::Sidecar::Ran(out)) => out,
-        Ok(super::dj::Sidecar::TimedOut) => return Err(format!("mixforge's Mixxx export timed out after {} s", MIXXX_TIMEOUT.as_secs())),
+        Ok(super::dj::Sidecar::TimedOut) => {
+            return Err(format!("mixforge's Mixxx export timed out after {} s — Mixxx may have been written; check it", MIXXX_TIMEOUT.as_secs()));
+        }
         Ok(super::dj::Sidecar::LeftHolding) => return Err("the mixforge sidecar left a process holding its output".into()),
         Ok(super::dj::Sidecar::Stopped) => return Err("mixforge's Mixxx export was stopped".into()),
         Err(err) => return Err(format!("could not run DJFORGE_PYTHON ({python}): {err}")),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let text = stdout.trim();
-    if text.is_empty() {
+    if stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let lines: Vec<&str> = stderr.lines().collect();
         let tail = lines.get(lines.len().saturating_sub(5)..).unwrap_or_default().join("\n");
         return Err(format!("mixforge printed nothing ({}): {tail}", out.status));
     }
+    sidecar_result(&stdout)
+}
+
+/// What the Mixxx sidecar printed (`stdout`, not empty) as its result: the last line printed,
+/// since mixforge may print notes before it, as a JSON object; its `{error}` as the error.
+fn sidecar_result(stdout: &str) -> std::result::Result<Value, String> {
+    let text = stdout.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
     let head = || text.chars().take(300).collect::<String>();
     let v: Value = serde_json::from_str(text).map_err(|_| format!("mixforge printed something that is not JSON: {}", head()))?;
     if let Some(msg) = v.get("error") {
@@ -384,16 +397,28 @@ fn mixforge_key(k: &str) -> Option<String> {
 
 /// mixforge's plan entry for track `t` exported as `path` with these tags: its quarter-note BPM
 /// from the median bar of its grid, its first downbeat, cue in (A, else the first downbeat), out
-/// start (C) and outro bars, in file seconds. Why it can't go to Mixxx otherwise.
-fn mixxx_track(t: &ExportTrack, path: &Path, title: &str, artist: Option<&str>, key: Option<&str>) -> std::result::Result<Value, String> {
+/// start (C) and outro bars, in file seconds; its key the first of `keys` that is one. With a
+/// doubt when its bars vary by more than 5 ms (Mixxx gets one tempo). Why it can't go to Mixxx
+/// otherwise.
+fn mixxx_track(
+    t: &ExportTrack,
+    path: &Path,
+    title: &str,
+    artist: Option<&str>,
+    keys: &[Option<&str>],
+) -> std::result::Result<(Value, Option<String>), String> {
     let path = path.to_str().ok_or("its path is not Unicode")?;
-    let key = key.and_then(mixforge_key).ok_or("its key is not known (no key tag in the copy)")?;
+    let key = keys.iter().flatten().find_map(|k| mixforge_key(k)).ok_or("its key is not known (no key tag and no analysis)")?;
     let mut bars: Vec<f64> = t.grid.windows(2).filter_map(|w| if let [a, b] = w { Some(b - a) } else { None }).collect();
     bars.sort_by(f64::total_cmp);
     let bar = bars.get(bars.len() / 2).copied().filter(|b| b.is_finite() && *b > 0.0).ok_or("its grid has fewer than two bars")?;
     let first = t.grid.first().copied().ok_or("its grid has fewer than two bars")?;
+    let spread = bars.last().zip(bars.first()).map_or(0.0, |(hi, lo)| hi - lo);
+    let doubt = (spread > DISAGREE_SECS).then(|| {
+        format!("Mixxx gets one tempo ({:.2} bpm); this track's bars vary by {:.0} ms, so its Mixxx grid drifts", 240.0 / bar, spread * 1000.0)
+    });
     let hot = |slot: u8| t.cues.iter().find(|c| c.slot == slot && !c.memory).map(|c| c.at);
-    Ok(json!({
+    let entry = json!({
         "path": path,
         "bpm": 4.0 * 60.0 / bar,
         "tempo_multiplier": 1,
@@ -405,7 +430,8 @@ fn mixxx_track(t: &ExportTrack, path: &Path, title: &str, artist: Option<&str>, 
         "title": title,
         "artist": artist.unwrap_or_default(),
         "sections": [],
-    }))
+    });
+    Ok((entry, doubt))
 }
 
 /// What `dj.export_set` reports for Mixxx after `run` was given `plan` for set `set`: what it
@@ -501,7 +527,7 @@ fn file_name(name: &str) -> String {
     let (base, rest) = kept.split_at(kept.find('.').unwrap_or(kept.len()));
     let upper = base.trim_end().to_ascii_uppercase();
     let numbered = |p: &str| upper.strip_prefix(p).is_some_and(|n| n.len() == 1 && n.bytes().all(|b| (b'1'..=b'9').contains(&b)));
-    if ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str()) || numbered("COM") || numbered("LPT") {
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) || numbered("COM") || numbered("LPT") {
         format!("{base}_{rest}")
     } else {
         kept.to_string()
@@ -746,7 +772,19 @@ impl Export {
     /// Preps the files, then writes the Rekordbox XML, the set into Mixxx, and the report. A
     /// cancelled prep ends it with nothing more written.
     fn run(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> crate::Result<Value> {
-        let prep = self.plan.prep(analyse, &shared.prep)?;
+        // What prep's analysis gave for each file it analysed (the key, if any): a key for Mixxx
+        // when the copy has no key tag.
+        let analysed: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<String>>> = Default::default();
+        let recording = |path: &str, stop: &dyn Fn() -> bool| {
+            let r = analyse(path, stop);
+            let key = r.as_ref().ok().and_then(|v| v.get("camelot")).and_then(Value::as_str).map(str::to_string);
+            analysed.borrow_mut().insert(crate::io::file_key(Path::new(path)), key);
+            r
+        };
+        let prep = self.plan.prep(&recording, &shared.prep)?;
+        let analysed = analysed.into_inner();
+        // A track left out of Mixxx shifts mixforge's reading of the next one it gets.
+        let mut left_out: Option<String> = None;
         let rows = prep.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
         if prep.get("cancelled").and_then(Value::as_bool).unwrap_or(false) {
             shared.stage("done");
@@ -784,11 +822,16 @@ impl Export {
                 doubts.push(format!("prep {status} ({}); exported the original", why.join("; ")));
                 t.path.clone()
             };
-            let tags = if path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3")) {
-                super::prep::tag_head(&path).map(|h| soundcraft_audio_io::mp3tags::read_basic(&h)).unwrap_or_default()
-            } else {
-                soundcraft_audio_io::mp3tags::TagBasics::default()
+            // Only a file that was found (or prep's copy) is read: never a missing or refused path.
+            let readable = item.copy.is_ok() || t.found;
+            let tags_of = |p: &Path| {
+                if readable && p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3")) {
+                    super::prep::tag_head(p).map(|h| soundcraft_audio_io::mp3tags::read_basic(&h)).unwrap_or_default()
+                } else {
+                    soundcraft_audio_io::mp3tags::TagBasics::default()
+                }
             };
+            let tags = tags_of(&path);
             let stem = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let title = tags.title.clone().unwrap_or_else(|| stem.clone());
             let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -808,12 +851,42 @@ impl Export {
                 None if self.request.rekordbox => doubts.push("its path has no file:// URL; left out of the Rekordbox XML".into()),
                 None => {}
             }
-            if self.request.mixxx && !t.found {
-                doubts.push("left out of the Mixxx export: its file was not found".into());
-            } else if self.request.mixxx {
-                match mixxx_track(t, &path, &title, tags.artist.as_deref(), tags.key.as_deref()) {
-                    Ok(entry) => mixxx_plan.push(entry),
-                    Err(why) => doubts.push(format!("left out of the Mixxx export: {why}")),
+            if self.request.mixxx {
+                let entry = if t.found {
+                    // The copy's key tag, else prep's analysis of the file, else the original's tag.
+                    let source = super::prep::normalise(&t.path);
+                    let earlier = analysed.get(&crate::io::file_key(&source)).cloned();
+                    // Prep analyses MP3s only: another file without a key tag is analysed here.
+                    let analysis = match (earlier, &tags.key, source.to_str()) {
+                        (Some(k), _, _) => k,
+                        (None, None, Some(p)) => {
+                            let stop = || shared.prep.cancel.load(Ordering::Relaxed);
+                            analyse(p, &stop).ok().and_then(|v| v.get("camelot").and_then(Value::as_str).map(str::to_string))
+                        }
+                        _ => None,
+                    };
+                    let analysis = analysis.as_deref();
+                    let original = if tags.key.is_none() && analysis.is_none() && path != t.path { tags_of(&t.path).key } else { None };
+                    mixxx_track(t, &path, &title, tags.artist.as_deref(), &[tags.key.as_deref(), analysis, original.as_deref()])
+                } else {
+                    Err("its file was not found".to_string())
+                };
+                match entry {
+                    Ok((entry, drift)) => {
+                        doubts.extend(drift);
+                        if let Some(gone) = left_out.take() {
+                            doubts.push(if mixxx_plan.is_empty() {
+                                format!("Mixxx takes it as the set's first track (main cue on its first downbeat, no intro) because {gone} was left out of the Mixxx export")
+                            } else {
+                                format!("its Mixxx intro may be off (it takes the length of the transition before {gone}) because {gone} was left out of the Mixxx export")
+                            });
+                        }
+                        mixxx_plan.push(entry);
+                    }
+                    Err(why) => {
+                        doubts.push(format!("left out of the Mixxx export: {why}"));
+                        left_out = Some(file.clone());
+                    }
                 }
             }
             let steps = if path == t.path {
@@ -1303,6 +1376,8 @@ mod tests {
             ("nul.txt", "nul_.txt"),
             ("Com1", "Com1_"),
             ("LPT9.set", "LPT9_.set"),
+            ("conin$", "conin$_"),
+            ("CONOUT$.x", "CONOUT$_.x"),
             ("COM10", "COM10"),
             ("Console", "Console"),
             ("a<b>", "ab"),
@@ -1310,6 +1385,15 @@ mod tests {
         ] {
             assert_eq!(file_name(name), want, "{name}");
         }
+    }
+
+    #[test]
+    fn the_sidecar_s_result_is_its_last_line() {
+        let v = sidecar_result("backing up the library...\n{\"playlist\": \"mixforge · s\"}\n\n").unwrap();
+        assert_eq!(v["playlist"], "mixforge · s");
+        assert_eq!(sidecar_result("note\n{\"error\": \"Close Mixxx first: ...\"}").unwrap_err(), "Close Mixxx first: ...");
+        assert!(sidecar_result("{\"a\": 1}\nnot json").unwrap_err().contains("not JSON"));
+        assert!(sidecar_result("[1]").unwrap_err().contains("not an object"));
     }
 
     #[test]
@@ -1336,16 +1420,25 @@ mod tests {
         let (e, _) = set();
         let set = collect(e.session()).unwrap();
         // B: 1.92 s bars (125 bpm); in on 25, out on 49 for 12 bars (quick: 8 build + 4 out).
-        let v = mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, Some("8A")).unwrap();
+        let (v, drift) = mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, &[None, Some("8A")]).unwrap();
+        assert_eq!(drift, None);
         assert!((v["bpm"].as_f64().unwrap() - 125.0).abs() < 1e-9, "{v}");
         assert!(close(v["first_downbeat"].as_f64().unwrap(), FIRST) && close(v["cue_in"].as_f64().unwrap(), bar_secs(0.0)), "{v}");
         assert!(close(v["out_start"].as_f64().unwrap(), bar_secs(24.0)), "{v}");
         assert_eq!((&v["transition_bars"], &v["key"], &v["artist"]), (&json!(12), &json!("Am"), &json!("")));
         // A track without a key, or a grid of one bar, can't go.
-        assert!(mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, None).unwrap_err().contains("key is not known"));
+        assert!(mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, &[None, Some("H"), None]).unwrap_err().contains("key is not known"));
+        // The first key that is one is taken.
+        let (v, _) = mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, &[Some("nope"), Some("4B"), Some("8A")]).unwrap();
+        assert_eq!(v["key"], "G#");
+        // Bars that vary by more than 5 ms: Mixxx's one tempo drifts.
+        let mut wobbly = set[1].clone();
+        wobbly.grid[3] += 0.01;
+        let (_, drift) = mixxx_track(&wobbly, Path::new("/x/b.mp3"), "B", None, &[Some("8A")]).unwrap();
+        assert!(drift.as_deref().is_some_and(|d| d.contains("vary by 20 ms") && d.contains("drifts")), "{drift:?}");
         let mut short = set[2].clone();
         short.grid.truncate(1);
-        assert!(mixxx_track(&short, Path::new("/x/c.mp3"), "C", None, Some("8A")).unwrap_err().contains("fewer than two bars"));
+        assert!(mixxx_track(&short, Path::new("/x/c.mp3"), "C", None, &[Some("8A")]).unwrap_err().contains("fewer than two bars"));
     }
 
     /// No test anywhere in the workspace runs the real Mixxx export: it writes Marty's Mixxx
@@ -1375,12 +1468,15 @@ mod tests {
             let text = std::fs::read_to_string(&f).unwrap();
             let in_tests_dir = f.components().any(|c| c.as_os_str() == "tests");
             let test_code = if in_tests_dir { text.as_str() } else { text.split_once("#[cfg(test)]").map_or("", |(_, t)| t) };
-            for word in forbidden {
+            // The apps set the real runner, so their tests (which run the real binaries) must not
+            // export a set at all: "dj.export_set" asks for Mixxx by default.
+            let in_apps = f.strip_prefix(&root).is_ok_and(|r| r.starts_with("apps"));
+            for word in forbidden.iter().chain(in_apps.then_some(&"dj.export_set")) {
                 if test_code.lines().any(|l| l.contains(word) && !l.trim_start().starts_with("//") && !l.contains("let forbidden")) {
                     offenders.push(format!("{}: {word}", f.display()));
                 }
             }
         }
-        assert!(offenders.is_empty(), "tests must use a fake Mixxx runner: {offenders:#?}");
+        assert!(offenders.is_empty(), "tests must use a fake Mixxx runner, and the apps' tests must not export sets: {offenders:#?}");
     }
 }

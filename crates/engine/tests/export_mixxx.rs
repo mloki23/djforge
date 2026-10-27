@@ -161,27 +161,72 @@ fn without_a_runner_mixxx_is_skipped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn a_track_without_a_key_is_left_out_of_mixxx_with_a_doubt() {
-    let dir = scratch("no-key");
-    let lib = dir.join("lib");
-    let (mut e, b) = set_b(&lib);
-    // A WAV copy of a: prep fills no tags in a WAV, so its key is unknown.
+/// The two-track set plus c.wav on bar 4, B -> C on bar 5 (2 bars).
+fn three(lib: &Path) -> Engine {
+    let (mut e, b) = set_b(lib);
     let buf = AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.1; 30 * 44_100]] };
     let wav = lib.join("c.wav");
     std::fs::write(&wav, encode(&buf, &EncodeOptions::default()).unwrap()).unwrap();
     let beats: Vec<f64> = (0..60).map(|k| k as f64 * 0.5).collect();
     let c = e.execute("dj.load_warped", &json!({"path": wav, "beats": beats, "at_bar": 4})).unwrap()["clip"].as_u64().unwrap();
     e.execute("dj.transition", &json!({"out_clip": b, "in_clip": c, "entry_bar": 5, "build_bars": 1, "out_bars": 1})).unwrap();
+    e
+}
+
+/// The analysis faked as 8A for every file but `keyless` (no key for that one).
+fn analysis_without(keyless: &'static str) -> PrepAnalyse {
+    Arc::new(move |path: &str, _: &dyn Fn() -> bool| {
+        Ok(if path.ends_with(keyless) { json!({"bpm": 120.0}) } else { json!({"camelot": "8A", "bpm": 120.0}) })
+    })
+}
+
+/// The plan the runner got and the result, exporting `e` with `analyse`.
+fn exported(e: &mut Engine, root: &Path, analyse: PrepAnalyse) -> (Value, Value) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     e.set_mixxx_runner(fake(&calls, Ok(json!({"playlist": "mixforge · test set"}))));
-    let r = export(&e, &dir.join("prepped"));
-    let plan = &calls.lock().unwrap()[0].0;
-    let files: Vec<&str> = plan["tracks"].as_array().unwrap().iter().map(|t| t["path"].as_str().unwrap()).collect();
-    assert!(files.len() == 2 && files.iter().all(|f| f.ends_with(".mp3")), "{plan}");
-    // B now mixes out into C: its outro is that transition's 2 bars.
+    let r = export_job_in(e, &json!({"targets": ["rekordbox", "mixxx"]}), Some(root), analyse).unwrap().wait().unwrap();
+    let plan = calls.lock().unwrap().first().map(|c| c.0.clone()).unwrap_or(Value::Null);
+    (plan, r)
+}
+
+fn names(plan: &Value) -> Vec<String> {
+    plan["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| Path::new(t["path"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A WAV copy has no key tag: its key comes from prep's analysis of the file.
+#[test]
+fn a_track_without_a_key_tag_takes_prep_s_analysis() {
+    let dir = scratch("wav-key");
+    let mut e = three(&dir.join("lib"));
+    let (plan, _) = exported(&mut e, &dir.join("prepped"), analysis());
+    assert_eq!(names(&plan), ["a.mp3", "b.mp3", "c.wav"]);
+    assert_eq!(plan["tracks"][2]["key"], "Am");
+    // B mixes out into C: its outro is that transition's 2 bars.
     assert_eq!(plan["tracks"][1]["transition_bars"], 2);
-    let doubts = r["tracks"][2]["doubts"].to_string();
-    assert!(doubts.contains("left out of the Mixxx export: its key is not known"), "{doubts}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A track with no key at all is left out of Mixxx; the next track Mixxx gets says how that
+/// shifts it: the first of the set, or an intro taken from the transition before.
+#[test]
+fn a_track_without_a_key_is_left_out_and_the_next_one_says_so() {
+    let dir = scratch("no-key");
+    let mut e = three(&dir.join("lib"));
+    let (plan, r) = exported(&mut e, &dir.join("middle"), analysis_without("b.mp3"));
+    assert_eq!(names(&plan), ["a.mp3", "c.wav"]);
+    assert!(r["tracks"][1]["doubts"].to_string().contains("left out of the Mixxx export: its key is not known"), "{r}");
+    let c = r["tracks"][2]["doubts"].to_string();
+    assert!(c.contains("its Mixxx intro may be off") && c.contains("b.mp3 was left out"), "{c}");
+
+    let (plan, r) = exported(&mut e, &dir.join("first"), analysis_without("a.mp3"));
+    assert_eq!(names(&plan), ["b.mp3", "c.wav"]);
+    let b = r["tracks"][1]["doubts"].to_string();
+    assert!(b.contains("Mixxx takes it as the set's first track") && b.contains("a.mp3 was left out"), "{b}");
+    assert!(!r["tracks"][2]["doubts"].to_string().contains("was left out"), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
