@@ -1,0 +1,9 @@
+# Stage 5 gate: export loki journey (as imported, first two tracks split into stems) to Rekordbox XML,
+# Mixxx (through mixforge; Mixxx must be closed) and .stem.mp4 files. The session gets its own name so
+# mixforge's playlist "mixforge · loki journey (djforge)" doesn't replace an existing one.
+#   soundcraft-cli script tools/export/export_loki.cmds   (DJFORGE_PYTHON and DJFORGE_MIXFORGE set)
+session.new {"name": "loki journey (djforge)", "sample_rate": 48000}
+dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json"}
+dj.split_stems {"clip": 5}
+dj.split_stems {"clip": 7}
+dj.export_set {"targets": ["rekordbox", "mixxx"], "stems": true}
