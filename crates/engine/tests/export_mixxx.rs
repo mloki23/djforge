@@ -5,9 +5,12 @@
 use serde_json::{Value, json};
 use soundcraft_audio_io::{AudioBuffer, EncodeOptions, encode};
 use soundcraft_engine::Engine;
+use soundcraft_engine::cmd::ExportJob;
 use soundcraft_engine::cmd::{MixxxRunner, PrepAnalyse, export_job_in};
+use soundcraft_engine::model::{ClipId, StemSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("djforge-export-mixxx-{name}-{}", std::process::id()));
@@ -220,6 +223,8 @@ fn a_track_without_a_key_is_left_out_and_the_next_one_says_so() {
     let (plan, r) = exported(&mut e, &dir.join("middle"), analysis_without(&["b.mp3"]));
     assert_eq!(names(&plan), ["a.mp3", "c.wav"]);
     assert!(r["tracks"][1]["doubts"].to_string().contains("left out of the Mixxx export: its key is not known"), "{r}");
+    let in_mixxx: Vec<&Value> = r["tracks"].as_array().unwrap().iter().map(|t| &t["in_mixxx"]).collect();
+    assert_eq!(in_mixxx, [&json!(true), &json!(false), &json!(true)], "{r}");
     let c = r["tracks"][2]["doubts"].to_string();
     assert!(c.contains("its Mixxx intro may be off") && c.contains("b.mp3 was left out"), "{c}");
 
@@ -253,5 +258,94 @@ fn a_stuck_analysis_is_waited_on_once() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{r}");
     // No track has a key, so none goes to Mixxx.
     assert_eq!(r["mixxx"]["skipped"], "no track could go to Mixxx; see the tracks' doubts", "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cancel once prep is done stops before the Rekordbox XML and Mixxx: nothing more is
+/// written, and the result says it was cancelled. (c.wav, which prep doesn't analyse, is
+/// analysed for its key after prep: the cancel lands then.)
+#[test]
+fn a_cancel_after_prep_writes_neither_the_xml_nor_mixxx() {
+    let dir = scratch("cancel-after-prep");
+    let mut e = three(&dir.join("lib"));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    e.set_mixxx_runner(fake(&calls, Ok(json!({"playlist": "mixforge · test set"}))));
+    let (reached_tx, reached) = mpsc::channel();
+    let reached_tx = Mutex::new(reached_tx);
+    let analyse: PrepAnalyse = Arc::new(move |path: &str, stop: &dyn Fn() -> bool| {
+        if path.ends_with("c.wav") {
+            let _ = reached_tx.lock().unwrap().send(());
+            let until = Instant::now() + Duration::from_secs(60);
+            while !stop() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Ok(json!({"camelot": "8A", "bpm": 120.0}))
+    });
+    let root = dir.join("prepped");
+    let job = export_job_in(&e, &json!({"targets": ["rekordbox", "mixxx"]}), Some(&root), analyse).unwrap();
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert_eq!(job.progress().stage, "rekordbox");
+    job.cancel();
+    let r = job.wait().unwrap();
+    assert_eq!(r["cancelled"], true, "{r}");
+    assert!(r["rekordbox"].is_null() && r["report"].is_null(), "{r}");
+    assert_eq!(r["prep"]["tracks"].as_array().unwrap().len(), 3, "prep's copies are reported: {r}");
+    assert!(calls.lock().unwrap().is_empty(), "Mixxx was written after the cancel");
+    let out = root.join("test set");
+    assert!(!out.join("test set.rekordbox.xml").exists() && !out.join("test set.export.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Once mixforge has started writing Mixxx's library it is never stopped part-way: a cancel then
+/// lets it finish, and skips what comes after (the stem files). The report says what was
+/// written.
+#[test]
+fn a_cancel_once_mixxx_started_lets_it_finish_and_skips_the_stem_files() {
+    let dir = scratch("cancel-in-mixxx");
+    let (mut e, b) = set_b(&dir.join("lib"));
+    let s = e.session_mut();
+    let src = s.find_clip(ClipId(b)).unwrap().1.source().unwrap();
+    s.find_clip_mut(ClipId(b)).unwrap().stems = Some(StemSet { key: "fake".into(), sources: [src; 4], scale_log2: 0 });
+    // Were the stems not skipped for the cancel, they would be for this missing ffmpeg.
+    e.set_ffmpeg(dir.join("no-ffmpeg.exe"));
+    let slot: Arc<Mutex<Option<ExportJob>>> = Arc::new(Mutex::new(None));
+    let stages = Arc::new(Mutex::new(Vec::new()));
+    let (runner_slot, runner_stages) = (Arc::clone(&slot), Arc::clone(&stages));
+    e.set_mixxx_runner(Arc::new(move |_: &Value, _: &str| {
+        if let Some(job) = runner_slot.lock().unwrap().as_ref() {
+            runner_stages.lock().unwrap().push(job.progress().stage);
+            job.cancel();
+        }
+        Ok(json!({"playlist": "mixforge · test set"}))
+    }));
+    // Prep waits until the job is in the slot, so the runner finds it.
+    let (go, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let analyse: PrepAnalyse = Arc::new(move |_: &str, _: &dyn Fn() -> bool| {
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+        Ok(json!({"camelot": "8A", "bpm": 120.0}))
+    });
+    let root = dir.join("prepped");
+    let job = export_job_in(&e, &json!({"targets": ["rekordbox", "mixxx"], "stems": true}), Some(&root), analyse).unwrap();
+    *slot.lock().unwrap() = Some(job);
+    go.send(()).unwrap();
+    go.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(120);
+    let r = loop {
+        assert!(Instant::now() < until, "the export never ended");
+        if let Some(r) = slot.lock().unwrap().as_mut().and_then(ExportJob::poll) {
+            break r.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(*stages.lock().unwrap(), ["mixxx"]);
+    assert_eq!(r["cancelled"], true, "{r}");
+    assert_eq!(r["mixxx"]["playlist"], "mixforge · test set", "{r}");
+    assert_eq!(r["stems"], json!({"skipped": "cancelled"}), "{r}");
+    let out = root.join("test set");
+    assert!(out.join("test set.rekordbox.xml").is_file());
+    let report = std::fs::read_to_string(out.join("test set.export.txt")).unwrap();
+    assert!(report.contains("cancelled") && report.contains("Mixxx: playlist"), "{report}");
     let _ = std::fs::remove_dir_all(&dir);
 }

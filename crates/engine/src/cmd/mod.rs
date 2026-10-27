@@ -43,7 +43,10 @@ mod vst3;
 mod zoom_toggle;
 
 pub use clip_list::{ClearEffect, clear_effect};
-pub use export::{ExportJob, ExportProgress, MixxxRunner, export_job, export_job_in, mixforge_mixxx_runner};
+pub use export::{
+    ExportJob, ExportProgress, MixxxRunner, export_job, export_job_in, mixforge_mixxx_runner, set_is_split as export_set_is_split,
+    set_refusal as export_set_refusal,
+};
 pub use file::bounce_job;
 pub use prep::{
     Analyse as PrepAnalyse, PrepJob, PrepProgress, default_root as prep_default_root, mixforge_analysis as prep_mixforge_analysis, prep_job,

@@ -387,6 +387,8 @@ pub struct SoundApp {
     /// The Export Set run in progress, on its own thread. It preps into `prep_root` with
     /// `prep_analyse`, and writes Mixxx through the engine's Mixxx runner.
     pub export: Option<soundcraft_engine::cmd::ExportJob>,
+    /// What the last export did, shown until its window is closed.
+    pub export_result: Option<export::ExportResult>,
     /// The Split into Stems run in progress, on its own thread.
     pub split: Option<soundcraft_engine::cmd::stems::SplitJob>,
     /// The level each muted stem fader had, restored when it is un-muted.
@@ -474,6 +476,7 @@ impl SoundApp {
             prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
             prep_quit: false,
             export: None,
+            export_result: None,
             split: None,
             stem_unmute: HashMap::new(),
             session_generation: 0,

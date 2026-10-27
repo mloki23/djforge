@@ -145,6 +145,8 @@ pub struct Engine {
     /// What exports a set to Mixxx: none until the app sets it up ([`Engine::set_mixxx_runner`]),
     /// so no test reaches Mixxx's library.
     mixxx: Option<cmd::MixxxRunner>,
+    /// The ffmpeg `dj.export_set` makes stem files with: `None` for `DJFORGE_FFMPEG` or the PATH's.
+    ffmpeg: Option<std::path::PathBuf>,
 }
 
 impl Default for Engine {
@@ -179,6 +181,7 @@ impl Engine {
             last_selection: None,
             stems: None,
             mixxx: None,
+            ffmpeg: None,
         }
     }
 
@@ -194,6 +197,17 @@ impl Engine {
     /// points call this, with [`cmd::mixforge_mixxx_runner`]; tests give a fake.
     pub fn set_mixxx_runner(&mut self, runner: cmd::MixxxRunner) {
         self.mixxx = Some(runner);
+    }
+
+    /// `dj.export_set` makes stem files with the ffmpeg at `path` instead of `DJFORGE_FFMPEG` or
+    /// the PATH's (tests point it at one that is missing).
+    pub fn set_ffmpeg(&mut self, path: std::path::PathBuf) {
+        self.ffmpeg = Some(path);
+    }
+
+    /// The ffmpeg set with [`Engine::set_ffmpeg`], if any.
+    pub fn ffmpeg(&self) -> Option<&std::path::Path> {
+        self.ffmpeg.as_deref()
     }
 
     /// What exports a set to Mixxx for this engine, if set up.

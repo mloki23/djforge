@@ -28,7 +28,7 @@ pub enum Dialog {
     ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
     SaveChanges { then: (String, Value) },
     ClearStemCache { message: String, refused: bool }, // DJ › Clear Stem Cache: what it holds, or why not now
-    ExportSet { rekordbox: bool, mixxx: bool, stems: bool, split: bool }, // DJ › Export Set: targets ticked; stems need a split track
+    ExportSet { rekordbox: bool, mixxx: bool, stems: bool, split: bool, refused: Option<String> }, // DJ › Export Set: targets; stems need a split track; why not
 }
 
 #[derive(Default)]
@@ -135,7 +135,13 @@ impl Dialogs {
             "prep.tracks" => {
                 Dialog::PathPrompt { cmd: id.into(), title: "Prep Tracks (plan.json or folder)".into(), path: home, key: "source".into() }
             }
-            "dj.export_set" => Dialog::ExportSet { rekordbox: true, mixxx: true, stems: false, split: crate::export::set_is_split(e.session()) },
+            "dj.export_set" => Dialog::ExportSet {
+                rekordbox: true,
+                mixxx: true,
+                stems: false,
+                split: soundcraft_engine::cmd::export_set_is_split(e.session()),
+                refused: soundcraft_engine::cmd::export_set_refusal(e.session()),
+            },
             "dj.tempo_ramp" => {
                 // The tempo the selection ends in (the next track's, when it reaches into it).
                 let s = e.session();
@@ -306,6 +312,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     crate::bounce::show(app, ctx);
     crate::prep::show(app, ctx);
     crate::export::show(app, ctx);
+    crate::export::show_result(app, ctx);
     crate::stems::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
     let mut keep = true;
@@ -625,8 +632,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         action = Some(("dj.clear_stem_cache".into(), json!({})));
                     }
                 }
-                Dialog::ExportSet { rekordbox, mixxx, stems, split } => {
+                Dialog::ExportSet { rekordbox, mixxx, stems, split, refused } => {
                     ui.set_max_width(380.0);
+                    if let Some(why) = refused {
+                        ui.label(egui::RichText::new(format!("This session can't be exported: {why}.")).color(ui.visuals().warn_fg_color));
+                    }
                     ui.label("Export the set as prepped copies to:");
                     crate::widgets::checkbox(ui, rekordbox, "Rekordbox");
                     ui.horizontal(|ui| {
@@ -640,7 +650,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         *stems = false;
                         ui.add_enabled(false, egui::Checkbox::new(&mut false, STEMS)).on_disabled_hover_text("No track of the set is split");
                     }
-                    let any = *rekordbox || *mixxx;
+                    let any = (*rekordbox || *mixxx) && refused.is_none();
                     let mut export = enter && any;
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -648,7 +658,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                             ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dlg_cancel"), true));
                         }
                         let ok = egui::Button::new(egui::RichText::new("Export").strong()).fill(Tokens::current().accent);
-                        export |= ui.add_enabled(any, ok).on_disabled_hover_text("Tick Rekordbox or Mixxx").clicked();
+                        let why = if refused.is_some() { "The session can't be exported" } else { "Tick Rekordbox or Mixxx" };
+                        export |= ui.add_enabled(any, ok).on_disabled_hover_text(why).clicked();
                     });
                     if export {
                         let targets: Vec<&str> =

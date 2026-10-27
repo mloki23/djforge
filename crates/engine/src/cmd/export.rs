@@ -215,12 +215,26 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
             grid,
             cues,
             mix_out_bars,
-            split: first.stems.clone(),
+            // Any split clip of the file gives its stems (the first in the timeline), as
+            // [`set_is_split`] has it.
+            split: f.clips.iter().find_map(|(c, _)| c.stems.clone()),
             first_clip: first.id,
             doubts: f.doubts,
         });
     }
     Ok(out)
+}
+
+/// Whether stem files can be asked of the set in `s`: a clip of one of its DJ transitions is
+/// split (its file's stems are then exported, whichever of the file's clips is split).
+pub fn set_is_split(s: &Session) -> bool {
+    s.dj.transitions.iter().flat_map(|t| [t.out_clip, t.in_clip]).any(|id| s.find_clip(id).is_some_and(|(_, c)| c.stems.is_some()))
+}
+
+/// Why the session `s` can't be exported as a set (no transitions, a meter other than 4/4, a
+/// transition clip missing or not beat-locked), or `None` when it can.
+pub fn set_refusal(s: &Session) -> Option<String> {
+    collect(s).err()
 }
 
 /// The file to export for source `src`, the doubts about it, and whether it was found. Every path
@@ -472,7 +486,7 @@ pub fn specs() -> Vec<super::CommandSpec> {
         "Export Set",
         [],
         None,
-        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). With stems: true, writes <file>.stem.mp4 for each split track: an NI STEM file (five ALAC tracks: the copy, then its drums, bass, other and vocals at the copy's gain, with NI's `stem` metadata) through ffmpeg (DJFORGE_FFMPEG or ffmpeg on the PATH; skipped without it); a file of that name an export didn't write is never replaced. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
+        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). With stems: true, writes <file>.stem.mp4 for each split track: an NI STEM file (five ALAC tracks: the copy, then its drums, bass, other and vocals at the copy's gain, with NI's `stem` metadata) through ffmpeg (DJFORGE_FFMPEG or ffmpeg on the PATH; skipped without it); a file of that name an export didn't write is never replaced. A cancel stops prep before its next track, and the XML, the Mixxx write and each stem file before they start (a Mixxx write once started runs to its end); the result then has cancelled: true and what was written. Returns {root, rekordbox: path|null|{error}, report: path|null|{error}, mixxx, stems, tracks: [{file, path, title, prep, grid_bars, cues, doubts, found, prep_refused, in_mixxx}], prep, cancelled}",
         super::always,
         export_set
     )]
@@ -534,10 +548,18 @@ fn file_name(name: &str) -> String {
     }
 }
 
-/// Why the export can't replace `path`: it exists and is not an earlier export (its text has
-/// `mark`: at the start for the report, anywhere for the XML).
+/// Bytes of a file read to tell an earlier export: both marks are in its first lines.
+const MARK_HEAD: usize = 4096;
+
+/// Why the export can't replace `path`: it exists and is not an earlier export (its first 4 KB
+/// have `mark`: at the start for the report, anywhere for the XML). Only that head is read.
 fn foreign(path: &Path, mark: &str) -> Option<String> {
-    let ours = || crate::io::read_text(path).is_ok_and(|t| if mark == REPORT_HEADER { t.starts_with(mark) } else { t.contains(mark) });
+    let ours = || {
+        crate::io::read_head(path, MARK_HEAD).is_ok_and(|h| {
+            let t = String::from_utf8_lossy(&h);
+            if mark == REPORT_HEADER { t.starts_with(mark) } else { t.contains(mark) }
+        })
+    };
     (crate::io::path_exists(path) && !ours())
         .then(|| format!("{}: exists and is not an earlier export; move it or choose another `out`", path.display()))
 }
@@ -564,33 +586,63 @@ struct Shared {
 
 impl Shared {
     fn stage(&self, stage: &'static str) {
-        *self.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+        *self.lock_stage() = stage;
+    }
+
+    fn lock_stage(&self) -> std::sync::MutexGuard<'_, &'static str> {
+        self.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.prep.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Cancels, under the stage's lock, so a cancel and the start of the Mixxx write
+    /// ([`Self::start_mixxx`]) never cross.
+    fn cancel(&self) {
+        let _stage = self.lock_stage();
+        self.prep.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Enters the "mixxx" stage unless the export was cancelled (false then): once entered,
+    /// mixforge writes Mixxx's library to the end, a cancel or not.
+    fn start_mixxx(&self) -> bool {
+        let mut stage = self.lock_stage();
+        if self.cancelled() {
+            return false;
+        }
+        *stage = "mixxx";
+        true
     }
 }
 
-/// One track of the export, with what it needs after prep: where its copy goes (with its row
-/// of prep's report) or why prep left it out, and its length.
+/// One track of the export: its length, and its stems.
 struct Item {
     track: ExportTrack,
-    copy: Result<(PathBuf, usize), String>,
     total_secs: f64,
     /// Its stems for a stem file, when stems are asked for and its clip is split; or why they
     /// can't be had.
     stems: Option<std::result::Result<stemfile::Stems, String>>,
 }
 
-/// An export whose checks all passed and whose folder exists.
+/// An export whose quick checks passed (its own files are not foreign and may be written): prep's
+/// plan (which may read earlier copies to tell prep's own) is made on the export's thread.
 struct Export {
     name: String,
     out: PathBuf,
     xml: PathBuf,
     report: PathBuf,
     request: Request,
-    plan: super::prep::Plan,
+    /// The session as the export started, for prep's checks and refusals.
+    session: Arc<Session>,
+    /// The set's tracks, each with its length and stems (when asked for); their copies are
+    /// known once prep's plan is made.
     items: Vec<Item>,
     session_files: crate::io::SourceFiles,
     /// What writes the set into Mixxx, when the engine has one.
     mixxx: Option<MixxxRunner>,
+    /// The ffmpeg stem files are made with.
+    ffmpeg: String,
 }
 
 /// A `dj.export_set` run on its own thread: how far it got, a cancel that stops prep before its
@@ -606,8 +658,9 @@ enum JobState {
     Ended(Option<crate::Result<Value>>),
 }
 
-/// Starts the run `dj.export_set` does for `p`: every check is made, and the folder created,
-/// before this returns; prep and the writing happen on another thread.
+/// Starts the run `dj.export_set` does for `p`: the request, the set and the export's own files
+/// are checked before this returns; prep's checks (which may read earlier copies), the folder,
+/// prep and the writing happen on another thread, so a refusal of prep's is the job's result.
 pub fn export_job(e: &crate::Engine, p: &Value) -> crate::Result<ExportJob> {
     export_job_in(e, p, None, super::prep::mixforge_analysis())
 }
@@ -626,8 +679,6 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
             None => super::prep::default_root()?.join(&name),
         }),
     };
-    // Only files that were found are prepped: nothing reads a path that is missing or refused.
-    let files: Vec<PathBuf> = tracks.iter().filter(|t| t.found).map(|t| super::prep::normalise(&t.path)).collect();
     let (xml, report) = (out.join(format!("{name}.rekordbox.xml")), out.join(format!("{name}.export.txt")));
     // The export's own files, before prep makes the folder: only earlier exports are replaced.
     for (path, mark) in [(&xml, XML_MARK), (&report, REPORT_HEADER)] {
@@ -637,26 +688,9 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
             return Err(super::bad(CMD, why));
         }
     }
-    let (plan, refused) = super::prep::Plan::for_files_except(s, &format!("set {}", s.name), files, out.clone(), TARGET_LUFS, CEILING)?;
     let sr = s.sample_rate.as_f64();
-    // Prep's rows and copies are those of the files it kept, in order.
-    let (mut file, mut row) = (0, 0);
     let mut items = Vec::with_capacity(tracks.len());
     for track in tracks {
-        let copy = if !track.found {
-            Err("its file was not found".to_string())
-        } else {
-            let at = file;
-            file += 1;
-            match refused.iter().find(|(i, _)| *i == at) {
-                Some((_, why)) => Err(format!("prep refused it: {why}")),
-                None => {
-                    let r = row;
-                    row += 1;
-                    plan.dests().get(r).cloned().map(|d| (d, r)).ok_or_else(|| "prep has no copy for it".to_string())
-                }
-            }
-        };
         let total_secs = s.source(track.source).map_or(0.0, |x| x.frames as f64 / sr);
         let stems = track.split.as_ref().filter(|_| request.stems).map(|set| {
             let audio: Option<Vec<_>> = set.sources.iter().map(|id| s.pool.get(*id).cloned()).collect();
@@ -665,7 +699,7 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
                 .map(|audio| stemfile::Stems { audio, scale_log2: set.scale_log2 })
                 .ok_or_else(|| "its stems are not loaded; split the clip again".to_string())
         });
-        items.push(Item { track, copy, total_secs, stems });
+        items.push(Item { track, total_secs, stems });
     }
     let export = Export {
         name,
@@ -673,10 +707,11 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
         xml,
         report,
         request,
-        plan,
+        session: e.session_arc(),
         items,
         session_files: crate::io::SourceFiles::of(s),
         mixxx: e.mixxx_runner().cloned(),
+        ffmpeg: e.ffmpeg().map_or_else(stemfile::ffmpeg, |p| p.to_string_lossy().into_owned()),
     };
     Ok(spawn(export, analyse, out))
 }
@@ -685,6 +720,8 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
 fn spawn(export: Export, analyse: super::prep::Analyse, out: PathBuf) -> ExportJob {
     let shared = Arc::new(Shared::default());
     shared.stage("prep");
+    let found = export.items.iter().filter(|i| i.track.found).count();
+    shared.prep.update(|p| p.total = found);
     let ended = |r| ExportJob { shared: Arc::clone(&shared), out: out.clone(), state: JobState::Ended(Some(r)) };
     if cfg!(target_arch = "wasm32") {
         return ended(export.run(&*analyse, &shared));
@@ -713,10 +750,12 @@ impl ExportJob {
         ExportProgress { stage, done: p.done, total: p.total, current: p.current }
     }
 
-    /// Stops prep before its next track (nothing is written after it), or the stem files before
-    /// the next (the report still is).
+    /// Stops the export at the next point it can: prep before its next track; the Rekordbox XML
+    /// and the Mixxx write before they start (a Mixxx write already started is never stopped:
+    /// the stage is "mixxx" until it ends); the stem files before the next. The result says it
+    /// was cancelled, and what was written.
     pub fn cancel(&self) {
-        self.shared.prep.cancel.store(true, Ordering::Relaxed);
+        self.shared.cancel();
     }
 
     /// Whether it was cancelled.
@@ -755,6 +794,9 @@ fn joined(handle: std::thread::JoinHandle<crate::Result<Value>>) -> crate::Resul
     handle.join().unwrap_or_else(|p| Err(crate::EngineError::Internal(CMD.into(), crate::panic_message(&*p))))
 }
 
+/// How the doubt of a track prep refused to copy starts.
+const PREP_REFUSED: &str = "prep refused it: ";
+
 /// One exported track's outcome.
 struct Done {
     file: String,
@@ -766,6 +808,12 @@ struct Done {
     doubts: Vec<String>,
     /// Prep's gain steps on the exported file (0 when it is the original).
     steps: i32,
+    /// Whether its file was found (else it was neither prepped nor read).
+    found: bool,
+    /// Why prep refused to copy it, when it did.
+    prep_refused: Option<String>,
+    /// Whether it went to Mixxx (`None` when Mixxx was not asked for).
+    in_mixxx: Option<bool>,
 }
 
 impl Export {
@@ -789,7 +837,32 @@ impl Export {
             analysed.borrow_mut().insert(crate::io::file_key(Path::new(path)), key);
             r
         };
-        let prep = self.plan.prep(&recording, &shared.prep)?;
+        let s = &*self.session;
+        // Only files that were found are prepped: nothing reads a path that is missing or refused.
+        let files: Vec<PathBuf> = self.items.iter().filter(|i| i.track.found).map(|i| super::prep::normalise(&i.track.path)).collect();
+        let (plan, refused) = super::prep::Plan::for_files_except(s, &format!("set {}", s.name), files, self.out.clone(), TARGET_LUFS, CEILING)?;
+        // Prep's rows and copies are those of the files it kept, in order.
+        let (mut file, mut row) = (0, 0);
+        let copies: Vec<Result<(PathBuf, usize), String>> = self
+            .items
+            .iter()
+            .map(|item| {
+                if !item.track.found {
+                    return Err("its file was not found".to_string());
+                }
+                let at = file;
+                file += 1;
+                match refused.iter().find(|(i, _)| *i == at) {
+                    Some((_, why)) => Err(format!("{PREP_REFUSED}{why}")),
+                    None => {
+                        let r = row;
+                        row += 1;
+                        plan.dests().get(r).cloned().map(|d| (d, r)).ok_or_else(|| "prep has no copy for it".to_string())
+                    }
+                }
+            })
+            .collect();
+        let prep = plan.prep(&recording, &shared.prep)?;
         // The tracks left out of Mixxx since the last it got: they shift mixforge's reading of the
         // next one it gets.
         let mut left_out: Vec<String> = Vec::new();
@@ -802,21 +875,21 @@ impl Export {
         let mut rb = Vec::with_capacity(self.items.len());
         let mut done = Vec::with_capacity(self.items.len());
         let mut mixxx_plan = Vec::with_capacity(self.items.len());
-        for item in &self.items {
+        for (item, item_copy) in self.items.iter().zip(&copies) {
             let t = &item.track;
             let mut doubts = t.doubts.clone();
-            let (row, copy) = match &item.copy {
+            let (row, copy) = match item_copy {
                 Ok((copy, r)) => (rows.get(*r), Some(copy)),
                 Err(_) => (None, None),
             };
-            let status = match &item.copy {
+            let status = match item_copy {
                 Err(_) => "not prepped".to_string(),
                 Ok(_) => row.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("failed").to_string(),
             };
             // The prepped copy when prep wrote one; the original (never written) otherwise.
             let path = if let (Some(copy), true) = (copy, matches!(status.as_str(), "ok" | "not_adjusted")) {
                 copy.clone()
-            } else if let Err(why) = &item.copy {
+            } else if let Err(why) = item_copy {
                 if t.found {
                     doubts.push(format!("{why}; exported the original"));
                 }
@@ -831,7 +904,7 @@ impl Export {
                 t.path.clone()
             };
             // Only a file that was found (or prep's copy) is read: never a missing or refused path.
-            let readable = item.copy.is_ok() || t.found;
+            let readable = item_copy.is_ok() || t.found;
             let tags_of = |p: &Path| {
                 if readable && p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3")) {
                     super::prep::tag_head(p).map(|h| soundcraft_audio_io::mp3tags::read_basic(&h)).unwrap_or_default()
@@ -859,6 +932,7 @@ impl Export {
                 None if self.request.rekordbox => doubts.push("its path has no file:// URL; left out of the Rekordbox XML".into()),
                 None => {}
             }
+            let mut in_mixxx = None;
             if self.request.mixxx {
                 let entry = if t.found {
                     // The copy's key tag, else prep's analysis of the file, else the original's tag.
@@ -881,6 +955,7 @@ impl Export {
                 };
                 match entry {
                     Ok((entry, drift)) => {
+                        in_mixxx = Some(true);
                         doubts.extend(drift);
                         if !left_out.is_empty() {
                             let gone = left_out.join(", ");
@@ -895,6 +970,7 @@ impl Export {
                         mixxx_plan.push(entry);
                     }
                     Err(why) => {
+                        in_mixxx = Some(false);
                         doubts.push(format!("left out of the Mixxx export: {why}"));
                         left_out.push(file.clone());
                     }
@@ -905,9 +981,29 @@ impl Export {
             } else {
                 row.and_then(|r| r.get("steps")).and_then(Value::as_i64).and_then(|x| i32::try_from(x).ok()).unwrap_or(0)
             };
-            done.push(Done { file, path, prep: status, title, grid_bars: t.grid.len(), cues: t.cues.len(), doubts, steps });
+            let prep_refused = item_copy.as_ref().err().and_then(|w| w.strip_prefix(PREP_REFUSED)).map(str::to_string);
+            done.push(Done {
+                file,
+                path,
+                prep: status,
+                title,
+                grid_bars: t.grid.len(),
+                cues: t.cues.len(),
+                doubts,
+                steps,
+                found: t.found,
+                prep_refused,
+                in_mixxx,
+            });
         }
 
+        // A cancel after prep: nothing more is written, as after a cancel in prep. Each later
+        // stage checks again.
+        let skipped = || json!({"skipped": "cancelled"});
+        if shared.cancelled() {
+            shared.stage("done");
+            return Ok(json!({"root": self.out, "cancelled": true, "rekordbox": null, "report": null, "prep": prep}));
+        }
         let rekordbox = if self.request.rekordbox {
             let xml = rekordbox::rekordbox_xml(&self.name, &rb);
             // Checked again: a file may have taken its place since the export started.
@@ -925,19 +1021,22 @@ impl Export {
             _ if !self.request.mixxx => json!({"skipped": "not requested"}),
             None => json!({"skipped": "Mixxx export is not set up"}),
             Some(_) if mixxx_plan.is_empty() => json!({"skipped": "no track could go to Mixxx; see the tracks' doubts"}),
-            Some(run) => {
-                shared.stage("mixxx");
-                mixxx_export(run, &json!({"tracks": mixxx_plan}), &self.name)
-            }
+            // Checked under the stage's lock right before mixforge starts: it is never stopped
+            // part-way.
+            Some(run) if shared.start_mixxx() => mixxx_export(run, &json!({"tracks": mixxx_plan}), &self.name),
+            Some(_) => skipped(),
         };
-        let stems = if self.request.stems {
+        let stems = if !self.request.stems {
+            json!([])
+        } else if shared.cancelled() {
+            skipped()
+        } else {
             shared.stage("stems");
             self.stem_files(&done, &shared.prep.cancel)
-        } else {
-            json!([])
         };
+        let cancelled = shared.cancelled();
 
-        let text = self.report_text(&rekordbox, &mixxx, &stems, &done);
+        let text = self.report_text(&rekordbox, &mixxx, &stems, &done, cancelled);
         // What was written stands when the report can't be: the result says why.
         let report = match foreign(&self.report, REPORT_HEADER) {
             Some(why) => json!({"error": why}),
@@ -949,7 +1048,20 @@ impl Export {
         shared.stage("done");
         let tracks: Vec<Value> = done
             .iter()
-            .map(|d| json!({"file": d.file, "path": d.path, "title": d.title, "prep": d.prep, "grid_bars": d.grid_bars, "cues": d.cues, "doubts": d.doubts}))
+            .map(|d| {
+                json!({
+                    "file": d.file,
+                    "path": d.path,
+                    "title": d.title,
+                    "prep": d.prep,
+                    "grid_bars": d.grid_bars,
+                    "cues": d.cues,
+                    "doubts": d.doubts,
+                    "found": d.found,
+                    "prep_refused": d.prep_refused,
+                    "in_mixxx": d.in_mixxx,
+                })
+            })
             .collect();
         Ok(json!({
             "root": self.out,
@@ -959,7 +1071,7 @@ impl Export {
             "stems": stems,
             "tracks": tracks,
             "prep": prep,
-            "cancelled": false,
+            "cancelled": cancelled,
         }))
     }
 
@@ -971,8 +1083,8 @@ impl Export {
         if split.is_empty() {
             return json!({"skipped": "no track of the set is split"});
         }
-        let ffmpeg = stemfile::ffmpeg();
-        if !stemfile::ffmpeg_found(&ffmpeg) {
+        let ffmpeg = &self.ffmpeg;
+        if !stemfile::ffmpeg_found(ffmpeg) {
             return json!({"skipped": "ffmpeg not found (install it, or set DJFORGE_FFMPEG to ffmpeg.exe)"});
         }
         let stop = || cancel.load(Ordering::Relaxed);
@@ -995,7 +1107,7 @@ impl Export {
                 Some(Ok(stems)) => {
                     let tmp = self.out.join(format!("{}{}-{k}", stemfile::TMP_PREFIX, std::process::id()));
                     let job = stemfile::Job {
-                        ffmpeg: &ffmpeg,
+                        ffmpeg,
                         mix: &d.path,
                         stems,
                         gain: 2f64.powf(f64::from(d.steps) / 4.0),
@@ -1022,7 +1134,7 @@ impl Export {
 
     /// The export report: what was written for each target, a line per track with its doubts,
     /// and the Rekordbox import steps.
-    fn report_text(&self, rekordbox: &Value, mixxx: &Value, stems: &Value, done: &[Done]) -> String {
+    fn report_text(&self, rekordbox: &Value, mixxx: &Value, stems: &Value, done: &[Done], cancelled: bool) -> String {
         let said = |v: &Value| match v {
             Value::Null => "not requested".to_string(),
             Value::String(p) => p.clone(),
@@ -1044,6 +1156,9 @@ impl Export {
             other => other.get("skipped").or_else(|| other.get("error")).and_then(Value::as_str).map_or_else(|| other.to_string(), str::to_string),
         };
         let mut out = format!("{REPORT_HEADER}{}\n{}\nfolder: {}\n\n", self.name, super::prep::utc_now(), self.out.display());
+        if cancelled {
+            out.push_str("The export was cancelled: what was written before the cancel is listed below.\n\n");
+        }
         out.push_str(&format!("Rekordbox: {}\nMixxx: {}\nStem files: {}\n\n", said(rekordbox), said(mixxx), said(stems)));
         for (i, d) in done.iter().enumerate() {
             let doubts = if d.doubts.is_empty() { String::new() } else { format!("  | {}", d.doubts.join("; ")) };

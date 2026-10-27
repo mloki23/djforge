@@ -648,7 +648,7 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn update(&self, f: impl FnOnce(&mut PrepProgress)) {
+    pub(crate) fn update(&self, f: impl FnOnce(&mut PrepProgress)) {
         f(&mut self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     }
 }

@@ -15,6 +15,7 @@ use soundcraft_engine::cmd::{ExportJob, MixxxRunner, PrepAnalyse};
 use soundcraft_engine::model::{ClipId, StemSet};
 use soundcraft_ui_egui::dialogs::Dialog;
 use soundcraft_ui_egui::{Services, SoundApp, menus};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -22,11 +23,26 @@ use std::time::{Duration, Instant};
 const MP3: &str = "../audio-io/tests/fixtures/mp3/cbr128_44k_stereo.mp3";
 const WAIT: &str = "Wait for the export to finish (or cancel it)";
 
-fn scratch(name: &str) -> PathBuf {
+/// A test's own scratch folder, removed when the test ends (passed or failed).
+struct Scratch(PathBuf);
+
+impl Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("djforge-ui-export-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 /// A two-track set at 120 bpm in a session named "test set", from MP3 copies in `dir/lib`: a.mp3
@@ -125,7 +141,7 @@ fn the_menu_opens_the_dialog_and_export_writes_rekordbox_and_mixxx() {
     let mut h = harness(e, &dir, analysis(), &calls);
     open_dialog(&mut h);
     match &h.state().dialogs.open {
-        Some(Dialog::ExportSet { rekordbox: true, mixxx: true, stems: false, split: false }) => {}
+        Some(Dialog::ExportSet { rekordbox: true, mixxx: true, stems: false, split: false, refused: None }) => {}
         other => panic!("expected the export dialog with both targets ticked, got {other:?}"),
     }
     assert!(h.query_by_label_contains("Mixxx must be closed").is_some());
@@ -147,7 +163,17 @@ fn the_menu_opens_the_dialog_and_export_writes_rekordbox_and_mixxx() {
     assert!(xml.contains("<PRODUCT Name=\"djforge\""), "{xml}");
     assert!(out.join("a.mp3").is_file() && out.join("b.mp3").is_file() && out.join("test set.export.txt").is_file());
     assert_eq!(*calls.lock().unwrap(), ["test set"]);
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.contains("see test set.export.txt"), "{status}");
+
+    // A window says what happened to each track, with the folder and a way to open it.
+    h.run_steps(6);
+    assert!(h.query_by_label_contains("Export Finished").is_some());
+    assert!(h.query_by_label(&out.display().to_string()).is_some());
+    assert!(h.query_by_label("Open folder").is_some());
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    assert!(h.state().export_result.is_none());
+    assert!(h.query_by_label_contains("Export Finished").is_none());
 }
 
 #[test]
@@ -177,7 +203,6 @@ fn export_needs_a_target_and_mixxx_can_be_left_out() {
     assert!(status.contains("Rekordbox XML written") && !status.contains("Mixxx"), "{status}");
     assert!(calls.lock().unwrap().is_empty(), "Mixxx was not asked for");
     assert!(dir.join("prepped").join("test set").join("test set.rekordbox.xml").is_file());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -195,8 +220,96 @@ fn the_stems_checkbox_is_enabled_once_a_track_of_the_set_is_split() {
     h.get_by_label(STEMS_LABEL).click();
     h.run_steps(2);
     assert!(matches!(h.state().dialogs.open, Some(Dialog::ExportSet { stems: true, .. })));
-    // Not exported: stem files need ffmpeg.
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stems asked for with no ffmpeg to make them: the rest is exported, and the status line says
+/// why there are no stem files. (The engine's ffmpeg is a path that doesn't exist.)
+#[test]
+fn stem_files_without_ffmpeg_are_skipped_and_the_status_line_says_why() {
+    let dir = scratch("no-ffmpeg");
+    let (mut e, clips) = set(&dir);
+    let s = e.session_mut();
+    // Only the clip of the file playing later in the set is split: its stems are still found.
+    let src = s.find_clip(clips[1]).unwrap().1.source().unwrap();
+    s.find_clip_mut(clips[1]).unwrap().stems = Some(StemSet { key: "fake".into(), sources: [src; 4], scale_log2: 0 });
+    e.set_ffmpeg(dir.join("missing").join("ffmpeg.exe"));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut h = harness(e, &dir, analysis(), &calls);
+    open_dialog(&mut h);
+    h.get_by_label(STEMS_LABEL).click();
+    h.run_steps(2);
+    h.get_by_label("Export").click();
+    h.run_steps(1);
+    step_until_exported(&mut h);
+    let status = h.state().ui.status.clone();
+    assert!(status.contains("Rekordbox XML written") && status.contains("stem files: skipped — ffmpeg not found"), "{status}");
+}
+
+#[test]
+fn a_session_that_can_t_be_exported_says_why_in_the_dialog() {
+    let dir = scratch("refused");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut h = harness(Engine::default(), &dir, analysis(), &calls);
+    open_dialog(&mut h);
+    assert!(h.query_by_label_contains("the session has no DJ transitions").is_some());
+    assert!(disabled(&h, "Export"));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().export.is_none() && !dir.join("prepped").exists());
+}
+
+#[test]
+fn the_status_line_names_missing_files_and_tracks_left_out_of_mixxx() {
+    let dir = scratch("missing");
+    let (e, _) = set(&dir);
+    std::fs::remove_file(dir.join("lib").join("b.mp3")).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut h = harness(e, &dir, analysis(), &calls);
+    h.state_mut().run("dj.export_set", json!({})).unwrap();
+    step_until_exported(&mut h);
+    let status = h.state().ui.status.clone();
+    assert!(status.contains("1 not found (b.mp3)"), "{status}");
+    assert!(status.contains("1 left out of Mixxx (b.mp3)"), "{status}");
+    assert!(status.contains("Mixxx: 1 track(s)"), "{status}");
+    // The window lists the track's doubts.
+    h.run_steps(6);
+    assert!(h.query_by_label_contains("its file was not found").is_some());
+}
+
+/// Once mixforge is writing Mixxx's library the export can't stop: the window says so, Cancel
+/// and Esc are off, and a quit waits for it to finish; what came after (the report) still says
+/// the export was cancelled.
+#[test]
+fn the_mixxx_write_can_t_be_stopped_and_a_quit_waits_for_it() {
+    let dir = scratch("in-mixxx");
+    let (e, _) = set(&dir);
+    let (reached_tx, reached) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let (reached_tx, go_rx) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let inner = fake_mixxx(&calls);
+    let runner: MixxxRunner = Arc::new(move |plan: &Value, set: &str| {
+        let _ = reached_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+        inner(plan, set)
+    });
+    let mut h = harness(e, &dir, analysis(), &Arc::new(Mutex::new(Vec::new())));
+    h.state_mut().engine.set_mixxx_runner(runner);
+    h.state_mut().run("dj.export_set", json!({})).unwrap();
+    reached.recv_timeout(Duration::from_secs(60)).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Writing the set into Mixxx — can't stop now").is_some());
+    assert!(disabled(&h, "Cancel"));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export.as_ref().is_some_and(ExportJob::cancelling), "Esc can't stop the Mixxx write");
+    assert!(soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
+    go.send(()).unwrap();
+    step_until_exported(&mut h);
+    let status = h.state().ui.status.clone();
+    assert!(status.contains("Export cancelled") && status.contains("Mixxx: 2 track(s)"), "{status}");
+    assert_eq!(*calls.lock().unwrap(), ["test set"]);
+    assert!(!h.state().prep_quit);
 }
 
 #[test]
@@ -255,7 +368,6 @@ fn an_agent_s_export_runs_in_the_background_and_jobs_wait_for_each_other() {
     // Like a prep, a background export doesn't go through the command journal.
     assert!(h.state().engine.journal[journaled..].iter().all(|(id, _)| id != "dj.export_set"));
     assert!(h.state_mut().run("session.inspect", json!({})).is_ok());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -286,7 +398,6 @@ fn an_export_waits_for_a_running_prep() {
         h.step();
         std::thread::sleep(Duration::from_millis(5));
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -308,5 +419,4 @@ fn a_quit_cancels_the_export_and_waits_for_it_to_stop() {
     assert!(!h.state().prep_quit, "the quit was not asked again");
     assert!(h.state().ui.status.contains("Export cancelled"), "{}", h.state().ui.status);
     assert!(!soundcraft_ui_egui::prep::holds_quit(h.state_mut()));
-    let _ = std::fs::remove_dir_all(&dir);
 }

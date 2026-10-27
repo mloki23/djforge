@@ -318,6 +318,9 @@ fn a_file_prep_refuses_is_exported_as_its_original() {
     assert_eq!(Path::new(rows[1]["path"].as_str().unwrap()), lib.join("y/Intro.mp3"));
     let doubts = rows[1]["doubts"].to_string();
     assert!(doubts.contains("prep refused it: another track of the set has the name `Intro.mp3`"), "{doubts}");
+    // The result says so plainly too, for a status line.
+    assert!(rows[1]["prep_refused"].as_str().unwrap().contains("another track of the set has the name `Intro.mp3`"), "{r}");
+    assert!(rows[0]["prep_refused"].is_null() && rows[0]["found"] == true && rows[1]["found"] == true, "{r}");
     let xml = std::fs::read_to_string(out.join("test set.rekordbox.xml")).unwrap();
     let locations: Vec<PathBuf> = collection(&xml).iter().map(|t| url_path(t.attr("Location"))).collect();
     assert_eq!(locations, vec![out.join("Intro.mp3"), lib.join("y/Intro.mp3")]);
