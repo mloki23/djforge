@@ -142,7 +142,7 @@ pub(crate) fn clip_menu(app: &mut SoundApp, ui: &mut Ui, clip: ClipId) {
     }
     ui.separator();
     if c.stems.is_none() {
-        let busy = app.prep.is_some() || app.split.is_some();
+        let busy = app.prep.is_some() || app.split.is_some() || app.export.is_some();
         let resp = ui.add_enabled(!busy, egui::Button::new("Split into Stems"));
         if resp.clicked() {
             let _ = start(app, &json!({"clip": clip.0}));

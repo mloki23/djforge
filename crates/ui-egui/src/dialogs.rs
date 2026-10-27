@@ -28,6 +28,7 @@ pub enum Dialog {
     ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
     SaveChanges { then: (String, Value) },
     ClearStemCache { message: String, refused: bool }, // DJ › Clear Stem Cache: what it holds, or why not now
+    ExportSet { rekordbox: bool, mixxx: bool, stems: bool, split: bool }, // DJ › Export Set: targets ticked; stems need a split track
 }
 
 #[derive(Default)]
@@ -58,6 +59,7 @@ impl Dialogs {
             Dialog::ScoreSetup { .. } => "score_setup",
             Dialog::SaveChanges { .. } => "save_changes",
             Dialog::ClearStemCache { .. } => "clear_stem_cache",
+            Dialog::ExportSet { .. } => "export_set",
         })
     }
 
@@ -133,6 +135,7 @@ impl Dialogs {
             "prep.tracks" => {
                 Dialog::PathPrompt { cmd: id.into(), title: "Prep Tracks (plan.json or folder)".into(), path: home, key: "source".into() }
             }
+            "dj.export_set" => Dialog::ExportSet { rekordbox: true, mixxx: true, stems: false, split: crate::export::set_is_split(e.session()) },
             "dj.tempo_ramp" => {
                 // The tempo the selection ends in (the next track's, when it reaches into it).
                 let s = e.session();
@@ -302,6 +305,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     crate::prep::show(app, ctx);
+    crate::export::show(app, ctx);
     crate::stems::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
     let mut keep = true;
@@ -327,6 +331,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         Dialog::SaveChanges { then } if then.0 == "session.revert" => "Revert to Saved",
         Dialog::SaveChanges { .. } => "Unsaved Changes",
         Dialog::ClearStemCache { .. } => "Clear Stem Cache",
+        Dialog::ExportSet { .. } => "Export Set",
     }
     .to_string();
     let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -620,6 +625,37 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         action = Some(("dj.clear_stem_cache".into(), json!({})));
                     }
                 }
+                Dialog::ExportSet { rekordbox, mixxx, stems, split } => {
+                    ui.set_max_width(380.0);
+                    ui.label("Export the set as prepped copies to:");
+                    crate::widgets::checkbox(ui, rekordbox, "Rekordbox");
+                    ui.horizontal(|ui| {
+                        crate::widgets::checkbox(ui, mixxx, "Mixxx");
+                        ui.label(egui::RichText::new("Mixxx must be closed").color(Tokens::current().text_dim));
+                    });
+                    const STEMS: &str = "Include stem files (.stem.mp4)";
+                    if *split {
+                        crate::widgets::checkbox(ui, stems, STEMS);
+                    } else {
+                        *stems = false;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut false, STEMS)).on_disabled_hover_text("No track of the set is split");
+                    }
+                    let any = *rekordbox || *mixxx;
+                    let mut export = enter && any;
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dlg_cancel"), true));
+                        }
+                        let ok = egui::Button::new(egui::RichText::new("Export").strong()).fill(Tokens::current().accent);
+                        export |= ui.add_enabled(any, ok).on_disabled_hover_text("Tick Rekordbox or Mixxx").clicked();
+                    });
+                    if export {
+                        let targets: Vec<&str> =
+                            [(*rekordbox, "rekordbox"), (*mixxx, "mixxx")].into_iter().filter(|(on, _)| *on).map(|(_, t)| t).collect();
+                        action = Some(("dj.export_set".into(), json!({"targets": targets, "stems": *stems})));
+                    }
+                }
                 Dialog::SaveChanges { then } => {
                     let name = &app.engine.session().name;
                     let revert = then.0 == "session.revert";
@@ -672,6 +708,9 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         keep = false;
         if cmd == "prep.tracks" {
             crate::prep::start(app, &params);
+        } else if cmd == "dj.export_set" {
+            // In the background, into the app's prep root; a refusal goes to the status line.
+            let _ = crate::export::start(app, &params);
         } else if cmd == "dj.clear_stem_cache" {
             // On the app's stem cache, which tests point elsewhere.
             let _ = crate::stems::clear(app);

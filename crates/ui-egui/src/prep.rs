@@ -44,20 +44,21 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
     quit_when_idle(app, ctx);
 }
 
-/// Once no background job (a prep or a stem split) runs, closes the window again when its close
-/// waited for them ([`holds_quit`]).
+/// Once no background job (a prep, a stem split or an export) runs, closes the window again
+/// when its close waited for them ([`holds_quit`]).
 pub(crate) fn quit_when_idle(app: &mut SoundApp, ctx: &egui::Context) {
-    if app.prep.is_none() && app.split.is_none() && std::mem::take(&mut app.prep_quit) && !app.quit_requested {
+    if job_name(app).is_none() && std::mem::take(&mut app.prep_quit) && !app.quit_requested {
         // The window's close waited for the jobs: ask again, now that they have stopped.
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 
-/// Holds a quit while a background job runs (a prep or a stem split): cancels it, and the quit
-/// goes ahead once it has stopped (a prep after its current track; the window is closed again
-/// then; a quit asked by command stays asked). True when held; the status line says why.
+/// Holds a quit while a background job runs (a prep, a stem split or an export): cancels it,
+/// and the quit goes ahead once it has stopped (a prep or an export's prep after its current
+/// track; the window is closed again then; a quit asked by command stays asked). True when
+/// held; the status line says why.
 pub fn holds_quit(app: &mut SoundApp) -> bool {
-    if app.prep.is_none() && app.split.is_none() {
+    if job_name(app).is_none() {
         return false;
     }
     if let Some(job) = &app.prep {
@@ -66,31 +67,48 @@ pub fn holds_quit(app: &mut SoundApp) -> bool {
     if let Some(job) = &app.split {
         job.cancel();
     }
+    if let Some(job) = &app.export {
+        job.cancel();
+    }
     app.prep_quit = true;
-    app.ui.status =
-        if app.prep.is_some() { "Quitting once the prep stops after the current track" } else { "Quitting once the stem split stops" }.into();
+    app.ui.status = if app.prep.is_some() {
+        "Quitting once the prep stops after the current track"
+    } else if app.export.is_some() {
+        "Quitting once the export stops"
+    } else {
+        "Quitting once the stem split stops"
+    }
+    .into();
     true
 }
 
-/// Refuses command `id` while a background job runs (a prep or a stem split) when it reads or
-/// writes files or replaces the session: every `file.` and `session.` command but the read-only
-/// ones, `dj.import_set`, and starting either job again (`prep.tracks`, `dj.split_stems`). A
-/// prep refuses to write over the audio of the session it started in (a snapshot of its source
-/// files), and a split is applied to the session it started in, so neither a file it may
-/// replace nor another session may come in meanwhile. A split also holds back emptying the stem
-/// cache it writes into (`dj.clear_stem_cache`). Playback, editing and mixing go on. True when
-/// refused; the status line says why.
-pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
-    let job = if app.prep.is_some() {
-        "prep"
+/// The background job running (a prep, a stem split or an export), as the status line names it.
+fn job_name(app: &SoundApp) -> Option<&'static str> {
+    if app.prep.is_some() {
+        Some("prep")
     } else if app.split.is_some() {
-        "stem split"
+        Some("stem split")
+    } else if app.export.is_some() {
+        Some("export")
     } else {
-        return false;
-    };
+        None
+    }
+}
+
+/// Refuses command `id` while a background job runs (a prep, a stem split or an export) when it
+/// reads or writes files or replaces the session: every `file.` and `session.` command but the
+/// read-only ones, `dj.import_set`, and starting any job again (`prep.tracks`,
+/// `dj.split_stems`, `dj.export_set`). A prep refuses to write over the audio of the session it
+/// started in (a snapshot of its source files), a split is applied to the session it started in,
+/// and an export preps and writes beside files the session may import, so neither a file one
+/// may replace nor another session may come in meanwhile. A split also holds back emptying the
+/// stem cache it writes into (`dj.clear_stem_cache`). Playback, editing and mixing go on. True
+/// when refused; the status line says why.
+pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
+    let Some(job) = job_name(app) else { return false };
     let read_only = soundcraft_engine::find_command(id).is_some_and(|c| !c.journal && !c.undoable && !c.view);
     let refused = ((id.starts_with("file.") || id.starts_with("session.")) && !read_only)
-        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems")
+        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems" | "dj.export_set")
         || (id == "dj.clear_stem_cache" && app.split.is_some());
     if refused {
         let job = if id == "dj.clear_stem_cache" { "stem split" } else { job };

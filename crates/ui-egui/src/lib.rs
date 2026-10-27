@@ -10,6 +10,7 @@ pub mod credits;
 pub mod dialogs;
 pub mod docking;
 pub mod edit_window;
+pub mod export;
 pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
@@ -381,8 +382,11 @@ pub struct SoundApp {
     pub prep_root: Option<std::path::PathBuf>,
     /// mixforge's analysis for Prep Tracks; tests swap in a fake so no sidecar runs.
     pub prep_analyse: soundcraft_engine::cmd::PrepAnalyse,
-    /// A quit waits for the running prep or stem split to stop ([`prep::holds_quit`]).
+    /// A quit waits for the running prep, stem split or export to stop ([`prep::holds_quit`]).
     pub prep_quit: bool,
+    /// The Export Set run in progress, on its own thread. It preps into `prep_root` with
+    /// `prep_analyse`, and writes Mixxx through the engine's Mixxx runner.
+    pub export: Option<soundcraft_engine::cmd::ExportJob>,
     /// The Split into Stems run in progress, on its own thread.
     pub split: Option<soundcraft_engine::cmd::stems::SplitJob>,
     /// The level each muted stem fader had, restored when it is un-muted.
@@ -469,6 +473,7 @@ impl SoundApp {
             prep_root: soundcraft_engine::cmd::prep_default_root().ok(),
             prep_analyse: soundcraft_engine::cmd::prep_mixforge_analysis(),
             prep_quit: false,
+            export: None,
             split: None,
             stem_unmute: HashMap::new(),
             session_generation: 0,
@@ -501,6 +506,10 @@ impl SoundApp {
         }
         if id == "dj.clear_stem_cache" {
             return stems::clear(self);
+        }
+        // An export runs in the background too, into the app's prep root.
+        if id == "dj.export_set" {
+            return export::start(self, &params);
         }
         if id.starts_with("session.save") || id.starts_with("file.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
@@ -1238,6 +1247,7 @@ impl SoundApp {
         self.apply_editor_edits();
         bounce::step(self, ctx);
         prep::step(self, ctx);
+        export::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
