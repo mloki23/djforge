@@ -26,6 +26,8 @@ pub(crate) struct ExportTrack {
     /// File seconds of each bar's downbeat, strictly increasing, over the whole file.
     pub grid: Vec<f64>,
     pub cues: Vec<Cue>,
+    /// Bars of the first transition out of the track, from its mix out to its bass gone.
+    pub mix_out_bars: Option<i64>,
     pub split: Option<StemSet>,
     /// The earliest of the set's clips playing this file.
     pub first_clip: ClipId,
@@ -183,6 +185,8 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
             f.doubts.push(format!("{name} plays more than once in the set; its later mix points are memory cues"));
         }
         cues.sort_by(|a, b| (a.slot, a.memory).cmp(&(b.slot, b.memory)).then(a.at.total_cmp(&b.at)));
+        let mix_out_bars =
+            transitions.iter().find(|t| f.clips.iter().any(|(c, _)| c.id == t.out_clip)).map(|t| t.gone_bar().saturating_sub(t.entry_bar));
         out.push(ExportTrack {
             source: f.source.id,
             path: f.path,
@@ -190,6 +194,7 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
             artist: String::new(),
             grid,
             cues,
+            mix_out_bars,
             split: first.stems.clone(),
             first_clip: first.id,
             doubts: f.doubts,
@@ -243,6 +248,126 @@ fn grid(w: &WarpMap, b0: f64, frames: f64, sr: f64) -> Vec<f64> {
     out
 }
 
+// ─── Mixxx ──────────────────────────────────────────────────────────────────────────────────────
+
+/// What writes an exported set into Mixxx's library: given mixforge's plan (`{tracks: [..]}`)
+/// and the set's name, it returns mixforge's summary or why it could not.
+pub type MixxxRunner = Arc<dyn Fn(&Value, &str) -> std::result::Result<Value, String> + Send + Sync>;
+
+/// The sidecar that runs `mixforge.mixxx.export`: prints its summary as JSON, or `{error}`.
+const MIXFORGE_MIXXX: &str = include_str!("mixforge_mixxx.py");
+/// Longest the Mixxx sidecar may take.
+const MIXXX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How mixforge's refusal while Mixxx runs starts.
+const MIXXX_RUNNING: &str = "Close Mixxx first";
+/// Bars of a track's outro when no transition leaves it (mixforge's default).
+const DEFAULT_TRANSITION_BARS: i64 = 16;
+/// mixforge's note names, from C.
+const PITCHES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/// The runner that calls `mixforge.mixxx.export(plan, set)` through the python in
+/// `DJFORGE_PYTHON` against the mixforge checkout in `DJFORGE_MIXFORGE`, the plan on its standard
+/// input, killed after two minutes. mixforge refuses while Mixxx runs and backs up Mixxx's
+/// database before writing it.
+pub fn mixforge_mixxx_runner() -> MixxxRunner {
+    Arc::new(run_mixforge_mixxx)
+}
+
+fn run_mixforge_mixxx(plan: &Value, set: &str) -> std::result::Result<Value, String> {
+    let var = |name: &str, what: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).ok_or_else(|| format!("set {name} to {what}"));
+    let python = var("DJFORGE_PYTHON", "the python.exe of mixforge's environment")?;
+    let mixforge = var("DJFORGE_MIXFORGE", "the mixforge folder (the one holding the `mixforge` package)")?;
+    let input = serde_json::to_vec(plan).map_err(|err| err.to_string())?;
+    let mut command = std::process::Command::new(&python);
+    command.args(["-I", "-c", MIXFORGE_MIXXX, &mixforge, set]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the GUI must not flash a console.
+        command.creation_flags(0x0800_0000);
+    }
+    let out = match super::dj::output_fed(&mut command, Some(input), MIXXX_TIMEOUT, &|| false) {
+        Ok(super::dj::Sidecar::Ran(out)) => out,
+        Ok(super::dj::Sidecar::TimedOut) => return Err(format!("mixforge's Mixxx export timed out after {} s", MIXXX_TIMEOUT.as_secs())),
+        Ok(super::dj::Sidecar::LeftHolding) => return Err("the mixforge sidecar left a process holding its output".into()),
+        Ok(super::dj::Sidecar::Stopped) => return Err("mixforge's Mixxx export was stopped".into()),
+        Err(err) => return Err(format!("could not run DJFORGE_PYTHON ({python}): {err}")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = stdout.trim();
+    if text.is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines.get(lines.len().saturating_sub(5)..).unwrap_or_default().join("\n");
+        return Err(format!("mixforge printed nothing ({}): {tail}", out.status));
+    }
+    let head = || text.chars().take(300).collect::<String>();
+    let v: Value = serde_json::from_str(text).map_err(|_| format!("mixforge printed something that is not JSON: {}", head()))?;
+    if let Some(msg) = v.get("error") {
+        return Err(msg.as_str().map_or_else(|| msg.to_string(), str::to_string));
+    }
+    if !v.is_object() {
+        return Err(format!("mixforge printed something that is not an object: {}", head()));
+    }
+    Ok(v)
+}
+
+/// Key `k` (Camelot or musical notation) as mixforge names it ('Am', 'F#'; sharps only): the
+/// inverse of its Camelot code, as mixforge's `camelot_to_key`.
+fn mixforge_key(k: &str) -> Option<String> {
+    let camelot = super::prep::to_camelot(k)?;
+    let (number, letter) = camelot.split_at(camelot.len().checked_sub(1)?);
+    let n: usize = number.parse().ok()?;
+    // Camelot follows the circle of fifths from C major = 8B; nA is the relative minor of nB.
+    let major = (n + 4) * 7 % 12;
+    match letter {
+        "B" => PITCHES.get(major).map(|p| (*p).to_string()),
+        _ => PITCHES.get((major + 9) % 12).map(|p| format!("{p}m")),
+    }
+}
+
+/// mixforge's plan entry for track `t` exported as `path` with these tags: its quarter-note BPM
+/// from the median bar of its grid, its first downbeat, cue in (A, else the first downbeat), out
+/// start (C) and outro bars, in file seconds. Why it can't go to Mixxx otherwise.
+fn mixxx_track(t: &ExportTrack, path: &Path, title: &str, artist: Option<&str>, key: Option<&str>) -> std::result::Result<Value, String> {
+    let path = path.to_str().ok_or("its path is not Unicode")?;
+    let key = key.and_then(mixforge_key).ok_or("its key is not known (no key tag in the copy)")?;
+    let mut bars: Vec<f64> = t.grid.windows(2).filter_map(|w| if let [a, b] = w { Some(b - a) } else { None }).collect();
+    bars.sort_by(f64::total_cmp);
+    let bar = bars.get(bars.len() / 2).copied().filter(|b| b.is_finite() && *b > 0.0).ok_or("its grid has fewer than two bars")?;
+    let first = t.grid.first().copied().ok_or("its grid has fewer than two bars")?;
+    let hot = |slot: u8| t.cues.iter().find(|c| c.slot == slot && !c.memory).map(|c| c.at);
+    Ok(json!({
+        "path": path,
+        "bpm": 4.0 * 60.0 / bar,
+        "tempo_multiplier": 1,
+        "first_downbeat": first,
+        "cue_in": hot(0).unwrap_or(first),
+        "out_start": hot(2),
+        "transition_bars": t.mix_out_bars.unwrap_or(DEFAULT_TRANSITION_BARS),
+        "key": key,
+        "title": title,
+        "artist": artist.unwrap_or_default(),
+        "sections": [],
+    }))
+}
+
+/// What `dj.export_set` reports for Mixxx after `run` was given `plan` for set `set`: what it
+/// wrote, or why it was skipped (a running Mixxx said plainly).
+fn mixxx_export(run: &MixxxRunner, plan: &Value, set: &str) -> Value {
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(plan, set))).unwrap_or_else(|p| Err(crate::panic_message(&*p)));
+    match ran {
+        Ok(summary) => json!({
+            "playlist": summary.get("playlist"),
+            "backup": summary.get("backup"),
+            "tracks": plan.get("tracks").and_then(Value::as_array).map_or(0, Vec::len),
+            "summary": summary,
+        }),
+        Err(m) if m.contains(MIXXX_RUNNING) => json!({"skipped": "Mixxx is running — close it and export again"}),
+        Err(m) => json!({"skipped": m}),
+    }
+}
+
 // ─── dj.export_set ──────────────────────────────────────────────────────────────────────────────
 
 const CMD: &str = "dj.export_set";
@@ -265,7 +390,7 @@ pub fn specs() -> Vec<super::CommandSpec> {
         "Export Set",
         [],
         None,
-        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt. Mixxx and stem files come later and are reported as skipped. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
+        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). Stem files come later and are reported as skipped. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
         super::always,
         export_set
     )]
@@ -318,7 +443,7 @@ fn file_name(name: &str) -> String {
 /// How far an export got.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportProgress {
-    /// "prep", then "rekordbox", then "done".
+    /// "prep", then "rekordbox", then "mixxx" (when asked for), then "done".
     pub stage: &'static str,
     /// Tracks prepped (during "prep").
     pub done: usize,
@@ -358,6 +483,8 @@ struct Export {
     plan: super::prep::Plan,
     items: Vec<Item>,
     session_files: crate::io::SourceFiles,
+    /// What writes the set into Mixxx, when the engine has one.
+    mixxx: Option<MixxxRunner>,
 }
 
 /// A `dj.export_set` run on its own thread: how far it got, a cancel that stops prep before its
@@ -416,7 +543,17 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
             Item { track, copy, total_secs }
         })
         .collect();
-    let export = Export { name, out: out.clone(), xml, report, request, plan, items, session_files: crate::io::SourceFiles::of(s) };
+    let export = Export {
+        name,
+        out: out.clone(),
+        xml,
+        report,
+        request,
+        plan,
+        items,
+        session_files: crate::io::SourceFiles::of(s),
+        mixxx: e.mixxx_runner().cloned(),
+    };
     Ok(spawn(export, analyse, out))
 }
 
@@ -505,8 +642,8 @@ struct Done {
 }
 
 impl Export {
-    /// Preps the files, then writes the Rekordbox XML and the report. A cancelled prep ends it
-    /// with nothing more written.
+    /// Preps the files, then writes the Rekordbox XML, the set into Mixxx, and the report. A
+    /// cancelled prep ends it with nothing more written.
     fn run(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> crate::Result<Value> {
         let prep = self.plan.prep(analyse, &shared.prep)?;
         let rows = prep.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -517,6 +654,7 @@ impl Export {
         shared.stage("rekordbox");
         let mut rb = Vec::with_capacity(self.items.len());
         let mut done = Vec::with_capacity(self.items.len());
+        let mut mixxx_plan = Vec::with_capacity(self.items.len());
         for (i, item) in self.items.iter().enumerate() {
             let t = &item.track;
             let mut doubts = t.doubts.clone();
@@ -558,6 +696,12 @@ impl Export {
                 None if self.request.rekordbox => doubts.push("its path has no file:// URL; left out of the Rekordbox XML".into()),
                 None => {}
             }
+            if self.request.mixxx {
+                match mixxx_track(t, &path, &title, tags.artist.as_deref(), tags.key.as_deref()) {
+                    Ok(entry) => mixxx_plan.push(entry),
+                    Err(why) => doubts.push(format!("left out of the Mixxx export: {why}")),
+                }
+            }
             done.push(Done { file, path, prep: status, title, grid_bars: t.grid.len(), cues: t.cues.len(), doubts });
         }
 
@@ -570,7 +714,15 @@ impl Export {
         } else {
             Value::Null
         };
-        let mixxx = if self.request.mixxx { json!({"skipped": "Mixxx export is not set up"}) } else { json!({"skipped": "not requested"}) };
+        let mixxx = match &self.mixxx {
+            _ if !self.request.mixxx => json!({"skipped": "not requested"}),
+            None => json!({"skipped": "Mixxx export is not set up"}),
+            Some(_) if mixxx_plan.is_empty() => json!({"skipped": "no track could go to Mixxx; see the tracks' doubts"}),
+            Some(run) => {
+                shared.stage("mixxx");
+                mixxx_export(run, &json!({"tracks": mixxx_plan}), &self.name)
+            }
+        };
         let stems = if self.request.stems { json!({"skipped": "stem files are not written yet"}) } else { json!([]) };
 
         let text = self.report_text(&rekordbox, &mixxx, &stems, &done);
@@ -599,6 +751,12 @@ impl Export {
             Value::Null => "not requested".to_string(),
             Value::String(p) => p.clone(),
             Value::Array(a) if a.is_empty() => "not requested".to_string(),
+            other if other.get("playlist").is_some_and(Value::is_string) => format!(
+                "playlist {} ({} tracks) in Mixxx's library; its database was backed up to {}",
+                other.get("playlist").map(Value::to_string).unwrap_or_default(),
+                other.get("tracks").and_then(Value::as_u64).unwrap_or(0),
+                other.get("backup").and_then(Value::as_str).unwrap_or("?"),
+            ),
             other => other.get("skipped").or_else(|| other.get("error")).and_then(Value::as_str).map_or_else(|| other.to_string(), str::to_string),
         };
         let mut out = format!("{REPORT_HEADER}{}\n{}\nfolder: {}\n\n", self.name, super::prep::utc_now(), self.out.display());
@@ -909,5 +1067,77 @@ mod tests {
         assert_eq!(trimmed.len(), grid.len());
         assert!(on_downbeats(&trimmed), "{trimmed:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_become_mixforge_s_names() {
+        // mixforge's camelot_to_key: 8A -> Am, 8B -> C; sharps only.
+        for (k, want) in
+            [("8A", "Am"), ("8B", "C"), ("11A", "F#m"), ("1B", "B"), ("12B", "E"), ("3A", "A#m"), ("5B", "D#"), ("Bbm", "A#m"), ("F", "F")]
+        {
+            assert_eq!(mixforge_key(k).as_deref(), Some(want), "{k}");
+        }
+        // Every Camelot code round-trips through prep's reading of musical notation.
+        for n in 1..=12 {
+            for l in ['A', 'B'] {
+                let name = mixforge_key(&format!("{n}{l}")).unwrap();
+                assert_eq!(crate::cmd::prep::to_camelot(&name), Some(format!("{n}{l}")), "{name}");
+            }
+        }
+        assert_eq!(mixforge_key(""), None);
+        assert_eq!(mixforge_key("13A"), None);
+    }
+
+    #[test]
+    fn the_plan_entry_is_the_track_in_file_seconds() {
+        let (e, _) = set();
+        let set = collect(e.session()).unwrap();
+        // B: 1.92 s bars (125 bpm); in on 25, out on 49 for 12 bars (quick: 8 build + 4 out).
+        let v = mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, Some("8A")).unwrap();
+        assert!((v["bpm"].as_f64().unwrap() - 125.0).abs() < 1e-9, "{v}");
+        assert!(close(v["first_downbeat"].as_f64().unwrap(), FIRST) && close(v["cue_in"].as_f64().unwrap(), bar_secs(0.0)), "{v}");
+        assert!(close(v["out_start"].as_f64().unwrap(), bar_secs(24.0)), "{v}");
+        assert_eq!((&v["transition_bars"], &v["key"], &v["artist"]), (&json!(12), &json!("Am"), &json!("")));
+        // A track without a key, or a grid of one bar, can't go.
+        assert!(mixxx_track(&set[1], Path::new("/x/b.mp3"), "B", None, None).unwrap_err().contains("key is not known"));
+        let mut short = set[2].clone();
+        short.grid.truncate(1);
+        assert!(mixxx_track(&short, Path::new("/x/c.mp3"), "C", None, Some("8A")).unwrap_err().contains("fewer than two bars"));
+    }
+
+    /// No test anywhere in the workspace runs the real Mixxx export: it writes Marty's Mixxx
+    /// library. Only the apps' entry points call `mixforge_mixxx_runner`; tests give a fake.
+    #[test]
+    fn no_test_reaches_the_real_mixxx_library() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() && !matches!(name.as_str(), "target" | ".git" | "node_modules") {
+                    walk(&path, out);
+                } else if name.ends_with(".rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let mut files = Vec::new();
+        for top in ["crates", "apps"] {
+            walk(&root.join(top), &mut files);
+        }
+        assert!(files.len() > 50, "{}", files.len());
+        let forbidden = ["mixforge_mixxx_runner(", "run_mixforge_mixxx("];
+        let mut offenders = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let in_tests_dir = f.components().any(|c| c.as_os_str() == "tests");
+            let test_code = if in_tests_dir { text.as_str() } else { text.split_once("#[cfg(test)]").map_or("", |(_, t)| t) };
+            for word in forbidden {
+                if test_code.lines().any(|l| l.contains(word) && !l.trim_start().starts_with("//") && !l.contains("let forbidden")) {
+                    offenders.push(format!("{}: {word}", f.display()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "tests must use a fake Mixxx runner: {offenders:#?}");
     }
 }

@@ -925,7 +925,7 @@ fn level(bytes: &[u8], range: std::result::Result<(i32, i32), GainError>, target
 
 /// `k` as a Camelot key (`1A`–`12B`): Camelot itself (`4B`, `04b`) or musical notation (`Am`,
 /// `F#m`, `Db`, `Ebmin`, `C major`).
-fn to_camelot(k: &str) -> Option<String> {
+pub(crate) fn to_camelot(k: &str) -> Option<String> {
     let k = k.trim();
     let upper = k.to_ascii_uppercase();
     if let Some(digits) = upper.strip_suffix(['A', 'B']).filter(|d| !d.is_empty() && d.len() <= 2 && d.bytes().all(|b| b.is_ascii_digit())) {

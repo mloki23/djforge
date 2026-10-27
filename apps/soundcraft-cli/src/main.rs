@@ -199,12 +199,14 @@ fn warn_media(report: &soundcraft_engine::io::OpenReport) {
 }
 
 /// `e` with the app's stem cache and Demucs set up (splits go there, and sessions read their
-/// stems from it), when its folder can be found.
+/// stems from it), when its folder can be found, and set exports writing into Mixxx's library
+/// through mixforge.
 fn with_stems(mut e: Engine) -> Engine {
     match soundcraft_engine::cmd::stems::StemCache::at_default() {
         Ok(cache) => e.set_stems(cache, soundcraft_engine::cmd::stems::demucs_runner()),
         Err(err) => eprintln!("note: no stem cache: {err}"),
     }
+    e.set_mixxx_runner(soundcraft_engine::cmd::mixforge_mixxx_runner());
     e
 }
 

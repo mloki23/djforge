@@ -142,6 +142,9 @@ pub struct Engine {
     /// The stem cache and Demucs runner splits use: none until the app sets them up
     /// ([`Engine::set_stems`]), so nothing (no test, no hostile command) reaches a real cache.
     stems: Option<cmd::stems::StemSetup>,
+    /// What exports a set to Mixxx: none until the app sets it up ([`Engine::set_mixxx_runner`]),
+    /// so no test reaches Mixxx's library.
+    mixxx: Option<cmd::MixxxRunner>,
 }
 
 impl Default for Engine {
@@ -175,6 +178,7 @@ impl Engine {
             messages: Vec::new(),
             last_selection: None,
             stems: None,
+            mixxx: None,
         }
     }
 
@@ -184,6 +188,17 @@ impl Engine {
     pub fn set_stems(&mut self, cache: cmd::stems::StemCache, runner: cmd::stems::StemRunner) {
         cmd::stems::use_root(cache.root());
         self.stems = Some(cmd::stems::StemSetup { cache, runner });
+    }
+
+    /// `dj.export_set` writes the set into Mixxx's library through `runner`. Only the app's entry
+    /// points call this, with [`cmd::mixforge_mixxx_runner`]; tests give a fake.
+    pub fn set_mixxx_runner(&mut self, runner: cmd::MixxxRunner) {
+        self.mixxx = Some(runner);
+    }
+
+    /// What exports a set to Mixxx for this engine, if set up.
+    pub fn mixxx_runner(&self) -> Option<&cmd::MixxxRunner> {
+        self.mixxx.as_ref()
     }
 
     /// The stem cache and runner set up for this engine, if any.

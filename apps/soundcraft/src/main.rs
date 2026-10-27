@@ -257,6 +257,8 @@ fn main() -> eframe::Result {
         Ok(cache) => engine.set_stems(cache, soundcraft_engine::cmd::stems::demucs_runner()),
         Err(e) => log::warn!("no stem cache: {e}"),
     }
+    // Set exports write into Mixxx's library through mixforge; only the app's entry points set it.
+    engine.set_mixxx_runner(soundcraft_engine::cmd::mixforge_mixxx_runner());
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

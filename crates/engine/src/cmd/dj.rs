@@ -366,9 +366,30 @@ pub(crate) enum Sidecar {
 /// Runs `command` (stdout and stderr captured) and returns its output; kills it when it runs
 /// longer than `limit` or `stop` says so (checked every 20 ms).
 pub(crate) fn output_within(command: &mut std::process::Command, limit: std::time::Duration, stop: &dyn Fn() -> bool) -> std::io::Result<Sidecar> {
-    use std::io::Read as _;
+    output_fed(command, None, limit, stop)
+}
+
+/// [`output_within`], writing `input` (when given) to the command's standard input and then
+/// closing it.
+pub(crate) fn output_fed(
+    command: &mut std::process::Command,
+    input: Option<Vec<u8>>,
+    limit: std::time::Duration,
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Sidecar> {
+    use std::io::{Read as _, Write as _};
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    if input.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
     let mut child = command.spawn()?;
+    // Written on a thread of its own, so a child that doesn't read can't stall this one; a
+    // writer that can't start drops the pipe, and the child reads an empty input.
+    if let (Some(bytes), Some(mut pipe)) = (input, child.stdin.take()) {
+        let _ = std::thread::Builder::new().name("sidecar-stdin".into()).spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
     // Both pipes are drained as the child writes, so a full pipe can't stall it. Each reader sends
     // what it read once its pipe closes; one that never closes is not waited for.
     let (tx, rx) = std::sync::mpsc::channel();
