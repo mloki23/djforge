@@ -36,8 +36,13 @@ const HZ: [f64; 4] = [700.0, 100.0, 50.0, 300.0];
 
 /// A two-track set at 120 bpm in a 48 kHz session named "test set": a.wav (30 s at 44.1 kHz)
 /// on bars 1..16, then a second WAV on bar 8, A -> B on bar 9. With `split`, A's clip is split
-/// into stems that are sines at [`HZ`] of amplitude 0.1, stored at half level (`scale_log2` 1).
+/// into stems that are sines at [`HZ`] of amplitude 0.1 (the drums `drums`), stored at half
+/// level (`scale_log2` 1).
 fn set(lib: &Path, split: bool) -> Engine {
+    set_with(lib, split, 0.1)
+}
+
+fn set_with(lib: &Path, split: bool, drums: f64) -> Engine {
     std::fs::create_dir_all(lib).unwrap();
     let mut e = Engine::default();
     e.session_mut().name = "test set".into();
@@ -58,7 +63,8 @@ fn set(lib: &Path, split: bool) -> Engine {
         let frames = s.pool.get(src).unwrap().buffer.frames();
         let rate = f64::from(s.sample_rate.hz());
         let sources = HZ.map(|hz| {
-            let x: Vec<f32> = (0..frames).map(|i| (0.05 * (std::f64::consts::TAU * hz * i as f64 / rate).sin()) as f32).collect();
+            let level = if hz == HZ[1] { drums } else { 0.1 };
+            let x: Vec<f32> = (0..frames).map(|i| (level / 2.0 * (std::f64::consts::TAU * hz * i as f64 / rate).sin()) as f32).collect();
             let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![x.clone(), x] };
             soundcraft_engine::io::add_source(s, "stem", buf, None, FileFormat::Wav)
         });
@@ -146,5 +152,32 @@ fn without_a_split_track_stems_are_skipped() {
     assert_eq!(r["stems"], json!({"skipped": "no track of the set is split"}), "{r}");
     let report = std::fs::read_to_string(dir.join("prepped/test set/test set.export.txt")).unwrap();
     assert!(report.contains("Stem files: no track of the set is split"), "{report}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stem louder than full scale (drums peaking at 1.6) would clip in ALAC: all five tracks are
+/// halved, so they still add up, and the file says it plays 6 dB quieter.
+#[test]
+fn a_stem_above_full_scale_halves_the_whole_file() {
+    if !tool("ffmpeg") {
+        return;
+    }
+    let dir = scratch("loud");
+    let e = set_with(&dir.join("lib"), true, 1.6);
+    let r = export(&e, &dir.join("prepped"));
+    let stem = &r["stems"][0];
+    let file = PathBuf::from(stem["stem_file"].as_str().unwrap_or_else(|| panic!("{r}")));
+    assert_eq!(stem["doubts"], json!(["the stem file plays 6.0 dB quieter than the prepped copy so no stem clips"]), "{r}");
+    let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    // The mix (0.1 throughout) and every stem are halved alike.
+    let mix = decoded(&file, 0);
+    assert!(mix.iter().all(|x| (x - 0.05).abs() < 1e-4));
+    let drums = decoded(&file, 1);
+    assert!((peak(&drums) - 0.8).abs() < 2e-3, "{}", peak(&drums));
+    let worst = (44_100..29 * 44_100)
+        .map(|i| (f64::from(drums[i]) - 0.8 * (std::f64::consts::TAU * HZ[1] * i as f64 / 44_100.0).sin()).abs())
+        .fold(0.0, f64::max);
+    assert!(worst < 2e-3, "drums off by {worst}");
+    assert!((peak(&decoded(&file, 2)) - 0.05).abs() < 2e-3);
     let _ = std::fs::remove_dir_all(&dir);
 }

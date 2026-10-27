@@ -17,6 +17,8 @@ const NI_ORDER: [(usize, &str, &str); 4] = [(1, "Drums", "#FF0000"), (2, "Bass",
 const MARK: &str = "djforge";
 /// Stems this many frames longer or shorter than the mix are padded or trimmed; more is refused.
 const SLACK_SECS: f64 = 0.05;
+/// The highest sample a track may hold: ALAC stores integers, so more would clip.
+const FULL_SCALE: f32 = 0.999;
 /// Shortest time ffmpeg is given; longer tracks get four times their length.
 const MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -84,18 +86,33 @@ pub(crate) struct Job<'a> {
 }
 
 /// Writes the stem file of `j`, never over a file an export didn't write; the temporary folder
-/// is removed whatever happens.
-pub(crate) fn write(j: &Job) -> Result<PathBuf, String> {
+/// is removed whatever happens. Returns where it went, and a doubt when it plays quieter than
+/// the exported file (so that no stem clips).
+pub(crate) fn write(j: &Job) -> Result<(PathBuf, Option<String>), String> {
     if let Some(why) = foreign(j.dest) {
         return Err(why);
     }
     crate::io::make_dir(j.tmp).map_err(|e| e.to_string())?;
     let r = build(j);
     let _ = crate::io::remove_tree(j.tmp);
-    r.map(|()| j.dest.to_path_buf())
+    r.map(|doubt| (j.dest.to_path_buf(), doubt))
 }
 
-fn build(j: &Job) -> Result<(), String> {
+/// The highest |sample| of `buf`.
+fn peak(buf: &AudioBuffer) -> f32 {
+    buf.channels.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()))
+}
+
+/// How many halvings bring `peak` under [`FULL_SCALE`]: 0 when it is under already.
+fn halvings(peak: f32) -> i32 {
+    let mut k = 0;
+    while k < 60 && peak * 2f32.powi(-k) >= FULL_SCALE {
+        k += 1;
+    }
+    k
+}
+
+fn build(j: &Job) -> Result<Option<String>, String> {
     let wav = |name: &str| j.tmp.join(name);
     let bytes = crate::io::read_file(j.mix).map_err(|e| e.to_string())?;
     let ext = j.mix.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
@@ -105,23 +122,44 @@ fn build(j: &Job) -> Result<(), String> {
     if frames == 0 || rate == 0 {
         return Err(format!("{}: no audio", j.mix.display()));
     }
-    write_wav(&wav("0.wav"), stereo(mix)?)?;
     let slack = (SLACK_SECS * f64::from(rate)).ceil() as usize;
     let scale = (j.gain * 2f64.powi(i32::from(j.stems.scale_log2))) as f32;
-    for (k, (index, name, _)) in NI_ORDER.iter().enumerate() {
-        let audio = j.stems.audio.get(*index).ok_or("a stem is missing")?;
-        let mut stem =
-            crate::io::at_rate(audio.buffer.clone(), rate, crate::io::MAX_IMPORT_SAMPLES).ok_or_else(|| format!("the {name} stem is too long"))?;
-        let have = stem.frames();
-        if have.abs_diff(frames) > slack {
-            return Err(format!("the {name} stem is {have} samples long and the track {frames}: they don't line up"));
+    // A stem can peak above full scale though the mix doesn't, and the WAVs (and ALAC) clip
+    // there: then all five tracks are halved until none does (a power of two, so exact), and
+    // they still add up to the mix. Guessed from the stems as stored (resampling can overshoot a
+    // little), then checked on each stem as written: one over starts again a halving lower.
+    let resampled = j.stems.audio.iter().any(|a| a.buffer.sample_rate != rate);
+    let stored = j.stems.audio.iter().map(|a| peak(&a.buffer)).fold(0.0f32, f32::max) * scale * if resampled { 1.05 } else { 1.0 };
+    let mut k = halvings(peak(&mix).max(stored));
+    'pass: loop {
+        let factor = 2f32.powi(-k);
+        let mut m = mix.clone();
+        m.channels.iter_mut().flatten().for_each(|x| *x *= factor);
+        write_wav(&wav("0.wav"), stereo(m)?)?;
+        for (n, (index, name, _)) in NI_ORDER.iter().enumerate() {
+            let audio = j.stems.audio.get(*index).ok_or("a stem is missing")?;
+            let mut stem = crate::io::at_rate(audio.buffer.clone(), rate, crate::io::MAX_IMPORT_SAMPLES)
+                .ok_or_else(|| format!("the {name} stem is too long"))?;
+            let have = stem.frames();
+            if have.abs_diff(frames) > slack {
+                return Err(format!("the {name} stem is {have} samples long and the track {frames}: they don't line up"));
+            }
+            for ch in &mut stem.channels {
+                ch.resize(frames, 0.0);
+                ch.iter_mut().for_each(|x| *x *= scale * factor);
+            }
+            if peak(&stem) >= FULL_SCALE {
+                if k >= 60 {
+                    return Err(format!("the {name} stem has samples that are not finite"));
+                }
+                k += 1;
+                continue 'pass;
+            }
+            write_wav(&wav(&format!("{}.wav", n + 1)), stereo(stem)?)?;
         }
-        for ch in &mut stem.channels {
-            ch.resize(frames, 0.0);
-            ch.iter_mut().for_each(|x| *x *= scale);
-        }
-        write_wav(&wav(&format!("{}.wav", k + 1)), stereo(stem)?)?;
+        break;
     }
+    drop(mix);
     let out = wav("out.mp4");
     run_ffmpeg(j, &out, frames as f64 / f64::from(rate))?;
     let mp4 = crate::io::read_file(&out).map_err(|e| e.to_string())?;
@@ -131,7 +169,8 @@ fn build(j: &Job) -> Result<(), String> {
     if let Some(why) = foreign(j.dest) {
         return Err(why);
     }
-    crate::io::replace_file_refusing(j.sources, j.dest, &file).map_err(|e| e.to_string())
+    crate::io::replace_file_refusing(j.sources, j.dest, &file).map_err(|e| e.to_string())?;
+    Ok((k > 0).then(|| format!("the stem file plays {:.1} dB quieter than the prepped copy so no stem clips", 20.0 * f64::from(k) * 2f64.log10())))
 }
 
 /// `buf` as two channels: a mono one doubled, more than two cut to the first two.
@@ -222,6 +261,15 @@ mod tests {
         assert_eq!(picked, ["drums", "bass", "other", "vocals"]);
         assert!(v[MARK].is_object());
         assert_eq!(v["mastering_dsp"]["limiter"]["enabled"], false);
+    }
+
+    #[test]
+    fn peaks_are_halved_under_full_scale() {
+        assert_eq!(halvings(0.5), 0);
+        assert_eq!(halvings(0.999), 1);
+        assert_eq!(halvings(1.6), 1);
+        assert_eq!(halvings(2.0), 2);
+        assert_eq!(halvings(f32::INFINITY), 60);
     }
 
     #[test]

@@ -994,9 +994,9 @@ impl Export {
                 None => Err("it is not split".to_string()),
             };
             out.push(match result {
-                Ok(p) => {
+                Ok((p, doubt)) => {
                     written.push(p.clone());
-                    json!({"file": d.file, "stem_file": p})
+                    json!({"file": d.file, "stem_file": p, "doubts": doubt.into_iter().collect::<Vec<_>>()})
                 }
                 Err(why) => json!({"file": d.file, "skipped": why}),
             });
