@@ -368,6 +368,31 @@ pub(crate) fn make_dir(dir: impl AsRef<Path>) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))
 }
 
+/// Create folder `dir`, which must not exist yet (its parent must), inside the automation write
+/// root when there is one.
+pub(crate) fn make_new_dir(dir: impl AsRef<Path>) -> Result<()> {
+    let dir = dir.as_ref();
+    crate::file_access::check_write(dir).map_err(EngineError::Io)?;
+    std::fs::create_dir(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))
+}
+
+/// Up to `len` bytes of the regular file at `path` from byte `offset` (fewer at its end), inside
+/// the automation read root when there is one.
+pub(crate) fn read_at(path: impl AsRef<Path>, offset: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let path = path.as_ref();
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    let err = |err: std::io::Error| EngineError::Io(format!("{}: {err}", path.display()));
+    let mut f = std::fs::File::open(path).map_err(err)?;
+    if !f.metadata().map_err(err)?.is_file() {
+        return Err(EngineError::Io(format!("{}: not a regular file", path.display())));
+    }
+    f.seek(std::io::SeekFrom::Start(offset)).map_err(err)?;
+    let mut out = Vec::new();
+    f.take(len as u64).read_to_end(&mut out).map_err(err)?;
+    Ok(out)
+}
+
 /// The regular files directly in folder `dir` (not its subfolders), inside the automation read
 /// root when there is one; unsorted. Errors name the folder.
 pub(crate) fn list_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {

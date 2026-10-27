@@ -173,10 +173,10 @@ fn three(lib: &Path) -> Engine {
     e
 }
 
-/// The analysis faked as 8A for every file but `keyless` (no key for that one).
-fn analysis_without(keyless: &'static str) -> PrepAnalyse {
+/// The analysis faked as 8A for every file but `keyless` (no key for those).
+fn analysis_without(keyless: &'static [&'static str]) -> PrepAnalyse {
     Arc::new(move |path: &str, _: &dyn Fn() -> bool| {
-        Ok(if path.ends_with(keyless) { json!({"bpm": 120.0}) } else { json!({"camelot": "8A", "bpm": 120.0}) })
+        Ok(if keyless.iter().any(|k| path.ends_with(k)) { json!({"bpm": 120.0}) } else { json!({"camelot": "8A", "bpm": 120.0}) })
     })
 }
 
@@ -217,16 +217,41 @@ fn a_track_without_a_key_tag_takes_prep_s_analysis() {
 fn a_track_without_a_key_is_left_out_and_the_next_one_says_so() {
     let dir = scratch("no-key");
     let mut e = three(&dir.join("lib"));
-    let (plan, r) = exported(&mut e, &dir.join("middle"), analysis_without("b.mp3"));
+    let (plan, r) = exported(&mut e, &dir.join("middle"), analysis_without(&["b.mp3"]));
     assert_eq!(names(&plan), ["a.mp3", "c.wav"]);
     assert!(r["tracks"][1]["doubts"].to_string().contains("left out of the Mixxx export: its key is not known"), "{r}");
     let c = r["tracks"][2]["doubts"].to_string();
     assert!(c.contains("its Mixxx intro may be off") && c.contains("b.mp3 was left out"), "{c}");
 
-    let (plan, r) = exported(&mut e, &dir.join("first"), analysis_without("a.mp3"));
+    let (plan, r) = exported(&mut e, &dir.join("first"), analysis_without(&["a.mp3"]));
     assert_eq!(names(&plan), ["b.mp3", "c.wav"]);
     let b = r["tracks"][1]["doubts"].to_string();
     assert!(b.contains("Mixxx takes it as the set's first track") && b.contains("a.mp3 was left out"), "{b}");
     assert!(!r["tracks"][2]["doubts"].to_string().contains("was left out"), "{r}");
+
+    // Two left out in a row: the next track names both.
+    let (plan, r) = exported(&mut e, &dir.join("both"), analysis_without(&["a.mp3", "b.mp3"]));
+    assert_eq!(names(&plan), ["c.wav"]);
+    let c = r["tracks"][2]["doubts"].to_string();
+    assert!(c.contains("because a.mp3, b.mp3 were left out of the Mixxx export"), "{c}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After one analysis times out, no other runs: neither prep's nor the export's own for keys,
+/// so a stuck sidecar costs one timeout, not one per track.
+#[test]
+fn a_stuck_analysis_is_waited_on_once() {
+    let dir = scratch("stuck");
+    let mut e = three(&dir.join("lib"));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let analyse: PrepAnalyse = Arc::new(move |_: &str, _: &dyn Fn() -> bool| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err("timed out after 120 s".to_string())
+    });
+    let (_, r) = exported(&mut e, &dir.join("prepped"), analyse);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{r}");
+    // No track has a key, so none goes to Mixxx.
+    assert_eq!(r["mixxx"]["skipped"], "no track could go to Mixxx; see the tracks' doubts", "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }

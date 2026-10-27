@@ -12,7 +12,12 @@ use std::sync::Arc;
 
 /// NI's stems after the mix, as indices into the session's stem order
 /// ([`soundcraft_model::STEMS`]: vocals, drums, bass, other), with their names and colours.
-const NI_ORDER: [(usize, &str, &str); 4] = [(1, "Drums", "#FF0000"), (2, "Bass", "#00FF00"), (3, "Other", "#FFFF00"), (0, "Vocals", "#00FFFF")];
+/// The colours are NI's defaults.
+const NI_ORDER: [(usize, &str, &str); 4] = [(1, "Drums", "#009E73"), (2, "Bass", "#D55E00"), (3, "Other", "#CC79A7"), (0, "Vocals", "#56B4E9")];
+/// How the temporary folder of a stem file starts: `<this><pid>-<n>`.
+pub(crate) const TMP_PREFIX: &str = ".djforge-stems-";
+/// Most bytes of a `moov` box read to find a stem file's metadata.
+const MAX_MOOV: u64 = 64 << 20;
 /// What marks a stem file an export wrote: a key of its metadata.
 const MARK: &str = "djforge";
 /// Stems this many frames longer or shorter than the mix are padded or trimmed; more is refused.
@@ -43,17 +48,67 @@ pub(crate) fn ffmpeg_found(ffmpeg: &str) -> bool {
     matches!(crate::cmd::dj::output_within(&mut c, std::time::Duration::from_secs(20), &|| false), Ok(crate::cmd::dj::Sidecar::Ran(out)) if out.status.success())
 }
 
-/// The `stem` box's JSON: NI's version 1 metadata (no mastering DSP: the stems play as they
-/// are), the stem names and colours, and djforge's mark.
+/// The `stem` box's JSON: NI's version 1 metadata with its full mastering DSP parameter set,
+/// switched off (the stems play as they are; the values are neutral settings written by hand),
+/// the stem names and NI's default colours, and djforge's mark.
 pub(crate) fn metadata() -> String {
     let stems: Vec<serde_json::Value> = NI_ORDER.iter().map(|(_, name, color)| serde_json::json!({"name": name, "color": color})).collect();
     serde_json::json!({
         "version": 1,
-        "mastering_dsp": {"compressor": {"enabled": false}, "limiter": {"enabled": false}},
+        "mastering_dsp": {
+            "compressor": {
+                "enabled": false,
+                "input_gain": 0.5,
+                "output_gain": 0.5,
+                "threshold": 0.0,
+                "dry_wet": 50,
+                "attack": 0.0001,
+                "release": 0.3,
+                "ratio": 3,
+                "hp_cutoff": 300,
+            },
+            "limiter": {"enabled": false, "threshold": 0.0, "ceiling": -0.35, "release": 0.05},
+        },
         "stems": stems,
         MARK: {"written_by": "djforge dj.export_set"},
     })
     .to_string()
+}
+
+/// The `moov` box of the MP4 file at `path`, read alone (top-level box headers walked, then
+/// `moov` read whole when it is at most 64 MB); `None` when there is none to be had.
+fn moov_of(path: &Path) -> Option<Vec<u8>> {
+    let mut pos = 0u64;
+    for _ in 0..10_000 {
+        let head = crate::io::read_at(path, pos, 8).ok()?;
+        let size = u64::from(u32::from_be_bytes([*head.first()?, *head.get(1)?, *head.get(2)?, *head.get(3)?]));
+        if size < 8 {
+            return None;
+        }
+        if head.get(4..8)? == b"moov" {
+            return (size <= MAX_MOOV).then(|| crate::io::read_at(path, pos, usize::try_from(size).ok()?).ok()).flatten();
+        }
+        pos = pos.checked_add(size)?;
+    }
+    None
+}
+
+/// Removes the temporary folders of stem files in `out` that a process no longer running left.
+pub(crate) fn sweep(out: &Path) {
+    for entry in crate::io::list_entries(out).unwrap_or_default() {
+        let pid = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(TMP_PREFIX))
+            .and_then(|r| r.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && pid != std::process::id()
+            && !crate::cmd::stems::pid_running(pid)
+        {
+            let _ = crate::io::remove_tree(&entry);
+        }
+    }
 }
 
 /// Why `path` may not be replaced: it exists and is not a stem file an export wrote.
@@ -61,7 +116,8 @@ pub(crate) fn foreign(path: &Path) -> Option<String> {
     if !crate::io::path_exists(path) {
         return None;
     }
-    let ours = crate::io::read_file(path).ok().is_some_and(|b| {
+    // Only the moov box is read: the audio can be hundreds of megabytes.
+    let ours = moov_of(path).is_some_and(|b| {
         soundcraft_audio_io::mp4box::stem_payload(&b)
             .and_then(|j| serde_json::from_slice::<serde_json::Value>(j).ok())
             .is_some_and(|v| v.get(MARK).is_some())
@@ -92,7 +148,8 @@ pub(crate) fn write(j: &Job) -> Result<(PathBuf, Option<String>), String> {
     if let Some(why) = foreign(j.dest) {
         return Err(why);
     }
-    crate::io::make_dir(j.tmp).map_err(|e| e.to_string())?;
+    // A folder of its own: one already there is not ours to fill.
+    crate::io::make_new_dir(j.tmp).map_err(|e| e.to_string())?;
     let r = build(j);
     let _ = crate::io::remove_tree(j.tmp);
     r.map(|doubt| (j.dest.to_path_buf(), doubt))
@@ -123,6 +180,9 @@ fn build(j: &Job) -> Result<Option<String>, String> {
         return Err(format!("{}: no audio", j.mix.display()));
     }
     let slack = (SLACK_SECS * f64::from(rate)).ceil() as usize;
+    // The stems come from the session's pool, at the session rate: when that is not the file's,
+    // they were resampled once from the file and are resampled back here (a small loss at the
+    // top of the band; reading the cache's stems at the file's rate would avoid it).
     let scale = (j.gain * 2f64.powi(i32::from(j.stems.scale_log2))) as f32;
     // A stem can peak above full scale though the mix doesn't, and the WAVs (and ALAC) clip
     // there: then all five tracks are halved until none does (a power of two, so exact), and
@@ -253,6 +313,16 @@ mod tests {
         assert_eq!(v["version"], 1);
         let names: Vec<&str> = v["stems"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["Drums", "Bass", "Other", "Vocals"]);
+        let colors: Vec<&str> = v["stems"].as_array().unwrap().iter().map(|s| s["color"].as_str().unwrap()).collect();
+        assert_eq!(colors, ["#009E73", "#D55E00", "#CC79A7", "#56B4E9"]);
+        let dsp = &v["mastering_dsp"];
+        for key in ["input_gain", "output_gain", "threshold", "dry_wet", "attack", "release", "ratio", "hp_cutoff"] {
+            assert!(dsp["compressor"][key].is_number(), "compressor {key}");
+        }
+        for key in ["threshold", "ceiling", "release"] {
+            assert!(dsp["limiter"][key].is_number(), "limiter {key}");
+        }
+        assert_eq!(dsp["compressor"]["enabled"], false);
         // Each is the session stem of that name.
         for (i, _, _) in NI_ORDER {
             assert!(soundcraft_model::STEMS.get(i).is_some());
@@ -270,6 +340,38 @@ mod tests {
         assert_eq!(halvings(1.6), 1);
         assert_eq!(halvings(2.0), 2);
         assert_eq!(halvings(f32::INFINITY), 60);
+    }
+
+    #[test]
+    fn the_sweep_removes_only_folders_of_processes_gone() {
+        let out = std::env::temp_dir().join(format!("sc-stem-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        // A pid no process has (Windows pids are multiples of 4), ours, and another name.
+        let names = [format!("{TMP_PREFIX}4000001-0"), format!("{TMP_PREFIX}{}-0", std::process::id()), "keep".to_string()];
+        for n in &names {
+            std::fs::create_dir_all(out.join(n)).unwrap();
+        }
+        sweep(&out);
+        let left: Vec<bool> = names.iter().map(|n| out.join(n).exists()).collect();
+        assert_eq!(left, [false, true, true]);
+        // A folder that is there already is not written into.
+        let tmp = out.join(&names[1]);
+        let none = crate::io::SourceFiles::default();
+        let job = Job {
+            ffmpeg: "x",
+            mix: &tmp,
+            stems: &Stems {
+                audio: std::array::from_fn(|_| Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![] }))),
+                scale_log2: 0,
+            },
+            gain: 1.0,
+            dest: &out.join("x.stem.mp4"),
+            tmp: &tmp,
+            sources: &none,
+            stop: &|| false,
+        };
+        assert!(write(&job).is_err());
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

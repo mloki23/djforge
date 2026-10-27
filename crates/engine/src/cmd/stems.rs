@@ -508,7 +508,7 @@ fn helper_output(command: &mut std::process::Command) -> Option<Vec<u8>> {
 }
 
 /// Whether process `pid` is running; when that can't be learned, it counts as running.
-fn pid_running(pid: u32) -> bool {
+pub(crate) fn pid_running(pid: u32) -> bool {
     if cfg!(windows) {
         let mut c = std::process::Command::new("tasklist");
         c.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);

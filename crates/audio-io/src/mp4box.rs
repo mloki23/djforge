@@ -79,6 +79,11 @@ fn size32(size: usize, what: &str) -> Result<[u8; 4], String> {
 /// every size is 32-bit and `moov` comes after `mdat`.
 pub fn insert_stem_box(b: &[u8], json: &[u8]) -> Result<Vec<u8>, String> {
     let boxes = walk(b)?;
+    for (path, what) in [("moov", "`moov` boxes"), ("moov/udta", "`udta` boxes in `moov`")] {
+        if boxes.iter().filter(|x| x.path == path).count() > 1 {
+            return Err(format!("the file has more than one of its {what}"));
+        }
+    }
     let moov = boxes.iter().find(|x| x.path == "moov").ok_or("the file has no `moov` box")?;
     let mdat = boxes.iter().find(|x| x.path == "mdat").ok_or("the file has no `mdat` box")?;
     if moov.start < mdat.start {
@@ -183,6 +188,15 @@ mod tests {
         let again = insert_stem_box(&out, b"{}").unwrap();
         assert_eq!(paths(&again).iter().filter(|p| p.ends_with("/stem")).count(), 1);
         assert_eq!(stem_payload(&again), Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn a_second_moov_or_udta_is_refused() {
+        let mut two = file(&[]);
+        two.extend_from_slice(&bx(b"moov", &bx(b"mvhd", &[0; 8])));
+        assert!(insert_stem_box(&two, b"{}").unwrap_err().contains("more than one of its `moov`"));
+        let udtas = file(&[bx(b"udta", &[]), bx(b"udta", &[])].concat());
+        assert!(insert_stem_box(&udtas, b"{}").unwrap_err().contains("`udta` boxes"));
     }
 
     #[test]

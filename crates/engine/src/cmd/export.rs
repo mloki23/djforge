@@ -772,19 +772,27 @@ impl Export {
     /// Preps the files, then writes the Rekordbox XML, the set into Mixxx, and the report. A
     /// cancelled prep ends it with nothing more written.
     fn run(&self, analyse: &dyn Fn(&str, &dyn Fn() -> bool) -> std::result::Result<Value, String>, shared: &Shared) -> crate::Result<Value> {
-        // What prep's analysis gave for each file it analysed (the key, if any): a key for Mixxx
-        // when the copy has no key tag.
+        // What mixforge's analysis gave for each file analysed (the key, if any), by prep or by
+        // the export: a key for Mixxx when the copy has no key tag. After one analysis timed out
+        // no other runs, here or in prep, so a stuck sidecar costs one timeout.
         let analysed: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<String>>> = Default::default();
+        let timed_out = std::cell::Cell::new(false);
         let recording = |path: &str, stop: &dyn Fn() -> bool| {
+            if timed_out.get() {
+                return Err("skipped after an earlier timeout".to_string());
+            }
             let r = analyse(path, stop);
+            if r.as_ref().is_err_and(|m| m.starts_with(super::dj::TIMED_OUT)) {
+                timed_out.set(true);
+            }
             let key = r.as_ref().ok().and_then(|v| v.get("camelot")).and_then(Value::as_str).map(str::to_string);
             analysed.borrow_mut().insert(crate::io::file_key(Path::new(path)), key);
             r
         };
         let prep = self.plan.prep(&recording, &shared.prep)?;
-        let analysed = analysed.into_inner();
-        // A track left out of Mixxx shifts mixforge's reading of the next one it gets.
-        let mut left_out: Option<String> = None;
+        // The tracks left out of Mixxx since the last it got: they shift mixforge's reading of the
+        // next one it gets.
+        let mut left_out: Vec<String> = Vec::new();
         let rows = prep.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
         if prep.get("cancelled").and_then(Value::as_bool).unwrap_or(false) {
             shared.stage("done");
@@ -855,13 +863,13 @@ impl Export {
                 let entry = if t.found {
                     // The copy's key tag, else prep's analysis of the file, else the original's tag.
                     let source = super::prep::normalise(&t.path);
-                    let earlier = analysed.get(&crate::io::file_key(&source)).cloned();
+                    let earlier = analysed.borrow().get(&crate::io::file_key(&source)).cloned();
                     // Prep analyses MP3s only: another file without a key tag is analysed here.
                     let analysis = match (earlier, &tags.key, source.to_str()) {
                         (Some(k), _, _) => k,
                         (None, None, Some(p)) => {
                             let stop = || shared.prep.cancel.load(Ordering::Relaxed);
-                            analyse(p, &stop).ok().and_then(|v| v.get("camelot").and_then(Value::as_str).map(str::to_string))
+                            recording(p, &stop).ok().and_then(|v| v.get("camelot").and_then(Value::as_str).map(str::to_string))
                         }
                         _ => None,
                     };
@@ -874,18 +882,21 @@ impl Export {
                 match entry {
                     Ok((entry, drift)) => {
                         doubts.extend(drift);
-                        if let Some(gone) = left_out.take() {
+                        if !left_out.is_empty() {
+                            let gone = left_out.join(", ");
+                            let were = if left_out.len() == 1 { "was" } else { "were" };
                             doubts.push(if mixxx_plan.is_empty() {
-                                format!("Mixxx takes it as the set's first track (main cue on its first downbeat, no intro) because {gone} was left out of the Mixxx export")
+                                format!("Mixxx takes it as the set's first track (main cue on its first downbeat, no intro) because {gone} {were} left out of the Mixxx export")
                             } else {
-                                format!("its Mixxx intro may be off (it takes the length of the transition before {gone}) because {gone} was left out of the Mixxx export")
+                                format!("its Mixxx intro may be off (it takes the length of the transition before {gone}) because {gone} {were} left out of the Mixxx export")
                             });
+                            left_out.clear();
                         }
                         mixxx_plan.push(entry);
                     }
                     Err(why) => {
                         doubts.push(format!("left out of the Mixxx export: {why}"));
-                        left_out = Some(file.clone());
+                        left_out.push(file.clone());
                     }
                 }
             }
@@ -965,7 +976,9 @@ impl Export {
             return json!({"skipped": "ffmpeg not found (install it, or set DJFORGE_FFMPEG to ffmpeg.exe)"});
         }
         let stop = || cancel.load(Ordering::Relaxed);
-        let mut written: Vec<PathBuf> = Vec::new();
+        stemfile::sweep(&self.out);
+        // (stem file, the file it was made from) of each written.
+        let mut written: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut out = Vec::with_capacity(split.len());
         for (k, (item, d)) in split.into_iter().enumerate() {
             let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -973,11 +986,14 @@ impl Export {
             let result = match &item.stems {
                 _ if stop() => Err("cancelled".to_string()),
                 _ if !item.track.found => Err("its file was not found".to_string()),
-                _ if written.iter().any(|w| crate::io::file_key(w) == crate::io::file_key(&dest)) => {
+                _ if written.iter().any(|(_, mix)| crate::io::file_key(mix) == crate::io::file_key(&d.path)) => {
+                    Err("written above: the track plays more than once in the set".to_string())
+                }
+                _ if written.iter().any(|(w, _)| crate::io::file_key(w) == crate::io::file_key(&dest)) => {
                     Err(format!("another track's stem file is named {name}.stem.mp4"))
                 }
                 Some(Ok(stems)) => {
-                    let tmp = self.out.join(format!(".djforge-stems-{}-{k}", std::process::id()));
+                    let tmp = self.out.join(format!("{}{}-{k}", stemfile::TMP_PREFIX, std::process::id()));
                     let job = stemfile::Job {
                         ffmpeg: &ffmpeg,
                         mix: &d.path,
@@ -995,7 +1011,7 @@ impl Export {
             };
             out.push(match result {
                 Ok((p, doubt)) => {
-                    written.push(p.clone());
+                    written.push((p.clone(), d.path.clone()));
                     json!({"file": d.file, "stem_file": p, "doubts": doubt.into_iter().collect::<Vec<_>>()})
                 }
                 Err(why) => json!({"file": d.file, "skipped": why}),
