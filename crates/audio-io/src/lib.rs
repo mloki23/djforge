@@ -21,6 +21,7 @@ mod flac;
 pub mod mp3gain;
 pub mod mp3tags;
 mod mp4;
+pub mod mp4box;
 mod pcm;
 pub mod peaks;
 mod symph;

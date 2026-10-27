@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "export_rekordbox.rs"]
 pub(crate) mod rekordbox;
+#[path = "export_stems.rs"]
+pub(crate) mod stemfile;
 
 /// One track of an exported set: a source file with its bar grid and cues, in seconds of the
 /// decoded file.
@@ -444,7 +446,7 @@ pub fn specs() -> Vec<super::CommandSpec> {
         "Export Set",
         [],
         None,
-        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). Stem files come later and are reported as skipped. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
+        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). With stems: true, writes <file>.stem.mp4 for each split track: an NI STEM file (five ALAC tracks: the copy, then its drums, bass, other and vocals at the copy's gain, with NI's `stem` metadata) through ffmpeg (DJFORGE_FFMPEG or ffmpeg on the PATH; skipped without it); a file of that name an export didn't write is never replaced. Returns {root, rekordbox: path|null|{error}, report, mixxx, stems, tracks: [{file, path, prep, grid_bars, cues, doubts}], prep, cancelled}",
         super::always,
         export_set
     )]
@@ -517,7 +519,7 @@ fn foreign(path: &Path, mark: &str) -> Option<String> {
 /// How far an export got.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportProgress {
-    /// "prep", then "rekordbox", then "mixxx" (when asked for), then "done".
+    /// "prep", then "rekordbox", then "mixxx" and "stems" (when asked for), then "done".
     pub stage: &'static str,
     /// Tracks prepped (during "prep").
     pub done: usize,
@@ -546,6 +548,9 @@ struct Item {
     track: ExportTrack,
     copy: Result<(PathBuf, usize), String>,
     total_secs: f64,
+    /// Its stems for a stem file, when stems are asked for and its clip is split; or why they
+    /// can't be had.
+    stems: Option<std::result::Result<stemfile::Stems, String>>,
 }
 
 /// An export whose checks all passed and whose folder exists.
@@ -627,7 +632,14 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
             }
         };
         let total_secs = s.source(track.source).map_or(0.0, |x| x.frames as f64 / sr);
-        items.push(Item { track, copy, total_secs });
+        let stems = track.split.as_ref().filter(|_| request.stems).map(|set| {
+            let audio: Option<Vec<_>> = set.sources.iter().map(|id| s.pool.get(*id).cloned()).collect();
+            audio
+                .and_then(|a| <[_; 4]>::try_from(a).ok())
+                .map(|audio| stemfile::Stems { audio, scale_log2: set.scale_log2 })
+                .ok_or_else(|| "its stems are not loaded; split the clip again".to_string())
+        });
+        items.push(Item { track, copy, total_secs, stems });
     }
     let export = Export {
         name,
@@ -675,7 +687,8 @@ impl ExportJob {
         ExportProgress { stage, done: p.done, total: p.total, current: p.current }
     }
 
-    /// Stops prep before its next track; nothing is written after it.
+    /// Stops prep before its next track (nothing is written after it), or the stem files before
+    /// the next (the report still is).
     pub fn cancel(&self) {
         self.shared.prep.cancel.store(true, Ordering::Relaxed);
     }
@@ -725,6 +738,8 @@ struct Done {
     grid_bars: usize,
     cues: usize,
     doubts: Vec<String>,
+    /// Prep's gain steps on the exported file (0 when it is the original).
+    steps: i32,
 }
 
 impl Export {
@@ -801,7 +816,12 @@ impl Export {
                     Err(why) => doubts.push(format!("left out of the Mixxx export: {why}")),
                 }
             }
-            done.push(Done { file, path, prep: status, title, grid_bars: t.grid.len(), cues: t.cues.len(), doubts });
+            let steps = if path == t.path {
+                0
+            } else {
+                row.and_then(|r| r.get("steps")).and_then(Value::as_i64).and_then(|x| i32::try_from(x).ok()).unwrap_or(0)
+            };
+            done.push(Done { file, path, prep: status, title, grid_bars: t.grid.len(), cues: t.cues.len(), doubts, steps });
         }
 
         let rekordbox = if self.request.rekordbox {
@@ -826,7 +846,12 @@ impl Export {
                 mixxx_export(run, &json!({"tracks": mixxx_plan}), &self.name)
             }
         };
-        let stems = if self.request.stems { json!({"skipped": "stem files are not written yet"}) } else { json!([]) };
+        let stems = if self.request.stems {
+            shared.stage("stems");
+            self.stem_files(&done, &shared.prep.cancel)
+        } else {
+            json!([])
+        };
 
         let text = self.report_text(&rekordbox, &mixxx, &stems, &done);
         // What was written stands when the report can't be: the result says why.
@@ -854,6 +879,58 @@ impl Export {
         }))
     }
 
+    /// The stem files of the split tracks (`done` are the tracks' outcomes, in order): for each,
+    /// `{file, stem_file}` or `{file, skipped}`; the whole part skipped when ffmpeg is missing or
+    /// no track is split. A cancel skips the rest.
+    fn stem_files(&self, done: &[Done], cancel: &std::sync::atomic::AtomicBool) -> Value {
+        let split: Vec<(&Item, &Done)> = self.items.iter().zip(done).filter(|(i, _)| i.stems.is_some()).collect();
+        if split.is_empty() {
+            return json!({"skipped": "no track of the set is split"});
+        }
+        let ffmpeg = stemfile::ffmpeg();
+        if !stemfile::ffmpeg_found(&ffmpeg) {
+            return json!({"skipped": "ffmpeg not found (install it, or set DJFORGE_FFMPEG to ffmpeg.exe)"});
+        }
+        let stop = || cancel.load(Ordering::Relaxed);
+        let mut written: Vec<PathBuf> = Vec::new();
+        let mut out = Vec::with_capacity(split.len());
+        for (k, (item, d)) in split.into_iter().enumerate() {
+            let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let dest = self.out.join(format!("{name}.stem.mp4"));
+            let result = match &item.stems {
+                _ if stop() => Err("cancelled".to_string()),
+                _ if !item.track.found => Err("its file was not found".to_string()),
+                _ if written.iter().any(|w| crate::io::file_key(w) == crate::io::file_key(&dest)) => {
+                    Err(format!("another track's stem file is named {name}.stem.mp4"))
+                }
+                Some(Ok(stems)) => {
+                    let tmp = self.out.join(format!(".djforge-stems-{}-{k}", std::process::id()));
+                    let job = stemfile::Job {
+                        ffmpeg: &ffmpeg,
+                        mix: &d.path,
+                        stems,
+                        gain: 2f64.powf(f64::from(d.steps) / 4.0),
+                        dest: &dest,
+                        tmp: &tmp,
+                        sources: &self.session_files,
+                        stop: &stop,
+                    };
+                    stemfile::write(&job)
+                }
+                Some(Err(why)) => Err(why.clone()),
+                None => Err("it is not split".to_string()),
+            };
+            out.push(match result {
+                Ok(p) => {
+                    written.push(p.clone());
+                    json!({"file": d.file, "stem_file": p})
+                }
+                Err(why) => json!({"file": d.file, "skipped": why}),
+            });
+        }
+        Value::Array(out)
+    }
+
     /// The export report: what was written for each target, a line per track with its doubts,
     /// and the Rekordbox import steps.
     fn report_text(&self, rekordbox: &Value, mixxx: &Value, stems: &Value, done: &[Done]) -> String {
@@ -861,6 +938,14 @@ impl Export {
             Value::Null => "not requested".to_string(),
             Value::String(p) => p.clone(),
             Value::Array(a) if a.is_empty() => "not requested".to_string(),
+            Value::Array(a) => a
+                .iter()
+                .map(|x| match (x.get("stem_file").and_then(Value::as_str), x.get("skipped").and_then(Value::as_str)) {
+                    (Some(p), _) => p.to_string(),
+                    (None, why) => format!("{}: skipped ({})", x.get("file").and_then(Value::as_str).unwrap_or("?"), why.unwrap_or("?")),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
             other if other.get("playlist").is_some_and(Value::is_string) => format!(
                 "playlist {} ({} tracks) in Mixxx's library; its database was backed up to {}",
                 other.get("playlist").map(Value::to_string).unwrap_or_default(),
