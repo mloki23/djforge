@@ -396,6 +396,39 @@ pub fn adjust(bytes: &[u8], steps: i32) -> Result<Vec<u8>, GainError> {
     Ok(out)
 }
 
+/// The MP3 decoder's own delay (samples) that the LAME tag's encoder delay doesn't count.
+const DECODER_DELAY: u32 = 529;
+
+/// The priming of MP3 `bytes`: how many samples (per channel) at its rate a gapless decode
+/// trims from its start, which a decoder that doesn't read the LAME tag plays first, and that
+/// rate. It is the encoder delay of the LAME extension of the Xing/Info frame (written by LAME
+/// and by ffmpeg) plus the decoder's 529; `(0, rate)` without that tag. `None` when no frame
+/// is found near the start.
+pub fn gapless_priming(b: &[u8]) -> Option<(u32, u32)> {
+    let start = skip_id3v2(b);
+    let (at, h) = (start..start.saturating_add(SEARCH).min(b.len())).find_map(|at| chained_at(b, at).map(|h| (at, h)))?;
+    if !is_info(b, at, &h) {
+        return Some((0, h.rate));
+    }
+    let tag = at + h.side_info_at() + h.side_info_len();
+    if b.get(tag..tag + 4) != Some(b"Xing") && b.get(tag..tag + 4) != Some(b"Info") {
+        // A VBRI frame: no LAME extension.
+        return Some((0, h.rate));
+    }
+    let flags = u32::from_be_bytes(b.get(tag + 4..tag + 8)?.try_into().ok()?);
+    // Frames, bytes, TOC and quality fields, when flagged, come before the extension.
+    let ext = tag + 8 + [(1, 4), (2, 4), (4, 100), (8, 4)].iter().filter(|(f, _)| flags & f != 0).map(|(_, n)| n).sum::<usize>();
+    // The extension starts with a 9-byte encoder version ("LAME3.100", "Lavc61.3."); its
+    // encoder delay is the 12 bits from byte 21.
+    let version = b.get(ext..ext + 4)?;
+    if !version.iter().all(u8::is_ascii_alphanumeric) {
+        return Some((0, h.rate));
+    }
+    let &[d0, d1] = b.get(ext + 21..ext + 23)? else { return None };
+    let delay = (u32::from(d0) << 4) | (u32::from(d1) >> 4);
+    Some((delay + DECODER_DELAY, h.rate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use soundcraft_audio_io::{AudioBuffer, EncodeOptions, encode};
 use soundcraft_engine::Engine;
 use soundcraft_engine::cmd::{PrepAnalyse, export_job_in};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 fn scratch(name: &str) -> PathBuf {
@@ -55,6 +57,8 @@ fn set(lib: &Path) -> Engine {
 struct XmlTrack {
     attrs: Vec<(String, String)>,
     tempos: usize,
+    /// Each TEMPO's Inizio (seconds).
+    inizio: Vec<f64>,
     marks: Vec<Vec<(String, String)>>,
 }
 
@@ -96,7 +100,11 @@ fn collection(xml: &str) -> Vec<XmlTrack> {
         match e.name().as_ref() {
             b"COLLECTION" => in_collection = !empty,
             b"TRACK" if in_collection => out.push(XmlTrack { attrs, ..XmlTrack::default() }),
-            b"TEMPO" => out.last_mut().unwrap().tempos += 1,
+            b"TEMPO" => {
+                let t = out.last_mut().unwrap();
+                t.tempos += 1;
+                t.inizio.push(attr(&attrs, "Inizio").parse().unwrap());
+            }
             b"POSITION_MARK" => out.last_mut().unwrap().marks.push(attrs),
             _ => {}
         }
@@ -390,5 +398,70 @@ fn a_movie_s_audio_remembers_no_original() {
     assert!(r["audio"].is_object(), "{r}");
     let src = &e.session().sources[0];
     assert_eq!((src.origin.as_deref(), src.origin_len, src.origin_modified_ms), (None, 0, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A session copy of an MP3 is its gapless decode, without the priming a LAME-tagged MP3 starts
+/// with (1105 samples: 25 ms at 44.1 kHz), and the set's grid and cues are on the MP3's timeline
+/// with it: exported on the copy, they move that much earlier. With the original gone (priming
+/// unknown), the doubt says they may sit late.
+#[test]
+fn a_session_copy_of_an_mp3_moves_its_grid_by_the_priming() {
+    let ffmpeg = Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success());
+    if !ffmpeg {
+        println!("note: ffmpeg is not on the PATH; this test checks nothing");
+        return;
+    }
+    let dir = scratch("priming");
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let mp3 = lib.join("a.mp3");
+    let o = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=220:d=12:sample_rate=44100", "-c:a", "libmp3lame", "-b:a", "192k"])
+        .arg(&mp3)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let b = lib.join("b.wav");
+    std::fs::write(&b, encode(&AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.1; 30 * 44_100]] }, &EncodeOptions::default()).unwrap())
+        .unwrap();
+    let mut e = Engine::default();
+    e.session_mut().name = "test set".into();
+    e.session_mut().tempo.set_tempo(0, 120.0).unwrap();
+    let mut clips = Vec::new();
+    for (path, bar) in [(&mp3, 1), (&b, 4)] {
+        // Downbeats from 0.5 s, a bar every 2 s.
+        let beats: Vec<f64> = (0..20).map(|k| 0.5 + k as f64 * 0.5).collect();
+        let r = e.execute("dj.load_warped", &json!({"path": path, "beats": beats, "at_bar": bar})).unwrap();
+        clips.push(r["clip"].as_u64().unwrap());
+    }
+    e.execute("dj.transition", &json!({"out_clip": clips[0], "in_clip": clips[1], "entry_bar": 5, "build_bars": 1, "out_bars": 1})).unwrap();
+    // Saved: the session keeps a resampled WAV copy of a.mp3.
+    let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+    soundcraft_engine::io::save_session(&mut e, &path).unwrap();
+
+    let first = |root: &str| {
+        let r = export(&e, &dir.join(root), analysis());
+        let xml = std::fs::read_to_string(dir.join(root).join("Set/Set.rekordbox.xml")).unwrap();
+        let t = collection(&xml).remove(0);
+        (r, t.inizio[0], hot_cue(&t, "2"))
+    };
+    // The original MP3: its own timeline.
+    let (r, bar, out) = first("original");
+    assert!(r["tracks"][0]["path"].as_str().unwrap().ends_with("a.mp3"), "{r}");
+    assert_eq!(bar, 0.5);
+
+    // Edited after import: the session's copy is exported, its grid and cues 25 ms earlier.
+    std::fs::OpenOptions::new().append(true).open(&mp3).unwrap().write_all(b"\0\0\0\0").unwrap();
+    let (r, copy_bar, copy_out) = first("copy");
+    assert!(r["tracks"][0]["path"].as_str().unwrap().ends_with(".wav"), "{r}");
+    // 1105 / 44100 s = 25.06 ms; the XML has milliseconds.
+    assert_eq!((copy_bar, copy_out), (0.475, out - 0.025), "{r}");
+
+    // The original gone: the copy's grid stays, with a doubt.
+    std::fs::remove_file(&mp3).unwrap();
+    let (r, gone_bar, _) = first("gone");
+    assert_eq!(gone_bar, 0.5);
+    assert!(r["tracks"][0]["doubts"].to_string().contains("may sit ~23 ms late on this copy"), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }

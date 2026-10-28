@@ -1,12 +1,11 @@
-//! Exporting a DJ set for playing out: the set's tracks in order, each file's bar grid and its
-//! cues in the file's own time ([`collect`]), and the set's Rekordbox XML ([`rekordbox`]).
-
-// Some of a track's fields are for the Mixxx and stem exports still to come.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Exporting a DJ set for playing out (`dj.export_set`): the set's tracks in order, each file's
+//! bar grid and cues in the file's own time ([`collect`]); prep's level-matched copies of the
+//! files; the set's Rekordbox XML ([`rekordbox`]); the set in Mixxx's library through mixforge
+//! ([`MixxxRunner`]); NI STEM files of its split tracks ([`stemfile`]); and a report.
 
 use super::dj::recipe::{bar_at_or_after, bar_sample};
 use serde_json::{Value, json};
-use soundcraft_model::{Clip, ClipId, Session, Source, SourceId, StemSet, Transition, WarpMap};
+use soundcraft_model::{Clip, Session, Source, SourceId, StemSet, Transition, WarpMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -26,8 +25,6 @@ pub(crate) struct ExportTrack {
     /// Whether `path` is a file that may be read (else nothing reads it: it is not prepped and
     /// not sent to Mixxx).
     pub found: bool,
-    pub title: String,
-    pub artist: String,
     /// File seconds of each bar's downbeat, strictly increasing, over the whole file.
     pub grid: Vec<f64>,
     pub cues: Vec<Cue>,
@@ -35,7 +32,8 @@ pub(crate) struct ExportTrack {
     pub mix_out_bars: Option<i64>,
     pub split: Option<StemSet>,
     /// The earliest of the set's clips playing this file.
-    pub first_clip: ClipId,
+    #[cfg(test)]
+    pub first_clip: soundcraft_model::ClipId,
     /// What the export can't vouch for.
     pub doubts: Vec<String>,
 }
@@ -204,20 +202,33 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
             f.doubts.push(format!("{name} plays more than once in the set; its later mix points are memory cues"));
         }
         cues.sort_by(|a, b| (a.slot, a.memory).cmp(&(b.slot, b.memory)).then(a.at.total_cmp(&b.at)));
+        // A session copy of an MP3 is its gapless decode: the grid and cues, on mixforge's
+        // timeline, sit the MP3's priming later on it, so they move that much earlier.
+        let mut grid = grid;
+        if f.found {
+            let shift = copy_shift(s, f.source, &f.path, &mut f.doubts);
+            if shift > 0.0 {
+                grid = grid.into_iter().map(|g| g - shift).filter(|g| *g >= 0.0).collect();
+                let before = cues.len();
+                cues = cues.into_iter().map(|c| Cue { at: c.at - shift, ..c }).filter(|c| c.at >= 0.0).collect();
+                if cues.len() < before {
+                    f.doubts.push("a cue fell before the start of the session's copy; left out".into());
+                }
+            }
+        }
         let mix_out_bars =
             transitions.iter().find(|t| f.clips.iter().any(|(c, _)| c.id == t.out_clip)).map(|t| t.gone_bar().saturating_sub(t.entry_bar));
         out.push(ExportTrack {
             source: f.source.id,
             path: f.path,
             found: f.found,
-            title: String::new(),
-            artist: String::new(),
             grid,
             cues,
             mix_out_bars,
             // Any split clip of the file gives its stems (the first in the timeline), as
             // [`set_is_split`] has it.
             split: f.clips.iter().find_map(|(c, _)| c.stems.clone()),
+            #[cfg(test)]
             first_clip: first.id,
             doubts: f.doubts,
         });
@@ -293,6 +304,31 @@ fn file_of(s: &Session, src: &Source) -> (PathBuf, Vec<String>, bool) {
             // track's file; a relative one names no place, so it stays as the track's identity.
             let path = origin.or_else(|| resolved.ok()).unwrap_or_else(|| PathBuf::from(if stored.is_relative() { &src.path } else { &src.name }));
             (path, doubts, false)
+        }
+    }
+}
+
+/// How far (seconds) the grid and cues move earlier on `path` when it is the session's copy (not
+/// an MP3) of a source imported from an MP3: the original's priming, which the copy (a gapless
+/// decode) doesn't have. 0 otherwise; 0 with a doubt when the original can't be read for it.
+fn copy_shift(s: &Session, src: &Source, path: &Path, doubts: &mut Vec<String>) -> f64 {
+    let mp3 = |p: &str| Path::new(p).extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
+    let from_mp3 = src.origin.as_deref().map_or_else(|| mp3(&src.name), mp3);
+    if !from_mp3 || path.to_str().is_some_and(mp3) {
+        return 0.0;
+    }
+    let primed = src
+        .origin
+        .as_deref()
+        .and_then(|o| crate::io::stored_path_in(o, s.folder.as_deref()).ok())
+        .filter(|o| crate::io::file_found(o))
+        .and_then(|o| crate::io::read_head(&o, 4 << 20).ok())
+        .and_then(|head| soundcraft_audio_io::mp3gain::gapless_priming(&head));
+    match primed {
+        Some((n, rate)) if rate > 0 => f64::from(n) / f64::from(rate),
+        _ => {
+            doubts.push("grid and cues may sit ~23 ms late on this copy (the original MP3 isn't there to tell)".into());
+            0.0
         }
     }
 }
@@ -1181,7 +1217,7 @@ mod tests {
     use crate::edit as ops;
     use serde_json::json;
     use soundcraft_audio_io::{AudioBuffer, FileFormat};
-    use soundcraft_model::{ChannelFormat, Clip, TrackKind, WarpMap};
+    use soundcraft_model::{ChannelFormat, Clip, ClipId, TrackKind, WarpMap};
 
     const SR: i64 = 48_000;
     /// Each test file: 100 s with a 125 bpm beat list from 0.1 s (a beat every 0.48 s, a bar
@@ -1255,7 +1291,7 @@ mod tests {
             // These sources have no files: the export names where they should be and says so.
             assert_eq!(t.path, PathBuf::from(&s.source(src).unwrap().path));
             assert!(t.doubts.len() == 1 && t.doubts[0].starts_with("no audio file found"), "{:?}", t.doubts);
-            assert!(t.title.is_empty() && t.artist.is_empty() && t.split.is_none());
+            assert!(t.split.is_none());
         }
     }
 
@@ -1598,7 +1634,17 @@ mod tests {
         for f in files {
             let text = std::fs::read_to_string(&f).unwrap();
             let in_tests_dir = f.components().any(|c| c.as_os_str() == "tests");
-            let test_code = if in_tests_dir { text.as_str() } else { text.split_once("#[cfg(test)]").map_or("", |(_, t)| t) };
+            // Test code: a tests folder, or from the first `#[cfg(test)]` at the start of a line (a
+            // test module; an indented one marks a field or item inside code).
+            let test_code = if in_tests_dir {
+                text.as_str()
+            } else {
+                text.split_once(
+                    "
+#[cfg(test)]",
+                )
+                .map_or("", |(_, t)| t)
+            };
             // The apps set the real runner, so their tests (which run the real binaries) must not
             // export a set at all: "dj.export_set" asks for Mixxx by default.
             let in_apps = f.strip_prefix(&root).is_ok_and(|r| r.starts_with("apps"));

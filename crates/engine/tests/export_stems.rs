@@ -260,4 +260,15 @@ fn the_stems_add_up_to_the_prepped_mix() {
     assert!(parts.iter().all(|p| p.len() == mix.len()));
     let worst = (0..mix.len()).map(|i| (parts.iter().map(|p| p[i]).sum::<f32>() - mix[i]).abs()).fold(0.0f32, f32::max);
     assert!(worst < 2e-3 * peak + 1e-4, "the stems are off the mix by {worst} (peak {peak}, steps {steps})");
+
+    // Its time 0 is the MP3's as a decoder that keeps the priming plays it (mixforge's timeline,
+    // where the grid and cues are): ffmpeg with skip_manual decodes the copy so.
+    let copy = dir.join("prepped/test set/a.mp3");
+    let o = Command::new("ffmpeg").args(["-v", "error", "-flags2", "+skip_manual", "-i"]).arg(&copy).args(["-f", "f32le", "-"]).output().unwrap();
+    let primed: Vec<f32> = o.stdout.as_chunks::<8>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let n = mix.len().min(primed.len());
+    assert!(n > 44_100, "{n}");
+    let off = (1105..n).map(|i| (mix[i] - primed[i]).abs()).fold(0.0f32, f32::max);
+    assert!(off < 1e-4, "the stem file's mix is off the primed MP3 by {off}");
+    assert!(mix[..1105].iter().all(|x| *x == 0.0));
 }

@@ -174,6 +174,13 @@ fn build(j: &Job) -> Result<Option<String>, String> {
     let bytes = crate::io::read_file(j.mix).map_err(|e| e.to_string())?;
     let ext = j.mix.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (_, mix) = soundcraft_audio_io::decode(&bytes, ext.as_deref()).map_err(|e| format!("{}: {e}", j.mix.display()))?;
+    // The decode is gapless, but the set's grid and cues are on mixforge's timeline, which keeps
+    // an MP3's priming: every track starts with that much silence so they fit the stem file.
+    let priming = if ext.as_deref() == Some("mp3") {
+        soundcraft_audio_io::mp3gain::gapless_priming(&bytes).filter(|(_, at)| *at == mix.sample_rate).map_or(0, |(n, _)| n as usize)
+    } else {
+        0
+    };
     drop(bytes);
     let (rate, frames) = (mix.sample_rate, mix.frames());
     if frames == 0 || rate == 0 {
@@ -195,7 +202,7 @@ fn build(j: &Job) -> Result<Option<String>, String> {
         let factor = 2f32.powi(-k);
         let mut m = mix.clone();
         m.channels.iter_mut().flatten().for_each(|x| *x *= factor);
-        write_wav(&wav("0.wav"), stereo(m)?)?;
+        write_wav(&wav("0.wav"), stereo(delayed(m, priming))?)?;
         for (n, (index, name, _)) in NI_ORDER.iter().enumerate() {
             let audio = j.stems.audio.get(*index).ok_or("a stem is missing")?;
             let mut stem = crate::io::at_rate(audio.buffer.clone(), rate, crate::io::MAX_IMPORT_SAMPLES)
@@ -215,7 +222,7 @@ fn build(j: &Job) -> Result<Option<String>, String> {
                 k += 1;
                 continue 'pass;
             }
-            write_wav(&wav(&format!("{}.wav", n + 1)), stereo(stem)?)?;
+            write_wav(&wav(&format!("{}.wav", n + 1)), stereo(delayed(stem, priming))?)?;
         }
         break;
     }
@@ -231,6 +238,16 @@ fn build(j: &Job) -> Result<Option<String>, String> {
     }
     crate::io::replace_file_refusing(j.sources, j.dest, &file).map_err(|e| e.to_string())?;
     Ok((k > 0).then(|| format!("the stem file plays {:.1} dB quieter than the prepped copy so no stem clips", 20.0 * f64::from(k) * 2f64.log10())))
+}
+
+/// `buf` with `frames` of silence before it.
+fn delayed(mut buf: AudioBuffer, frames: usize) -> AudioBuffer {
+    if frames > 0 {
+        for ch in &mut buf.channels {
+            ch.splice(0..0, std::iter::repeat_n(0.0, frames));
+        }
+    }
+    buf
 }
 
 /// `buf` as two channels: a mono one doubled, more than two cut to the first two.
