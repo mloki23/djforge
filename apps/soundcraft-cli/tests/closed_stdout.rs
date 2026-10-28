@@ -5,6 +5,13 @@ use std::process::{Command, Stdio};
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soundcraft-cli"));
     cmd.env("SOUNDCRAFT_NO_PREFS", "1");
+    // The binary sets up mixforge, Demucs and the app's stem cache: under test none of them may
+    // reach the real ones.
+    for var in ["DJFORGE_PYTHON", "DJFORGE_MIXFORGE", "DJFORGE_DEMUCS_PYTHON", "DJFORGE_FFMPEG"] {
+        cmd.env_remove(var);
+    }
+    let cache = std::env::temp_dir().join("djforge-cli-tests-cache");
+    cmd.env("LOCALAPPDATA", &cache).env("XDG_CACHE_HOME", &cache);
     cmd
 }
 

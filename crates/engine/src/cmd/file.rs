@@ -59,6 +59,8 @@ pub fn specs() -> Vec<CommandSpec> {
             for t in &mut s.tracks { for pl in &mut t.playlists { pl.clips.clear() } }
             s.sources.clear();
             s.videos.clear();
+            // The Live columns stay, empty: their slots played the sources just cleared.
+            s.live.columns.iter_mut().for_each(|c| c.slots = Default::default());
             let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
             if cfg!(target_arch = "wasm32") {
                 crate::io::write_file(&file.to_string_lossy(), text.as_bytes())?;

@@ -11,6 +11,13 @@ use serde_json::Value;
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soundcraft-cli"));
     cmd.env("SOUNDCRAFT_NO_PREFS", "1");
+    // The binary sets up mixforge, Demucs and the app's stem cache: under test none of them may
+    // reach the real ones.
+    for var in ["DJFORGE_PYTHON", "DJFORGE_MIXFORGE", "DJFORGE_DEMUCS_PYTHON", "DJFORGE_FFMPEG"] {
+        cmd.env_remove(var);
+    }
+    let cache = std::env::temp_dir().join("djforge-cli-tests-cache");
+    cmd.env("LOCALAPPDATA", &cache).env("XDG_CACHE_HOME", &cache);
     cmd
 }
 
@@ -137,4 +144,18 @@ fn usage_lists_the_root_flags() {
     let o = run(&["--help"]);
     let help = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(help.contains("--automation-read-root DIR") && help.contains("--automation-write-root DIR"), "{help}");
+}
+
+#[test]
+fn the_binary_under_test_reaches_no_real_mixforge_demucs_or_stem_cache() {
+    let cmd = bin();
+    let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    for var in ["DJFORGE_PYTHON", "DJFORGE_MIXFORGE", "DJFORGE_DEMUCS_PYTHON", "DJFORGE_FFMPEG"] {
+        assert_eq!(envs.get(std::ffi::OsStr::new(var)), Some(&None), "{var} is passed on");
+    }
+    let temp = std::env::temp_dir();
+    for var in ["LOCALAPPDATA", "XDG_CACHE_HOME"] {
+        let dir = envs.get(std::ffi::OsStr::new(var)).copied().flatten().map(std::path::Path::new);
+        assert!(dir.is_some_and(|d| d.starts_with(&temp)), "{var}: {dir:?}");
+    }
 }

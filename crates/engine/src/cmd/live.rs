@@ -35,7 +35,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Selection to Slot",
             [],
             None,
-            "{column (0-based), slot? (0-based; default: the column's first empty slot), track? (default: the selected tracks)} — the time selection over one beat-locked clip becomes a looping slot: its source, beat grid, stems and stem mask, the selection in the clip's own track beats snapped to whole bars (at least 1). Returns {column, slot, start_beat, length_beats, bars}",
+            "{column (0-based), slot? (0-based; default: the column's first empty slot), track? (default: the selected tracks)} — the time selection over one beat-locked clip becomes a looping slot: its source, beat grid, stems and stem mask, the selection in the clip's own track beats snapped to whole 4-beat bars (at least 1) inside what the clip plays. Needs 4/4 throughout. Returns {column, slot, start_beat, length_beats, bars}",
             has_live,
             from_selection
         ),
@@ -44,7 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load File into Slot",
             [],
             None,
-            "{column (0-based), path, slot? (0-based; default: the column's first empty slot), bpm? + first_beat? (seconds of a downbeat; default: mixforge's analysis when the app has it, else the file's BPM tag with the first downbeat at 0)} — imports the audio file as the slot's source: a whole-bar loop from its first downbeat when it has a beat grid, else a one-shot at its own rate. Returns {column, slot, source, mode, grid: given|mixforge|tag|null, length_beats}",
+            "{column (0-based), path, slot? (0-based; default: the column's first empty slot), bpm? + first_beat? (seconds of a downbeat; default: mixforge's analysis when the app has it, else the file's BPM tag with the first downbeat at 0)} — imports the audio file as the slot's source: a whole-bar loop from its first downbeat when it has a beat grid and at least a bar after it, else a one-shot at its own rate. Needs 4/4 throughout. Returns {column, slot, source, mode, grid: given|mixforge|tag|null, length_beats, analysis_error (why mixforge gave no grid), grid_error (why a grid was not used)}",
             has_live,
             from_file
         ),
@@ -53,7 +53,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Slot",
             [],
             None,
-            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1.., whole bars of the session's meter), gain_db? (-144..=24)} — edits a filled slot; a slot without a beat grid plays only as a one-shot",
+            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1..=256 whole 4-beat bars; needs 4/4 throughout), gain_db? (-144..=24)} — edits a filled slot; a slot without a beat grid plays only as a one-shot",
             has_live,
             set
         ),
@@ -92,7 +92,7 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
             .ok_or_else(|| bad(SETUP, format!("`columns` must be 1..={MAX_LIVE_COLUMNS}")))?,
     };
     let s = e.session();
-    let lost: Vec<usize> = s.live.columns.iter().enumerate().filter(|(_, c)| s.track(c.track).is_none()).map(|(i, _)| i).collect();
+    let lost = s.live.lost_columns(&s.tracks);
     let more = want.saturating_sub(s.live.columns.len());
     let mut created = 0usize;
     if !lost.is_empty() || more > 0 {
@@ -101,7 +101,7 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
             created += 1;
             s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(&format!("Live {}", i + 1)))
         };
-        // A column whose track was deleted keeps its slots on a new track.
+        // A column whose track was lost keeps its slots on a new track.
         for i in lost {
             let track = make(s, i);
             if let Some(c) = s.live.columns.get_mut(i) {
@@ -149,9 +149,34 @@ fn target(e: &Engine, cmd: &str, p: &Value, column: usize) -> Result<usize> {
     col.next_empty().ok_or_else(|| bad(cmd, format!("Live column {} is full: pass `slot` to replace one, or clear one", column + 1)))
 }
 
-/// Beats in a bar of the session's meter at `tick` (quarter notes, as warp maps count them).
-fn beats_per_bar(s: &Session, tick: i64) -> f64 {
-    f64::from(s.tempo.meter_at_tick(tick).numerator.max(1))
+/// Beats in a slot's bar. Slots count bars of four beats, so the session must be in 4/4
+/// throughout (as for set exports): see [`four_four`].
+const BAR: f64 = 4.0;
+
+/// Refuses a session whose meter is not 4/4 throughout, where slot bars would not be bars.
+fn four_four(cmd: &str, s: &Session) -> Result<()> {
+    match s.tempo.meters().iter().find(|m| (m.numerator, m.denominator) != (4, 4)) {
+        Some(m) => Err(bad(
+            cmd,
+            format!(
+                "bar {} is in {}/{}: Session view slots need 4/4 throughout; set the meter to 4/4 first",
+                s.tempo.bar_beat_at_tick(m.tick).bar,
+                m.numerator,
+                m.denominator
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The first bar line at or after track beat `beat` (allowing for rounding).
+fn bar_at_or_after(beat: f64) -> f64 {
+    (beat / BAR - 1e-6).ceil() * BAR
+}
+
+/// The last bar line at or before track beat `beat` (allowing for rounding).
+fn bar_at_or_before(beat: f64) -> f64 {
+    (beat / BAR + 1e-6).floor() * BAR
 }
 
 /// Puts `slot` at `column`, `row`.
@@ -180,14 +205,17 @@ fn slot_from_selection(s: &Session, tracks: &[TrackId], sel: Range) -> std::resu
     let (Some(source), Some(warp)) = (clip.source(), clip.warp.as_ref().filter(|w| w.is_usable())) else {
         return Err(format!("`{}` is not beat-locked: load it with Load Track Beat-Locked (dj.load_warped)", clip.name));
     };
-    // The part of the clip selected, in the clip's own track beats, snapped to its bars.
+    // The part of the clip selected, in the clip's own track beats, snapped to its bars and kept
+    // inside what the clip plays: from its first downbeat (beat 0) and its start, to its end and
+    // the end of its audio.
     let (a, b) = (sel.start.max(clip.start), sel.end.min(clip.end()));
     let at = |t: Samples| warp.track_beat_at(&s.tempo, s.sample_rate, clip.start, t);
-    let per_bar = beats_per_bar(s, s.tempo.samples_to_ticks_f(a, s.sample_rate) as i64);
-    let snap = |beat: f64| (beat / per_bar).round() * per_bar;
-    let (start, end) = (snap(at(a)), snap(at(b)));
+    let frames = s.source(source).map_or(0.0, |x| x.frames as f64);
+    let (lo, hi) = (at(clip.start).max(0.0), at(clip.end()).min(warp.beat_at_source(frames)));
+    let snap = |beat: f64| (beat / BAR).round() * BAR;
+    let (start, end) = (snap(at(a)).max(bar_at_or_after(lo)), snap(at(b)).min(bar_at_or_before(hi)));
     let length = end - start;
-    if !(start.is_finite() && length.is_finite()) || length < per_bar {
+    if !(start.is_finite() && length.is_finite()) || length < BAR {
         return Err("the selection is under 1 bar: select at least one whole bar of the clip".into());
     }
     if length > MAX_SLOT_BEATS {
@@ -207,7 +235,7 @@ fn slot_from_selection(s: &Session, tracks: &[TrackId], sel: Range) -> std::resu
         mode: SlotMode::Loop,
         gain_db: clip.gain_db,
     };
-    Ok((slot, length / per_bar))
+    Ok((slot, length / BAR))
 }
 
 fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -218,6 +246,7 @@ fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
         None => e.session().edit.selected_tracks.clone(),
     };
     let s = e.session();
+    four_four(FROM_SELECTION, s)?;
     let (slot, bars) = slot_from_selection(s, &tracks, s.edit.selection).map_err(|why| bad(FROM_SELECTION, why))?;
     let out = json!({"column": column, "slot": row, "start_beat": slot.start_beat, "length_beats": slot.length_beats, "bars": bars});
     put(e, column, row, slot);
@@ -228,57 +257,74 @@ fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, FROM_FILE, p)?;
     let path = str_param(p, "path").ok_or_else(|| bad(FROM_FILE, "`path` required"))?.to_string();
     let row = target(e, FROM_FILE, p, column)?;
-    let bpm = p.get("bpm").and_then(Value::as_f64);
-    if let Some(b) = bpm
-        && !(b.is_finite() && (20.0..=400.0).contains(&b))
-    {
-        return Err(bad(FROM_FILE, "`bpm` must be 20..=400"));
-    }
-    let first_beat = f64_or(p, "first_beat", 0.0);
-    if !(first_beat.is_finite() && (0.0..=600.0).contains(&first_beat)) {
-        return Err(bad(FROM_FILE, "`first_beat` must be 0..=600 seconds"));
-    }
-    // The beat grid: given, else mixforge's analysis (when the app set it up), else the file's
-    // BPM tag with the first downbeat at the file start, else none (a one-shot).
-    let (beats, how) = match bpm {
-        Some(bpm) => (Some(Beats::Constant { bpm, first: first_beat }), Some("given")),
-        None => match analysed(e, &path) {
-            Some(b) => (Some(b), Some("mixforge")),
-            None => match tagged_bpm(&path) {
-                Some(bpm) => (Some(Beats::Constant { bpm, first: 0.0 }), Some("tag")),
-                None => (None, None),
-            },
-        },
+    let bpm = match p.get("bpm") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_f64().filter(|b| b.is_finite() && (20.0..=400.0).contains(b)).ok_or_else(|| bad(FROM_FILE, "`bpm` must be a number 20..=400"))?,
+        ),
     };
+    let first_beat = match (p.get("first_beat"), bpm) {
+        (None | Some(Value::Null), _) => 0.0,
+        (Some(_), None) => return Err(bad(FROM_FILE, "`first_beat` needs a `bpm`")),
+        (Some(v), Some(_)) => {
+            v.as_f64().filter(|f| f.is_finite() && (0.0..=600.0).contains(f)).ok_or_else(|| bad(FROM_FILE, "`first_beat` must be 0..=600 seconds"))?
+        }
+    };
+    four_four(FROM_FILE, e.session())?;
+    // The file is imported first, so a file that won't read or decode is refused before mixforge
+    // runs; a failure after this is rolled back with the import.
     let bytes = crate::io::read_file(&path)?;
     let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
     let (source, frames, _) = crate::io::import_source_bytes(e, &name, &bytes, Some(&path))?;
+    // The beat grid: given, else mixforge's analysis (when the app set it up), else the file's
+    // BPM tag with the first downbeat at the file start, else none (a one-shot).
+    let mut analysis_error = None;
+    let (beats, how) = match bpm {
+        Some(bpm) => (Some(Beats::Constant { bpm, first: first_beat }), Some("given")),
+        None => match analysed(e, &path) {
+            Ok(b) => (Some(b), Some("mixforge")),
+            Err(why) => {
+                analysis_error = Some(why);
+                match tagged_bpm(&path) {
+                    Some(bpm) => (Some(Beats::Constant { bpm, first: 0.0 }), Some("tag")),
+                    None => (None, None),
+                }
+            }
+        },
+    };
     let s = e.session();
     let label = s.source(source).map(|x| x.name.clone()).unwrap_or_default();
-    let color = s.live.columns.get(column).and_then(|c| s.track(c.track)).map_or([128, 128, 128], |t| t.color);
-    let per_bar = beats_per_bar(s, 0);
+    let color = s.live.column_track(column, &s.tracks).and_then(|t| s.track(t)).map_or([128, 128, 128], |t| t.color);
     let mut slot = Slot::one_shot(label, color, source);
-    if let Some((warp, track_beats)) =
-        beats.and_then(|b| grid(&b.secs(frames, s.sample_rate.as_f64()), s.sample_rate.as_f64(), frames, per_bar as i64, Some(0.0)))
-    {
-        // From the first downbeat, whole bars of the file (whole beats when it is under a bar).
-        let bars = (track_beats / per_bar).floor() * per_bar;
-        slot.length_beats = if bars >= per_bar { bars } else { track_beats.floor() }.clamp(1.0, MAX_SLOT_BEATS);
-        slot.warp = Some(warp);
-        slot.mode = SlotMode::Loop;
+    let rate = s.sample_rate.as_f64();
+    let mut grid_error = None;
+    if let Some(b) = beats {
+        // From the first downbeat, whole bars of the file; a file with less than a bar from its
+        // first downbeat (or a downbeat past its end) stays a one-shot.
+        match grid(&b.secs(frames, rate), rate, frames, BAR as i64, Some(0.0)) {
+            Some((warp, track_beats)) if track_beats >= BAR => {
+                slot.length_beats = bar_at_or_before(track_beats).clamp(BAR, MAX_SLOT_BEATS);
+                slot.warp = Some(warp);
+                slot.mode = SlotMode::Loop;
+            }
+            Some(_) => grid_error = Some("the file holds less than a bar from its first downbeat, so it plays as a one-shot"),
+            None => grid_error = Some("the beat grid is unusable, so it plays as a one-shot"),
+        }
     }
     let how = how.filter(|_| slot.warp.is_some());
-    let out = json!({"column": column, "slot": row, "source": source, "mode": slot.mode.id(), "grid": how, "length_beats": slot.length_beats});
+    let out = json!({"column": column, "slot": row, "source": source, "mode": slot.mode.id(), "grid": how, "length_beats": slot.length_beats,
+        "analysis_error": analysis_error, "grid_error": grid_error});
     put(e, column, row, slot);
     Ok(out)
 }
 
-/// The beat grid mixforge's analysis gives the file at `path`, when the app set analysis up and
-/// it has a usable BPM and first downbeat.
-fn analysed(e: &Engine, path: &str) -> Option<Beats> {
-    let a = (e.analyse()?)(path, &|| false).ok()?;
-    let (bpm, first) = grid_of(&a)?;
-    Some(Beats::Constant { bpm, first })
+/// The beat grid mixforge's analysis gives the file at `path`, or why there is none. The command
+/// runs it to the end: it has no cancel of its own, and the sidecar has its time limit.
+fn analysed(e: &Engine, path: &str) -> std::result::Result<Beats, String> {
+    let analyse = e.analyse().ok_or("no mixforge analysis is set up")?;
+    let a = analyse(path, &|| false)?;
+    let (bpm, first) = grid_of(&a).ok_or("mixforge's analysis has no usable bpm/first_downbeat")?;
+    Ok(Beats::Constant { bpm, first })
 }
 
 /// The BPM in the ID3 tag of the MP3 at `path`, when it is a usable tempo.
@@ -322,13 +368,13 @@ fn set(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     if let Some(v) = p.get("length_bars") {
-        let per_bar = beats_per_bar(e.session(), 0);
-        let most = (MAX_SLOT_BEATS / per_bar).floor();
+        four_four(SET, e.session())?;
+        let most = (MAX_SLOT_BEATS / BAR).floor();
         let bars = v
             .as_f64()
             .filter(|b| b.fract() == 0.0 && (1.0..=most).contains(b))
             .ok_or_else(|| bad(SET, format!("`length_bars` must be a whole number 1..={most}")))?;
-        slot.length_beats = bars * per_bar;
+        slot.length_beats = bars * BAR;
     }
     if let Some(v) = p.get("gain_db") {
         let (lo, hi) = SLOT_GAIN_DB;

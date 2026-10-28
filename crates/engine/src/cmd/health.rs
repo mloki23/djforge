@@ -102,7 +102,7 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
     let mut slots = 0usize;
     for (column, row, slot) in s.live.slots() {
         slots += 1;
-        let track = s.live.columns.get(column).and_then(|c| s.track(c.track));
+        let track = s.live.column_track(column, &s.tracks).and_then(|t| s.track(t));
         let stems = slot.stems.iter().flat_map(|set| STEMS.iter().zip(set.sources).map(|(name, id)| (Some(*name), id)));
         for (stem, source) in std::iter::once((None, slot.source)).chain(stems) {
             let metadata = sources.get(&source);

@@ -111,14 +111,29 @@ fn setup_makes_four_stereo_live_tracks_once_and_rebinds_a_deleted_one() {
     run(&mut e, "live.slot_from_file", json!({"column": 1, "path": wav(&dir.0, "hit.wav", 0.5)}));
     let gone = e.session().live.columns[1].track;
     run(&mut e, "track.delete", json!({"tracks": [gone.0]}));
-    assert_eq!(run(&mut e, "live.setup", json!({"columns": 6}))["created"], 3);
+    // Saved and opened again meanwhile, the column stays (lost, slots and all) and is reported.
+    let file = dir.0.join("lost.scraft");
+    soundcraft_engine::io::save_session(&mut e, file.to_str().unwrap()).unwrap();
+    let mut e = Engine::default();
+    let missing = soundcraft_engine::io::open_session(&mut e, file.to_str().unwrap()).unwrap();
+    assert!(missing.iter().any(|m| m.contains("Live column 2") && m.contains("live.setup")), "{missing:?}");
+    assert_eq!(e.session().live.lost_columns(&e.session().tracks), [1]);
+    // A column on a track another column plays into, or on a track that isn't audio, is lost too.
+    let aux = TrackId(run(&mut e, "track.new", json!({"kind": "aux"}))["tracks"][0].as_u64().unwrap());
+    let s = e.session_mut();
+    s.live.columns[3].track = s.live.columns[2].track;
+    s.live.columns[0].track = aux;
+    assert_eq!(e.session().live.lost_columns(&e.session().tracks), [0, 1, 3]);
+    assert_eq!(run(&mut e, "live.setup", json!({"columns": 6}))["created"], 5);
     let s = e.session();
+    assert!(s.live.lost_columns(&s.tracks).is_empty());
     assert_eq!(s.live.columns.len(), 6);
     assert!(s.track(s.live.columns[1].track).is_some_and(|t| t.name == "Live 2"));
-    assert!(s.live.slot(1, 0).is_some());
+    assert!(s.live.slot(1, 0).is_some(), "the lost column kept its slot");
     // Undo takes the whole setup back.
     assert!(e.undo());
     assert_eq!(e.session().live.columns.len(), 4);
+    assert_eq!(e.session().live.lost_columns(&e.session().tracks), [0, 1, 3]);
 }
 
 #[test]
@@ -423,4 +438,121 @@ fn health_checks_slot_audio_too() {
         "{sick}"
     );
     assert_eq!(issue["track"], "Live 3");
+}
+
+#[test]
+fn a_selection_snaps_inside_what_the_clip_plays() {
+    let dir = Scratch::new("inside");
+    // 30.25 s at 120 bpm with the first downbeat 0.5 s in, from bar 3: the clip starts on a bar of
+    // lead-in (its beat -4) and its audio ends at beat 59.5, nearer bar line 60 than 56.
+    let path = wav(&dir.0, "short.wav", 30.25);
+    let mut e = Engine::default();
+    run(&mut e, "live.setup", json!({}));
+    let r = run(&mut e, "dj.load_warped", json!({"path": path, "bpm": 120, "first_beat": 0.5, "at_bar": 3}));
+    e.session_mut().edit.selected_tracks = vec![TrackId(r["track"].as_u64().unwrap())];
+    let clip = e.session().find_clip(ClipId(r["clip"].as_u64().unwrap())).unwrap().1.clone();
+    // From the clip start: the lead-in is not part of the loop, which starts on the downbeat.
+    let (a, b) = (clip.start, at(&e, 5, 0.0));
+    select(&mut e, a, b);
+    let r = run(&mut e, "live.slot_from_selection", json!({"column": 0}));
+    assert_eq!((r["start_beat"].as_f64(), r["length_beats"].as_f64()), (Some(0.0), Some(4.0)), "{r}");
+    // To the clip end: the last bar line the audio reaches, not the one nearest the end.
+    let (a, b) = (at(&e, 15, 0.0), clip.end());
+    select(&mut e, a, b);
+    let r = run(&mut e, "live.slot_from_selection", json!({"column": 0}));
+    assert_eq!((r["start_beat"].as_f64(), r["length_beats"].as_f64()), (Some(44.0), Some(12.0)), "{r}");
+}
+
+#[test]
+fn slot_bars_need_four_four_throughout() {
+    let dir = Scratch::new("meter");
+    let (mut e, _, _) = deck(&dir.0, 1);
+    let path = wav(&dir.0, "a.wav", 4.0);
+    run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path, "bpm": 120}));
+    e.session_mut().tempo.set_meter(TICKS_PER_QUARTER * 32, 3, 4).unwrap();
+    let (a, b) = (0, at(&e, 3, 0.0));
+    select(&mut e, a, b);
+    for (cmd, p) in [
+        ("live.slot_from_selection", json!({"column": 1})),
+        ("live.slot_from_file", json!({"column": 1, "path": path})),
+        ("live.slot_set", json!({"column": 0, "slot": 0, "length_bars": 2})),
+    ] {
+        let why = err(&mut e, cmd, p);
+        assert!(why.contains("bar 9 is in 3/4") && why.contains("4/4"), "{cmd}: {why}");
+    }
+    run(&mut e, "live.slot_set", json!({"column": 0, "slot": 0, "name": "no bars here"}));
+}
+
+#[test]
+fn a_file_under_a_bar_from_its_downbeat_is_a_one_shot() {
+    let dir = Scratch::new("short");
+    let mut e = Engine::default();
+    run(&mut e, "live.setup", json!({}));
+    // A 0.3 s kick tagged 128 bpm: the fixture's 10-byte ID3 header and 34-byte tag, then about
+    // 0.3 s of its 128 kbit/s frames.
+    let fixture = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../audio-io/tests/fixtures/mp3/cbr128_44k_stereo.mp3")).unwrap();
+    let kick = &fixture[..44 + 4_800];
+    let fill = soundcraft_audio_io::mp3tags::TagFill { camelot: None, bpm: Some(128.0), prep_note: "" };
+    let (tagged, _) = soundcraft_audio_io::mp3tags::fill(kick, &fill).unwrap();
+    let path = dir.0.join("kick.mp3");
+    std::fs::write(&path, tagged).unwrap();
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path}));
+    assert_eq!((r["mode"].as_str(), &r["grid"]), (Some("one_shot"), &Value::Null), "{r}");
+    assert!(r["grid_error"].as_str().unwrap().contains("less than a bar"), "{r}");
+    let src = SourceId(r["source"].as_u64().unwrap());
+    let frames = e.session().source(src).unwrap().frames;
+    assert!((10_000..20_000).contains(&frames), "about 0.3 s: {frames}");
+    assert!(e.session().live.slot(0, 0).unwrap().warp.is_none());
+    // A first downbeat past the end of a 2 s file.
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "b.wav", 2.0), "bpm": 120, "first_beat": 5.0}));
+    assert_eq!((r["mode"].as_str(), &r["grid"]), (Some("one_shot"), &Value::Null), "{r}");
+    assert!(e.session().live.slot(0, 1).unwrap().warp.is_none());
+}
+
+#[test]
+fn a_file_is_imported_before_it_is_analysed_and_says_why_analysis_gave_no_grid() {
+    let dir = Scratch::new("order");
+    let mut e = Engine::default();
+    assert!(e.analyse().is_none(), "an engine reaches no mixforge until the app sets it up");
+    run(&mut e, "live.setup", json!({}));
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "a.wav", 3.0)}));
+    assert_eq!(r["analysis_error"], "no mixforge analysis is set up", "{r}");
+    let (fake, asked) = fake_analysis(Err("not analysed by mixforge".into()));
+    e.set_analyse(fake);
+    // A file that won't decode is refused before mixforge runs, and leaves nothing behind.
+    let junk = dir.0.join("junk.wav");
+    std::fs::write(&junk, "not audio").unwrap();
+    let sources = e.session().sources.len();
+    assert!(err(&mut e, "live.slot_from_file", json!({"column": 0, "path": junk})).contains("junk.wav"));
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(e.session().sources.len(), sources);
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "b.wav", 3.0)}));
+    assert_eq!((r["analysis_error"].as_str(), r["mode"].as_str()), (Some("not analysed by mixforge"), Some("one_shot")), "{r}");
+    let (fake, _) = fake_analysis(Ok(json!({"bpm": "fast"})));
+    e.set_analyse(fake);
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "c.wav", 3.0)}));
+    assert!(r["analysis_error"].as_str().unwrap().contains("no usable bpm"), "{r}");
+    // A given grid needs no analysis; parameters of the wrong type are refused.
+    let (fake, asked) = fake_analysis(Ok(json!({})));
+    e.set_analyse(fake);
+    let path = wav(&dir.0, "d.wav", 3.0);
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path, "bpm": 120}));
+    assert_eq!((&r["analysis_error"], asked.lock().unwrap().len()), (&Value::Null, 0), "{r}");
+    assert!(err(&mut e, "live.slot_from_file", json!({"column": 0, "path": path, "bpm": "120"})).contains("`bpm` must be a number"));
+    assert!(err(&mut e, "live.slot_from_file", json!({"column": 0, "path": path, "first_beat": 0.5})).contains("`first_beat` needs a `bpm`"));
+}
+
+#[test]
+fn a_template_keeps_the_live_columns_but_not_their_slots() {
+    let dir = Scratch::new("template");
+    let mut e = Engine::default();
+    run(&mut e, "live.setup", json!({}));
+    run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "a.wav", 1.0)}));
+    let file = dir.0.join("t.scraft");
+    run(&mut e, "session.save_template", json!({"path": file}));
+    let mut t = Engine::default();
+    soundcraft_engine::io::open_session(&mut t, file.to_str().unwrap()).unwrap();
+    let live = &t.session().live;
+    assert_eq!((live.columns.len(), live.slots().count()), (4, 0));
+    assert!(live.lost_columns(&t.session().tracks).is_empty());
 }

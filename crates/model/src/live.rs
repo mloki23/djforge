@@ -2,7 +2,7 @@
 //!
 //! What a slot holds is part of the document (saved, undoable to edit); what is playing is not.
 
-use crate::{MAX_NAME_CHARS, MAX_WARP_BEATS, STEMS, Source, SourceId, StemSet, TrackId, WarpMap, truncate_chars};
+use crate::{MAX_NAME_CHARS, MAX_WARP_BEATS, STEMS, Source, SourceId, StemSet, Track, TrackId, TrackKind, WarpMap, truncate_chars};
 use serde::Deserialize;
 use serde::de::Deserializer;
 
@@ -181,10 +181,16 @@ impl Slot {
         self.start_beat = if self.start_beat.is_finite() { self.start_beat.clamp(-max_start, max_start) } else { 0.0 };
         self.length_beats = if self.length_beats.is_finite() { self.length_beats.clamp(1.0, MAX_SLOT_BEATS) } else { 1.0 };
         self.gain_db = if self.gain_db.is_finite() { self.gain_db.clamp(SLOT_GAIN_DB.0, SLOT_GAIN_DB.1) } else { 0.0 };
+        // Four distinct stem files, none of them the slot's own source.
+        let distinct = |set: &StemSet| {
+            let ids: std::collections::BTreeSet<SourceId> = set.sources.iter().copied().chain([self.source]).collect();
+            ids.len() == STEMS.len() + 1
+        };
+        if !self.stems.as_ref().is_some_and(distinct) {
+            self.unsplit();
+        }
         if let Some(set) = &mut self.stems {
             truncate_chars(&mut set.key, MAX_NAME_CHARS);
-        } else {
-            self.unsplit();
         }
     }
 }
@@ -194,8 +200,8 @@ impl Slot {
 pub struct LiveColumn {
     pub track: TrackId,
     /// Reading is lenient: a malformed slot reads as empty, and the list is cut or padded to
-    /// [`LIVE_SLOTS`].
-    #[serde(deserialize_with = "loadable_slots")]
+    /// [`LIVE_SLOTS`] (a missing list is all empty).
+    #[serde(default, deserialize_with = "loadable_slots")]
     pub slots: [Option<Slot>; LIVE_SLOTS],
 }
 
@@ -262,20 +268,34 @@ impl LiveState {
         self.columns.iter().enumerate().flat_map(|(c, col)| col.slots.iter().enumerate().filter_map(move |(r, s)| s.as_ref().map(|s| (c, r, s))))
     }
 
-    /// Repair invariants after loading untrusted data: a column whose track is gone (or that
-    /// repeats one) is dropped, at most [`MAX_LIVE_COLUMNS`] are kept, a slot whose source is
-    /// missing is emptied, stems naming a missing source are dropped, and each slot is bounded.
-    pub fn sanitize(&mut self, has_track: impl Fn(TrackId) -> bool, sources: &[Source]) {
-        let known = |id: SourceId| sources.iter().any(|s| s.id == id);
-        let mut seen = std::collections::BTreeSet::new();
-        self.columns.retain(|c| has_track(c.track) && seen.insert(c.track));
+    /// The track column `column` plays into, while it has one: an audio track of `tracks` that
+    /// no earlier column plays into. `None` for a column whose track was lost (deleted, not an
+    /// audio track, or taken by another column): it keeps its slots, plays nothing, and
+    /// `live.setup` gives it a new track.
+    pub fn column_track(&self, column: usize, tracks: &[Track]) -> Option<TrackId> {
+        let id = self.columns.get(column)?.track;
+        let earlier = self.columns.iter().take(column).any(|c| c.track == id);
+        tracks.iter().any(|t| t.id == id && t.kind == TrackKind::Audio).then_some(id).filter(|_| !earlier)
+    }
+
+    /// The columns whose track was lost (see [`LiveState::column_track`]).
+    pub fn lost_columns(&self, tracks: &[Track]) -> Vec<usize> {
+        (0..self.columns.len()).filter(|&c| self.column_track(c, tracks).is_none()).collect()
+    }
+
+    /// Repair invariants after loading untrusted data: at most [`MAX_LIVE_COLUMNS`] columns are
+    /// kept (a column whose track was lost stays, see [`LiveState::column_track`]), a slot whose
+    /// source is missing is emptied, stems naming a missing source are dropped, and each slot is
+    /// bounded.
+    pub fn sanitize(&mut self, sources: &[Source]) {
+        let known: std::collections::BTreeSet<SourceId> = sources.iter().map(|s| s.id).collect();
         self.columns.truncate(MAX_LIVE_COLUMNS);
         for slot in self.columns.iter_mut().flat_map(|c| c.slots.iter_mut()) {
-            if slot.as_ref().is_some_and(|s| !known(s.source)) {
+            if slot.as_ref().is_some_and(|s| !known.contains(&s.source)) {
                 *slot = None;
             }
             if let Some(s) = slot {
-                if s.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !known(*id))) {
+                if s.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !known.contains(id))) {
                     s.unsplit();
                 }
                 s.sanitize();
@@ -307,6 +327,8 @@ mod tests {
         assert_eq!((c.track, c.slots.iter().filter(|s| s.is_some()).count()), (TrackId(3), 0));
         let c: LiveColumn = serde_json::from_str(&format!(r#"{{"track": 3, "slots": [{}]}}"#, vec!["null"; 20].join(","))).unwrap();
         assert_eq!(c.slots.len(), LIVE_SLOTS);
+        let c: LiveColumn = serde_json::from_str(r#"{"track": 3}"#).unwrap();
+        assert!(c.slots.iter().all(Option::is_none), "no slots: eight empty ones");
     }
 
     #[test]
@@ -326,5 +348,27 @@ mod tests {
         s.length_beats = 1e9;
         s.sanitize();
         assert_eq!((s.mode, s.length_beats, s.warp.as_ref().unwrap().lock), (SlotMode::Loop, MAX_SLOT_BEATS, None));
+    }
+
+    #[test]
+    fn stems_that_repeat_a_file_are_dropped() {
+        let set = |sources: [u64; 4]| Some(StemSet { key: "k".into(), sources: sources.map(SourceId), scale_log2: 0 });
+        for (stems, kept) in [(set([2, 3, 4, 5]), true), (set([2, 3, 3, 5]), false), (set([1, 3, 4, 5]), false)] {
+            let mut s = Slot::one_shot("s", [0; 3], SourceId(1));
+            s.stems = stems;
+            s.stem_mask = [true, false, true, true];
+            s.sanitize();
+            assert_eq!((s.stems.is_some(), s.stem_mask == [true; 4]), (kept, !kept));
+        }
+    }
+
+    #[test]
+    fn a_column_without_its_own_audio_track_is_lost() {
+        let track = |id: u64, kind| Track::new(TrackId(id), format!("t{id}"), kind, crate::ChannelFormat::Stereo, [0; 3]);
+        let tracks = [track(1, TrackKind::Audio), track(2, TrackKind::Aux), track(3, TrackKind::Audio)];
+        let live = LiveState { columns: [1, 2, 9, 3, 1].map(|t| LiveColumn::new(TrackId(t))).to_vec(), quantise: Quantise::default() };
+        let tracks_of: Vec<_> = (0..5).map(|c| live.column_track(c, &tracks)).collect();
+        assert_eq!(tracks_of, [Some(TrackId(1)), None, None, Some(TrackId(3)), None]);
+        assert_eq!(live.lost_columns(&tracks), [1, 2, 4]);
     }
 }

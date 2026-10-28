@@ -89,7 +89,7 @@ pub fn session(e: &Engine, full: bool) -> Value {
             "id": x.id, "name": x.name, "channels": x.channels, "frames": x.frames, "path": x.path,
             "loaded": s.pool.contains(x.id),
         })).collect::<Vec<_>>(),
-        "live": {"quantise": s.live.quantise.id(), "columns": s.live.columns.iter().map(|c| json!({"track": c.track, "slots": c.slots.iter().map(|x| x.as_ref().map(|x| json!({
+        "live": {"quantise": s.live.quantise.id(), "columns": s.live.columns.iter().enumerate().map(|(i, c)| json!({"track": c.track, "lost": s.live.column_track(i, &s.tracks).is_none(), "slots": c.slots.iter().map(|x| x.as_ref().map(|x| json!({
             "name": x.name, "color": x.color, "source": x.source, "mode": x.mode.id(), "beat_locked": x.warp.is_some(), "start_beat": x.start_beat,
             "length_beats": x.length_beats, "gain_db": x.gain_db, "stems": x.stems.is_some(), "stem_mask": x.stem_mask,
         }))).collect::<Vec<_>>()})).collect::<Vec<_>>()},

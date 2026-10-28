@@ -580,6 +580,8 @@ impl Session {
             .chain(self.busses.iter().map(|b| b.id.0))
             .chain(self.markers.iter().map(|m| m.id.0))
             .chain(self.groups.iter().map(|g| g.id.0))
+            // A lost Live column's track id is never handed out again.
+            .chain(self.live.columns.iter().map(|c| c.track.0))
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(max_id.saturating_add(1));
@@ -657,8 +659,7 @@ impl Session {
             self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))).collect();
         self.midi_originals.retain(|id, _| clip_ids.contains(id));
         self.dj.sanitize(&self.tracks);
-        let tracks: std::collections::BTreeSet<TrackId> = self.tracks.iter().map(|t| t.id).collect();
-        self.live.sanitize(|t| tracks.contains(&t), &self.sources);
+        self.live.sanitize(&self.sources);
         if !self.edit.zoom.samples_per_px.is_finite() || self.edit.zoom.samples_per_px <= 0.0 {
             self.edit.zoom.samples_per_px = 1024.0;
         }
@@ -935,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_drops_columns_without_a_track_and_slots_without_a_source() {
+    fn loading_keeps_columns_whose_track_is_lost_and_drops_slots_without_a_source() {
         let (mut s, a, b) = live_session();
         s.tracks.retain(|t| t.id != b);
         let mut stray = crate::Slot::one_shot("Gone", [0; 3], SourceId(99));
@@ -946,8 +947,13 @@ mod tests {
             set.sources[3] = SourceId(98);
         }
         s.live.columns[0].slots[5] = lost_stem;
+        s.live.columns[1].slots[4] = s.live.columns[0].slots[2].clone();
+        let lost = s.live.columns[1].clone();
         let back = Session::from_json(&s.to_json().unwrap()).unwrap();
-        assert_eq!(back.live.columns.iter().map(|c| c.track).collect::<Vec<_>>(), [a]);
+        // The column whose track is gone stays, slots and all, waiting for live.setup.
+        assert_eq!(back.live.columns.iter().map(|c| c.track).collect::<Vec<_>>(), [a, b]);
+        assert_eq!(back.live.columns[1], lost);
+        assert_eq!(back.live.lost_columns(&back.tracks), [1]);
         let col = &back.live.columns[0];
         assert!(col.slots[0].is_none(), "its source is missing");
         let kept = col.slots[5].as_ref().unwrap();

@@ -1586,6 +1586,10 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
             missing.push(format!("{} (Live {} slot {}): stems missing — the slot plays its own audio", slot.name, c + 1, r + 1));
         }
     }
+    // A Live column whose track is gone keeps its slots until View › Session gives it a new one.
+    for c in s.live.lost_columns(&s.tracks) {
+        missing.push(format!("Live column {}: its track is missing — open View › Session (live.setup) to give it a new one", c + 1));
+    }
     s.folder = Some(dir);
     e.replace_session(s);
     e.path = Some(path.to_string());
