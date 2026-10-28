@@ -349,3 +349,19 @@ fn a_cancel_once_mixxx_started_lets_it_finish_and_skips_the_stem_files() {
     assert!(report.contains("cancelled") && report.contains("Mixxx: playlist"), "{report}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// mixforge writes Mixxx's library and its own outside any automation roots, so an export run
+/// confined to them writes no Mixxx: the runner is never called.
+#[test]
+fn a_confined_export_writes_no_mixxx() {
+    let dir = scratch("confined");
+    let mut e = set(&dir.join("lib"));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    e.set_mixxx_runner(fake(&calls, Ok(json!({"playlist": "mixforge · test set"}))));
+    let roots = soundcraft_engine::file_access::AutomationRoots::new(Some(&dir), Some(&dir)).unwrap().unwrap();
+    let r = soundcraft_engine::file_access::confine(Some(&roots), || export(&e, &dir.join("prepped")));
+    assert_eq!(r["mixxx"], json!({"skipped": "Mixxx export isn't available to a confined automation session"}), "{r}");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(dir.join("prepped/test set/test set.rekordbox.xml").is_file(), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

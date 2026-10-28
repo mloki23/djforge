@@ -363,6 +363,7 @@ mod tests {
     fn the_sweep_removes_only_folders_of_processes_gone() {
         let out = std::env::temp_dir().join(format!("sc-stem-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
+        let out = crate::cmd::export::tests::Folder(out);
         // A pid no process has (Windows pids are multiples of 4), ours, and another name.
         let names = [format!("{TMP_PREFIX}4000001-0"), format!("{TMP_PREFIX}{}-0", std::process::id()), "keep".to_string()];
         for n in &names {
@@ -388,7 +389,6 @@ mod tests {
             stop: &|| false,
         };
         assert!(write(&job).is_err());
-        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

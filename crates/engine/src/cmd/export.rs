@@ -367,7 +367,7 @@ pub type MixxxRunner = Arc<dyn Fn(&Value, &str) -> std::result::Result<Value, St
 
 /// The sidecar that runs `mixforge.mixxx.export`: prints its summary as JSON, or `{error}`.
 const MIXFORGE_MIXXX: &str = include_str!("mixforge_mixxx.py");
-/// Longest the Mixxx sidecar may take.
+/// Shortest time the Mixxx sidecar is given; a set of more than 12 tracks gets 10 s a track.
 const MIXXX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// How mixforge's refusal while Mixxx runs starts.
 const MIXXX_RUNNING: &str = "Close Mixxx first";
@@ -397,10 +397,12 @@ fn run_mixforge_mixxx(plan: &Value, set: &str) -> std::result::Result<Value, Str
         // CREATE_NO_WINDOW: the GUI must not flash a console.
         command.creation_flags(0x0800_0000);
     }
-    let out = match super::dj::output_fed(&mut command, Some(input), MIXXX_TIMEOUT, &|| false) {
+    let tracks = plan.get("tracks").and_then(Value::as_array).map_or(0, Vec::len);
+    let limit = MIXXX_TIMEOUT.max(std::time::Duration::from_secs(10u64.saturating_mul(tracks as u64)));
+    let out = match super::dj::output_fed(&mut command, Some(input), limit, &|| false) {
         Ok(super::dj::Sidecar::Ran(out)) => out,
         Ok(super::dj::Sidecar::TimedOut) => {
-            return Err(format!("mixforge's Mixxx export timed out after {} s — Mixxx may have been written; check it", MIXXX_TIMEOUT.as_secs()));
+            return Err(format!("mixforge's Mixxx export timed out after {} s — Mixxx may have been written; check it", limit.as_secs()));
         }
         Ok(super::dj::Sidecar::LeftHolding) => return Err("the mixforge sidecar left a process holding its output".into()),
         Ok(super::dj::Sidecar::Stopped) => return Err("mixforge's Mixxx export was stopped".into()),
@@ -677,6 +679,9 @@ struct Export {
     session_files: crate::io::SourceFiles,
     /// What writes the set into Mixxx, when the engine has one.
     mixxx: Option<MixxxRunner>,
+    /// Whether it runs confined to automation roots: mixforge writes Mixxx's library and its own
+    /// outside them, so a confined export writes no Mixxx.
+    confined: bool,
     /// The ffmpeg stem files are made with.
     ffmpeg: String,
 }
@@ -747,6 +752,7 @@ pub fn export_job_in(e: &crate::Engine, p: &Value, root: Option<&Path>, analyse:
         items,
         session_files: crate::io::SourceFiles::of(s),
         mixxx: e.mixxx_runner().cloned(),
+        confined: crate::file_access::current().is_some(),
         ffmpeg: e.ffmpeg().map_or_else(stemfile::ffmpeg, |p| p.to_string_lossy().into_owned()),
     };
     Ok(spawn(export, analyse, out))
@@ -1055,6 +1061,7 @@ impl Export {
         };
         let mixxx = match &self.mixxx {
             _ if !self.request.mixxx => json!({"skipped": "not requested"}),
+            _ if self.confined => json!({"skipped": "Mixxx export isn't available to a confined automation session"}),
             None => json!({"skipped": "Mixxx export is not set up"}),
             Some(_) if mixxx_plan.is_empty() => json!({"skipped": "no track could go to Mixxx; see the tracks' doubts"}),
             // Checked under the stage's lock right before mixforge starts: it is never stopped
@@ -1443,11 +1450,27 @@ mod tests {
     }
 
     /// A folder of its own for one test's files.
-    fn folder(name: &str) -> std::path::PathBuf {
+    fn folder(name: &str) -> Folder {
         let dir = std::env::temp_dir().join(format!("sc-export-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Folder(dir)
+    }
+
+    /// A test's folder, removed when the test ends, failed or not.
+    pub(super) struct Folder(pub PathBuf);
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Folder {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
     }
 
     /// The pool holds each file from its first sample at the session rate, so a pool position over
@@ -1501,7 +1524,6 @@ mod tests {
         let trimmed = collect(e.session()).unwrap()[0].grid.clone();
         assert_eq!(trimmed.len(), grid.len());
         assert!(on_downbeats(&trimmed), "{trimmed:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The file a source was imported from is a path the session names, so it goes through
