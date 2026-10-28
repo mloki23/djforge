@@ -259,6 +259,8 @@ fn main() -> eframe::Result {
     }
     // Set exports write into Mixxx's library through mixforge; only the app's entry points set it.
     engine.set_mixxx_runner(soundcraft_engine::cmd::mixforge_mixxx_runner());
+    // Files loaded into Session view slots are gridded by mixforge's analysis.
+    engine.set_analyse(soundcraft_engine::cmd::prep_mixforge_analysis());
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

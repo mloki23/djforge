@@ -207,6 +207,8 @@ fn with_stems(mut e: Engine) -> Engine {
         Err(err) => eprintln!("note: no stem cache: {err}"),
     }
     e.set_mixxx_runner(soundcraft_engine::cmd::mixforge_mixxx_runner());
+    // Files loaded into Session view slots are gridded by mixforge's analysis.
+    e.set_analyse(soundcraft_engine::cmd::prep_mixforge_analysis());
     e
 }
 

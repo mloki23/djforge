@@ -16,6 +16,13 @@ const KNOWN_UNREACHED: &[&str] = &[
     "edit.paste_clip_gain",
     "event.midi_note",
     "file.bounce_stems",
+    // Session view UI comes in stage 6 Task 4.
+    "live.quantise",
+    "live.setup",
+    "live.slot_clear",
+    "live.slot_from_file",
+    "live.slot_from_selection",
+    "live.slot_set",
     "markers.next",
     "markers.previous",
     "mix.clear_mutes",

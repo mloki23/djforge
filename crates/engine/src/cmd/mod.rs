@@ -21,6 +21,7 @@ pub(crate) mod export;
 mod file;
 mod health;
 mod instrument;
+mod live;
 mod midi;
 mod mix;
 mod more_util;
@@ -153,6 +154,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(prep::specs());
         v.extend(export::specs());
         v.extend(stems::specs());
+        v.extend(live::specs());
         v
     })
 }

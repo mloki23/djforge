@@ -474,6 +474,25 @@ fn stamp_at_rate(stamp: u64, file_rate: u32, session_rate: u32) -> u64 {
 
 /// Decode and place an audio file. With no target track, a new track of matching width is made.
 pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>, target: Option<TrackId>, at: Samples) -> Result<Value> {
+    let (src, frames, channels) = import_source_bytes(e, name, bytes, path)?;
+    let s = e.session_mut();
+    let track = match target {
+        Some(t) => t,
+        None => {
+            let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).unwrap_or("Audio").to_string();
+            s.add_track(TrackKind::Audio, ChannelFormat::for_channels(channels), Some(&stem))
+        }
+    };
+    let cid = s.new_clip_id();
+    let stem = s.source(src).map(|x| x.name.clone()).unwrap_or_default();
+    crate::edit::place_clip(s, track, Clip::audio(cid, stem, src, 0, at, frames));
+    Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels}))
+}
+
+/// Decode an audio file into a new source, as [`import_audio_bytes`] does, without placing it:
+/// referenced in place when it plays as decoded, its origin and time stamp recorded. Returns the
+/// source, its length in frames at the session rate and its channel count.
+pub(crate) fn import_source_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>) -> Result<(SourceId, Samples, usize)> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (info, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
     let buf = at_rate(buf, e.session().sample_rate.hz(), MAX_IMPORT_SAMPLES)
@@ -520,17 +539,7 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
         }
     }
     let frames = s.source(src).map_or(0, |x| i64::try_from(x.frames).unwrap_or(0));
-    let track = match target {
-        Some(t) => t,
-        None => {
-            let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).unwrap_or("Audio").to_string();
-            s.add_track(TrackKind::Audio, ChannelFormat::for_channels(channels), Some(&stem))
-        }
-    };
-    let cid = s.new_clip_id();
-    let stem = s.source(src).map(|x| x.name.clone()).unwrap_or_default();
-    crate::edit::place_clip(s, track, Clip::audio(cid, stem, src, 0, at, frames));
-    Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels}))
+    Ok((src, frames, channels))
 }
 
 /// Loads an audio file's bytes into an instrument track's Sampler as one undo step ("Load
@@ -1563,6 +1572,18 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
         if c.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !s.pool.contains(*id))) {
             c.unsplit();
             missing.push(format!("{}: stems missing — the clip plays its own audio; split it again", c.name));
+        }
+    }
+    for ((c, r), slot) in s
+        .live
+        .columns
+        .iter_mut()
+        .enumerate()
+        .flat_map(|(i, c)| c.slots.iter_mut().enumerate().filter_map(move |(r, x)| x.as_mut().map(|x| ((i, r), x))))
+    {
+        if slot.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !s.pool.contains(*id))) {
+            slot.unsplit();
+            missing.push(format!("{} (Live {} slot {}): stems missing — the slot plays its own audio", slot.name, c + 1, r + 1));
         }
     }
     s.folder = Some(dir);

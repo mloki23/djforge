@@ -14,6 +14,8 @@ pub fn specs() -> Vec<CommandSpec> {
 
 /// The advice for any problem with a stem file.
 const AGAIN: &str = "Remove the stems (Remove Stems) and split the clip again.";
+/// The advice for any problem with a slot's stem file.
+const AGAIN_SLOT: &str = "Fill the slot again from a clip split again.";
 
 fn report(e: &mut Engine, _: &Value) -> Result<Value> {
     let s = e.session();
@@ -96,10 +98,51 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
             }
         }
     }
-    Ok(json!({"audio_clips": clips, "active_audio_end_samples": active_end,
+    // Session view slots read their source and stems the same way.
+    let mut slots = 0usize;
+    for (column, row, slot) in s.live.slots() {
+        slots += 1;
+        let track = s.live.columns.get(column).and_then(|c| s.track(c.track));
+        let stems = slot.stems.iter().flat_map(|set| STEMS.iter().zip(set.sources).map(|(name, id)| (Some(*name), id)));
+        for (stem, source) in std::iter::once((None, slot.source)).chain(stems) {
+            let metadata = sources.get(&source);
+            let mut add = |code: &str, own: &str, of_stem: &str| {
+                let message = if stem.is_some() { format!("{of_stem} {AGAIN_SLOT}") } else { own.to_string() };
+                issues.push(json!({"code": code, "message": message, "track": track.map(|t| t.name.as_str()), "track_id": track.map(|t| t.id.0),
+                    "active": true, "slot": {"column": column, "row": row, "name": slot.name}, "source_id": source.0, "stem": stem,
+                    "path": metadata.map(|m| m.path.as_str())}));
+            };
+            if metadata.is_none() {
+                add("missing_source", "Source metadata is missing. Load the file into the slot again.", "Stem file metadata is missing.");
+            }
+            let Some(audio) = s.pool.get(source) else {
+                add(
+                    "unavailable_audio",
+                    "Audio is not loaded; this slot will be silent. Restore the media and reopen the session, or load the file into the slot again.",
+                    "Stem audio is not loaded; this stem will be silent.",
+                );
+                continue;
+            };
+            if audio.buffer.sample_rate != s.sample_rate.hz() {
+                add(
+                    "sample_rate_mismatch",
+                    "Loaded audio differs from the session sample rate. Load the file into the slot again to convert it.",
+                    "Stem audio differs from the session sample rate.",
+                );
+            }
+            if audio.buffer.channels.is_empty() || audio.frames() == 0 {
+                add(
+                    "empty_audio",
+                    "Loaded audio has no playable frames. Load a valid audio file into the slot.",
+                    "Stem audio has no playable frames.",
+                );
+            }
+        }
+    }
+    Ok(json!({"audio_clips": clips, "slots": slots, "active_audio_end_samples": active_end,
         "active_audio_end_seconds": (s.sample_rate.hz() != 0).then(|| active_end as f64 / f64::from(s.sample_rate.hz())),
         "issue_count": issues.len(), "healthy": issues.is_empty(), "issues": issues,
-        "scope": "All playlists, the stems of split clips included; loaded audio availability and clip bounds only. Does not check files on disk, signal levels, plugins or routing."}))
+        "scope": "All playlists, the stems of split clips and the Session view's slots included; loaded audio availability and clip bounds only. Does not check files on disk, signal levels, plugins or routing."}))
 }
 
 #[cfg(test)]

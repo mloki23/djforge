@@ -2,8 +2,8 @@
 
 use crate::clip::{bound, bound_sequence};
 use crate::{
-    Bus, BusId, ChannelFormat, Clip, ClipId, DjState, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
-    TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
+    Bus, BusId, ChannelFormat, Clip, ClipId, DjState, Group, GroupId, LiveState, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId,
+    SourcePool, TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
 };
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
@@ -324,6 +324,9 @@ pub struct Session {
     /// DJ arrangement data: transitions between beat-locked tracks of an imported set.
     #[serde(default, skip_serializing_if = "DjState::is_empty")]
     pub dj: DjState,
+    /// The Session view's Live columns and their clip slots.
+    #[serde(default, skip_serializing_if = "LiveState::is_empty")]
+    pub live: LiveState,
     /// Original MIDI performances keyed by clip id (Event › MIDI Operations › Restore/Flatten
     /// Performance). Independent of undo so a restore survives later edits.
     #[serde(default)]
@@ -365,6 +368,7 @@ impl Session {
             next_id: 1,
             comments: String::new(),
             dj: DjState::default(),
+            live: LiveState::default(),
             midi_originals: std::collections::BTreeMap::new(),
             pool: SourcePool::default(),
             folder: None,
@@ -434,6 +438,21 @@ impl Session {
     /// Clips (any playlist) that play `src`, as their source or as one of their stems.
     pub fn clips_using(&self, src: SourceId) -> impl Iterator<Item = &Clip> {
         self.all_clips().filter(move |c| c.audio_sources().any(|x| x == src))
+    }
+
+    /// Session view slots that play `src`, as their source or as one of their stems, with their
+    /// column and row.
+    pub fn slots_using(&self, src: SourceId) -> impl Iterator<Item = (usize, usize, &crate::Slot)> {
+        self.live.slots().filter(move |(_, _, s)| s.audio_sources().any(|x| x == src))
+    }
+
+    /// Every audio source the timeline, the Session view's slots and the Samplers play (with
+    /// repeats).
+    pub fn used_sources(&self) -> impl Iterator<Item = SourceId> + '_ {
+        self.all_clips()
+            .flat_map(Clip::audio_sources)
+            .chain(self.live.slots().flat_map(|(_, _, s)| s.audio_sources()))
+            .chain(self.tracks.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)))
     }
 
     /// End of the last clip on any track (session length).
@@ -638,6 +657,8 @@ impl Session {
             self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))).collect();
         self.midi_originals.retain(|id, _| clip_ids.contains(id));
         self.dj.sanitize(&self.tracks);
+        let tracks: std::collections::BTreeSet<TrackId> = self.tracks.iter().map(|t| t.id).collect();
+        self.live.sanitize(|t| tracks.contains(&t), &self.sources);
         if !self.edit.zoom.samples_per_px.is_finite() || self.edit.zoom.samples_per_px <= 0.0 {
             self.edit.zoom.samples_per_px = 1024.0;
         }
@@ -857,5 +878,93 @@ mod tests {
         assert_eq!(lanes.iter().map(|l| l.param.clone()).collect::<Vec<_>>(), [crate::AutoParam::Stem(2)]);
         // Points written out of range are clamped to the fader's.
         assert_eq!(lanes[0].points.iter().map(|p| p.value).collect::<Vec<_>>(), [0.0, -144.0, 6.0, -144.0]);
+    }
+    /// A session with two Live columns: the first holds a beat-locked slot of source 7 split into
+    /// stems 11..14 (vocals only) in row 2; the second track's column holds nothing.
+    fn live_session() -> (Session, TrackId, TrackId) {
+        let (mut s, _, _) = split_session();
+        for id in [7, 11, 12, 13, 14] {
+            s.sources.push(crate::Source {
+                id: SourceId(id),
+                name: format!("s{id}"),
+                path: format!("/a/{id}.wav"),
+                channels: 2,
+                frames: 100,
+                sample_rate: 48_000,
+                format: soundcraft_audio_io::FileFormat::Wav,
+                time_reference: 0,
+                unsaved: false,
+                file_len: 0,
+                file_modified_ms: 0,
+                origin: None,
+                origin_len: 0,
+                origin_modified_ms: 0,
+            });
+        }
+        let a = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Live 1"));
+        let b = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Live 2"));
+        let mut slot = crate::Slot::one_shot("Drums", [10, 20, 30], SourceId(7));
+        slot.warp = crate::WarpMap::new(vec![0.0, 24_000.0, 48_000.0], 0.0);
+        slot.mode = crate::SlotMode::Loop;
+        (slot.start_beat, slot.length_beats, slot.gain_db) = (16.0, 16.0, -3.0);
+        slot.stems = Some(crate::StemSet { scale_log2: 2, key: "k".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
+        slot.stem_mask = [true, false, false, false];
+        let mut col = crate::LiveColumn::new(a);
+        col.slots[2] = Some(slot);
+        s.live.columns = vec![col, crate::LiveColumn::new(b)];
+        s.live.quantise = crate::Quantise::Bar(2);
+        s.sanitize();
+        (s, a, b)
+    }
+
+    #[test]
+    fn live_slots_round_trip_and_an_older_session_loads_without_any() {
+        let (s, _, _) = live_session();
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back.live, s.live);
+        assert_eq!(back, s);
+        // A session written before the Session view has no `live` key.
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("live");
+        assert_eq!(Session::from_json(&v.to_string()).unwrap().live, crate::LiveState::default());
+        // A session without live state writes none, and a malformed one loads without it.
+        assert!(serde_json::to_value(Session::default()).unwrap().get("live").is_none());
+        let mut v = serde_json::to_value(&s).unwrap();
+        v["live"] = serde_json::json!({"columns": "x", "quantise": {"Bar": 3}});
+        assert_eq!(Session::from_json(&v.to_string()).unwrap().live, crate::LiveState::default());
+    }
+
+    #[test]
+    fn loading_drops_columns_without_a_track_and_slots_without_a_source() {
+        let (mut s, a, b) = live_session();
+        s.tracks.retain(|t| t.id != b);
+        let mut stray = crate::Slot::one_shot("Gone", [0; 3], SourceId(99));
+        stray.length_beats = -4.0;
+        s.live.columns[0].slots[0] = Some(stray);
+        let mut lost_stem = s.live.columns[0].slots[2].clone();
+        if let Some(set) = lost_stem.as_mut().and_then(|x| x.stems.as_mut()) {
+            set.sources[3] = SourceId(98);
+        }
+        s.live.columns[0].slots[5] = lost_stem;
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back.live.columns.iter().map(|c| c.track).collect::<Vec<_>>(), [a]);
+        let col = &back.live.columns[0];
+        assert!(col.slots[0].is_none(), "its source is missing");
+        let kept = col.slots[5].as_ref().unwrap();
+        assert_eq!((&kept.stems, kept.stem_mask, kept.source), (&None, [true; 4], SourceId(7)), "a stem is missing: it plays its own audio");
+        assert!(col.slots[2].as_ref().unwrap().stems.is_some());
+    }
+
+    #[test]
+    fn slot_sources_and_their_stems_count_as_used() {
+        let (mut s, _, _) = live_session();
+        // Only the slot plays them now.
+        s.tracks.iter_mut().flat_map(|t| t.playlists.iter_mut()).for_each(|p| p.clips.clear());
+        for src in [7, 11, 12, 13, 14] {
+            assert_eq!(s.slots_using(SourceId(src)).map(|(c, r, _)| (c, r)).collect::<Vec<_>>(), [(0, 2)], "source {src}");
+            assert!(s.used_sources().any(|x| x == SourceId(src)), "source {src}");
+        }
+        assert_eq!(s.slots_using(SourceId(8)).count(), 0);
+        assert!(!s.used_sources().any(|x| x == SourceId(8)));
     }
 }

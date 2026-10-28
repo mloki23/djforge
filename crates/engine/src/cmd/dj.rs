@@ -238,6 +238,20 @@ pub(super) enum Beats {
     Constant { bpm: f64, first: f64 },
 }
 
+impl Beats {
+    /// The beat times (seconds) through a file of `frames` samples at `rate`.
+    pub(super) fn secs(self, frames: i64, rate: f64) -> Vec<f64> {
+        match self {
+            Beats::List(b) => b,
+            Beats::Constant { bpm, first } => {
+                let beat = 60.0 / bpm;
+                let n = ((frames as f64 / rate - first) / beat).ceil().max(1.0) as usize + 1;
+                (0..n.min(MAX_WARP_BEATS)).map(|i| first + i as f64 * beat).collect()
+            }
+        }
+    }
+}
+
 /// A beat-locked clip [`place_warped`] put on the timeline.
 pub(super) struct Placed {
     /// The track it is on (as the import reported it).
@@ -278,14 +292,7 @@ pub(super) fn place_warped(
     // Beat times in seconds of the source-pool audio (the import resampled the file to the
     // session rate). A failure from here on is rolled back by `Engine::execute`.
     let rate = sr.as_f64();
-    let secs: Vec<f64> = match source {
-        Beats::List(b) => b,
-        Beats::Constant { bpm, first } => {
-            let beat = 60.0 / bpm;
-            let n = ((frames as f64 / rate - first) / beat).ceil().max(1.0) as usize + 1;
-            (0..n.min(MAX_WARP_BEATS)).map(|i| first + i as f64 * beat).collect()
-        }
-    };
+    let secs = source.secs(frames, rate);
     let per_bar = i64::from(e.session().tempo.meter_at_tick(start_tick).numerator.max(1));
     let (warp, track_beats) = grid(&secs, rate, frames, per_bar, from_beat).ok_or_else(|| bad(cmd, BAD_BEATS))?;
     let anchor = warp.anchor;
@@ -452,7 +459,7 @@ fn parse_analysis(cmd: &str, out: &str) -> Result<Value> {
 }
 
 /// (bpm, first downbeat in seconds) of an analysis, when both are usable.
-fn grid_of(a: &Value) -> Option<(f64, f64)> {
+pub(super) fn grid_of(a: &Value) -> Option<(f64, f64)> {
     let bpm = a.get("bpm")?.as_f64().filter(|b| b.is_finite() && (20.0..=400.0).contains(b))?;
     let first = a.get("first_downbeat")?.as_f64().filter(|f| f.is_finite() && (0.0..=600.0).contains(f))?;
     Some((bpm, first))
@@ -466,7 +473,7 @@ const PRE_ROLL_SECS: f64 = 0.060;
 /// starts on a bar line and the first downbeat falls on the first bar line at or after the file
 /// start; `from_beat` overrides that. `None` unless the beats are finite, non-negative, strictly
 /// increasing and at least two.
-fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Option<f64>) -> Option<(WarpMap, f64)> {
+pub(super) fn grid(secs: &[f64], rate: f64, frames: i64, beats_per_bar: i64, from_beat: Option<f64>) -> Option<(WarpMap, f64)> {
     if secs.len() < 2 || secs.len() > MAX_WARP_BEATS || !(rate.is_finite() && rate > 0.0) {
         return None;
     }

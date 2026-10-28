@@ -14,7 +14,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Clear Clips",
         [],
         Some("Cmd+Shift+B"),
-        "{clips?: [id], sources?: [id], with_clips?: bool} — removes clips and audio files from the session (files stay on disk); default: the Clip List selection. A file still used on the timeline needs `with_clips: true`, which removes the clips that play it (and their stem files, when no other clip uses them); split clips that use it only as a stem stay and lose their stems. Returns {clips, sources, unsplit}",
+        "{clips?: [id], sources?: [id], with_clips?: bool} — removes clips and audio files from the session (files stay on disk); default: the Clip List selection. A file still used on the timeline needs `with_clips: true`, which removes the clips that play it (and their stem files, when no other clip or slot uses them); split clips that use it only as a stem stay and lose their stems. A file a Session view slot plays is refused until the slot is cleared. Returns {clips, sources, unsplit}",
         has_list_selection,
         clear
     )]
@@ -36,9 +36,12 @@ pub struct ClearEffect {
     pub removed: BTreeSet<ClipId>,
     /// Split clips that only use a cleared file as a stem: they stay and lose their stems.
     pub unsplit: BTreeSet<ClipId>,
-    /// Stem files of removed clips whose own file is cleared, once no other clip uses them: they
-    /// go too.
+    /// Stem files of removed clips whose own file is cleared, once no other clip, slot or Sampler
+    /// uses them: they go too.
     pub stem_files: BTreeSet<SourceId>,
+    /// Session view slots (column, row) that play a cleared file, as their source or a stem: the
+    /// clear is refused while there are any.
+    pub slots: BTreeSet<(usize, usize)>,
 }
 
 impl ClearEffect {
@@ -58,20 +61,22 @@ pub fn clear_effect(s: &Session, clips: &BTreeSet<ClipId>, sources: &BTreeSet<So
     let unsplit: BTreeSet<ClipId> =
         s.all_clips().filter(|c| !removed.contains(&c.id) && c.audio_sources().skip(1).any(|f| sources.contains(&f))).map(|c| c.id).collect();
     // What the clips left on the timeline still play (unsplit clips keep only their own file),
-    // and the Samplers' samples.
+    // the Session view's slots and the Samplers' samples.
     let used: BTreeSet<SourceId> = s
         .all_clips()
         .filter(|c| !removed.contains(&c.id))
         .flat_map(|c| c.audio_sources().take(if unsplit.contains(&c.id) { 1 } else { usize::MAX }))
+        .chain(s.live.slots().flat_map(|(_, _, slot)| slot.audio_sources()))
         .chain(s.tracks.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)))
         .collect();
+    let slots = s.live.slots().filter(|(_, _, slot)| slot.audio_sources().any(|f| sources.contains(&f))).map(|(c, r, _)| (c, r)).collect();
     let stem_files = s
         .all_clips()
         .filter(|c| removed.contains(&c.id) && own_cleared(c))
         .flat_map(|c| c.audio_sources().skip(1))
         .filter(|f| !sources.contains(f) && !used.contains(f) && s.source(*f).is_some())
         .collect();
-    ClearEffect { removed, unsplit, stem_files }
+    ClearEffect { removed, unsplit, stem_files, slots }
 }
 
 fn plural(n: usize, what: &str) -> String {
@@ -93,6 +98,20 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
         return Err(bad(CLEAR, "nothing to clear: pass `clips` or `sources`, or select them in the Clip List"));
     }
     let effect = clear_effect(s, &clips, &sources);
+    // A slot is never emptied behind the player's back: it is cleared on its own first.
+    if let Some(f) = files.iter().find(|f| s.slots_using(f.id).next().is_some()) {
+        let at: Vec<String> = s.slots_using(f.id).map(|(c, r, _)| format!("Live {} slot {}", c + 1, r + 1)).collect();
+        return Err(bad(
+            CLEAR,
+            format!(
+                "`{}` is played by {} in the Session view ({}): clear {} first (live.slot_clear)",
+                f.name,
+                plural(at.len(), "slot"),
+                at.join(", "),
+                if at.len() == 1 { "it" } else { "them" }
+            ),
+        ));
+    }
     if !bool_or(p, "with_clips", false)
         && let Some((f, (removed, unsplit))) = files.iter().map(|f| (f, effect.of_file(s, &clips, f.id))).find(|(_, (r, u))| r + u > 0)
     {

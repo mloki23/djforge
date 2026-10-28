@@ -857,12 +857,8 @@ fn unsplit_stems(e: &mut Engine, p: &Value) -> crate::Result<Value> {
             kept.push(c.id.0);
         }
     }
-    // The stem files go when no clip or Sampler plays them any more.
-    let used: Vec<SourceId> = s
-        .all_clips()
-        .flat_map(soundcraft_model::Clip::audio_sources)
-        .chain(s.tracks.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)))
-        .collect();
+    // The stem files go when no clip, Session view slot or Sampler plays them any more.
+    let used: Vec<SourceId> = s.used_sources().collect();
     let gone: Vec<SourceId> = set.sources.iter().copied().filter(|id| !used.contains(id)).collect();
     s.sources.retain(|x| !gone.contains(&x.id));
     for id in &gone {
@@ -905,6 +901,7 @@ fn cache_users(s: &Session) -> Option<String> {
     let count = |n: usize, what: &str| if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") };
     let split = s.all_clips().filter(|c| c.stems.as_ref().is_some_and(|set| set.sources.iter().any(|x| cached.contains(x)))).count();
     let playing = s.all_clips().filter(|c| c.source().is_some_and(|x| cached.contains(&x))).count();
+    let slots = s.live.slots().filter(|(_, _, slot)| slot.audio_sources().any(|x| cached.contains(&x))).count();
     let samplers: Vec<&str> = s
         .tracks
         .iter()
@@ -917,6 +914,9 @@ fn cache_users(s: &Session) -> Option<String> {
     }
     if playing > 0 {
         why.push(format!("{} playing a stem file — remove them first", count(playing, "clip")));
+    }
+    if slots > 0 {
+        why.push(format!("{} in the Session view playing stems — clear them first", count(slots, "slot")));
     }
     for t in &samplers {
         why.push(format!("the Sampler on `{t}` plays a stem file — change the Sampler's sample"));
@@ -1130,8 +1130,11 @@ fn file_of(s: &Session, id: SourceId) -> Option<PathBuf> {
 fn stem_source(s: &Session, path: &Path, rate: u32, frames: u64, channels: usize, scale_log2: u8) -> Option<SourceId> {
     let want = path_key(path);
     // Played at another level by a split clip: not the same stems.
-    let other_scale =
-        |id: SourceId| s.all_clips().any(|c| c.stems.as_ref().is_some_and(|set| set.sources.contains(&id) && set.scale_log2 != scale_log2));
+    let other_scale = |id: SourceId| {
+        let other =
+            |set: &Option<soundcraft_model::StemSet>| set.as_ref().is_some_and(|set| set.sources.contains(&id) && set.scale_log2 != scale_log2);
+        s.all_clips().any(|c| other(&c.stems)) || s.live.slots().any(|(_, _, slot)| other(&slot.stems))
+    };
     s.sources.iter().filter(|x| !other_scale(x.id)).find_map(|x| {
         let audio = s.pool.get(x.id)?;
         let fits = audio.buffer.sample_rate == rate && audio.buffer.frames() as u64 == frames && audio.buffer.num_channels() == channels;

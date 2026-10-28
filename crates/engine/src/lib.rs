@@ -147,6 +147,9 @@ pub struct Engine {
     mixxx: Option<cmd::MixxxRunner>,
     /// The ffmpeg `dj.export_set` makes stem files with: `None` for `DJFORGE_FFMPEG` or the PATH's.
     ffmpeg: Option<std::path::PathBuf>,
+    /// What analyses a file loaded into a Session view slot: none until the app sets it up
+    /// ([`Engine::set_analyse`]), so no test runs mixforge's sidecar.
+    analyse: Option<cmd::PrepAnalyse>,
 }
 
 impl Default for Engine {
@@ -182,6 +185,7 @@ impl Engine {
             stems: None,
             mixxx: None,
             ffmpeg: None,
+            analyse: None,
         }
     }
 
@@ -197,6 +201,17 @@ impl Engine {
     /// points call this, with [`cmd::mixforge_mixxx_runner`]; tests give a fake.
     pub fn set_mixxx_runner(&mut self, runner: cmd::MixxxRunner) {
         self.mixxx = Some(runner);
+    }
+
+    /// `live.slot_from_file` grids files through `analyse`. Only the app's entry points call this,
+    /// with [`cmd::prep_mixforge_analysis`]; tests give a fake.
+    pub fn set_analyse(&mut self, analyse: cmd::PrepAnalyse) {
+        self.analyse = Some(analyse);
+    }
+
+    /// What analyses files for this engine, if set up.
+    pub fn analyse(&self) -> Option<&cmd::PrepAnalyse> {
+        self.analyse.as_ref()
     }
 
     /// `dj.export_set` makes stem files with the ffmpeg at `path` instead of `DJFORGE_FFMPEG` or

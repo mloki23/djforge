@@ -10,6 +10,7 @@ pub mod b64;
 mod clip;
 mod dj;
 mod ids;
+mod live;
 mod markers;
 mod mixer;
 mod session;
@@ -24,6 +25,7 @@ pub use dj::{
     NudgeSuggestion, OwnedSpan, Transition, TransitionStyle,
 };
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
+pub use live::{LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, LiveState, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, Slot, SlotMode};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use mixer::{
     Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
