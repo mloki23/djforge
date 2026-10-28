@@ -14,7 +14,7 @@ use std::path::Path;
 pub const SAMPLER: &str = "sampler";
 
 /// File extensions a sample can come from (what the audio decoder reads).
-const AUDIO_EXTS: &[&str] = &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf"];
+pub(crate) const AUDIO_EXTS: &[&str] = &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf"];
 
 /// Markers on the sample strip: the parameter each one sets, and whether it needs a loop.
 const MARKERS: [(&str, bool); 3] = [("start", false), ("loop_start", true), ("loop_end", true)];
@@ -87,6 +87,11 @@ impl SoundApp {
     /// for the shell to read. Everything else is returned for the shell to open or import.
     pub fn take_dropped_files(&mut self, ctx: &egui::Context) -> Vec<egui::DroppedFileHandle> {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        if files.is_empty() {
+            return files;
+        }
+        // A file dropped on a Session view slot loads into it.
+        let files = crate::session_view::take_drop(self, files, pos);
         if files.is_empty() {
             return files;
         }

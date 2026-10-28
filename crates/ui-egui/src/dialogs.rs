@@ -289,6 +289,18 @@ fn clear_message(s: &Session, clips: &[ClipId], sources: &[SourceId]) -> Option<
         [(name, _)] => text += &format!(" \"{name}\" is used by {users}"),
         many => text += &format!(" {} of the files are used by {users}", many.len()),
     }
+    // A file a Session view slot plays can't be cleared until the slot is.
+    if !effect.slots.is_empty() {
+        let at: Vec<String> = effect.slots.iter().map(|(c, r)| format!("Live {} slot {}", c + 1, r + 1)).collect();
+        let one = at.len() == 1;
+        text += &format!(
+            " {} in the Session view ({}) {} it, so it can't be cleared: clear {} first (right-click › Clear).",
+            count(at.len(), "slot"),
+            at.join(", "),
+            if one { "plays" } else { "play" },
+            if one { "that slot" } else { "those slots" }
+        );
+    }
     if !files.is_empty() && files.iter().all(|f| !f.unsaved) {
         text += if files.len() == 1 { " The file stays on disk." } else { " The files stay on disk." };
     }

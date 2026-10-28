@@ -72,6 +72,10 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd and Ctrl are separate keys only on macOS (asked at runtime so the web build in a Mac browser agrees).
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;
     for (key, mods) in events {
+        // The Session window's keys, while it has focus.
+        if crate::session_view::key(app, key, mods) {
+            continue;
+        }
         if fixed(app, key, mods, mac) {
             continue;
         }

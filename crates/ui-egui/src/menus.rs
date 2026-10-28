@@ -48,6 +48,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.config_update", "Update Active Configuration", "Window > Configurations > Update Active Configuration", None),
     ("window.config_auto_update", "Auto-Update Active Configuration", "Window > Configurations > Auto-Update Active Configuration", None),
     ("window.renderer", "Renderer", "Window > Renderer", None),
+    ("window.session", "Session", "", None),
     ("window.ui_customization", "UI Customization", "Window > UI Customization", None),
     ("window.arrange_tile", "Tile", "Window > Arrange > Tile", None),
     ("window.arrange_tile_h", "Tile Horizontal", "Window > Arrange > Tile Horizontal", None),
@@ -431,6 +432,7 @@ fn params_for(path: &str, id: &str) -> Value {
 
 /// Menu items that open a SoundCraft window when clicked (programmatic calls still run the command).
 const MENU_WINDOWS: &[(&str, &str)] = &[
+    ("View > Session", "window.session"),
     ("Setup > Appearance", "window.ui_customization"),
     ("Setup > Hardware...", "window.playback_engine"),
     ("Setup > Playback Engine...", "window.playback_engine"),
@@ -511,6 +513,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     }
     if let Some(v) = crate::extra_windows::run(app, id, p) {
         return Some(Ok(v));
+    }
+    if id == "window.session" {
+        return Some(crate::session_view::command(app, p));
     }
     if id == "ui.audio_device" {
         return Some(crate::windows::audio_device_command(app, p));

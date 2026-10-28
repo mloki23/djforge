@@ -26,6 +26,7 @@ mod recent;
 pub mod recovery;
 pub mod sampler_window;
 pub mod score_editor;
+pub mod session_view;
 pub mod shortcuts;
 pub mod spot;
 pub mod stems;
@@ -347,6 +348,8 @@ pub struct SoundApp {
     pub synthetic: Vec<egui::Event>,
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
+    /// View › Session: the Live columns' clip slots.
+    pub session_view: session_view::SessionView,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -454,6 +457,7 @@ impl SoundApp {
             focus_mix: false,
             synthetic: Vec::new(),
             sample_drop_targets: Vec::new(),
+            session_view: session_view::SessionView::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
@@ -1345,6 +1349,7 @@ impl SoundApp {
         }
         shortcuts::handle(self, &ctx);
         self.sample_drop_targets.clear();
+        self.session_view.drop_targets.clear();
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
         }
@@ -1361,6 +1366,7 @@ impl SoundApp {
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);
+        session_view::show(self, &ctx);
         recovery::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
