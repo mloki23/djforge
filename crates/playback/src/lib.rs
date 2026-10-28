@@ -30,12 +30,13 @@ pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{
-    LiveCmd, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold, main_channels,
+    ColumnPlay, LiveCmd, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold,
+    main_channels,
 };
-use soundcraft_model::{Session, SourceId, TrackId};
+use soundcraft_model::{MAX_LIVE_COLUMNS, Session, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -92,6 +93,82 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     meters: Mutex<MeterSnapshot>,
+    /// What each Live column plays and has queued, published by the audio thread.
+    live: LiveShared,
+}
+
+/// What a Live column plays and has queued, as [`Player::live_state`] reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveColumnState {
+    /// The row playing and the sample it started at.
+    pub playing: Option<(usize, Samples)>,
+    /// A launch (`Some(row)`) or stop (`None`) waiting for its sample.
+    pub queued: Option<(Option<usize>, Samples)>,
+}
+
+impl LiveColumnState {
+    fn of(c: &ColumnPlay) -> LiveColumnState {
+        LiveColumnState { playing: c.playing.map(|p| (p.slot, p.start)), queued: c.queued.map(|q| (q.slot, q.at)) }
+    }
+}
+
+/// [`LiveColumnState`]s shared lock-free by the audio thread: a sequence counter (odd while it
+/// writes) around four words per column (playing row or -1, its start, queued row or -1 for a
+/// stop or -2 for none, its sample).
+struct LiveShared {
+    seq: AtomicU64,
+    words: [[AtomicI64; 4]; MAX_LIVE_COLUMNS],
+}
+
+impl Default for LiveShared {
+    fn default() -> Self {
+        LiveShared { seq: AtomicU64::new(0), words: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI64::new(-2))) }
+    }
+}
+
+impl LiveShared {
+    /// Publishes `state` (audio thread: no allocation, no lock).
+    fn publish(&self, state: &[ColumnPlay]) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        for (w, c) in self.words.iter().zip(state.iter().map(LiveColumnState::of).chain(std::iter::repeat(LiveColumnState::default()))) {
+            let row = |r: usize| i64::try_from(r).unwrap_or(-1);
+            let (p, start) = c.playing.map_or((-1, 0), |(r, at)| (row(r), at));
+            let (q, at) = match c.queued {
+                None => (-2, 0),
+                Some((None, at)) => (-1, at),
+                Some((Some(r), at)) => (row(r), at),
+            };
+            for (a, v) in w.iter().zip([p, start, q, at]) {
+                a.store(v, Ordering::Relaxed);
+            }
+        }
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// The last state published (a few retries when a write is under way; then what was read).
+    fn read(&self) -> [LiveColumnState; MAX_LIVE_COLUMNS] {
+        let mut out = [LiveColumnState::default(); MAX_LIVE_COLUMNS];
+        for _ in 0..64 {
+            let before = self.seq.load(Ordering::Acquire);
+            for (o, w) in out.iter_mut().zip(&self.words) {
+                let [p, start, q, at] = [0, 1, 2, 3].map(|i| w.get(i).map_or(-2, |a| a.load(Ordering::Relaxed)));
+                let row = |r: i64| usize::try_from(r).ok();
+                *o = LiveColumnState {
+                    playing: row(p).map(|r| (r, start)),
+                    queued: match q {
+                        -2 => None,
+                        -1 => Some((None, at)),
+                        r => Some((row(r), at)),
+                    },
+                };
+            }
+            if before.is_multiple_of(2) && self.seq.load(Ordering::Acquire) == before {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        out
+    }
 }
 
 /// What stopped the audio output.
@@ -185,6 +262,8 @@ struct AudioState {
     old_sessions: Option<SyncSender<Arc<Session>>>,
     /// A spent warp room the full `rooms` channel refused, sent again on the next callback.
     room_backlog: Option<WarpRoom>,
+    /// The Live state last published to [`Shared::live`].
+    live_seen: [ColumnPlay; MAX_LIVE_COLUMNS],
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -281,6 +360,7 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
+            live_seen: [ColumnPlay::default(); MAX_LIVE_COLUMNS],
         }
     }
 
@@ -489,6 +569,17 @@ impl AudioState {
 
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
+        self.fill_block(out, channels);
+        // What the Live columns play, for the UI: published only when it changed.
+        if self.mix.live_state() != self.live_seen.as_slice() {
+            for (seen, c) in self.live_seen.iter_mut().zip(self.mix.live_state()) {
+                *seen = *c;
+            }
+            self.shared.live.publish(&self.live_seen);
+        }
+    }
+
+    fn fill_block(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
@@ -713,6 +804,7 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -781,6 +873,24 @@ impl Player {
                 Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
             }
         }
+    }
+
+    /// A player on the silent clock, without opening any audio device (headless runs, tests).
+    pub fn silent(session: Arc<Session>) -> Player {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
+        });
+        let side_rate = session.sample_rate.as_f64() as f32;
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let p = Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), Mutex::new(Side::new(side_rate, grx)), gtx);
+        p.side().return_old_sessions(&p.tx);
+        p.update_session(session);
+        p
     }
 
     fn silent_clock(shared: Arc<Shared>, tx: Sender<Cmd>, rx: Receiver<Cmd>, rate: u32, side: Mutex<Side>, gtx: Bin) -> Player {
@@ -940,6 +1050,12 @@ impl Player {
     /// whose player has not arrived plays silence.
     pub fn live(&self, cmd: LiveCmd) {
         let _ = self.tx.send(Cmd::Live(cmd));
+    }
+
+    /// What each Live column plays and has queued, as the audio thread last published it (all
+    /// idle until it has run).
+    pub fn live_state(&self) -> [LiveColumnState; MAX_LIVE_COLUMNS] {
+        self.shared.live.read()
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
@@ -1310,6 +1426,7 @@ mod tests {
             playing: AtomicBool::new(true),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1351,6 +1468,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -1369,6 +1487,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -1394,6 +1513,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, bin().0);
@@ -1427,6 +1547,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1478,6 +1599,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1523,6 +1645,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, bin().0);
@@ -1576,6 +1699,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1635,6 +1759,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1772,6 +1897,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         (tx, AudioState::new(rx, shared, Arc::new(Session::default()), 48_000.0, gtx))
@@ -1886,6 +2012,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, bin().0);
@@ -1975,6 +2102,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -2004,6 +2132,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -2039,6 +2168,7 @@ mod tests {
                 playing: AtomicBool::new(false),
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
+                live: LiveShared::default(),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
@@ -2069,6 +2199,7 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
@@ -2082,5 +2213,26 @@ mod tests {
         st.fill(&mut out, 2);
         assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
         assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod live_state_tests {
+    use super::*;
+
+    #[test]
+    fn live_state_reads_back_what_the_audio_thread_published() {
+        let shared = LiveShared::default();
+        assert_eq!(shared.read(), [LiveColumnState::default(); MAX_LIVE_COLUMNS], "idle before anything is published");
+        // Column 0 is queued to stop at 4800; column 2 waits to launch row 7 at 9600.
+        let mut mix = new_engine(48_000.0);
+        mix.live(LiveCmd::Launch { column: 2, slot: 7, at: 9_600 });
+        mix.live(LiveCmd::Stop { column: 0, at: 4_800 });
+        shared.publish(mix.live_state());
+        let read = shared.read();
+        assert_eq!(read[0], LiveColumnState { playing: None, queued: Some((None, 4_800)) });
+        assert_eq!(read[2], LiveColumnState { playing: None, queued: Some((Some(7), 9_600)) });
+        assert!(read.iter().enumerate().all(|(c, s)| c == 0 || c == 2 || *s == LiveColumnState::default()));
     }
 }

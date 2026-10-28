@@ -68,6 +68,27 @@ pub enum TransportRequest {
     HalfSpeed,
     Scrub(Samples),
     AllNotesOff,
+    /// A Session view launch or stop, for the host to place on the next quantise boundary.
+    Live(LiveRequest),
+}
+
+/// A Session view launch or stop (see `live.launch`). The host turns it into the audio engine's
+/// commands at the boundary [`cmd::live_next_boundary`] gives, with [`cmd::live_cmds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum LiveRequest {
+    Launch { column: usize, slot: usize },
+    Stop { column: usize },
+    StopAll,
+    Scene { row: usize },
+}
+
+/// What a Live column plays and has queued, as the host's audio engine last reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct LiveStatus {
+    /// The row playing and the sample it started at.
+    pub playing: Option<(usize, Samples)>,
+    /// A launch (`Some(row)`) or stop (`None`) waiting for its sample.
+    pub queued: Option<(Option<usize>, Samples)>,
 }
 
 /// Snapshot of the transport reported back by the host (playback position etc.).
@@ -119,6 +140,11 @@ pub struct Engine {
     pub clipboard: Clipboard,
     pub transport_requests: Vec<TransportRequest>,
     pub transport: TransportStatus,
+    /// True while the host has an audio engine that carries out Session view launches (the app
+    /// sets it; headless sessions have none, and launches are refused).
+    pub live_audio: bool,
+    /// What each Live column plays, as the host's audio engine last reported it.
+    pub live_status: [LiveStatus; soundcraft_model::MAX_LIVE_COLUMNS],
     /// Command journal (id, params) for macro recording / agents.
     pub journal: Vec<(String, Value)>,
     /// Path of the session file, if saved.
@@ -173,6 +199,8 @@ impl Engine {
             clipboard: Clipboard::default(),
             transport_requests: Vec::new(),
             transport: TransportStatus::default(),
+            live_audio: false,
+            live_status: Default::default(),
             journal: Vec::new(),
             path: None,
             revision: 1,
@@ -261,6 +289,7 @@ impl Engine {
         // Recorded as part of what was loaded, so the document starts clean.
         cmd::dj::record_locks(&mut s);
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
+        self.live_status = Default::default();
         self.transport_requests.clear();
         self.transport_requests.push(TransportRequest::ResetSession);
         self.doc = Arc::new(s);

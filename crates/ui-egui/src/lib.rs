@@ -14,6 +14,7 @@ pub mod export;
 pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
+mod live_transport;
 pub mod menus;
 pub mod midi_editor;
 pub mod mix_window;
@@ -414,7 +415,9 @@ fn automation_step_due(pos: Samples, last: Samples, step: Samples) -> bool {
 }
 
 impl SoundApp {
-    pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
+    pub fn new(mut engine: Engine, player: Option<Player>, services: Services) -> Self {
+        // Session view launches run through the player's audio engine.
+        engine.live_audio = player.is_some();
         SoundApp {
             recent_seen: engine.path.clone(),
             recent_changed: false,
@@ -1095,7 +1098,11 @@ impl SoundApp {
         }
     }
 
-    fn handle_transport(&mut self, dt: f32) {
+    /// Carries out the engine's transport requests and reads the player's state back (once a
+    /// frame; `dt` is the frame time).
+    pub fn handle_transport(&mut self, dt: f32) {
+        // Whether Session view launches can run, before any command of this frame needs it.
+        self.engine.live_audio = self.player.is_some();
         let reqs: Vec<TransportRequest> = std::mem::take(&mut self.engine.transport_requests);
         for r in reqs {
             match r {
@@ -1166,8 +1173,10 @@ impl SoundApp {
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {}
+                TransportRequest::Live(req) => self.live_request(req),
             }
         }
+        self.sync_live_status();
         // Read back the position.
         if let Some(p) = &self.player {
             let playing = p.is_playing();

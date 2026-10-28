@@ -3,7 +3,7 @@
 
 use super::dj::{Beats, grid, grid_of};
 use super::*;
-use crate::cmd;
+use crate::{TransportRequest, cmd};
 use serde_json::json;
 use soundcraft_model::{
     ChannelFormat, LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, Session, Slot, SlotMode, TrackKind,
@@ -74,6 +74,35 @@ pub fn specs() -> Vec<CommandSpec> {
             "{value: none | 1/4 | 1/2 | 1 | 2 | 4 | 8 (bars)} — where launches in the Session view wait for: at once, the next quarter or half note, or the next bar line of every 1, 2, 4 or 8 bars",
             always,
             quantise
+        ),
+        cmd!(
+            noundo "live.launch",
+            "Launch Slot",
+            [],
+            None,
+            "{column, slot (0-based)} — launches a filled slot at the next launch-quantise boundary (at least 50 ms ahead), stopping what its column plays there; with the transport stopped it starts playback from the edit insertion and launches on the first boundary from there. Needs the app's audio engine (refused headless) and 4/4 throughout",
+            has_live,
+            launch
+        ),
+        cmd!(noundo "live.stop", "Stop Column", [], None, "{column (0-based)} — stops the column at the next launch-quantise boundary", has_live, stop),
+        cmd!(noundo "live.stop_all", "Stop All Slots", [], None, "{} — stops every column at the next launch-quantise boundary", has_live, stop_all),
+        cmd!(
+            noundo "live.scene",
+            "Launch Scene",
+            [],
+            None,
+            "{row (0-based)} — launches row `row` of every column that has a slot there, together on the next boundary; columns without one keep playing",
+            has_live,
+            scene
+        ),
+        cmd!(
+            query "live.state",
+            "Session View State",
+            [],
+            None,
+            "{} — per column: its track, the slot playing (with where it is in its loop, in beats) and the launch or stop queued, as the audio engine last reported; plus the transport and the launch quantise",
+            always,
+            state
         ),
     ]
 }
@@ -153,20 +182,21 @@ fn target(e: &Engine, cmd: &str, p: &Value, column: usize) -> Result<usize> {
 /// throughout (as for set exports): see [`four_four`].
 const BAR: f64 = 4.0;
 
+/// Why slot bars would not be bars in `s`: a meter other than 4/4 somewhere.
+fn not_four_four(s: &Session) -> Option<String> {
+    s.tempo.meters().iter().find(|m| (m.numerator, m.denominator) != (4, 4)).map(|m| {
+        format!(
+            "bar {} is in {}/{}: Session view slots need 4/4 throughout; set the meter to 4/4 first",
+            s.tempo.bar_beat_at_tick(m.tick).bar,
+            m.numerator,
+            m.denominator
+        )
+    })
+}
+
 /// Refuses a session whose meter is not 4/4 throughout, where slot bars would not be bars.
 fn four_four(cmd: &str, s: &Session) -> Result<()> {
-    match s.tempo.meters().iter().find(|m| (m.numerator, m.denominator) != (4, 4)) {
-        Some(m) => Err(bad(
-            cmd,
-            format!(
-                "bar {} is in {}/{}: Session view slots need 4/4 throughout; set the meter to 4/4 first",
-                s.tempo.bar_beat_at_tick(m.tick).bar,
-                m.numerator,
-                m.denominator
-            ),
-        )),
-        None => Ok(()),
-    }
+    not_four_four(s).map_or(Ok(()), |why| Err(bad(cmd, why)))
 }
 
 /// The first bar line at or after track beat `beat` (allowing for rounding).
@@ -413,4 +443,152 @@ fn quantise(e: &mut Engine, p: &Value) -> Result<Value> {
         e.session_mut().live.quantise = q;
     }
     Ok(json!({"quantise": q.id()}))
+}
+
+// ---- launching -----------------------------------------------------------------------------
+
+const LAUNCH: &str = "live.launch";
+const STOP: &str = "live.stop";
+const STOP_ALL: &str = "live.stop_all";
+const SCENE: &str = "live.scene";
+
+/// The least time a launch is sent ahead of the boundary it waits for, in seconds.
+pub const LAUNCH_MARGIN_S: f64 = 0.050;
+
+/// How far ahead of the playhead a launch must land: at least [`LAUNCH_MARGIN_S`] and one audio
+/// block of `block` samples, so the audio thread has it before its sample comes.
+pub fn launch_margin(s: &Session, block: usize) -> Samples {
+    s.sample_rate.samples(LAUNCH_MARGIN_S).max(i64::try_from(block).unwrap_or(i64::MAX))
+}
+
+/// The first launch boundary of `quantise` at or after `playhead + margin`: that sample itself
+/// for [`Quantise::None`], else the first quarter note, half note or line of every `n` bars
+/// (counted from bar 1) there or later, on the session tempo map (ramps included). Bars are four
+/// beats, so a session not in 4/4 throughout is refused, as the slot commands refuse it.
+pub fn next_boundary(s: &Session, playhead: Samples, quantise: Quantise, margin: Samples) -> std::result::Result<Samples, String> {
+    if let Some(why) = not_four_four(s) {
+        return Err(why);
+    }
+    let t0 = playhead.saturating_add(margin.max(0));
+    let beats: i64 = match quantise.normalised() {
+        Quantise::None => return Ok(t0),
+        Quantise::Quarter => 1,
+        Quantise::Half => 2,
+        Quantise::Bar(n) => 4 * i64::from(n),
+    };
+    let grid = beats.saturating_mul(soundcraft_time::TICKS_PER_QUARTER).max(1);
+    let tick0 = s.tempo.samples_to_ticks_f(t0, s.sample_rate);
+    if !tick0.is_finite() {
+        return Err("the playhead is outside the session".into());
+    }
+    let mut k = ((tick0 / grid as f64) - 1e-9).ceil() as i64;
+    // The boundary's tick becomes its nearest sample, which may fall just before `t0`.
+    for _ in 0..3 {
+        let at = s.tempo.tick_to_samples(k.saturating_mul(grid), s.sample_rate);
+        if at >= t0 {
+            return Ok(at);
+        }
+        k = k.saturating_add(1);
+    }
+    Ok(s.tempo.tick_to_samples(k.saturating_mul(grid), s.sample_rate))
+}
+
+/// The audio engine's commands for `req` at sample `at`. A scene launches its row in every
+/// column that plays into a track and has a slot there (none, when no column has one).
+pub fn live_cmds(s: &Session, req: &crate::LiveRequest, at: Samples) -> Vec<soundcraft_mix::LiveCmd> {
+    use crate::LiveRequest as R;
+    use soundcraft_mix::LiveCmd as C;
+    match *req {
+        R::Launch { column, slot } => vec![C::Launch { column, slot, at }],
+        R::Stop { column } => vec![C::Stop { column, at }],
+        R::StopAll => vec![C::StopAll { at }],
+        R::Scene { row } => (0..s.live.columns.len())
+            .filter(|&c| s.live.slot(c, row).is_some() && s.live.column_track(c, &s.tracks).is_some())
+            .map(|column| C::Launch { column, slot: row, at })
+            .collect(),
+    }
+}
+
+/// Refuses a launch or stop the host can't carry out: no audio engine, or bars that aren't bars.
+fn can_launch(e: &Engine, cmd: &str) -> Result<()> {
+    if !e.live_audio {
+        return Err(bad(
+            cmd,
+            "Session view launches need the app's audio engine: run this in SoundCraft (or `soundcraft --control` and `soundcraft-cli mcp --connect`)",
+        ));
+    }
+    four_four(cmd, e.session())
+}
+
+/// The column `p` names, which must play into a track.
+fn playing_column(e: &Engine, cmd: &str, p: &Value) -> Result<usize> {
+    let column = column_param(e, cmd, p)?;
+    let s = e.session();
+    if s.live.column_track(column, &s.tracks).is_none() {
+        return Err(bad(cmd, format!("Live column {} has lost its track: open View › Session (live.setup) to give it a new one", column + 1)));
+    }
+    Ok(column)
+}
+
+fn queue(e: &mut Engine, req: crate::LiveRequest) -> Value {
+    e.transport_requests.push(TransportRequest::Live(req));
+    json!({"request": req, "quantise": e.session().live.quantise.id(), "starts_transport": !e.transport.playing})
+}
+
+fn launch(e: &mut Engine, p: &Value) -> Result<Value> {
+    let column = playing_column(e, LAUNCH, p)?;
+    let row = slot_param(LAUNCH, p)?.ok_or_else(|| bad(LAUNCH, "`slot` required (0-based)"))?;
+    if e.session().live.slot(column, row).is_none() {
+        return Err(bad(LAUNCH, format!("slot {} of Live column {} is empty", row + 1, column + 1)));
+    }
+    can_launch(e, LAUNCH)?;
+    Ok(queue(e, crate::LiveRequest::Launch { column, slot: row }))
+}
+
+fn stop(e: &mut Engine, p: &Value) -> Result<Value> {
+    let column = column_param(e, STOP, p)?;
+    can_launch(e, STOP)?;
+    Ok(queue(e, crate::LiveRequest::Stop { column }))
+}
+
+fn stop_all(e: &mut Engine, _: &Value) -> Result<Value> {
+    can_launch(e, STOP_ALL)?;
+    Ok(queue(e, crate::LiveRequest::StopAll))
+}
+
+fn scene(e: &mut Engine, p: &Value) -> Result<Value> {
+    let row = p
+        .get("row")
+        .and_then(Value::as_u64)
+        .and_then(|r| usize::try_from(r).ok())
+        .filter(|r| *r < LIVE_SLOTS)
+        .ok_or_else(|| bad(SCENE, format!("`row` must be 0..{LIVE_SLOTS}")))?;
+    if live_cmds(e.session(), &crate::LiveRequest::Scene { row }, 0).is_empty() {
+        return Err(bad(SCENE, format!("no Live column has a slot in row {}", row + 1)));
+    }
+    can_launch(e, SCENE)?;
+    Ok(queue(e, crate::LiveRequest::Scene { row }))
+}
+
+fn state(e: &mut Engine, _: &Value) -> Result<Value> {
+    let s = e.session();
+    let now = e.transport.position;
+    let beat = |t: Samples| s.tempo.samples_to_ticks_f(t, s.sample_rate) / soundcraft_time::TICKS_PER_QUARTER as f64;
+    let columns: Vec<Value> = (0..s.live.columns.len())
+        .map(|c| {
+            let status = e.live_status.get(c).copied().unwrap_or_default();
+            let playing = status.playing.map(|(row, start)| {
+                let slot = s.live.slot(c, row);
+                // Where a loop is: session beats since its launch, wrapped to its length.
+                let looping = slot.filter(|x| soundcraft_mix::slot_loops(x));
+                let position = looping.map(|x| (beat(now) - beat(start)).max(0.0).rem_euclid(x.length_beats.max(1.0)));
+                json!({"slot": row, "name": slot.map(|x| x.name.as_str()), "start": start, "loop_beat": position,
+                    "length_beats": looping.map(|x| x.length_beats)})
+            });
+            let queued = status.queued.map(|(row, at)| json!({"slot": row, "at": at, "stop": row.is_none()}));
+            json!({"column": c, "track": s.live.column_track(c, &s.tracks), "playing": playing, "queued": queued})
+        })
+        .collect();
+    Ok(json!({"transport": {"playing": e.transport.playing, "position": now}, "quantise": s.live.quantise.id(),
+        "audio": e.live_audio, "columns": columns}))
 }
