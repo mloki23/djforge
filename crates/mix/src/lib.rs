@@ -54,14 +54,17 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, LIVE_SLOTS, MAX_LIVE_COLUMNS, Route, Session, SourceAudio, Speaker, SurroundPan, Track,
+    TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
+mod live;
 mod warp;
+pub use live::{ColumnPlay, LiveCmd, LivePlaying, LiveQueued, LiveStore, XFADE_S, column_of, slot_loops, slot_player_plays, slot_sources};
 use warp::WarpPlayers;
 pub use warp::{PlayerStem, PreparedWarp, SOURCE_PLAYER, WarpPlayer, WarpRoom, played_sources};
 
@@ -239,6 +242,10 @@ struct Strip {
     clipbuf: Vec<Vec<f32>>,
     /// Realtime stretchers for beat-locked (warped) clips.
     warps: WarpPlayers,
+    /// A Live column track's slot players and tail (see [`live`]).
+    live_store: Option<LiveStore>,
+    /// The column this strip plays and its state, for the block being rendered.
+    live_play: Option<(usize, ColumnPlay)>,
     /// Total latency of the active inserts (samples).
     latency: usize,
     /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
@@ -322,6 +329,8 @@ impl Strip {
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
             warps: HashMap::with_capacity(16),
+            live_store: None,
+            live_play: None,
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -381,6 +390,8 @@ pub struct MixEngine {
     retired_warps: Vec<WarpPlayer>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    /// What each Live column plays (see [`MixEngine::live`]). Offline renders leave it empty.
+    live: [ColumnPlay; MAX_LIVE_COLUMNS],
 }
 
 /// What `sync` needs to fill a slot.
@@ -456,6 +467,66 @@ impl MixEngine {
             warp_inbox: Vec::new(),
             retired_warps: Vec::new(),
             work: Vec::new(),
+            live: [ColumnPlay::default(); MAX_LIVE_COLUMNS],
+        }
+    }
+
+    /// Queues a Live launch or stop for its sample (one that is due already takes effect at the
+    /// start of the next block). It replaces whatever the column had queued. Neither allocates
+    /// nor frees: call it on the audio thread.
+    pub fn live(&mut self, cmd: LiveCmd) {
+        match cmd {
+            LiveCmd::Launch { column, slot, at } if slot < LIVE_SLOTS => {
+                if let Some(c) = self.live.get_mut(column) {
+                    c.queued = Some(LiveQueued { slot: Some(slot), at });
+                }
+            }
+            LiveCmd::Launch { .. } => {}
+            LiveCmd::Stop { column, at } => {
+                if let Some(c) = self.live.get_mut(column) {
+                    c.queued = Some(LiveQueued { slot: None, at });
+                }
+            }
+            LiveCmd::StopAll { at } => {
+                for c in self.live.iter_mut().filter(|c| c.playing.is_some() || c.queued.is_some()) {
+                    c.queued = Some(LiveQueued { slot: None, at });
+                }
+            }
+        }
+    }
+
+    /// What each Live column plays and has queued, by column.
+    pub fn live_state(&self) -> &[ColumnPlay] {
+        &self.live
+    }
+
+    /// The transport stopped: every Live slot stops and nothing stays queued.
+    pub fn live_clear(&mut self) {
+        self.live = [ColumnPlay::default(); MAX_LIVE_COLUMNS];
+        self.clear_live_tails();
+    }
+
+    /// The transport jumped from `from` to `to`: loops keep playing, re-phased to the new
+    /// position (their phase counts session beats from their launch); one-shots go on where they
+    /// were. Queued launches and stops, meant for a boundary of the old position, are dropped.
+    pub fn live_locate(&mut self, from: Samples, to: Samples) {
+        let shift = to.saturating_sub(from);
+        for c in self.live.iter_mut() {
+            c.queued = None;
+            if let Some(p) = &mut c.playing {
+                p.start = p.start.saturating_add(shift);
+                // A loop's phase counts session beats from its launch beat, which stays.
+                p.fade_at = p.fade_at.map(|f| f.saturating_add(shift));
+            }
+        }
+        self.clear_live_tails();
+    }
+
+    fn clear_live_tails(&mut self) {
+        for st in self.strips.values_mut() {
+            if let Some(l) = &mut st.live_store {
+                l.clear_carry();
+            }
         }
     }
 
@@ -561,6 +632,15 @@ impl MixEngine {
             }
             std::mem::swap(&mut st.warps, table);
         }
+        // Live columns: a strip without slot storage takes the room's (it is built full size, so
+        // a strip that has one keeps it); the rest goes back.
+        for (id, store) in room.live.iter_mut() {
+            if let Some(st) = self.strips.get_mut(id)
+                && st.live_store.is_none()
+            {
+                st.live_store = store.take();
+            }
+        }
         room
     }
 
@@ -583,6 +663,10 @@ impl MixEngine {
                 |(cid, stem): (u64, PlayerStem)| track.is_some_and(|t| t.clips().iter().any(|c| c.id.0 == cid && warp_player_plays(t, c, stem)));
             self.retired_warps.extend(st.warps.extract_if(|key, _| !plays(*key)).map(|(_, p)| p));
         }
+        for (id, st) in self.strips.iter_mut() {
+            let Some(l) = &mut st.live_store else { continue };
+            self.retired_warps.extend(l.players.extract_if(|(row, stem), _| !slot_player_plays(s, *id, usize::from(*row), *stem)).map(|(_, p)| p));
+        }
     }
 
     /// Warp players taken out of service since the last call (drop them off the audio thread).
@@ -597,6 +681,9 @@ impl MixEngine {
         let mut out = std::mem::take(&mut self.retired_warps);
         for st in self.strips.values_mut() {
             out.extend(st.warps.drain().map(|(_, p)| p));
+            if let Some(l) = &mut st.live_store {
+                out.extend(l.players.drain().map(|(_, p)| p));
+            }
         }
         out.extend(self.warp_inbox.drain(..).map(|w| w.player));
         out
@@ -605,6 +692,18 @@ impl MixEngine {
     /// The warp players in the strips, by track, clip id and [`PlayerStem`].
     pub fn warp_players(&self) -> impl Iterator<Item = (TrackId, u64, PlayerStem, &WarpPlayer)> {
         self.strips.iter().flat_map(|(t, st)| st.warps.iter().map(move |((c, stem), p)| (*t, *c, *stem, p)))
+    }
+
+    /// The Live-slot players in the strips, by track, slot row and [`PlayerStem`].
+    pub fn slot_players(&self) -> impl Iterator<Item = (TrackId, usize, PlayerStem, &WarpPlayer)> {
+        self.strips
+            .iter()
+            .flat_map(|(t, st)| st.live_store.iter().flat_map(move |l| l.players.iter().map(move |((r, stem), p)| (*t, usize::from(*r), *stem, p))))
+    }
+
+    /// Capacity of the Live-slot player table of `track`'s strip (0 without one).
+    pub fn slot_table_capacity(&self, track: TrackId) -> usize {
+        self.strips.get(&track).and_then(|st| st.live_store.as_ref()).map_or(0, LiveStore::player_capacity)
     }
 
     /// True when handed-over warp players wait to be placed.
@@ -618,6 +717,18 @@ impl MixEngine {
     /// growing the retired list.
     pub fn place_pending_warps(&mut self, s: &Session) {
         for w in self.warp_inbox.drain(..) {
+            if let Some(row) = w.slot {
+                let store = self.strips.get_mut(&w.track).and_then(|st| st.live_store.as_mut());
+                match store {
+                    Some(l) if slot_player_plays(s, w.track, usize::from(row), w.stem) => {
+                        if let Some(old) = l.players.insert((row, w.stem), w.player) {
+                            self.retired_warps.push(old);
+                        }
+                    }
+                    _ => self.retired_warps.push(w.player),
+                }
+                continue;
+            }
             let plays = s.track(w.track).is_some_and(|t| t.clips().iter().any(|c| c.id == w.clip && warp_player_plays(t, c, w.stem)));
             match self.strips.get_mut(&w.track) {
                 Some(st) if plays => {
@@ -684,6 +795,9 @@ impl MixEngine {
                 }
                 cx.retire(st.instrument.take());
                 self.retired_warps.extend(st.warps.drain().map(|(_, p)| p));
+                if let Some(l) = &mut st.live_store {
+                    self.retired_warps.extend(l.players.drain().map(|(_, p)| p));
+                }
             }
         }
         for t in &s.tracks {
@@ -722,6 +836,10 @@ impl MixEngine {
                 strip.sample = None;
             }
             sync_sample(strip, want, s);
+            // A realtime host hands column storage over in a `WarpRoom`; elsewhere it is made here.
+            if strip.live_store.is_none() && !on_audio_thread() && column_of(s, t.id).is_some() {
+                strip.live_store = Some(LiveStore::new());
+            }
         }
         // Instances nobody claimed (the session changed again before they arrived).
         let leftovers: Vec<(TrackId, usize)> = cx.adopt.keys().copied().collect();
@@ -796,10 +914,12 @@ impl MixEngine {
                 work.push((i, st));
             }
         }
-        for (_, st) in work.iter_mut() {
+        for (i, st) in work.iter_mut() {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
+            let column = if self.monitor_only { None } else { s.tracks.get(*i).and_then(|t| column_of(s, t.id)) };
+            st.live_play = column.and_then(|c| Some((c, *self.live.get(c)?)));
         }
         let busses = std::mem::take(&mut self.busses);
         let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
@@ -865,9 +985,28 @@ impl MixEngine {
             };
             st.out_extra.set(if waits { lmax_a } else { 0 }, ch);
         }
+        let mut rendered = [false; MAX_LIVE_COLUMNS];
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
                 self.route_strip(t, st, pos, frames);
+            }
+            if let Some((c, play)) = st.live_play.take()
+                && let Some(d) = self.live.get_mut(c)
+            {
+                *d = play;
+                if let Some(r) = rendered.get_mut(c) {
+                    *r = true;
+                }
+            }
+        }
+        // Columns whose track did not render (inactive) still launch and stop on time.
+        if !self.monitor_only {
+            let end = pos.saturating_add(frames as i64);
+            for c in 0..s.live.columns.len() {
+                let (Some(play), Some(t)) = (self.live.get_mut(c), s.live.column_track(c, &s.tracks).and_then(|t| s.track(t))) else { continue };
+                if !rendered.get(c).copied().unwrap_or(true) {
+                    live::Column { s, track: t, column: c }.advance(play, end);
+                }
             }
         }
         for (i, st) in work.drain(..) {
@@ -1164,6 +1303,16 @@ fn process_strip(
         }
         _ => {}
     }
+    // Live slots play into the column track's input, before trim, inserts and fader.
+    if !live.monitor_only
+        && t.kind == TrackKind::Audio
+        && let (Some((column, play)), Some(store)) = (strip.live_play.as_mut(), strip.live_store.as_mut())
+    {
+        live::Column { s, track: t, column: *column }.render(play, store, &mut strip.buf, pos, frames);
+    } else if let Some((column, play)) = strip.live_play.as_mut() {
+        // Not an audio track (or no storage yet): silent, but launches and stops keep time.
+        live::Column { s, track: t, column: *column }.advance(play, pos.saturating_add(frames as i64));
+    }
     let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
     if (trim - 1.0).abs() > f32::EPSILON {
         for c in strip.buf.iter_mut() {
@@ -1383,6 +1532,9 @@ fn structure_fingerprint(s: &Session) -> usize {
         b.id.hash(&mut h);
         b.format.hash(&mut h);
     }
+    for c in &s.live.columns {
+        c.track.hash(&mut h);
+    }
     s.main_format().hash(&mut h);
     h.finish() as usize
 }
@@ -1594,7 +1746,8 @@ fn render_any_clip(
         return;
     };
     for (i, src) in set.sources.iter().enumerate() {
-        if !stem_gains(faders, clip, i, pos, frames, scratch) {
+        let scale = clip.stems.as_ref().map_or(1.0, |set| set.scale());
+        if !stem_gains(faders, &clip.stem_mask, scale, i, pos, frames, scratch) {
             continue;
         }
         render_source(s, clip, *src, i as PlayerStem, Some(scratch), pos, frames, buf, warps);
@@ -1645,15 +1798,14 @@ pub fn stem_lane(t: &Track, i: usize) -> Option<&soundcraft_model::AutomationLan
     t.lane(&AutoParam::Stem(u8::try_from(i).unwrap_or(u8::MAX))).filter(|l| !l.points.is_empty())
 }
 
-/// Fills `out[..frames]` with the gain of stem `i` of split clip `clip` for the block at `pos`:
-/// the mask, times `db_to_gain(stem_db_at)` (top +6 dB) when `faders` is given, times the
-/// set's [`StemSet::scale`](soundcraft_model::StemSet::scale) (the stems are stored with
-/// headroom). False when the stem is silent for the whole block.
-fn stem_gains(faders: Option<&Track>, clip: &Clip, i: usize, pos: Samples, frames: usize, out: &mut [f32]) -> bool {
-    if !clip.stem_mask.get(i).copied().unwrap_or(false) {
+/// Fills `out[..frames]` with the gain of stem `i` of a split clip or slot for the block at
+/// `pos`: its `mask`, times `db_to_gain(stem_db_at)` (top +6 dB) when `faders` is given, times
+/// `scale`, the set's [`StemSet::scale`](soundcraft_model::StemSet::scale) (the stems are
+/// stored with headroom). False when the stem is silent for the whole block.
+pub(crate) fn stem_gains(faders: Option<&Track>, mask: &[bool; 4], scale: f32, i: usize, pos: Samples, frames: usize, out: &mut [f32]) -> bool {
+    if !mask.get(i).copied().unwrap_or(false) {
         return false;
     }
-    let scale = clip.stems.as_ref().map_or(1.0, |set| set.scale());
     let n = frames.min(out.len());
     let Some(t) = faders else {
         out.iter_mut().take(n).for_each(|g| *g = scale);

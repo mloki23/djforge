@@ -30,7 +30,7 @@ pub use devices::AudioConfig;
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{
-    MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold, main_channels,
+    LiveCmd, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold, main_channels,
 };
 use soundcraft_model::{Session, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
@@ -82,6 +82,8 @@ enum Cmd {
     },
     Stop,
     Locate(Samples),
+    /// A Live slot launch or stop at its sample (see [`Player::live`]).
+    Live(LiveCmd),
 }
 
 struct Shared {
@@ -223,15 +225,24 @@ const WARP_IDLE_BATCH: usize = 2;
 /// A snapshot command, with a warp room sized for the snapshot's players (built here, off the
 /// audio thread) and for retiring the batch's replaced players plus `stale` more (players of
 /// clips and tracks the snapshot no longer has).
-fn session_cmd_retiring(s: Arc<Session>, instances: Vec<PreparedInstance>, warps: Vec<PreparedWarp>, stale: usize) -> Cmd {
-    let room = WarpRoom::for_session(&s, warps.len().saturating_add(stale));
+///
+/// Live-slot storage goes only to the column tracks `need_store` names (the audio thread keeps
+/// the storage it has).
+fn session_cmd_with(
+    s: Arc<Session>,
+    instances: Vec<PreparedInstance>,
+    warps: Vec<PreparedWarp>,
+    stale: usize,
+    need_store: impl Fn(TrackId) -> bool,
+) -> Cmd {
+    let room = WarpRoom::for_session_with(&s, warps.len().saturating_add(stale), need_store);
     Cmd::Session(s, instances, warps, room)
 }
 
-/// [`session_cmd_retiring`] with nothing known to have gone.
+/// [`session_cmd_with`] with nothing known to have gone, and storage for every column.
 #[cfg(test)]
 fn session_cmd(s: Arc<Session>, instances: Vec<PreparedInstance>, warps: Vec<PreparedWarp>) -> Cmd {
-    session_cmd_retiring(s, instances, warps, 0)
+    session_cmd_with(s, instances, warps, 0, |_| true)
 }
 
 /// A command with more warp players for the current snapshot, and room to retire as many.
@@ -315,7 +326,13 @@ impl AudioState {
                     self.place_warps();
                 }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
+                Cmd::Live(cmd) => self.mix.live(cmd),
                 Cmd::Play { from, end, looped } => {
+                    if self.playing {
+                        self.mix.live_locate(self.pos, from);
+                    } else {
+                        self.mix.live_clear();
+                    }
                     self.pos = from;
                     self.end = end;
                     self.looped = looped.filter(|r| r.len() > 64);
@@ -325,12 +342,14 @@ impl AudioState {
                     self.mix.reset();
                 }
                 Cmd::Stop => {
+                    self.mix.live_clear();
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
                     self.mix.reset();
                 }
                 Cmd::Locate(at) => {
+                    self.mix.live_locate(self.pos, at);
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
@@ -416,6 +435,7 @@ impl AudioState {
         if let Some(l) = self.looped
             && self.pos >= l.end
         {
+            self.mix.live_locate(self.pos, l.start);
             self.pos = l.start;
         }
         if let Some(l) = self.looped {
@@ -424,6 +444,7 @@ impl AudioState {
             if self.pos >= e {
                 self.playing = false;
                 self.end = None;
+                self.mix.live_clear();
                 self.shared.playing.store(false, Ordering::Relaxed);
                 n = 0;
             } else {
@@ -547,9 +568,11 @@ struct Side {
     refused: HashSet<(TrackId, usize)>,
     garbage: BinRx,
     old_sessions: Option<Receiver<Arc<Session>>>,
-    /// Warp players sent for beat-locked clips: (track, clip id, stem or source) -> (the audio
-    /// it plays, channels, sample rate).
-    prepared_warps: HashMap<(TrackId, u64, PlayerStem), (SourceId, usize, u32)>,
+    /// Warp players sent for beat-locked clips and Live slots: (track, clip or slot, stem or
+    /// source) -> (the audio it plays, channels, sample rate).
+    prepared_warps: HashMap<WarpKey, (SourceId, usize, u32)>,
+    /// Column tracks whose Live-slot storage was sent (the engine keeps it while the track lives).
+    live_stores: HashSet<TrackId>,
     /// The snapshot last sent (an extra reference, released here on the UI thread), while some
     /// of its warp players are still to be built.
     warps_for: Option<Arc<Session>>,
@@ -557,8 +580,18 @@ struct Side {
     /// may retire that many, so the snapshot's room is sized for them.
     stale_warps: usize,
     /// Players whose build failed, warned about once; they are retried.
-    failed_warps: HashSet<(TrackId, u64, PlayerStem)>,
+    failed_warps: HashSet<WarpKey>,
 }
+
+/// What a warp player plays for: a clip by id, or a Live slot by row (the column is its track).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum WarpFor {
+    Clip(u64),
+    Slot(usize),
+}
+
+/// A warp player's key on the UI side: its track, what it plays for and which audio.
+type WarpKey = (TrackId, WarpFor, PlayerStem);
 
 impl Side {
     fn new(rate: f32, garbage: BinRx) -> Side {
@@ -571,6 +604,7 @@ impl Side {
             garbage,
             old_sessions: None,
             prepared_warps: HashMap::new(),
+            live_stores: HashSet::new(),
             warps_for: None,
             stale_warps: 0,
             failed_warps: HashSet::new(),
@@ -820,8 +854,12 @@ impl Player {
         side.warps_for = Some(Arc::clone(&s));
         let warps = side.prepare_warps(&s, self.position(), WARP_BATCH);
         let stale = side.stale_warps;
+        // Live-slot storage goes once per column track; a strip keeps it until its track goes.
+        side.live_stores.retain(|t| s.track(*t).is_some());
+        let sent = side.live_stores.clone();
+        side.live_stores.extend((0..s.live.columns.len()).filter_map(|c| s.live.column_track(c, &s.tracks)));
         // Sent under the lock, so a batch from `idle` can't overtake the snapshot it belongs to.
-        let _ = self.tx.send(session_cmd_retiring(s, instances, warps, stale));
+        let _ = self.tx.send(session_cmd_with(s, instances, warps, stale, |t| !sent.contains(&t)));
         drop(side);
     }
 
@@ -895,6 +933,13 @@ impl Player {
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Play { from, end, looped });
+    }
+
+    /// Launches or stops Live slots at the sample `cmd` names (the audio thread splits its block
+    /// there). Players for the session's filled slots are prepared with each snapshot; a slot
+    /// whose player has not arrived plays silence.
+    pub fn live(&self, cmd: LiveCmd) {
+        let _ = self.tx.send(Cmd::Live(cmd));
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
@@ -982,6 +1027,7 @@ impl Side {
         let sr = s.sample_rate.as_f64() as f32;
         if (sr - self.rate).abs() > 0.5 {
             // The audio thread rebuilds its engine: everything is created anew.
+            self.live_stores.clear();
             let keys: Vec<(TrackId, usize)> = self.shadow.keys().copied().collect();
             for k in keys {
                 self.forget(k);
@@ -1042,7 +1088,7 @@ impl Side {
                     if ch == 0 {
                         continue;
                     }
-                    let key = (t.id, c.id.0, stem);
+                    let key = (t.id, WarpFor::Clip(c.id.0), stem);
                     live.insert(key);
                     if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
                         missing.push((stem, source, ch));
@@ -1055,8 +1101,31 @@ impl Side {
                     } else {
                         r.start.saturating_sub(playhead).saturating_abs().min(r.end.saturating_sub(playhead).saturating_abs())
                     };
-                    todo.push((distance, t.id, c.id, missing));
+                    todo.push((distance, t.id, WarpFor::Clip(c.id.0), missing));
                 }
+            }
+        }
+        // Live slots that loop: ready before anything, since a launch can come at any moment.
+        for (column, row, slot) in s.live.slots() {
+            // A lost column plays nothing.
+            let Some(track) = s.live.column_track(column, &s.tracks) else { continue };
+            if !soundcraft_mix::slot_loops(slot) {
+                continue;
+            }
+            let mut missing = Vec::new();
+            for (stem, source) in soundcraft_mix::slot_sources(slot) {
+                let ch = s.pool.get(source).map_or(0, |a| a.buffer.channels.len());
+                if ch == 0 {
+                    continue;
+                }
+                let key = (track, WarpFor::Slot(row), stem);
+                live.insert(key);
+                if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
+                    missing.push((stem, source, ch));
+                }
+            }
+            if !missing.is_empty() {
+                todo.push((-1, track, WarpFor::Slot(row), missing));
             }
         }
         let before = self.prepared_warps.len();
@@ -1067,10 +1136,15 @@ impl Side {
         let all = todo.len() <= budget;
         let mut failed = false;
         let mut out = Vec::new();
-        for (_, track, clip, missing) in todo.into_iter().take(budget) {
+        for (_, track, owner, missing) in todo.into_iter().take(budget) {
             for (stem, source, ch) in missing {
-                let key = (track, clip.0, stem);
-                match PreparedWarp::new(track, clip, stem, ch, s.sample_rate.as_f64() as f32) {
+                let key = (track, owner, stem);
+                let rate = s.sample_rate.as_f64() as f32;
+                let made = match owner {
+                    WarpFor::Clip(id) => PreparedWarp::new(track, soundcraft_model::ClipId(id), stem, ch, rate),
+                    WarpFor::Slot(row) => PreparedWarp::for_slot(track, row, stem, ch, rate),
+                };
+                match made {
                     Some(w) => {
                         self.prepared_warps.insert(key, (source, ch, sr));
                         self.failed_warps.remove(&key);
@@ -1080,7 +1154,7 @@ impl Side {
                         // Not remembered, so it is tried again (a stem would stay silent).
                         failed = true;
                         if self.failed_warps.insert(key) {
-                            log::warn!("could not build a time-stretch player for clip {} (stem {stem}); retrying", clip.0);
+                            log::warn!("could not build a time-stretch player for {owner:?} (stem {stem}); retrying");
                         }
                     }
                 }
@@ -1625,6 +1699,73 @@ mod tests {
         s
     }
 
+    /// A session with a Live column whose slots 0 (a loop) and 1 (a split loop) are filled.
+    fn live_session() -> (Session, TrackId) {
+        use soundcraft_model::{ChannelFormat, LiveColumn, Slot, SlotMode, SourceAudio, StemSet, TrackKind, WarpMap};
+        let mut s = Session::default();
+        for k in 900..905 {
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 192_000]; 2] };
+            s.pool.insert(SourceId(k), Arc::new(SourceAudio::new(buf)));
+        }
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let mut col = LiveColumn::new(t);
+        let mut slot = Slot::one_shot("loop", [0; 3], SourceId(900));
+        slot.warp = WarpMap::new((0..8).map(|k| f64::from(k) * 24_000.0).collect(), 0.0);
+        slot.mode = SlotMode::Loop;
+        slot.length_beats = 4.0;
+        col.slots[0] = Some(slot.clone());
+        slot.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
+        col.slots[1] = Some(slot);
+        s.live.columns.push(col);
+        (s, t)
+    }
+
+    /// Every looping slot's players are built on the UI side, first, and its column storage goes
+    /// once; on the audio thread a launch plays at its sample, a locate keeps it playing and a
+    /// transport stop clears it.
+    #[test]
+    fn live_slots_get_prepared_players_and_stop_with_the_transport() {
+        let (s, t) = live_session();
+        let mut side = Side::new(48_000.0, bin().1);
+        let warps = side.prepare_warps(&s, 0, 1);
+        let mut got: Vec<_> = warps.iter().map(|w| (w.slot(), w.stem())).collect();
+        got.sort_unstable();
+        assert_eq!(got, [(Some(0), soundcraft_mix::SOURCE_PLAYER)], "a slot counts as one in a batch");
+        let more = side.prepare_warps(&s, 0, WARP_BATCH);
+        assert_eq!(more.iter().filter(|w| w.slot() == Some(1)).count(), 4, "a split slot gets a player per stem");
+        assert!(side.prepare_warps(&s, 0, WARP_BATCH).is_empty(), "built once");
+        let (gtx, _grx) = bin();
+        let (tx, mut st) = audio_state(gtx);
+        let mut batch = warps;
+        batch.extend(more);
+        tx.send(session_cmd(Arc::new(s.clone()), Vec::new(), batch)).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        mark_audio_thread();
+        let mut out = vec![0.0f32; 1024];
+        st.fill(&mut out, 2);
+        assert_eq!(st.mix.slot_players().count(), 5);
+        let cap = st.mix.slot_table_capacity(t);
+        tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 1, at: 2_000 })).unwrap();
+        for _ in 0..8 {
+            st.fill(&mut out, 2);
+        }
+        assert!(st.mix.live_state()[0].playing.is_some_and(|p| p.slot == 1 && p.start == 2_000));
+        assert!(out.iter().any(|x| x.abs() > 0.01), "the slot sounds");
+        tx.send(Cmd::Locate(96_000)).unwrap();
+        st.fill(&mut out, 2);
+        assert!(st.mix.live_state()[0].playing.is_some(), "a locate keeps it playing");
+        tx.send(Cmd::Stop).unwrap();
+        st.fill(&mut out, 2);
+        assert!(st.mix.live_state().iter().all(|c| c.playing.is_none() && c.queued.is_none()), "stop clears");
+        assert_eq!(st.mix.slot_table_capacity(t), cap);
+        // A later snapshot sends no second storage for the column.
+        let mut side = Side::new(48_000.0, bin().1);
+        side.live_stores.insert(t);
+        let sent = side.live_stores.clone();
+        let Cmd::Session(_, _, _, room) = session_cmd_with(Arc::new(s), Vec::new(), Vec::new(), 0, |t| !sent.contains(&t)) else { panic!() };
+        assert_eq!(room.live_stores(), 0);
+    }
+
     fn audio_state(gtx: Bin) -> (Sender<Cmd>, AudioState) {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
@@ -1674,7 +1815,7 @@ mod tests {
         let mut side = Side::new(48_000.0, bin().1);
         let warps = side.prepare_warps(&s, 0, WARP_BATCH);
         assert_eq!(warps.len(), 12);
-        tx.send(session_cmd_retiring(Arc::new(s.clone()), Vec::new(), warps, side.stale_warps)).unwrap();
+        tx.send(session_cmd_with(Arc::new(s.clone()), Vec::new(), warps, side.stale_warps, |_| true)).unwrap();
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         let mut out = vec![0.0f32; 256];
         st.fill(&mut out, 2);
@@ -1685,7 +1826,7 @@ mod tests {
         }
         let warps = side.prepare_warps(&s, 0, WARP_BATCH);
         assert_eq!((warps.len(), side.stale_warps), (1, 8));
-        tx.send(session_cmd_retiring(Arc::new(s), Vec::new(), warps, side.stale_warps)).unwrap();
+        tx.send(session_cmd_with(Arc::new(s), Vec::new(), warps, side.stale_warps, |_| true)).unwrap();
         st.fill(&mut out, 2);
         let retired: Vec<_> = grx.warps.try_iter().collect();
         assert_eq!(retired.iter().map(|w| (w.len(), w.capacity())).collect::<Vec<_>>(), [(9, 9)]);
