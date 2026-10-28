@@ -280,7 +280,7 @@ fn a_stem_slot_plays_its_masked_stems_through_the_columns_stem_faders() {
     let a = run(&mut e1, &split, at + 200_000, &launch);
     let mut e2 = engine();
     let b = run(&mut e2, &plain, at + 200_000, &launch);
-    assert_eq!(e1.slot_players().count(), 1, "players are built for the stems it plays");
+    assert_eq!(e1.slot_players().count(), 2, "players (two: playing and warming) are built only for the stems it plays");
     let diff = a.iter().zip(&b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
     assert!(diff < 1e-6, "the masked loop is its unmasked stem (diff {diff})");
     assert!(a.iter().any(|x| x.abs() > 0.5));
@@ -307,7 +307,7 @@ fn stop_clears_and_locate_re_phases() {
     // on, its first beat on the bar lines of the new position.
     let from = at + 50_176;
     let to = bar(&s, 11) - 30_000;
-    eng.live_locate(from, to);
+    eng.live_locate(from, to, false);
     assert!(eng.live_state()[0].queued.is_none());
     let mut out = vec![vec![0.0; BLOCK]; 2];
     let mut left = Vec::new();
@@ -358,4 +358,127 @@ fn a_lost_column_plays_nothing() {
     let mut eng = engine();
     let out = run(&mut eng, &s, 8_192, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: 1_000 })]);
     assert!((out[4_000] - 0.25).abs() < 1e-6, "the owning column plays");
+}
+
+/// The transport wrapping at the end of its loop range moves queued launches with it: a launch
+/// for the range's end sample starts at its start. A locate drops them.
+#[test]
+fn a_loop_wrap_keeps_queued_launches() {
+    let (mut s, _) = session(false);
+    s.pool.insert(SourceId(901), audio(vec![vec![0.25; 48_000]]));
+    put(&mut s, 0, Slot::one_shot("dc", [0; 3], SourceId(901)));
+    let (l0, l1) = (10_240, 20_480);
+    let mut eng = engine();
+    let _ = run(&mut eng, &s, l1, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: l1 })]);
+    eng.live_locate(l1, l0, true);
+    assert_eq!(eng.live_state()[0].queued.map(|q| q.at), Some(l0));
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    eng.render(&s, l0, BLOCK, &mut out);
+    assert_eq!(out[0][0], 0.25, "it starts on the wrap's first sample");
+    eng.live(LiveCmd::Stop { column: 0, at: l1 });
+    eng.live_locate(l0 + 512, 0, false);
+    assert!(eng.live_state()[0].queued.is_none(), "a locate drops it");
+}
+
+/// Launches sent just before the transport starts stay queued; ones for before the play
+/// position are dropped.
+#[test]
+fn launches_sent_before_play_stay_queued() {
+    let mut eng = engine();
+    eng.live(LiveCmd::Launch { column: 0, slot: 0, at: 4_800 });
+    eng.live(LiveCmd::Launch { column: 1, slot: 0, at: 100 });
+    eng.live_start(1_000);
+    assert_eq!(eng.live_state()[0].queued.map(|q| q.at), Some(4_800));
+    assert!(eng.live_state()[1].queued.is_none());
+}
+
+/// While a slot plays, the column track's own clips are muted (fading over the crossfade), and
+/// they come back when the column stops.
+#[test]
+fn a_playing_slot_mutes_the_column_tracks_clips() {
+    let (mut s, t) = session(false);
+    s.pool.insert(SourceId(901), audio(vec![vec![0.25; 96_000]]));
+    s.pool.insert(SourceId(905), audio(vec![vec![0.125; 96_000]]));
+    let id = s.new_clip_id();
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::audio(id, "arr", SourceId(905), 0, 0, 96_000));
+    put(&mut s, 0, Slot::one_shot("dc", [0; 3], SourceId(901)));
+    let xf = (soundcraft_mix::XFADE_S * SR).round() as usize;
+    let (on, off) = (10_000usize, 40_000usize);
+    let mut eng = engine();
+    let out = run(
+        &mut eng,
+        &s,
+        60_000,
+        &[(0, LiveCmd::Launch { column: 0, slot: 0, at: on as i64 }), (on as i64 + BLOCK as i64, LiveCmd::Stop { column: 0, at: off as i64 })],
+    );
+    assert!(out[..on].iter().all(|x| (x - 0.125).abs() < 1e-6), "the arrangement plays");
+    assert!(out[on + xf..off].iter().all(|x| (x - 0.25).abs() < 1e-6), "only the slot while it plays");
+    assert!(out[off + xf..].iter().all(|x| (x - 0.125).abs() < 1e-6), "the arrangement is back");
+    // The clips fade under the slot's (hard) start and back in under its tail: no steps there.
+    assert!(out[on] > 0.37 && out[on..on + xf + 1].windows(2).all(|w| w[1] <= w[0]), "the clips fade out");
+    assert!(max_step(&out[off - 10..off + xf + 10]) < 0.01, "slot and clips cross over");
+}
+
+/// A playing slot that is cleared fades out (rather than cutting off); one whose audio is gone
+/// stops its column; a column whose track is deleted forgets its state.
+#[test]
+fn clearing_a_playing_slot_fades_it_out_and_a_lost_column_forgets() {
+    let (mut s, t) = session(false);
+    s.pool.insert(SourceId(901), audio(vec![vec![0.5; 96_000]]));
+    put(&mut s, 0, Slot::one_shot("dc", [0; 3], SourceId(901)));
+    let xf = (soundcraft_mix::XFADE_S * SR).round() as usize;
+    let mut eng = engine();
+    let at = 8_192;
+    let before = run(&mut eng, &s, at, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: 1_000 })]);
+    assert!((before[at as usize - 1] - 0.5).abs() < 1e-6);
+    let mut cleared = s.clone();
+    cleared.live.columns[0].slots[0] = None;
+    eng.live_snapshot(&s, &cleared, at);
+    assert!(eng.live_state()[0].playing.is_none());
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    eng.render(&cleared, at, BLOCK, &mut out);
+    let tail = &out[0];
+    assert!(tail[0] > 0.45 && tail[..xf].windows(2).all(|w| w[1] <= w[0]), "it fades out");
+    assert!(tail[xf..].iter().all(|x| *x == 0.0));
+
+    // Its audio gone: the column stops.
+    let mut eng = engine();
+    let _ = run(&mut eng, &s, at, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: 1_000 })]);
+    let mut gone = s.clone();
+    gone.pool.remove(SourceId(901));
+    eng.render(&gone, at, BLOCK, &mut out);
+    assert!(eng.live_state()[0].playing.is_none());
+
+    // The track deleted: the lost column forgets what it played and had queued.
+    let mut eng = engine();
+    let _ = run(&mut eng, &s, at, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: 1_000 }), (2_048, LiveCmd::Stop { column: 0, at: 90_000 })]);
+    let mut lost = s.clone();
+    lost.tracks.retain(|x| x.id != t);
+    eng.render(&lost, at, BLOCK, &mut out);
+    assert_eq!(eng.live_state()[0], soundcraft_mix::ColumnPlay::default());
+}
+
+/// A launch exactly on a loop restart that falls on a block boundary takes over from the pass
+/// that ends once: its tail is not rendered twice (no level bump).
+#[test]
+fn a_launch_on_a_restart_at_a_block_boundary_has_one_tail() {
+    let (mut s, _) = session(false);
+    let amp = 0.5f32;
+    let sine: Vec<f32> = (0..48_000 * 4).map(|i| amp * (i as f32 * std::f32::consts::TAU * 441.0 / 48_000.0).sin()).collect();
+    s.pool.insert(SourceId(903), audio(vec![sine]));
+    let beats = (0..8).map(|k| 1_000.0 + k as f64 * 24_000.0).collect();
+    put(&mut s, 0, loop_slot(SourceId(903), WarpMap::new(beats, 0.0).unwrap(), 1.0));
+    // Restarts every 24 000 samples from bar 2 (96 000); the fourth falls on a block boundary.
+    let at = bar(&s, 2);
+    let target = at + 4 * 24_000;
+    assert_eq!(target % BLOCK as i64, 0);
+    let mut eng = engine();
+    let out = run(
+        &mut eng,
+        &s,
+        target + 4_000,
+        &[(0, LiveCmd::Launch { column: 0, slot: 0, at }), (target - 10_000, LiveCmd::Launch { column: 0, slot: 0, at: target })],
+    );
+    let around = out[(target - 200) as usize..(target + 300) as usize].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(around < 2.05 * amp, "peak {around} around the relaunch (one tail plus the new pass)");
 }

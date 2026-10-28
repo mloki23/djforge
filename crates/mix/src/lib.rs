@@ -506,20 +506,79 @@ impl MixEngine {
         self.clear_live_tails();
     }
 
-    /// The transport jumped from `from` to `to`: loops keep playing, re-phased to the new
-    /// position (their phase counts session beats from their launch); one-shots go on where they
-    /// were. Queued launches and stops, meant for a boundary of the old position, are dropped.
-    pub fn live_locate(&mut self, from: Samples, to: Samples) {
-        let shift = to.saturating_sub(from);
+    /// The transport starts at `from` (from stopped): nothing plays yet, and launches and stops
+    /// queued for `from` or later (sent just before the play command) stay queued.
+    pub fn live_start(&mut self, from: Samples) {
         for c in self.live.iter_mut() {
-            c.queued = None;
-            if let Some(p) = &mut c.playing {
-                p.start = p.start.saturating_add(shift);
-                // A loop's phase counts session beats from its launch beat, which stays.
-                p.fade_at = p.fade_at.map(|f| f.saturating_add(shift));
-            }
+            let queued = c.queued.filter(|q| q.at >= from);
+            *c = ColumnPlay { queued, ..ColumnPlay::default() };
         }
         self.clear_live_tails();
+    }
+
+    /// The transport jumped from `from` to `to`: loops keep playing, re-phased to the new
+    /// position (their phase counts session beats from their launch); one-shots go on where they
+    /// were. A jump the transport makes itself (`wrap`, at the end of its loop range) moves
+    /// queued launches and stops and the tails fading out along with it, so a launch at the
+    /// loop's end lands at its start; a locate drops them, as they were meant for the old
+    /// position.
+    pub fn live_locate(&mut self, from: Samples, to: Samples, wrap: bool) {
+        let shift = to.saturating_sub(from);
+        for c in self.live.iter_mut() {
+            c.queued = if wrap { c.queued.map(|q| LiveQueued { at: q.at.saturating_add(shift), ..q }) } else { None };
+            c.shift(shift);
+        }
+        if wrap {
+            for st in self.strips.values_mut() {
+                if let Some(l) = &mut st.live_store {
+                    l.shift_carry(shift);
+                }
+            }
+        } else {
+            self.clear_live_tails();
+        }
+    }
+
+    /// The session snapshot changes from `old` to `new` with the next block at `at`: a playing
+    /// slot that was cleared, refilled with other audio or lost its audio fades out from `at`
+    /// (rendered from `old`) and its column stops; a column that was lost (its track deleted or
+    /// taken) stops and forgets what it had queued. Call before rendering `new`. Neither
+    /// allocates nor frees.
+    pub fn live_snapshot(&mut self, old: &Session, new: &Session, at: Samples) {
+        for (c, play) in self.live.iter_mut().enumerate() {
+            let (Some(p), was) = (play.playing, old.live.column_track(c, &old.tracks)) else {
+                if new.live.column_track(c, &new.tracks).is_none() {
+                    *play = ColumnPlay::default();
+                }
+                continue;
+            };
+            let now = new.live.column_track(c, &new.tracks);
+            let same_audio = |a: &soundcraft_model::Slot, b: &soundcraft_model::Slot| {
+                a.source == b.source && a.stems.as_ref().map(|x| x.sources) == b.stems.as_ref().map(|x| x.sources)
+            };
+            let keeps = now.is_some()
+                && now == was
+                && new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot)).is_some_and(|(n, o)| same_audio(n, o))
+                && new.live.slot(c, p.slot).is_some_and(|sl| live::slot_sources(sl).all(|(_, id)| new.pool.contains(id)));
+            if keeps {
+                continue;
+            }
+            if let Some(id) = was
+                && let (Some(track), Some(store)) = (old.track(id), self.strips.get_mut(&id).and_then(|st| st.live_store.as_mut()))
+            {
+                live::Column { s: old, track, column: c }.tail(p, play.side_of(p.slot), store, at);
+            }
+            if now.is_none() || now != was {
+                *play = ColumnPlay::default();
+            } else {
+                play.set_playing(None, at);
+            }
+        }
+    }
+
+    /// Frames the Live-slot stretchers produced (heard or warming up) since the last call.
+    pub fn take_live_stretched(&mut self) -> usize {
+        self.strips.values_mut().filter_map(|st| st.live_store.as_mut()).map(|l| std::mem::take(&mut l.stretched)).sum()
     }
 
     fn clear_live_tails(&mut self) {
@@ -665,7 +724,7 @@ impl MixEngine {
         }
         for (id, st) in self.strips.iter_mut() {
             let Some(l) = &mut st.live_store else { continue };
-            self.retired_warps.extend(l.players.extract_if(|(row, stem), _| !slot_player_plays(s, *id, usize::from(*row), *stem)).map(|(_, p)| p));
+            l.retire_where(|row, stem| slot_player_plays(s, *id, row, stem), &mut self.retired_warps);
         }
     }
 
@@ -682,7 +741,7 @@ impl MixEngine {
         for st in self.strips.values_mut() {
             out.extend(st.warps.drain().map(|(_, p)| p));
             if let Some(l) = &mut st.live_store {
-                out.extend(l.players.drain().map(|(_, p)| p));
+                out.extend(l.drain_players());
             }
         }
         out.extend(self.warp_inbox.drain(..).map(|w| w.player));
@@ -695,15 +754,16 @@ impl MixEngine {
     }
 
     /// The Live-slot players in the strips, by track, slot row and [`PlayerStem`].
-    pub fn slot_players(&self) -> impl Iterator<Item = (TrackId, usize, PlayerStem, &WarpPlayer)> {
+    /// Each slot audio has two players (side 0 and 1).
+    pub fn slot_players(&self) -> impl Iterator<Item = (TrackId, usize, PlayerStem, usize, &WarpPlayer)> {
         self.strips
             .iter()
-            .flat_map(|(t, st)| st.live_store.iter().flat_map(move |l| l.players.iter().map(move |((r, stem), p)| (*t, usize::from(*r), *stem, p))))
+            .flat_map(|(t, st)| st.live_store.iter().flat_map(move |l| l.players().map(move |(r, stem, side, p)| (*t, r, stem, side, p))))
     }
 
-    /// Capacity of the Live-slot player table of `track`'s strip (0 without one).
+    /// Room for Live-slot players in `track`'s strip (0 without its storage; fixed once there).
     pub fn slot_table_capacity(&self, track: TrackId) -> usize {
-        self.strips.get(&track).and_then(|st| st.live_store.as_ref()).map_or(0, LiveStore::player_capacity)
+        self.strips.get(&track).and_then(|st| st.live_store.as_ref()).map_or(0, LiveStore::player_room)
     }
 
     /// True when handed-over warp players wait to be placed.
@@ -717,14 +777,11 @@ impl MixEngine {
     /// growing the retired list.
     pub fn place_pending_warps(&mut self, s: &Session) {
         for w in self.warp_inbox.drain(..) {
-            if let Some(row) = w.slot {
+            if let Some((row, side)) = w.slot {
+                let (row, side) = (usize::from(row), usize::from(side));
                 let store = self.strips.get_mut(&w.track).and_then(|st| st.live_store.as_mut());
                 match store {
-                    Some(l) if slot_player_plays(s, w.track, usize::from(row), w.stem) => {
-                        if let Some(old) = l.players.insert((row, w.stem), w.player) {
-                            self.retired_warps.push(old);
-                        }
-                    }
+                    Some(l) if slot_player_plays(s, w.track, row, w.stem) => self.retired_warps.extend(l.place(row, w.stem, side, w.player)),
                     _ => self.retired_warps.push(w.player),
                 }
                 continue;
@@ -796,7 +853,7 @@ impl MixEngine {
                 cx.retire(st.instrument.take());
                 self.retired_warps.extend(st.warps.drain().map(|(_, p)| p));
                 if let Some(l) = &mut st.live_store {
-                    self.retired_warps.extend(l.players.drain().map(|(_, p)| p));
+                    self.retired_warps.extend(l.drain_players());
                 }
             }
         }
@@ -838,7 +895,7 @@ impl MixEngine {
             sync_sample(strip, want, s);
             // A realtime host hands column storage over in a `WarpRoom`; elsewhere it is made here.
             if strip.live_store.is_none() && !on_audio_thread() && column_of(s, t.id).is_some() {
-                strip.live_store = Some(LiveStore::new());
+                strip.live_store = Some(LiveStore::new(t.channels()));
             }
         }
         // Instances nobody claimed (the session changed again before they arrived).
@@ -1002,8 +1059,12 @@ impl MixEngine {
         // Columns whose track did not render (inactive) still launch and stop on time.
         if !self.monitor_only {
             let end = pos.saturating_add(frames as i64);
-            for c in 0..s.live.columns.len() {
-                let (Some(play), Some(t)) = (self.live.get_mut(c), s.live.column_track(c, &s.tracks).and_then(|t| s.track(t))) else { continue };
+            for (c, play) in self.live.iter_mut().enumerate() {
+                let Some(t) = s.live.column_track(c, &s.tracks).and_then(|t| s.track(t)) else {
+                    // A lost column (or none) plays nothing and keeps nothing to resume later.
+                    *play = ColumnPlay::default();
+                    continue;
+                };
                 if !rendered.get(c).copied().unwrap_or(true) {
                     live::Column { s, track: t, column: c }.advance(play, end);
                 }
@@ -1305,12 +1366,11 @@ fn process_strip(
     }
     // Live slots play into the column track's input, before trim, inserts and fader.
     if !live.monitor_only
-        && t.kind == TrackKind::Audio
         && let (Some((column, play)), Some(store)) = (strip.live_play.as_mut(), strip.live_store.as_mut())
     {
         live::Column { s, track: t, column: *column }.render(play, store, &mut strip.buf, pos, frames);
     } else if let Some((column, play)) = strip.live_play.as_mut() {
-        // Not an audio track (or no storage yet): silent, but launches and stops keep time.
+        // No storage yet: silent, but launches and stops keep time.
         live::Column { s, track: t, column: *column }.advance(play, pos.saturating_add(frames as i64));
     }
     let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };

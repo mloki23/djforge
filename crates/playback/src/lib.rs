@@ -390,6 +390,10 @@ impl AudioState {
                         self.read = 0.0;
                     }
                     self.fold = fold_gains(&s);
+                    if self.playing {
+                        // Slots cleared or refilled fade out from the old snapshot.
+                        self.mix.live_snapshot(&self.session, &s, self.pos);
+                    }
                     let old = std::mem::replace(&mut self.session, s);
                     if let Some(tx) = &self.old_sessions {
                         let _ = tx.try_send(old);
@@ -409,9 +413,10 @@ impl AudioState {
                 Cmd::Live(cmd) => self.mix.live(cmd),
                 Cmd::Play { from, end, looped } => {
                     if self.playing {
-                        self.mix.live_locate(self.pos, from);
+                        self.mix.live_locate(self.pos, from, false);
                     } else {
-                        self.mix.live_clear();
+                        // Launches sent just before the play command (for `from` on) stay queued.
+                        self.mix.live_start(from);
                     }
                     self.pos = from;
                     self.end = end;
@@ -429,7 +434,7 @@ impl AudioState {
                     self.mix.reset();
                 }
                 Cmd::Locate(at) => {
-                    self.mix.live_locate(self.pos, at);
+                    self.mix.live_locate(self.pos, at, false);
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
@@ -515,7 +520,7 @@ impl AudioState {
         if let Some(l) = self.looped
             && self.pos >= l.end
         {
-            self.mix.live_locate(self.pos, l.start);
+            self.mix.live_locate(self.pos, l.start, true);
             self.pos = l.start;
         }
         if let Some(l) = self.looped {
@@ -674,11 +679,12 @@ struct Side {
     failed_warps: HashSet<WarpKey>,
 }
 
-/// What a warp player plays for: a clip by id, or a Live slot by row (the column is its track).
+/// What a warp player plays for: a clip by id, or one of the two players of a Live slot by row
+/// and side (the column is its track).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum WarpFor {
     Clip(u64),
-    Slot(usize),
+    Slot(usize, usize),
 }
 
 /// A warp player's key on the UI side: its track, what it plays for and which audio.
@@ -1207,7 +1213,7 @@ impl Side {
                     let key = (t.id, WarpFor::Clip(c.id.0), stem);
                     live.insert(key);
                     if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
-                        missing.push((stem, source, ch));
+                        missing.push((WarpFor::Clip(c.id.0), stem, source, ch));
                     }
                 }
                 if !missing.is_empty() {
@@ -1234,14 +1240,17 @@ impl Side {
                 if ch == 0 {
                     continue;
                 }
-                let key = (track, WarpFor::Slot(row), stem);
-                live.insert(key);
-                if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
-                    missing.push((stem, source, ch));
+                // Two players each: one plays while the other warms up for the next restart.
+                for side in 0..2 {
+                    let key = (track, WarpFor::Slot(row, side), stem);
+                    live.insert(key);
+                    if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
+                        missing.push((WarpFor::Slot(row, side), stem, source, ch));
+                    }
                 }
             }
             if !missing.is_empty() {
-                todo.push((-1, track, WarpFor::Slot(row), missing));
+                todo.push((-1, track, WarpFor::Slot(row, 0), missing));
             }
         }
         let before = self.prepared_warps.len();
@@ -1252,13 +1261,13 @@ impl Side {
         let all = todo.len() <= budget;
         let mut failed = false;
         let mut out = Vec::new();
-        for (_, track, owner, missing) in todo.into_iter().take(budget) {
-            for (stem, source, ch) in missing {
+        for (_, track, _, missing) in todo.into_iter().take(budget) {
+            for (owner, stem, source, ch) in missing {
                 let key = (track, owner, stem);
                 let rate = s.sample_rate.as_f64() as f32;
                 let made = match owner {
                     WarpFor::Clip(id) => PreparedWarp::new(track, soundcraft_model::ClipId(id), stem, ch, rate),
-                    WarpFor::Slot(row) => PreparedWarp::for_slot(track, row, stem, ch, rate),
+                    WarpFor::Slot(row, side) => PreparedWarp::for_slot(track, row, side, stem, ch, rate),
                 };
                 match made {
                     Some(w) => {
@@ -1853,11 +1862,12 @@ mod tests {
         let (s, t) = live_session();
         let mut side = Side::new(48_000.0, bin().1);
         let warps = side.prepare_warps(&s, 0, 1);
-        let mut got: Vec<_> = warps.iter().map(|w| (w.slot(), w.stem())).collect();
+        let mut got: Vec<_> = warps.iter().map(|w| (w.slot(), w.side(), w.stem())).collect();
         got.sort_unstable();
-        assert_eq!(got, [(Some(0), soundcraft_mix::SOURCE_PLAYER)], "a slot counts as one in a batch");
+        let sp = soundcraft_mix::SOURCE_PLAYER;
+        assert_eq!(got, [(Some(0), 0, sp), (Some(0), 1, sp)], "a slot (two players per audio) counts as one in a batch");
         let more = side.prepare_warps(&s, 0, WARP_BATCH);
-        assert_eq!(more.iter().filter(|w| w.slot() == Some(1)).count(), 4, "a split slot gets a player per stem");
+        assert_eq!(more.iter().filter(|w| w.slot() == Some(1)).count(), 8, "a split slot gets two players per stem");
         assert!(side.prepare_warps(&s, 0, WARP_BATCH).is_empty(), "built once");
         let (gtx, _grx) = bin();
         let (tx, mut st) = audio_state(gtx);
@@ -1868,7 +1878,7 @@ mod tests {
         mark_audio_thread();
         let mut out = vec![0.0f32; 1024];
         st.fill(&mut out, 2);
-        assert_eq!(st.mix.slot_players().count(), 5);
+        assert_eq!(st.mix.slot_players().count(), 10);
         let cap = st.mix.slot_table_capacity(t);
         tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 1, at: 2_000 })).unwrap();
         for _ in 0..8 {
@@ -1889,6 +1899,32 @@ mod tests {
         let sent = side.live_stores.clone();
         let Cmd::Session(_, _, _, room) = session_cmd_with(Arc::new(s), Vec::new(), Vec::new(), 0, |t| !sent.contains(&t)) else { panic!() };
         assert_eq!(room.live_stores(), 0);
+    }
+
+    /// A launch sent before the play command (while stopped) plays; one for the end of the
+    /// transport's loop range plays from its start when the transport wraps.
+    #[test]
+    fn launches_survive_play_and_loop_wraps() {
+        let (s, _) = live_session();
+        let (gtx, _grx) = bin();
+        let (tx, mut st) = audio_state(gtx);
+        tx.send(session_cmd(Arc::new(s), Vec::new(), Vec::new())).unwrap();
+        tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 0, at: 1_000 })).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: Some(Range::new(0, 8_192)) }).unwrap();
+        let mut out = vec![0.0f32; 1024];
+        for _ in 0..4 {
+            st.fill(&mut out, 2);
+        }
+        assert!(st.mix.live_state()[0].playing.is_some_and(|p| p.start == 1_000), "sent before play, it plays");
+        tx.send(Cmd::Live(LiveCmd::Stop { column: 0, at: 8_192 })).unwrap();
+        while st.pos < 8_192 && st.pos >= 1_000 {
+            st.fill(&mut out, 2);
+        }
+        // The stop for the loop's end landed on the wrap.
+        for _ in 0..2 {
+            st.fill(&mut out, 2);
+        }
+        assert!(st.mix.live_state()[0].playing.is_none() && st.mix.live_state()[0].queued.is_none());
     }
 
     fn audio_state(gtx: Bin) -> (Sender<Cmd>, AudioState) {

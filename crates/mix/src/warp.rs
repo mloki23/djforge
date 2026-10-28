@@ -94,8 +94,9 @@ impl WarpPlayer {
 pub struct PreparedWarp {
     pub(crate) track: TrackId,
     pub(crate) clip: ClipId,
-    /// The Live slot (row of the track's column) the player is for, instead of a clip.
-    pub(crate) slot: Option<u8>,
+    /// The Live slot (row of the track's column) and which of its two players (see
+    /// [`crate::live`]) the player is for, instead of a clip.
+    pub(crate) slot: Option<(u8, u8)>,
     pub(crate) stem: PlayerStem,
     pub(crate) player: WarpPlayer,
 }
@@ -107,17 +108,23 @@ impl PreparedWarp {
         Some(PreparedWarp { track, clip, slot: None, stem, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 
-    /// Builds the stretcher for row `slot` of the Live column on `track` (allocates; call off
-    /// the audio thread). `stem` says which of the slot's audio it plays (see
-    /// [`crate::slot_sources`]).
-    pub fn for_slot(track: TrackId, slot: usize, stem: PlayerStem, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
+    /// Builds the stretcher for row `slot` of the Live column on `track`, one of the two (`side`
+    /// 0 or 1) each of the slot's audio has (allocates; call off the audio thread). `stem` says
+    /// which of the slot's audio it plays (see [`crate::slot_sources`]).
+    pub fn for_slot(track: TrackId, slot: usize, side: usize, stem: PlayerStem, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
         let slot = u8::try_from(slot).ok().filter(|r| usize::from(*r) < soundcraft_model::LIVE_SLOTS)?;
-        Some(PreparedWarp { track, clip: ClipId(0), slot: Some(slot), stem, player: WarpPlayer::build(channels, sample_rate, true)? })
+        let side = u8::try_from(side).ok().filter(|s| usize::from(*s) < crate::live::SIDES)?;
+        Some(PreparedWarp { track, clip: ClipId(0), slot: Some((slot, side)), stem, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 
     /// The Live slot row the player is for, when it is for a slot rather than a clip.
     pub fn slot(&self) -> Option<usize> {
-        self.slot.map(usize::from)
+        self.slot.map(|(r, _)| usize::from(r))
+    }
+
+    /// Which of the slot's two players it is (0 for a clip's).
+    pub fn side(&self) -> usize {
+        self.slot.map_or(0, |(_, s)| usize::from(s))
     }
 
     /// The clip the player is for.
@@ -155,7 +162,7 @@ impl WarpRoom {
     pub fn for_session_with(s: &Session, retire: usize, need_store: impl Fn(TrackId) -> bool) -> WarpRoom {
         let cols: Vec<TrackId> = (0..s.live.columns.len()).filter_map(|c| s.live.column_track(c, &s.tracks)).filter(|t| need_store(*t)).collect();
         let mut live = Vec::with_capacity(cols.len());
-        live.extend(cols.into_iter().map(|t| (t, Some(crate::live::LiveStore::new()))));
+        live.extend(cols.into_iter().map(|t| (t, Some(crate::live::LiveStore::new(s.track(t).map_or(2, |t| t.channels()))))));
         let tables = s
             .tracks
             .iter()
@@ -182,7 +189,7 @@ impl WarpRoom {
     pub fn players(&self) -> usize {
         self.tables.iter().map(|(_, t)| t.len()).sum::<usize>()
             + self.retired.len()
-            + self.live.iter().filter_map(|(_, l)| l.as_ref()).map(|l| l.players.len()).sum::<usize>()
+            + self.live.iter().filter_map(|(_, l)| l.as_ref()).map(|l| l.player_count()).sum::<usize>()
     }
 
     /// Live-slot storages the room still holds (those the engine did not need).
@@ -313,7 +320,8 @@ pub(crate) fn render_warped(
 /// into `out[..][off..off + n]`, through `player`, times `gain(i)` for frame `i`. `heard(t)` is
 /// the source position heard at timeline sample `t`, continuous over the span; a span that does
 /// not continue the player's last one (a seek, a loop restart) restarts the player with a
-/// pre-roll. False when the stretcher failed (nothing was added).
+/// pre-roll, as clips do (see [`warm_toward`] for a restart whose first frames must come out
+/// whole). Returns the frames the stretcher produced (0 when it failed).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stretch_into(
     player: &mut WarpPlayer,
@@ -325,10 +333,10 @@ pub(crate) fn stretch_into(
     out: &mut [Vec<f32>],
     off: usize,
     gain: impl Fn(usize) -> f32,
-) -> bool {
+) -> usize {
     let n = n.min(PLAYER_BLOCK);
     if n == 0 || src.is_empty() {
-        return true;
+        return 0;
     }
     if player.source != Some(source) {
         player.source = Some(source);
@@ -341,22 +349,12 @@ pub(crate) fn stretch_into(
     let p0 = feed(t0);
     let p1 = feed(t1);
     if player.next_pos != t0 || (player.next_src - p0).abs() > 1.0 {
-        // A jump: restart and pre-roll, then run the stretcher through the frames leading up to
-        // `t0` (their output unheard), so the audio at `t0` comes out whole, its first
-        // transient too, rather than out of a stretcher just started.
         player.st.reset();
-        let warm = (player.st.input_latency() + player.st.output_latency()).clamp(1, PLAYER_BLOCK);
-        let tw = t0.saturating_sub(warm as i64);
-        let pw = feed(tw);
         let pre = (player.st.input_latency() * 2 + 1024).min(player.st.max_input());
-        fill_input(src, pw.floor() as i64 - pre as i64, pre, &mut player.input);
-        let rate = ((p0 - pw) / warm as f64).max(0.01);
+        fill_input(src, p0.floor() as i64 - pre as i64, pre, &mut player.input);
+        let rate = ((p1 - p0) / n as f64).max(0.01);
         let _ = player.st.seek(&player.input, pre, rate);
-        let a = pw.floor() as i64;
-        let n_in = usize::try_from(p0.floor() as i64 - a).unwrap_or(0).min(player.st.max_input());
-        fill_input(src, a, n_in, &mut player.input);
-        let _ = player.st.process(&player.input, n_in, &mut player.out, warm, 0.0);
-        player.next_src = a as f64 + n_in as f64;
+        player.next_src = p0;
     }
     let a = player.next_src.floor() as i64;
     let b = p1.floor() as i64;
@@ -367,7 +365,7 @@ pub(crate) fn stretch_into(
     }
     if player.st.process(&player.input, n_in, &mut player.out, n, 1.0).is_err() {
         player.next_pos = Samples::MIN;
-        return false;
+        return 0;
     }
     let nout = player.out.len();
     for (ch, dst) in out.iter_mut().enumerate() {
@@ -380,5 +378,45 @@ pub(crate) fn stretch_into(
     }
     player.next_pos = t1;
     player.next_src = if n_in == usize::try_from(b - a).unwrap_or(0) { p1 } else { a as f64 + n_in as f64 };
-    true
+    n
+}
+
+/// Frames a player must run before a restart at `t` for the audio at `t` to come out whole (a
+/// stretcher just restarted puts out its first transient at a fraction of its level): its
+/// output latency.
+pub(crate) fn warm_span(player: &WarpPlayer) -> usize {
+    player.st.output_latency().clamp(1, PLAYER_BLOCK)
+}
+
+/// Runs `player` (its output unheard) towards a restart at timeline sample `target`, where it
+/// will play `heard`: from [`warm_span`] frames before it, or from where an earlier call left
+/// off, for at most `budget` frames. A restart's warm-up can so be spread over the blocks before
+/// it. Returns the frames run; the player is ready once it has reached `target`.
+pub(crate) fn warm_toward(
+    player: &mut WarpPlayer,
+    src: &[Vec<f32>],
+    source: SourceId,
+    heard: impl Fn(Samples) -> f64,
+    target: Samples,
+    budget: usize,
+) -> usize {
+    let span = warm_span(player) as i64;
+    let start = target.saturating_sub(span);
+    let lat_in = player.st.input_latency() as f64;
+    let lat_out = player.st.output_latency() as i64;
+    let on_way = player.source == Some(source)
+        && (start..=target).contains(&player.next_pos)
+        && (player.next_src - (heard(player.next_pos.saturating_add(lat_out)) + lat_in)).abs() <= 1.0;
+    let mut v = if on_way { player.next_pos } else { start };
+    let mut done = 0;
+    while v < target && done < budget {
+        let n = usize::try_from(target - v).unwrap_or(0).min(budget - done).min(PLAYER_BLOCK);
+        let ran = stretch_into(player, src, source, &heard, v, n, &mut [], 0, |_| 0.0);
+        if ran == 0 {
+            break;
+        }
+        done += ran;
+        v = v.saturating_add(ran as i64);
+    }
+    done
 }
