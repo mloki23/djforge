@@ -1,0 +1,20 @@
+# Stage 6 gate: loki journey with Session view slots ready to jam (Marty opens it in the app,
+# View > Session, clicks the window, then 1-8 / Shift+1-8 / 0 / Shift+0).
+#   soundcraft-cli script tools/live/jam_loki.cmds --save "C:/Users/marty/Music/djforge-tests/jam/loki jam.scraft"
+session.new {"name": "loki jam", "sample_rate": 48000}
+dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json"}
+dj.split_stems {"clip": 7}
+live.setup {}
+edit.select {"tracks": [1], "start": 3000000, "end": 3700000}
+live.slot_from_selection {"column": 0}
+edit.select {"tracks": [1], "start": 9000000, "end": 9700000}
+live.slot_from_selection {"column": 0}
+clip.stem_mask {"clip": 7, "mask": ["vocals"]}
+edit.select {"tracks": [2], "start": 30000000, "end": 31400000}
+live.slot_from_selection {"column": 1}
+clip.stem_mask {"clip": 7, "mask": ["vocals", "drums", "bass", "other"]}
+clip.stem_mask {"clip": 7, "mask": ["drums"]}
+edit.select {"tracks": [2], "start": 33000000, "end": 33700000}
+live.slot_from_selection {"column": 2}
+clip.stem_mask {"clip": 7, "mask": ["vocals", "drums", "bass", "other"]}
+live.state {}
