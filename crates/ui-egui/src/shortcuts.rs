@@ -57,23 +57,27 @@ fn search_chord(m: Modifiers, mac: bool) -> bool {
 pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd+= and Cmd+0 are Mix/Edit and Quantize to Grid, not egui's built-in interface zoom.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
+    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() || app.session_view.edit.is_some() {
         return;
     }
-    let events: Vec<(Key, Modifiers)> = ctx.input(|i| {
+    // Each key with the physical key it came from (the Session window's digits go by the key
+    // pressed, whatever Shift or the layout makes of it).
+    let events: Vec<(Key, Modifiers, Key)> = ctx.input(|i| {
         i.events
             .iter()
             .filter_map(|e| match e {
-                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => {
+                    Some((*key, *modifiers, physical_key.unwrap_or(*key)))
+                }
                 _ => None,
             })
             .collect()
     });
     // Cmd and Ctrl are separate keys only on macOS (asked at runtime so the web build in a Mac browser agrees).
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;
-    for (key, mods) in events {
+    for (key, mods, physical) in events {
         // The Session window's keys, while it has focus.
-        if crate::session_view::key(app, key, mods) {
+        if crate::session_view::key(app, physical, mods) {
             continue;
         }
         if fixed(app, key, mods, mac) {

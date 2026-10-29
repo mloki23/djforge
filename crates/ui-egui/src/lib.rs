@@ -1121,6 +1121,8 @@ impl SoundApp {
         for r in reqs {
             match r {
                 TransportRequest::ResetSession => {
+                    // The Session window's slots, jobs and dialog belonged to the old session.
+                    self.session_view = session_view::SessionView { open: self.session_view.open, ..Default::default() };
                     if let Some(p) = &self.player {
                         p.stop();
                         p.set_recording(false);
@@ -1290,6 +1292,7 @@ impl SoundApp {
         self.handle_transport(dt);
         // After the transport, which notes a replaced session.
         stems::step(self, ctx);
+        session_view::step(self, ctx);
         if self.engine.revision != self.last_rev {
             self.last_rev = self.engine.revision;
             if let Some(p) = &self.player {
@@ -1382,6 +1385,10 @@ impl SoundApp {
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
+        // What a click in this frame asked of the transport (a Session view launch) acts now.
+        if !self.engine.transport_requests.is_empty() {
+            self.handle_transport(0.0);
+        }
         // Here, not in logic(): a covered or minimized window runs only logic(), with no vsync to pace it.
         if self.meters_live() {
             let hz = if self.ui.window == MainWindow::Mix { 60 } else { 30 };

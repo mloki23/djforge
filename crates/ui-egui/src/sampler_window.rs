@@ -91,7 +91,7 @@ impl SoundApp {
             return files;
         }
         // A file dropped on a Session view slot loads into it.
-        let files = crate::session_view::take_drop(self, files, pos);
+        let files = crate::session_view::take_drop(self, ctx, files, pos);
         if files.is_empty() {
             return files;
         }

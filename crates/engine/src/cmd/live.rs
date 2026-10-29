@@ -283,7 +283,17 @@ fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
-fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
+/// What `live.slot_from_file` was asked for, checked.
+#[derive(Debug, Clone)]
+struct FileParams {
+    column: usize,
+    row: usize,
+    path: String,
+    bpm: Option<f64>,
+    first_beat: f64,
+}
+
+fn file_params(e: &Engine, p: &Value) -> Result<FileParams> {
     let column = column_param(e, FROM_FILE, p)?;
     let path = str_param(p, "path").ok_or_else(|| bad(FROM_FILE, "`path` required"))?.to_string();
     let row = target(e, FROM_FILE, p, column)?;
@@ -301,27 +311,66 @@ fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     };
     four_four(FROM_FILE, e.session())?;
-    // The file is imported first, so a file that won't read or decode is refused before mixforge
-    // runs; a failure after this is rolled back with the import.
-    let bytes = crate::io::read_file(&path)?;
-    let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
-    let (source, frames, _) = crate::io::import_source_bytes(e, &name, &bytes, Some(&path))?;
-    // The beat grid: given, else mixforge's analysis (when the app set it up), else the file's
-    // BPM tag with the first downbeat at the file start, else none (a one-shot).
+    Ok(FileParams { column, row, path, bpm, first_beat })
+}
+
+/// A file read, decoded and gridded for a slot: the slow part of `live.slot_from_file`, which a
+/// [`SlotFileJob`] does off the UI thread.
+#[derive(Debug)]
+struct Loaded {
+    path: String,
+    decoded: crate::io::DecodedImport,
+    beats: Option<Beats>,
+    how: Option<&'static str>,
+    analysis_error: Option<String>,
+}
+
+/// Reads and decodes the file (so one that won't decode is refused before mixforge runs), then
+/// finds its beat grid: given, else mixforge's analysis (`analyse`, when the app set it up),
+/// else the file's BPM tag with the first downbeat at the file start, else none (a one-shot).
+fn load(f: &FileParams, rate: u32, analyse: Option<&super::PrepAnalyse>) -> Result<Loaded> {
+    let bytes = crate::io::read_file(&f.path)?;
+    let decoded = crate::io::decode_import(&file_name(&f.path), &bytes, rate)?;
     let mut analysis_error = None;
-    let (beats, how) = match bpm {
-        Some(bpm) => (Some(Beats::Constant { bpm, first: first_beat }), Some("given")),
-        None => match analysed(e, &path) {
+    let (beats, how) = match f.bpm {
+        Some(bpm) => (Some(Beats::Constant { bpm, first: f.first_beat }), Some("given")),
+        None => match analysed(analyse, &f.path) {
             Ok(b) => (Some(b), Some("mixforge")),
             Err(why) => {
                 analysis_error = Some(why);
-                match tagged_bpm(&path) {
+                match tagged_bpm(&f.path) {
                     Some(bpm) => (Some(Beats::Constant { bpm, first: 0.0 }), Some("tag")),
                     None => (None, None),
                 }
             }
         },
     };
+    Ok(Loaded { path: f.path.clone(), decoded, beats, how, analysis_error })
+}
+
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string()
+}
+
+thread_local! {
+    /// The file a [`SlotFile`] loaded, for the `live.slot_from_file` it runs to apply it.
+    static LOADED: std::cell::RefCell<Option<Loaded>> = const { std::cell::RefCell::new(None) };
+}
+
+fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
+    let f = file_params(e, p)?;
+    let ready = LOADED.with(|l| l.borrow_mut().take()).filter(|l| l.path == f.path);
+    let loaded = match ready {
+        Some(l) => l,
+        None => {
+            let analyse = e.analyse().cloned();
+            load(&f, e.session().sample_rate.hz(), analyse.as_ref())?
+        }
+    };
+    let Loaded { decoded, beats, how, analysis_error, .. } = loaded;
+    let (column, row) = (f.column, f.row);
+    // A failure from here on is rolled back with the import.
+    let (source, frames, _) = crate::io::add_import(e, &file_name(&f.path), decoded, Some(&f.path))?;
     let s = e.session();
     let label = s.source(source).map(|x| x.name.clone()).unwrap_or_default();
     let color = s.live.column_track(column, &s.tracks).and_then(|t| s.track(t)).map_or([128, 128, 128], |t| t.color);
@@ -348,13 +397,95 @@ fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// The beat grid mixforge's analysis gives the file at `path`, or why there is none. The command
-/// runs it to the end: it has no cancel of its own, and the sidecar has its time limit.
-fn analysed(e: &Engine, path: &str) -> std::result::Result<Beats, String> {
-    let analyse = e.analyse().ok_or("no mixforge analysis is set up")?;
+/// The beat grid mixforge's analysis (`analyse`) gives the file at `path`, or why there is none.
+/// It runs to the end: there is no cancel, and the sidecar has its time limit.
+fn analysed(analyse: Option<&super::PrepAnalyse>, path: &str) -> std::result::Result<Beats, String> {
+    let analyse = analyse.ok_or("no mixforge analysis is set up")?;
     let a = analyse(path, &|| false)?;
     let (bpm, first) = grid_of(&a).ok_or("mixforge's analysis has no usable bpm/first_downbeat")?;
     Ok(Beats::Constant { bpm, first })
+}
+
+/// `live.slot_from_file` with the file read, decoded and analysed on another thread, so the app
+/// stays responsive: [`slot_file_job`] checks the parameters and starts it, [`SlotFileJob::poll`]
+/// gives the [`SlotFile`] once ready, and [`SlotFile::apply`] fills the slot as one undo step.
+pub struct SlotFileJob {
+    column: usize,
+    row: usize,
+    params: Value,
+    state: JobState,
+}
+
+enum JobState {
+    Running(std::thread::JoinHandle<Result<Loaded>>),
+    Ended(Option<Box<Result<Loaded>>>),
+}
+
+/// A loaded file waiting to fill its slot.
+pub struct SlotFile {
+    params: Value,
+    loaded: Loaded,
+}
+
+/// Starts loading the file `p` (`live.slot_from_file`'s parameters) names, for its slot: every
+/// check is made before this returns (refusals as `live.slot_from_file` makes them).
+pub fn slot_file_job(e: &Engine, p: &Value) -> Result<SlotFileJob> {
+    if e.session().live.columns.is_empty() {
+        return Err(bad(FROM_FILE, NO_COLUMNS));
+    }
+    let f = file_params(e, p)?;
+    let mut params = p.clone();
+    if let Some(o) = params.as_object_mut() {
+        o.insert("slot".into(), json!(f.row));
+    }
+    let rate = e.session().sample_rate.hz();
+    let analyse = e.analyse().cloned();
+    let roots = crate::file_access::current();
+    let (column, row) = (f.column, f.row);
+    let work = move || {
+        let run = || load(&f, rate, analyse.as_ref());
+        match &roots {
+            Some(r) => crate::file_access::confine(Some(r), run),
+            None => crate::file_access::unconfined(run),
+        }
+    };
+    let state = match std::thread::Builder::new().name("slot-file".into()).spawn(work) {
+        Ok(handle) => JobState::Running(handle),
+        Err(err) => return Err(EngineError::Io(format!("could not start loading the file: {err}"))),
+    };
+    Ok(SlotFileJob { column, row, params, state })
+}
+
+impl SlotFileJob {
+    /// The slot it loads into (column, row).
+    pub fn target(&self) -> (usize, usize) {
+        (self.column, self.row)
+    }
+
+    /// The loaded file once ready (once), or why it could not be loaded.
+    pub fn poll(&mut self) -> Option<Result<SlotFile>> {
+        if let JobState::Running(handle) = &self.state
+            && !handle.is_finished()
+        {
+            return None;
+        }
+        let r = match std::mem::replace(&mut self.state, JobState::Ended(None)) {
+            JobState::Running(handle) => Some(handle.join().unwrap_or_else(|_| Err(EngineError::Io("loading the file failed".into())))),
+            JobState::Ended(r) => r.map(|r| *r),
+        };
+        r.map(|r| r.map(|loaded| SlotFile { params: self.params.clone(), loaded }))
+    }
+}
+
+impl SlotFile {
+    /// Fills the slot with the loaded file: `live.slot_from_file` (one undo step), refused as it
+    /// would be now (the slot's column gone, the meter changed…).
+    pub fn apply(self, e: &mut Engine) -> Result<Value> {
+        LOADED.with(|l| *l.borrow_mut() = Some(self.loaded));
+        let r = e.execute(FROM_FILE, &self.params);
+        LOADED.with(|l| l.borrow_mut().take());
+        r
+    }
 }
 
 /// The BPM in the ID3 tag of the MP3 at `path`, when it is a usable tempo.

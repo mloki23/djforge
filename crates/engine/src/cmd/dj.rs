@@ -231,6 +231,7 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 /// Where a beat-locked track's beat times come from.
+#[derive(Debug)]
 pub(super) enum Beats {
     /// Analysed beat times (seconds, the first a downbeat).
     List(Vec<f64>),

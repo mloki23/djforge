@@ -108,7 +108,7 @@ pub fn refuses_command(app: &mut SoundApp, id: &str) -> bool {
     let Some(job) = job_name(app) else { return false };
     let read_only = soundcraft_engine::find_command(id).is_some_and(|c| !c.journal && !c.undoable && !c.view);
     let refused = ((id.starts_with("file.") || id.starts_with("session.")) && !read_only)
-        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems" | "dj.export_set")
+        || matches!(id, "dj.import_set" | "prep.tracks" | "dj.split_stems" | "dj.export_set" | "live.slot_from_file" | "mix.sampler_load")
         || (id == "dj.clear_stem_cache" && app.split.is_some());
     if refused {
         let job = if id == "dj.clear_stem_cache" { "stem split" } else { job };

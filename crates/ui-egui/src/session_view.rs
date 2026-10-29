@@ -2,25 +2,32 @@
 //!
 //! A grid of 8 slots per Live column, a Scene column, a Stop button per column, Stop All and the
 //! launch quantise. Each slot shows what `live.state` reports: empty, filled (name and colour),
-//! queued (blinking until its boundary) or playing (a ring showing where its loop is). A slot's
-//! right-click menu adds the time selection, loads a file, edits or clears it; a file dropped on
-//! a slot loads into it.
+//! queued (blinking until its boundary), playing (a ring showing where its loop is) or loading
+//! (a file on its way in). A slot's right-click menu adds the time selection, loads a file, edits
+//! or clears it; a file dropped on a slot loads into it. Files load on another thread, so the
+//! app keeps playing while one is read and analysed.
 //!
 //! While the window has focus (it was clicked last), 1–8 launch the selected column's slots, 0
-//! stops it, ←/→ select the column, Shift+1–8 launch a scene and Esc stops everything. Elsewhere
+//! stops it, Shift+0 stops everything, ←/→ select the column and Shift+1–8 launch a scene. The
+//! digits go by the key pressed, whatever Shift or the keyboard layout makes of it. Elsewhere
 //! those keys keep their arrangement meaning.
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
 use egui::{Color32, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{LIVE_SLOTS, Quantise, SLOT_GAIN_DB, SlotMode};
+use soundcraft_engine::cmd::{SlotFileJob, slot_file_job};
+use soundcraft_model::{LIVE_SLOTS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, Slot, SlotMode};
 
 /// Size of a slot cell.
 const CELL: egui::Vec2 = vec2(116.0, 26.0);
+/// Beats in a slot's bar (slots count 4/4 bars).
+const BAR_BEATS: f64 = 4.0;
+/// The keys, as the window shows them.
+const KEYS_HELP: &str = "Click the window, then: 1–8 launch · 0 stop column · Shift+0 stop all · ←/→ column · Shift+1–8 scene";
 
 /// The Session window's state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SessionView {
     pub open: bool,
     /// The window was clicked last: its keys apply.
@@ -29,8 +36,12 @@ pub struct SessionView {
     pub column: usize,
     /// Where a dropped file loads into a slot this frame: (cell, column, row).
     pub drop_targets: Vec<(Rect, usize, usize)>,
+    /// The window's layer as last drawn (drops and clicks count only on it).
+    pub window_layer: Option<egui::LayerId>,
     /// The slot being edited (Edit...).
     pub edit: Option<SlotEdit>,
+    /// Files loading into slots.
+    pub jobs: Vec<(SlotFileJob, String)>,
 }
 
 /// The Edit Slot dialog's fields.
@@ -44,18 +55,24 @@ pub struct SlotEdit {
     /// `None` for a slot without a beat grid (it has no bars).
     pub length_bars: Option<u32>,
     pub gain_db: f32,
-    /// The values when the dialog opened, to send only what changed.
-    first: Box<Option<SlotEdit>>,
+    /// Why the last OK was refused.
+    pub error: Option<String>,
+    /// The slot when the dialog opened: what changed is sent, and the dialog closes if the slot
+    /// itself changes meanwhile (cleared, undone, another session).
+    slot: Slot,
 }
 
 /// `window.session`: opens (or with `value`, shows or hides) the Session window. Opening it on a
-/// session without Live columns sets them up (`live.setup`, one undo step).
+/// session without Live columns sets them up first (`live.setup`, one undo step); the window
+/// opens only when that succeeds. Opening doesn't take the keyboard: that takes a click.
 pub fn command(app: &mut SoundApp, p: &Value) -> Result<Value, String> {
     let open = p.get("value").and_then(Value::as_bool).unwrap_or(!app.session_view.open);
-    app.session_view.open = open;
-    app.session_view.focused = open;
     if open && app.engine.session().live.columns.is_empty() {
         app.run("live.setup", json!({}))?;
+    }
+    app.session_view.open = open;
+    if !open {
+        app.session_view.focused = false;
     }
     Ok(json!({"value": open}))
 }
@@ -88,10 +105,10 @@ fn states(app: &mut SoundApp) -> Vec<ColumnState> {
         .unwrap_or_default()
 }
 
-/// Handles a key while the Session window has focus; true when it did.
+/// Handles a key (the physical key pressed) while the Session window has focus; true when it did.
 pub fn key(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
     let view = &app.session_view;
-    if !view.open || !view.focused || m.command || m.alt || m.ctrl {
+    if !view.open || !view.focused || view.edit.is_some() || m.command || m.alt || m.ctrl {
         return false;
     }
     let columns = app.engine.session().live.columns.len();
@@ -111,50 +128,97 @@ pub fn key(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
         Key::Num8 => Some(8),
         _ => None,
     };
-    match (key, digit) {
-        (_, Some(0)) if !m.shift => {
+    match (key, digit, m.shift) {
+        (_, Some(0), false) => {
             let _ = app.run("live.stop", json!({"column": column}));
         }
-        (_, Some(n)) if n > 0 && m.shift => {
-            let _ = app.run("live.scene", json!({"row": n - 1}));
-        }
-        (_, Some(n)) if n > 0 => {
-            let _ = app.run("live.launch", json!({"column": column, "slot": n - 1}));
-        }
-        (Key::ArrowLeft, _) if !m.shift => app.session_view.column = column.saturating_sub(1),
-        (Key::ArrowRight, _) if !m.shift => app.session_view.column = (column + 1).min(columns - 1),
-        (Key::Escape, _) if !m.shift => {
+        (_, Some(0), true) => {
             let _ = app.run("live.stop_all", json!({}));
         }
+        (_, Some(n), true) => {
+            let _ = app.run("live.scene", json!({"row": n - 1}));
+        }
+        (_, Some(n), false) => {
+            let _ = app.run("live.launch", json!({"column": column, "slot": n - 1}));
+        }
+        (Key::ArrowLeft, _, false) => app.session_view.column = column.saturating_sub(1),
+        (Key::ArrowRight, _, false) => app.session_view.column = (column + 1).min(columns - 1),
         _ => return false,
     }
     true
 }
 
-/// Loads the first audio file of `files` dropped at `pos` on a slot into it; returns the rest.
-pub(crate) fn take_drop(app: &mut SoundApp, files: Vec<egui::DroppedFileHandle>, pos: Option<egui::Pos2>) -> Vec<egui::DroppedFileHandle> {
-    let Some(&(_, column, row)) = pos.and_then(|p| app.session_view.drop_targets.iter().rev().find(|(r, _, _)| r.contains(p))) else {
-        return files;
-    };
-    let mut rest = Vec::new();
-    let mut claimed = false;
-    for f in files {
-        let path = f.path().to_string_lossy().into_owned();
-        if claimed || !f.path().is_absolute() || !crate::sampler_window::is_audio_name(&path) {
-            rest.push(f);
-            continue;
+/// Starts loading the audio file at `path` into a slot on another thread (`live.slot_from_file`,
+/// applied as one undo step once loaded). Refused while a prep, split or export runs.
+pub fn start_load(app: &mut SoundApp, column: usize, row: usize, path: &str) -> Result<(), String> {
+    if crate::prep::refuses_command(app, "live.slot_from_file") {
+        return Err(app.ui.status.clone());
+    }
+    let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+    match slot_file_job(&app.engine, &json!({"column": column, "slot": row, "path": path})) {
+        Ok(job) => {
+            app.ui.status = format!("Loading {name} into Live {} slot {}…", column + 1, row + 1);
+            app.session_view.jobs.push((job, name));
+            Ok(())
         }
-        claimed = true;
-        if app.run("live.slot_from_file", json!({"column": column, "slot": row, "path": path})).is_ok() {
-            app.ui.status = format!(
-                "Loaded {} into Live {} slot {}",
-                f.path().file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned()),
-                column + 1,
-                row + 1
-            );
+        Err(e) => {
+            app.ui.status = e.to_string();
+            Err(e.to_string())
         }
     }
-    rest
+}
+
+/// Fills the slots whose files have loaded (each as one undo step). Called every frame.
+pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
+    if app.session_view.jobs.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while let Some((job, _)) = app.session_view.jobs.get_mut(i) {
+        let Some(r) = job.poll() else {
+            i += 1;
+            continue;
+        };
+        let (job, name) = app.session_view.jobs.remove(i);
+        let (column, row) = job.target();
+        app.ui.status = match r.and_then(|ready| ready.apply(&mut app.engine)) {
+            Ok(v) => {
+                let how = match v["grid"].as_str() {
+                    Some(g) => format!("a {}-beat loop ({g} grid)", v["length_beats"].as_f64().unwrap_or(0.0)),
+                    None => "a one-shot".to_string(),
+                };
+                format!("Loaded {name} into Live {} slot {} as {how}", column + 1, row + 1)
+            }
+            Err(e) => format!("{name}: {e}"),
+        };
+    }
+    if !app.session_view.jobs.is_empty() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Takes files dropped on a slot (the topmost layer under the pointer being the Session window):
+/// the first audio file with a path loads into that slot, and the others are ignored rather than
+/// imported elsewhere. Files dropped anywhere else are returned.
+pub(crate) fn take_drop(
+    app: &mut SoundApp,
+    ctx: &egui::Context,
+    files: Vec<egui::DroppedFileHandle>,
+    pos: Option<egui::Pos2>,
+) -> Vec<egui::DroppedFileHandle> {
+    let view = &app.session_view;
+    let Some(p) = pos.filter(|p| view.window_layer.is_some() && ctx.layer_id_at(*p) == view.window_layer) else { return files };
+    let Some(&(_, column, row)) = view.drop_targets.iter().rev().find(|(r, _, _)| r.contains(p)) else { return files };
+    let total = files.len();
+    let first = files.iter().find(|f| f.path().is_absolute() && crate::sampler_window::is_audio_name(&f.path().to_string_lossy()));
+    let Some(path) = first.map(|f| f.path().to_string_lossy().into_owned()) else {
+        app.ui.status = "Drop an audio file (from a folder) on the slot".into();
+        return Vec::new();
+    };
+    if start_load(app, column, row, &path).is_ok() && total > 1 {
+        app.ui.status += &format!(" ({} more file{} ignored)", total - 1, if total == 2 { "" } else { "s" });
+    }
+    Vec::new()
 }
 
 fn quantise_label(q: Quantise) -> String {
@@ -170,6 +234,7 @@ fn quantise_label(q: Quantise) -> String {
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     if !app.session_view.open {
         app.session_view.focused = false;
+        app.session_view.window_layer = None;
         return;
     }
     let states = states(app);
@@ -179,18 +244,22 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let shown = egui::Window::new(egui::RichText::new("Session").font(bold(13.0)))
         .id(egui::Id::new("session_view"))
         .open(&mut open)
-        .default_size(vec2(5.0 * CELL.x + 80.0, 11.0 * CELL.y + 60.0))
+        .default_size(vec2(5.0 * CELL.x + 80.0, 11.0 * CELL.y + 80.0))
         .resizable(true)
         .show(ctx, |ui| grid(app, ui, &states, now));
+    app.session_view.window_layer = shown.as_ref().map(|r| r.response.layer_id);
     if let Some(r) = &shown {
-        let rect = r.response.rect;
-        // Keys go to the Session window after a click in it, and back to the arrangement after
-        // a click anywhere else.
+        // Keys go to the Session window after a click on it, and back to the arrangement after a
+        // click anywhere else; a click in a menu or popup (the window's own) changes nothing.
         if let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten()) {
-            app.session_view.focused = rect.contains(p);
+            match ctx.layer_id_at(p) {
+                Some(l) if l == r.response.layer_id => app.session_view.focused = true,
+                Some(l) if l.order == egui::Order::Foreground => {}
+                _ => app.session_view.focused = false,
+            }
         }
         if app.session_view.focused {
-            ui_outline(ctx, rect, t.accent);
+            ui_outline(ctx, r.response.rect, t.accent);
         }
     }
     if !open {
@@ -234,7 +303,7 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
         if chosen != current {
             let _ = app.run("live.quantise", json!({"value": chosen.id()}));
         }
-        if ui.button("Stop All").clicked() {
+        if ui.button("Stop All").on_hover_text("Shift+0").clicked() {
             let _ = app.run("live.stop_all", json!({}));
         }
     });
@@ -263,7 +332,7 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
             }
             if ui
                 .add_sized(vec2(60.0, CELL.y), egui::Button::new(format!("▶ {}", row + 1)))
-                .on_hover_text("Launch this row in every column")
+                .on_hover_text(format!("Launch this row in every column (Shift+{})", row + 1))
                 .clicked()
             {
                 let _ = app.run("live.scene", json!({"row": row}));
@@ -282,6 +351,8 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
         }
         ui.end_row();
     });
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(KEYS_HELP).font(regular(10.0)).color(t.text_dim));
 }
 
 fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state: ColumnState, now: f64) {
@@ -289,6 +360,7 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
     let (rect, resp) = ui.allocate_exact_size(CELL, Sense::click());
     let s = app.engine.session();
     let filled = s.live.slot(column, row).map(|x| (x.name.clone(), x.color));
+    let loading = app.session_view.jobs.iter().any(|(j, _)| j.target() == (column, row));
     let label = format!("Live {} slot {}", column + 1, row + 1);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
     app.session_view.drop_targets.push((rect, column, row));
@@ -326,8 +398,12 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
         }
         (None, None) => {}
     }
-    if let Some((name, _)) = &filled {
-        p.text(egui::pos2(rect.min.x + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, name, regular(11.0), t.text);
+    let text = if loading { Some("loading…".to_string()) } else { filled.as_ref().map(|(name, _)| name.clone()) };
+    if let Some(text) = text {
+        p.text(egui::pos2(rect.min.x + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, text, regular(11.0), t.text);
+    }
+    if loading {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
     if resp.clicked() {
         app.session_view.column = column;
@@ -342,12 +418,12 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
             ui.close();
         }
         let can_pick = app.services.pick_open.is_some();
-        let load = ui.add_enabled(can_pick, egui::Button::new("Load File..."));
+        let load = ui.add_enabled(can_pick && !loading, egui::Button::new("Load File..."));
         let load = if can_pick { load } else { load.on_disabled_hover_text("Drop an audio file on the slot") };
         if load.clicked() {
             ui.close();
             if let Some(path) = app.services.pick_open.as_ref().and_then(|pick| pick("live.slot_from_file", crate::sampler_window::AUDIO_EXTS)) {
-                let _ = app.run("live.slot_from_file", json!({"column": column, "slot": row, "path": path}));
+                let _ = start_load(app, column, row, &path);
             }
         }
         if ui.add_enabled(filled.is_some(), egui::Button::new("Edit...")).clicked() {
@@ -363,15 +439,23 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
 
 fn edit_of(app: &SoundApp, column: usize, row: usize) -> Option<SlotEdit> {
     let x = app.engine.session().live.slot(column, row)?;
-    let bars = x.warp.as_ref().map(|_| (x.length_beats / 4.0).round().max(1.0) as u32);
-    let e =
-        SlotEdit { column, row, name: x.name.clone(), color: x.color, mode: x.mode, length_bars: bars, gain_db: x.gain_db, first: Box::new(None) };
-    Some(SlotEdit { first: Box::new(Some(e.clone())), ..e })
+    let bars = x.warp.as_ref().map(|_| (x.length_beats / BAR_BEATS).round().max(1.0) as u32);
+    Some(SlotEdit {
+        column,
+        row,
+        name: x.name.clone(),
+        color: x.color,
+        mode: x.mode,
+        length_bars: bars,
+        gain_db: x.gain_db,
+        error: None,
+        slot: x.clone(),
+    })
 }
 
 /// The `live.slot_set` parameters for what the dialog changed (`None`: nothing).
 fn changes(e: &SlotEdit) -> Option<Value> {
-    let first = e.first.as_ref().as_ref()?;
+    let first = &e.slot;
     let mut p = json!({"column": e.column, "slot": e.row});
     let o = p.as_object_mut()?;
     if e.name != first.name {
@@ -383,7 +467,8 @@ fn changes(e: &SlotEdit) -> Option<Value> {
     if e.mode != first.mode {
         o.insert("mode".into(), json!(e.mode.id()));
     }
-    if e.length_bars != first.length_bars
+    let bars = first.warp.as_ref().map(|_| (first.length_beats / BAR_BEATS).round().max(1.0) as u32);
+    if e.length_bars != bars
         && let Some(b) = e.length_bars
     {
         o.insert("length_bars".into(), json!(b));
@@ -396,47 +481,55 @@ fn changes(e: &SlotEdit) -> Option<Value> {
 
 fn edit_dialog(app: &mut SoundApp, ctx: &egui::Context) {
     let Some(mut e) = app.session_view.edit.take() else { return };
+    // The slot changed under the dialog (cleared, undone, replaced, another session): it closes.
+    if app.engine.session().live.slot(e.column, e.row) != Some(&e.slot) {
+        return;
+    }
+    let most_bars = (MAX_SLOT_BEATS / BAR_BEATS).floor() as u32;
     let mut keep = true;
     let mut apply = false;
-    egui::Window::new(egui::RichText::new(format!("Edit Live {} Slot {}", e.column + 1, e.row + 1)).font(bold(13.0)))
-        .id(egui::Id::new("session_slot_edit"))
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            egui::Grid::new("slot_edit_fields").num_columns(2).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut e.name);
-                ui.end_row();
-                ui.label("Colour");
-                ui.color_edit_button_srgb(&mut e.color);
-                ui.end_row();
-                ui.label("Mode");
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(e.length_bars.is_some(), |ui| ui.radio_value(&mut e.mode, SlotMode::Loop, "Loop"));
-                    ui.radio_value(&mut e.mode, SlotMode::OneShot, "One-shot");
-                });
-                ui.end_row();
-                if let Some(bars) = &mut e.length_bars {
-                    ui.label("Length (bars)");
-                    ui.add(egui::DragValue::new(bars).range(1..=256));
-                    ui.end_row();
-                }
-                ui.label("Gain (dB)");
-                ui.add(egui::Slider::new(&mut e.gain_db, SLOT_GAIN_DB.0..=SLOT_GAIN_DB.1));
-                ui.end_row();
-            });
+    egui::Modal::new(egui::Id::new("session_slot_edit")).show(ctx, |ui| {
+        ui.label(egui::RichText::new(format!("Edit Live {} Slot {}", e.column + 1, e.row + 1)).font(bold(13.0)));
+        egui::Grid::new("slot_edit_fields").num_columns(2).show(ui, |ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut e.name);
+            ui.end_row();
+            ui.label("Colour");
+            ui.color_edit_button_srgb(&mut e.color);
+            ui.end_row();
+            ui.label("Mode");
             ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    apply = true;
-                    keep = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    keep = false;
-                }
+                ui.add_enabled_ui(e.length_bars.is_some(), |ui| ui.radio_value(&mut e.mode, SlotMode::Loop, "Loop"));
+                ui.radio_value(&mut e.mode, SlotMode::OneShot, "One-shot");
             });
+            ui.end_row();
+            if let Some(bars) = &mut e.length_bars {
+                ui.label("Length (bars)");
+                ui.add(egui::DragValue::new(bars).range(1..=most_bars));
+                ui.end_row();
+            }
+            ui.label("Gain (dB)");
+            ui.add(egui::Slider::new(&mut e.gain_db, SLOT_GAIN_DB.0..=SLOT_GAIN_DB.1));
+            ui.end_row();
         });
-    if apply && let Some(p) = changes(&e) {
-        let _ = app.run("live.slot_set", p);
+        if let Some(why) = &e.error {
+            ui.colored_label(Tokens::current().accent, why);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("OK").clicked() {
+                apply = true;
+            }
+            if ui.button("Cancel").clicked() {
+                keep = false;
+            }
+        });
+    });
+    if apply {
+        match changes(&e).map(|p| app.run("live.slot_set", p)) {
+            // Refused: the dialog stays, with the edits and why.
+            Some(Err(why)) => e.error = Some(why),
+            _ => keep = false,
+        }
     }
     if keep {
         app.session_view.edit = Some(e);

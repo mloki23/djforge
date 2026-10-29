@@ -493,12 +493,35 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
 /// referenced in place when it plays as decoded, its origin and time stamp recorded. Returns the
 /// source, its length in frames at the session rate and its channel count.
 pub(crate) fn import_source_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>) -> Result<(SourceId, Samples, usize)> {
+    let decoded = decode_import(name, bytes, e.session().sample_rate.hz())?;
+    add_import(e, name, decoded, path)
+}
+
+/// An audio file decoded at the session rate for [`add_import`] (made off the UI thread by
+/// background imports).
+#[derive(Debug)]
+pub(crate) struct DecodedImport {
+    info: soundcraft_audio_io::AudioInfo,
+    buf: AudioBuffer,
+    ext: Option<String>,
+}
+
+/// Decodes the file `name` (`bytes`) at the session rate `rate`, as an import does.
+pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<DecodedImport> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (info, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
-    let buf = at_rate(buf, e.session().sample_rate.hz(), MAX_IMPORT_SAMPLES)
-        .ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
+    let buf = at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
+    }
+    Ok(DecodedImport { info, buf, ext })
+}
+
+/// Adds decoded audio as a new source, as [`import_source_bytes`] does.
+pub(crate) fn add_import(e: &mut Engine, name: &str, decoded: DecodedImport, path: Option<&str>) -> Result<(SourceId, Samples, usize)> {
+    let DecodedImport { info, buf, ext } = decoded;
+    if buf.sample_rate != e.session().sample_rate.hz() {
+        return Err(EngineError::Io(format!("{name}: the session's sample rate changed while it was read; load it again")));
     }
     let channels = buf.num_channels();
     let file_rate = info.sample_rate;

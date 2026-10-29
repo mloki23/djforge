@@ -17,6 +17,8 @@ pub(crate) struct LiveFrame {
     from: Samples,
     margin: Samples,
     looped: Option<Range>,
+    /// The transport is stopped: the first request that goes through starts it.
+    start: bool,
 }
 
 impl SoundApp {
@@ -33,13 +35,18 @@ impl SoundApp {
         (frames * self.engine.session().sample_rate.as_f64() / rate).ceil() as Samples
     }
 
-    /// Carries out a Session view launch or stop. With the transport stopped (as the player
-    /// reports it) it starts open-ended playback from the edit insertion, looping the selection
-    /// when loop playback is on, with no pre-roll; the request lands on the first boundary at or
-    /// after that point (Play and the launch reach the audio thread together, so no margin).
-    /// While playing, it lands on the first boundary at least the launch margin ahead, folded
-    /// into the transport's loop when it would fall past the loop's end. Every request of one
-    /// frame (`frame`) counts from the same point, so they land together.
+    /// Carries out a Session view launch or stop.
+    ///
+    /// - **While playing** it lands on the first boundary at least the launch margin ahead,
+    ///   folded into the transport's loop when it would fall past the loop's end.
+    /// - **With the transport stopped** (as the player reports it), a launch or scene starts
+    ///   open-ended playback from the edit insertion (looping the selection when loop playback is
+    ///   on, with no pre-roll) and lands on the first boundary at or after that point; the launch
+    ///   is sent before Play, which keeps it, so the first block can't miss it. A stop does
+    ///   nothing: nothing plays. A launch refused (no boundary in the loop, a meter not in 4/4)
+    ///   leaves the transport stopped.
+    ///
+    /// Every request of one frame (`frame`) counts from the same point, so they land together.
     pub(crate) fn live_request(&mut self, req: LiveRequest, frame: &mut Option<LiveFrame>) {
         let Some(playing) = self.player.as_ref().map(|p| p.is_playing()) else {
             self.ui.status = "Session view launches need the audio engine".into();
@@ -47,20 +54,16 @@ impl SoundApp {
         };
         let f = match *frame {
             Some(f) => f,
+            None if playing => {
+                let from = self.player.as_ref().map_or(0, |p| p.position());
+                LiveFrame { from, margin: live_launch_margin(self.engine.session(), self.callback_samples()), looped: self.play_loop, start: false }
+            }
+            None if matches!(req, LiveRequest::Stop { .. } | LiveRequest::StopAll) => return,
             None => {
-                let f = if playing {
-                    let from = self.player.as_ref().map_or(0, |p| p.position());
-                    LiveFrame { from, margin: live_launch_margin(self.engine.session(), self.callback_samples()), looped: self.play_loop }
-                } else {
-                    let s = self.engine.session();
-                    let sel = s.edit.selection;
-                    let looped = (s.edit.loop_playback && !sel.is_empty()).then_some(sel);
-                    let from = sel.start.max(0);
-                    self.start_play(from, None, looped);
-                    LiveFrame { from, margin: 0, looped }
-                };
-                *frame = Some(f);
-                f
+                let s = self.engine.session();
+                let sel = s.edit.selection;
+                let looped = (s.edit.loop_playback && !sel.is_empty()).then_some(sel);
+                LiveFrame { from: sel.start.max(0), margin: 0, looped, start: true }
             }
         };
         let s = self.engine.session();
@@ -68,11 +71,20 @@ impl SoundApp {
             Some(l) => live_fold_into_loop(s, at, f.from, l, s.live.quantise, f.margin),
             None => Ok(at),
         });
-        match (at, &self.player) {
-            (Ok(at), Some(p)) => live_cmds(s, &req, at).into_iter().for_each(|c| p.live(c)),
-            (Err(why), _) => self.ui.status = why,
-            (Ok(_), None) => {}
+        let at = match at {
+            Ok(at) => at,
+            Err(why) => {
+                self.ui.status = why;
+                return;
+            }
+        };
+        if let Some(p) = &self.player {
+            live_cmds(s, &req, at).into_iter().for_each(|c| p.live(c));
         }
+        if f.start {
+            self.start_play(f.from, None, f.looped);
+        }
+        *frame = Some(LiveFrame { start: false, ..f });
     }
 
     /// Hands the engine what the audio thread last reported the Live columns playing, and

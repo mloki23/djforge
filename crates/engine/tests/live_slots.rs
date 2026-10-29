@@ -556,3 +556,43 @@ fn a_template_keeps_the_live_columns_but_not_their_slots() {
     assert_eq!((live.columns.len(), live.slots().count()), (4, 0));
     assert!(live.lost_columns(&t.session().tracks).is_empty());
 }
+
+#[test]
+fn a_slot_file_job_loads_off_the_thread_and_fills_the_slot_in_one_undo_step() {
+    let dir = Scratch::new("job");
+    let path = wav(&dir.0, "loop.wav", 10.0);
+    let mut e = Engine::default();
+    assert!(soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 0, "path": path})).err().unwrap().to_string().contains("View › Session"));
+    run(&mut e, "live.setup", json!({}));
+    let (fake, asked) = fake_analysis(Ok(json!({"bpm": 120.0, "first_downbeat": 0.0})));
+    e.set_analyse(fake);
+    // Checked before it starts.
+    assert!(soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 0, "path": path, "bpm": "x"})).is_err());
+    let mut job = soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 2, "path": path})).unwrap();
+    assert_eq!(job.target(), (2, 0));
+    let undo = e.undo_history().len();
+    let ready = loop {
+        if let Some(r) = job.poll() {
+            break r.unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(*asked.lock().unwrap(), std::slice::from_ref(&path), "analysed on the job's thread, before anything changed");
+    assert_eq!(e.session().sources.len(), 0);
+    let r = ready.apply(&mut e).unwrap();
+    assert_eq!((r["grid"].as_str(), r["length_beats"].as_f64()), (Some("mixforge"), Some(20.0)), "{r}");
+    assert_eq!(e.undo_history().len(), undo + 1);
+    assert_eq!(asked.lock().unwrap().len(), 1, "applying doesn't analyse again");
+    assert!(e.session().live.slot(2, 0).is_some());
+    // A file that won't decode fails in the job, leaving the session alone.
+    let junk = dir.0.join("junk.wav");
+    std::fs::write(&junk, "not audio").unwrap();
+    let mut job = soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 1, "path": junk})).unwrap();
+    let r = loop {
+        if let Some(r) = job.poll() {
+            break r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(r.err().unwrap().to_string().contains("junk.wav"));
+}

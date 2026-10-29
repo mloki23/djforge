@@ -88,7 +88,7 @@ fn harness(dir: &Path) -> (Harness<'static, SoundApp>, TrackId) {
     (h, track)
 }
 
-/// Opens View › Session and gives it focus.
+/// Opens View › Session (which doesn't take the keyboard).
 fn open(h: &mut Harness<'_, SoundApp>) {
     h.state_mut().run("window.session", json!({"value": true})).unwrap();
     steps(h, 4);
@@ -112,10 +112,15 @@ fn until(h: &mut Harness<'_, SoundApp>, done: impl Fn(&Value) -> bool) -> Value 
 }
 
 fn press(h: &mut Harness<'_, SoundApp>, key: Key, modifiers: Modifiers) {
+    press_as(h, key, None, modifiers);
+}
+
+/// Presses the physical key `physical` that the layout (or Shift) makes `key`.
+fn press_as(h: &mut Harness<'_, SoundApp>, key: Key, physical: Option<Key>, modifiers: Modifiers) {
     let s = &mut h.state_mut().synthetic;
     s.push(Event::ModifiersChanged(modifiers));
     for pressed in [true, false] {
-        s.push(Event::Key { key, physical_key: None, pressed, repeat: false, modifiers });
+        s.push(Event::Key { key, physical_key: physical, pressed, repeat: false, modifiers });
     }
     s.push(Event::ModifiersChanged(Modifiers::NONE));
     steps(h, 2);
@@ -207,16 +212,24 @@ fn keys_launch_stop_and_pick_columns_only_while_the_window_has_focus() {
     press(&mut h, Key::Num5, Modifiers::NONE);
     assert!(h.state().ui.status.contains("is empty"), "{}", h.state().ui.status);
     // Shift+4: scene 4 launches row 4 where a slot fills it (columns 2 and 3).
-    press(&mut h, Key::Num4, Modifiers::SHIFT);
+    press_as(&mut h, Key::Num4, Some(Key::Num4), Modifiers::SHIFT);
     let s = until(&mut h, |s| playing(s, 1) == Some(3) && playing(s, 2) == Some(3));
     assert_eq!((playing(&s, 0), playing(&s, 1), playing(&s, 2)), (None, Some(3), Some(3)), "{s}");
-    // 0 stops the selected column; Esc stops everything.
+    // 0 stops the selected column; Esc is left alone (it closes menus and dialogs); Shift+0
+    // stops everything.
     press(&mut h, Key::Num0, Modifiers::NONE);
     let s = until(&mut h, |s| playing(s, 1).is_none());
     assert_eq!((playing(&s, 1), playing(&s, 2)), (None, Some(3)), "{s}");
     press(&mut h, Key::Escape, Modifiers::NONE);
+    steps(&mut h, 20);
+    assert_eq!(playing(&state(&mut h), 2), Some(3), "Esc stops nothing");
+    press_as(&mut h, Key::Num0, Some(Key::Num0), Modifiers::SHIFT);
     let s = until(&mut h, |s| playing(s, 2).is_none());
     assert_eq!(playing(&s, 2), None, "{s}");
+    // Shift+1 arrives as `!`: the key pressed (1) counts, so it launches scene 1.
+    press_as(&mut h, Key::Exclamationmark, Some(Key::Num1), Modifiers::SHIFT);
+    let s = until(&mut h, |s| playing(s, 0) == Some(0));
+    assert_eq!(playing(&s, 0), Some(0), "{s}");
     // ← stops at the first column.
     for _ in 0..3 {
         press(&mut h, Key::ArrowLeft, Modifiers::NONE);
@@ -250,11 +263,26 @@ fn a_dropped_file_loads_into_the_slot_under_the_pointer() {
     let target = h.state().session_view.drop_targets.iter().find(|(_, c, r)| (*c, *r) == (2, 5)).map(|(rect, _, _)| *rect).unwrap();
     h.state_mut().synthetic.push(Event::PointerMoved(target.center()));
     steps(&mut h, 3);
+    let tracks = h.state().engine.session().tracks.len();
+    // Two files: the first loads into the slot, on its own thread; the other is not imported.
     h.input_mut().dropped_files.push(Arc::new(Dropped(wav(&dir.0, "hit.wav", 0.5))));
-    steps(&mut h, 3);
+    h.input_mut().dropped_files.push(Arc::new(Dropped(wav(&dir.0, "other.wav", 0.5))));
+    step(&mut h);
+    assert!(
+        h.state().ui.status.contains("Loading hit.wav into Live 3 slot 6") && h.state().ui.status.contains("1 more file ignored"),
+        "{}",
+        h.state().ui.status
+    );
+    let start = std::time::Instant::now();
+    while h.state().engine.session().live.slot(2, 5).is_none() && start.elapsed() < std::time::Duration::from_secs(5) {
+        step(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let slot = h.state().engine.session().live.slot(2, 5).cloned().unwrap();
     assert_eq!((slot.name.as_str(), slot.mode), ("hit", SlotMode::OneShot));
-    assert!(h.state().ui.status.contains("Live 3 slot 6"), "{}", h.state().ui.status);
+    assert!(h.state().ui.status.contains("Loaded hit.wav into Live 3 slot 6 as a one-shot"), "{}", h.state().ui.status);
+    assert_eq!(h.state().engine.session().tracks.len(), tracks, "nothing was imported into the arrangement");
+    assert_eq!(h.state().engine.session().sources.len(), 2, "the track and the slot's file only");
 }
 
 #[test]
@@ -291,4 +319,53 @@ fn the_slot_menu_edits_and_clears() {
     assert!(h.state().engine.session().live.slot(1, 0).is_none());
     assert!(h.state_mut().engine.undo());
     assert!(h.state().engine.session().live.slot(1, 0).is_some(), "clearing is undoable");
+}
+
+#[test]
+fn stops_never_start_playback_and_a_refused_launch_leaves_it_stopped() {
+    let dir = Scratch::new("stopped");
+    let (mut h, _) = harness(&dir.0);
+    open(&mut h);
+    h.state_mut().session_view.focused = true;
+    let file = wav(&dir.0, "loop.wav", 4.0);
+    h.state_mut().run("live.slot_from_file", json!({"column": 0, "slot": 0, "path": file, "bpm": 120})).unwrap();
+    // Stop, Stop All and their keys while stopped: nothing plays, nothing starts.
+    h.get_by_label("■ Stop 1").click();
+    h.get_by_label("Stop All").click();
+    steps(&mut h, 2);
+    press(&mut h, Key::Num0, Modifiers::NONE);
+    press_as(&mut h, Key::Num0, Some(Key::Num0), Modifiers::SHIFT);
+    steps(&mut h, 10);
+    assert!(!h.state().is_playing(), "a stop started the transport");
+    // A launch with no boundary inside the loop it would play is refused, transport stopped.
+    h.state_mut().run("options.loop_playback", json!({"value": true})).unwrap();
+    h.state_mut().run("edit.select", json!({"start": 96_000, "end": 192_000})).unwrap();
+    h.state_mut().run("live.quantise", json!({"value": 8})).unwrap();
+    h.get_by_label("Live 1 slot 1").click();
+    steps(&mut h, 10);
+    assert!(h.state().ui.status.contains("inside the loop"), "{}", h.state().ui.status);
+    assert!(!h.state().is_playing(), "a refused launch started the transport");
+}
+
+#[test]
+fn the_edit_dialog_closes_when_its_slot_changes_and_keeps_refused_edits() {
+    let dir = Scratch::new("edit-close");
+    let (mut h, _) = harness(&dir.0);
+    open(&mut h);
+    let file = wav(&dir.0, "loop.wav", 10.0);
+    h.state_mut().run("live.slot_from_file", json!({"column": 0, "slot": 0, "path": file})).unwrap();
+    menu(&mut h, "Live 1 slot 1", "Edit...");
+    // A one-shot can't loop: refused, the dialog stays with the edits and why.
+    h.state_mut().session_view.edit.as_mut().unwrap().mode = SlotMode::Loop;
+    h.state_mut().session_view.edit.as_mut().unwrap().name = "Kept".into();
+    steps(&mut h, 2);
+    h.get_by_label("OK").click();
+    steps(&mut h, 3);
+    let edit = h.state().session_view.edit.clone().expect("still open");
+    assert!(edit.error.as_deref().is_some_and(|e| e.contains("one-shot")), "{edit:?}");
+    assert_eq!(edit.name, "Kept");
+    // The slot is cleared under it: the dialog closes.
+    h.state_mut().run("live.slot_clear", json!({"column": 0, "slot": 0})).unwrap();
+    steps(&mut h, 3);
+    assert!(h.state().session_view.edit.is_none());
 }
