@@ -365,6 +365,8 @@ pub struct SoundApp {
     sim: Option<(Samples, Option<Samples>, Option<Range>)>,
     /// The range the transport loops over while it plays looped (Session view launches fold into it).
     play_loop: Option<Range>,
+    /// Late Live launches the player had reported by the last frame.
+    live_late_seen: u64,
     /// When Record last found nothing to record on, and why: the Record buttons show it for a moment.
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
@@ -471,6 +473,7 @@ impl SoundApp {
             docking_context: None,
             sim: None,
             play_loop: None,
+            live_late_seen: 0,
             record_hint: None,
             quit_requested: false,
             arrange_request: false,

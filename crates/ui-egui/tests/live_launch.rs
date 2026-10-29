@@ -142,3 +142,16 @@ fn a_launch_past_the_transport_loop_lands_inside_it() {
     app.handle_transport(0.01);
     assert!(app.ui.status.contains("inside the loop"), "{}", app.ui.status);
 }
+
+#[test]
+fn a_launch_that_lands_late_says_so() {
+    let (mut app, _dir) = app("late", "none");
+    app.engine.execute("transport.play", &json!({})).unwrap();
+    until(&mut app, |s| s["transport"]["position"].as_i64().is_some_and(|p| p > 10_000));
+    assert!(!app.ui.status.contains("late"), "{}", app.ui.status);
+    // A launch meant for a sample already played (as one sent too close would be).
+    app.player.as_ref().unwrap().live(soundcraft_mix::LiveCmd::Launch { column: 0, slot: 0, at: 0 });
+    until(&mut app, |s| s["columns"][0]["playing"].is_object());
+    app.handle_transport(0.01);
+    assert!(app.ui.status.contains("Launch landed late"), "{}", app.ui.status);
+}

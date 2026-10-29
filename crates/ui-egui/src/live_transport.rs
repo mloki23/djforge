@@ -20,9 +20,14 @@ pub(crate) struct LiveFrame {
 }
 
 impl SoundApp {
-    /// The largest audio callback in session samples (the device's buffer at the session rate).
+    /// The largest audio callback in session samples: as the player measured it, else (before
+    /// its first callback) the device's buffer at the session rate.
     fn callback_samples(&self) -> Samples {
         let Some(p) = &self.player else { return 0 };
+        let measured = p.max_callback_samples();
+        if measured > 0 {
+            return measured;
+        }
         let frames = f64::from(p.device_buffer.unwrap_or(DEFAULT_CALLBACK).max(1));
         let rate = f64::from(p.device_rate.max(1));
         (frames * self.engine.session().sample_rate.as_f64() / rate).ceil() as Samples
@@ -71,16 +76,22 @@ impl SoundApp {
     }
 
     /// Hands the engine what the audio thread last reported the Live columns playing, and
-    /// whether launches can be carried out at all.
+    /// whether launches can be carried out at all. A launch the audio thread reports late (it
+    /// arrived after its sample) is told on the status line.
     pub(crate) fn sync_live_status(&mut self) {
         self.engine.live_audio = self.player.is_some();
-        match &self.player {
-            Some(p) => {
-                for (status, c) in self.engine.live_status.iter_mut().zip(p.live_state()) {
-                    *status = soundcraft_engine::LiveStatus { playing: c.playing, queued: c.queued };
-                }
-            }
-            None => self.engine.live_status = Default::default(),
+        let Some(p) = &self.player else {
+            self.engine.live_status = Default::default();
+            return;
+        };
+        let state = p.live_state();
+        for (status, c) in self.engine.live_status.iter_mut().zip(state.iter()) {
+            *status = soundcraft_engine::LiveStatus { playing: c.playing, queued: c.queued };
         }
+        let late: u64 = state.iter().map(|c| u64::from(c.late)).sum();
+        if late > self.live_late_seen {
+            self.ui.status = "Launch landed late — try a larger launch quantise or a smaller audio buffer".into();
+        }
+        self.live_late_seen = late;
     }
 }
