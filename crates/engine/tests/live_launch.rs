@@ -33,8 +33,8 @@ fn the_next_boundary_follows_every_quantise() {
     // A boundary exactly at playhead + margin is taken; one a sample short of it is not.
     assert_eq!(live_next_boundary(&s, 96_000 - 2_400, Quantise::Bar(1), 2_400), Ok(96_000));
     assert_eq!(live_next_boundary(&s, 96_000 - 2_399, Quantise::Bar(1), 2_400), Ok(192_000));
-    // The margin is 50 ms, or one audio block when that is longer.
-    assert_eq!((live_launch_margin(&s, 512), live_launch_margin(&s, 4_096)), (2_400, 4_096));
+    // The margin is 70 ms, or the largest callback plus a block when that is longer.
+    assert_eq!((live_launch_margin(&s, 512), live_launch_margin(&s, 4_096)), (3_360, 4_608));
 }
 
 #[test]
@@ -188,4 +188,29 @@ fn state_reports_what_plays_queued_and_where_a_loop_is() {
     assert_eq!(state["columns"][0]["queued"], json!({"slot": null, "at": 192_000, "stop": true}));
     assert!(state["columns"][0]["playing"]["loop_beat"].is_null(), "a one-shot has no loop position");
     assert_eq!(state["columns"][3]["track"], json!(e.session().live.columns[3].track.0));
+}
+
+#[test]
+fn a_launch_past_the_end_of_a_transport_loop_folds_into_it() {
+    let s = Session::default();
+    // Looping bars 2..4 (96 000..288 000), at bar 3 beat 4 (264 000).
+    let looped = soundcraft_time::Range::new(96_000, 288_000);
+    let (pos, margin) = (264_000, 3_360);
+    let fold = |at: Samples, q: Quantise| soundcraft_engine::cmd::live_fold_into_loop(&s, at, pos, looped, q, margin);
+    // Inside the loop: unchanged.
+    let quarter = live_next_boundary(&s, pos, Quantise::Quarter, margin).unwrap();
+    assert_eq!(fold(quarter, Quantise::Quarter), Ok(quarter));
+    // The next bar (bar 4) is the loop's end: one wrap later its first bar line (bar 2), sent a
+    // loop length on so the audio engine moves it back onto bar 2 at the wrap.
+    let bar = live_next_boundary(&s, pos, Quantise::Bar(1), margin).unwrap();
+    assert_eq!(bar, 288_000);
+    assert_eq!(fold(bar, Quantise::Bar(1)), Ok(96_000 + 192_000));
+    // 2-bar lines are bars 1, 3, 5…: bar 3 (192 000) is the loop's first.
+    let two = live_next_boundary(&s, pos, Quantise::Bar(2), margin).unwrap();
+    assert_eq!(fold(two, Quantise::Bar(2)), Ok(192_000 + 192_000));
+    // 8-bar lines are bars 1, 9…: none inside, refused with the reason.
+    let eight = live_next_boundary(&s, pos, Quantise::Bar(8), margin).unwrap();
+    assert!(fold(eight, Quantise::Bar(8)).unwrap_err().contains("no 8 boundary falls inside the loop"));
+    // No loop: unchanged.
+    assert_eq!(soundcraft_engine::cmd::live_fold_into_loop(&s, eight, pos, soundcraft_time::Range::new(0, 0), Quantise::Bar(8), margin), Ok(eight));
 }

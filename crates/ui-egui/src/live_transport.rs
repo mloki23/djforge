@@ -4,31 +4,69 @@
 
 use crate::SoundApp;
 use soundcraft_engine::LiveRequest;
-use soundcraft_engine::cmd::{live_cmds, live_launch_margin, live_next_boundary};
+use soundcraft_engine::cmd::{live_cmds, live_fold_into_loop, live_launch_margin, live_next_boundary};
+use soundcraft_time::{Range, Samples};
 
-/// Frames in one block of the audio engine (the player renders at most this many at once).
-const BLOCK: usize = 512;
+/// A device callback's frames when the device doesn't say (the usual default).
+const DEFAULT_CALLBACK: u32 = 1_024;
+
+/// Where this frame's Session view requests count from, worked out by the first of them so all
+/// land on one boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveFrame {
+    from: Samples,
+    margin: Samples,
+    looped: Option<Range>,
+}
 
 impl SoundApp {
-    /// Carries out a Session view launch or stop. With the transport stopped it starts playback
-    /// from the edit insertion (as Play does) and the request lands on the first boundary from
-    /// there; while playing, on the first boundary at least the launch margin ahead.
-    pub(crate) fn live_request(&mut self, req: LiveRequest) {
-        if self.player.is_none() {
+    /// The largest audio callback in session samples (the device's buffer at the session rate).
+    fn callback_samples(&self) -> Samples {
+        let Some(p) = &self.player else { return 0 };
+        let frames = f64::from(p.device_buffer.unwrap_or(DEFAULT_CALLBACK).max(1));
+        let rate = f64::from(p.device_rate.max(1));
+        (frames * self.engine.session().sample_rate.as_f64() / rate).ceil() as Samples
+    }
+
+    /// Carries out a Session view launch or stop. With the transport stopped (as the player
+    /// reports it) it starts open-ended playback from the edit insertion, looping the selection
+    /// when loop playback is on, with no pre-roll; the request lands on the first boundary at or
+    /// after that point (Play and the launch reach the audio thread together, so no margin).
+    /// While playing, it lands on the first boundary at least the launch margin ahead, folded
+    /// into the transport's loop when it would fall past the loop's end. Every request of one
+    /// frame (`frame`) counts from the same point, so they land together.
+    pub(crate) fn live_request(&mut self, req: LiveRequest, frame: &mut Option<LiveFrame>) {
+        let Some(playing) = self.player.as_ref().map(|p| p.is_playing()) else {
             self.ui.status = "Session view launches need the audio engine".into();
             return;
-        }
-        let starting = !self.is_playing();
-        if starting {
-            self.play_from_selection();
-        }
-        let Some(p) = &self.player else { return };
+        };
+        let f = match *frame {
+            Some(f) => f,
+            None => {
+                let f = if playing {
+                    let from = self.player.as_ref().map_or(0, |p| p.position());
+                    LiveFrame { from, margin: live_launch_margin(self.engine.session(), self.callback_samples()), looped: self.play_loop }
+                } else {
+                    let s = self.engine.session();
+                    let sel = s.edit.selection;
+                    let looped = (s.edit.loop_playback && !sel.is_empty()).then_some(sel);
+                    let from = sel.start.max(0);
+                    self.start_play(from, None, looped);
+                    LiveFrame { from, margin: 0, looped }
+                };
+                *frame = Some(f);
+                f
+            }
+        };
         let s = self.engine.session();
-        let block = p.device_buffer.map_or(BLOCK, |b| usize::try_from(b).unwrap_or(BLOCK)).max(BLOCK);
-        let (from, margin) = if starting { (self.engine.transport.position, 0) } else { (p.position(), live_launch_margin(s, block)) };
-        match live_next_boundary(s, from, s.live.quantise, margin) {
-            Ok(at) => live_cmds(s, &req, at).into_iter().for_each(|c| p.live(c)),
-            Err(why) => self.ui.status = why,
+        let at = live_next_boundary(s, f.from, s.live.quantise, f.margin).and_then(|at| match f.looped {
+            Some(l) => live_fold_into_loop(s, at, f.from, l, s.live.quantise, f.margin),
+            None => Ok(at),
+        });
+        match (at, &self.player) {
+            (Ok(at), Some(p)) => live_cmds(s, &req, at).into_iter().for_each(|c| p.live(c)),
+            (Err(why), _) => self.ui.status = why,
+            (Ok(_), None) => {}
         }
     }
 

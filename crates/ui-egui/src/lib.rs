@@ -363,6 +363,8 @@ pub struct SoundApp {
     pub(crate) docking_context: Option<egui::Context>,
     /// Transport simulation when there is no player (tests, offscreen renders).
     sim: Option<(Samples, Option<Samples>, Option<Range>)>,
+    /// The range the transport loops over while it plays looped (Session view launches fold into it).
+    play_loop: Option<Range>,
     /// When Record last found nothing to record on, and why: the Record buttons show it for a moment.
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
@@ -468,6 +470,7 @@ impl SoundApp {
             theme_applied: None,
             docking_context: None,
             sim: None,
+            play_loop: None,
             record_hint: None,
             quit_requested: false,
             arrange_request: false,
@@ -571,6 +574,7 @@ impl SoundApp {
     }
 
     fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        self.play_loop = looped;
         if let Some(p) = &self.player {
             p.update_session(self.engine.session_arc());
             p.play(from, end, looped);
@@ -598,6 +602,7 @@ impl SoundApp {
             self.finish_recording();
         }
         self.sim = None;
+        self.play_loop = None;
         self.engine.transport.playing = false;
         self.engine.transport.recording = false;
         let stop_at = self.engine.transport.position;
@@ -1108,6 +1113,8 @@ impl SoundApp {
         // Whether Session view launches can run, before any command of this frame needs it.
         self.engine.live_audio = self.player.is_some();
         let reqs: Vec<TransportRequest> = std::mem::take(&mut self.engine.transport_requests);
+        // Session view requests of one frame land on one boundary.
+        let mut live_frame = None;
         for r in reqs {
             match r {
                 TransportRequest::ResetSession => {
@@ -1118,6 +1125,7 @@ impl SoundApp {
                         p.locate(self.engine.transport.position);
                     }
                     self.sim = None;
+                    self.play_loop = None;
                     // The old capture belongs to the replaced document, never to the new one.
                     self.recorder = None;
                     self.recorder_failed = false;
@@ -1177,7 +1185,7 @@ impl SoundApp {
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {}
-                TransportRequest::Live(req) => self.live_request(req),
+                TransportRequest::Live(req) => self.live_request(req, &mut live_frame),
             }
         }
         self.sync_live_status();

@@ -453,12 +453,46 @@ const STOP_ALL: &str = "live.stop_all";
 const SCENE: &str = "live.scene";
 
 /// The least time a launch is sent ahead of the boundary it waits for, in seconds.
-pub const LAUNCH_MARGIN_S: f64 = 0.050;
+pub const LAUNCH_MARGIN_S: f64 = 0.070;
 
-/// How far ahead of the playhead a launch must land: at least [`LAUNCH_MARGIN_S`] and one audio
-/// block of `block` samples, so the audio thread has it before its sample comes.
-pub fn launch_margin(s: &Session, block: usize) -> Samples {
-    s.sample_rate.samples(LAUNCH_MARGIN_S).max(i64::try_from(block).unwrap_or(i64::MAX))
+/// Samples beyond one audio callback a launch is sent ahead: the audio thread renders a block of
+/// up to this many on top of the callback in progress.
+pub const LAUNCH_BLOCK: Samples = 512;
+
+/// How far ahead of the playhead a launch must land, in session samples: at least
+/// [`LAUNCH_MARGIN_S`], and the largest audio callback (`callback`, in session samples) plus
+/// [`LAUNCH_BLOCK`], so the audio thread has the launch before its sample comes.
+pub fn launch_margin(s: &Session, callback: Samples) -> Samples {
+    s.sample_rate.samples(LAUNCH_MARGIN_S).max(callback.max(0).saturating_add(LAUNCH_BLOCK))
+}
+
+/// Where a launch meant for `at` lands while the transport loops over `looped` and is at `pos`:
+/// `at` itself inside the loop, else the loop's first boundary of `quantise` (at or after its
+/// start), as many loop lengths ahead as the transport needs to reach it at least `margin` from
+/// now. The audio engine moves what is queued back one loop length at each wrap, so it plays
+/// there. Refused when no boundary falls inside the loop (it is shorter than the quantise).
+pub fn fold_into_loop(
+    s: &Session,
+    at: Samples,
+    pos: Samples,
+    looped: soundcraft_time::Range,
+    quantise: Quantise,
+    margin: Samples,
+) -> std::result::Result<Samples, String> {
+    let len = looped.len();
+    if len <= 0 || at < looped.end {
+        return Ok(at);
+    }
+    let first = next_boundary(s, looped.start, quantise, 0)?;
+    if first >= looped.end {
+        return Err(format!(
+            "no {} boundary falls inside the loop: launch with a smaller launch quantise, or loop a longer selection",
+            quantise.id()
+        ));
+    }
+    let behind = pos.saturating_add(margin.max(0)).saturating_sub(first);
+    let wraps = (behind.max(1).saturating_add(len - 1) / len).max(1);
+    Ok(first.saturating_add(wraps.saturating_mul(len)))
 }
 
 /// The first launch boundary of `quantise` at or after `playhead + margin`: that sample itself

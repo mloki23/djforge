@@ -101,3 +101,44 @@ fn a_launch_while_playing_is_queued_then_plays_from_its_boundary() {
     let after = until(&mut app, |s| s["columns"][1]["playing"].is_null());
     assert!(after["columns"][1]["playing"].is_null(), "{after}");
 }
+
+#[test]
+fn a_launch_while_stopped_over_a_selection_plays_on_past_its_end() {
+    let (mut app, _dir) = app("selection", "1");
+    app.engine.execute("edit.select", &json!({"start": 1_000, "end": 20_000})).unwrap();
+    // Two launches in one frame: one start of the transport, one boundary.
+    app.engine.execute("live.launch", &json!({"column": 0, "slot": 2})).unwrap();
+    app.engine.execute("live.launch", &json!({"column": 1, "slot": 2})).unwrap();
+    let state = until(&mut app, |s| (0..2).all(|c| s["columns"][c]["playing"].is_object()));
+    // The first bar line at or after the selection start, not the selection's end or a pre-roll.
+    assert_eq!(state["columns"][0]["playing"]["start"], 96_000, "{state}");
+    assert_eq!(state["columns"][1]["playing"]["start"], 96_000, "together: {state}");
+    assert!(app.is_playing() && app.engine.transport.position > 20_000, "open-ended: still playing past the selection");
+}
+
+#[test]
+fn a_launch_past_the_transport_loop_lands_inside_it() {
+    let (mut app, _dir) = app("loop", "1");
+    // 240 bpm: a bar is 48 000 samples; loop a bar and a half (0..72 000).
+    app.engine.execute("event.tempo", &json!({"bpm": 240.0, "at": 0})).unwrap();
+    app.engine.execute("options.loop_playback", &json!({"value": true})).unwrap();
+    app.engine.execute("edit.select", &json!({"start": 0, "end": 72_000})).unwrap();
+    app.engine.execute("transport.play", &json!({})).unwrap();
+    let past = until(&mut app, |s| s["transport"]["position"].as_i64().is_some_and(|p| p > 50_000));
+    assert!(past["transport"]["position"].as_i64().is_some_and(|p| p < 64_000), "launch inside the last half bar: {past}");
+    // The next bar line (96 000) is past the loop's end: the launch waits for the wrap and starts
+    // on the loop's first bar line, not half a bar into it.
+    app.engine.execute("live.launch", &json!({"column": 0, "slot": 0})).unwrap();
+    let state = until(&mut app, |s| s["columns"][0]["playing"].is_object());
+    assert_eq!(state["columns"][0]["playing"]["start"], 0, "{state}");
+    // A quantise with no line inside the loop is refused, and says why.
+    app.engine.execute("live.quantise", &json!({"value": 4})).unwrap();
+    app.engine.execute("edit.select", &json!({"start": 48_000, "end": 144_000})).unwrap();
+    app.engine.execute("transport.stop", &json!({})).unwrap();
+    app.handle_transport(0.01);
+    app.engine.execute("transport.play", &json!({})).unwrap();
+    until(&mut app, |s| s["transport"]["position"].as_i64().is_some_and(|p| p > 50_000));
+    app.engine.execute("live.launch", &json!({"column": 1, "slot": 2})).unwrap();
+    app.handle_transport(0.01);
+    assert!(app.ui.status.contains("inside the loop"), "{}", app.ui.status);
+}
