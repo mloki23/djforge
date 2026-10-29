@@ -65,7 +65,18 @@ const PLAYER_BLOCK: usize = 4096;
 impl WarpPlayer {
     /// Builds a player for `channels` source channels (allocates).
     pub(crate) fn build(channels: usize, sample_rate: f32, prepared: bool) -> Option<WarpPlayer> {
-        let st = Stretcher::new(channels.max(1), sample_rate, PLAYER_BLOCK, Quality::Default).ok()?;
+        WarpPlayer::build_with(channels, sample_rate, prepared, false)
+    }
+
+    /// [`WarpPlayer::build`] for a Live slot pool: its stretcher splits each interval's spectral
+    /// work over the next interval's blocks, so several columns restarting together don't all
+    /// compute in one callback (one interval more latency, which the players compensate).
+    pub(crate) fn build_live(channels: usize, sample_rate: f32, prepared: bool) -> Option<WarpPlayer> {
+        WarpPlayer::build_with(channels, sample_rate, prepared, true)
+    }
+
+    fn build_with(channels: usize, sample_rate: f32, prepared: bool, split: bool) -> Option<WarpPlayer> {
+        let st = Stretcher::with_split(channels.max(1), sample_rate, PLAYER_BLOCK, Quality::Default, split).ok()?;
         let max_in = st.max_input();
         Some(WarpPlayer {
             input: vec![vec![0.0; max_in]; channels.max(1)],
@@ -119,7 +130,7 @@ impl PreparedWarp {
     /// `track`, for the audio `stem` of its slots (allocates; call off the audio thread).
     pub fn for_pool(track: TrackId, stem: PlayerStem, index: usize, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
         let index = u8::try_from(index).ok().filter(|i| usize::from(*i) < crate::live::ROLES)?;
-        Some(PreparedWarp { track, clip: ClipId(0), pool: Some(index), stem, player: WarpPlayer::build(channels, sample_rate, true)? })
+        Some(PreparedWarp { track, clip: ClipId(0), pool: Some(index), stem, player: WarpPlayer::build_live(channels, sample_rate, true)? })
     }
 
     /// Source channels the player was built for.

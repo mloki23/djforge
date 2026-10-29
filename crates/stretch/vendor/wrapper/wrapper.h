@@ -15,6 +15,10 @@ typedef struct signalsmith_stretch signalsmith_stretch_t;
 signalsmith_stretch_t *signalsmith_stretch_create(int channel_count, size_t block_length, size_t interval);
 signalsmith_stretch_t *signalsmith_stretch_create_preset_default(int channel_count, float sample_rate);
 signalsmith_stretch_t *signalsmith_stretch_create_preset_cheaper(int channel_count, float sample_rate);
+// djforge: a preset (cheaper or not) with `splitComputation` chosen: the spectral work of each
+// interval is spread over the blocks of the next one (smoother CPU per block, one interval more
+// output latency).
+signalsmith_stretch_t *signalsmith_stretch_create_preset(int channel_count, float sample_rate, int cheaper, int split_computation);
 
 // Destroys a SignalsmithStretch instance.
 void signalsmith_stretch_destroy(signalsmith_stretch_t *handle);

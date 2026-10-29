@@ -66,6 +66,18 @@ signalsmith_stretch_t *signalsmith_stretch_create_preset_cheaper(int channel_cou
     return handle;
 }
 
+signalsmith_stretch_t *signalsmith_stretch_create_preset(int channel_count, float sample_rate, int cheaper, int split_computation) {
+    auto handle = new signalsmith_stretch;
+    handle->channel_count = channel_count;
+    if (cheaper) {
+        handle->instance.presetCheaper(channel_count, sample_rate, split_computation != 0);
+    } else {
+        handle->instance.presetDefault(channel_count, sample_rate, split_computation != 0);
+    }
+
+    return handle;
+}
+
 void signalsmith_stretch_destroy(signalsmith_stretch_t *handle) {
     delete handle;
 }

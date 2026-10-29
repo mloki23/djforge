@@ -58,8 +58,17 @@ pub struct Stretcher {
 
 impl Stretcher {
     /// A stretcher for blocks of at most `max_block` output frames, accepting up to
-    /// `max_block * MAX_RATE` input frames per call.
+    /// `max_block * MAX_RATE` input frames per call. `Default` quality computes each interval's
+    /// spectra in the block that reaches it; `Cheaper` splits that work (see
+    /// [`Stretcher::with_split`]).
     pub fn new(channels: usize, sample_rate: f32, max_block: usize, quality: Quality) -> Result<Stretcher, StretchError> {
+        Stretcher::with_split(channels, sample_rate, max_block, quality, quality == Quality::Cheaper)
+    }
+
+    /// [`Stretcher::new`], choosing whether the spectral work of each interval is split over the
+    /// blocks of the next one (`split`): steadier CPU per block, at one interval (a quarter of
+    /// the window) more output latency.
+    pub fn with_split(channels: usize, sample_rate: f32, max_block: usize, quality: Quality, split: bool) -> Result<Stretcher, StretchError> {
         if channels == 0 || channels > 64 {
             return Err(StretchError::Invalid("channel count must be 1..=64"));
         }
@@ -72,12 +81,12 @@ impl Stretcher {
         let max_in = max_block.saturating_mul(MAX_RATE);
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = quality;
+            let _ = (quality, split);
             Err(StretchError::Unsupported)
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let handle = ffi::Handle::new(channels, sample_rate, quality == Quality::Cheaper).ok_or(StretchError::Unsupported)?;
+            let handle = ffi::Handle::new(channels, sample_rate, quality == Quality::Cheaper, split).ok_or(StretchError::Unsupported)?;
             Ok(Stretcher {
                 handle,
                 channels,
@@ -230,6 +239,23 @@ mod tests {
             let f = freq(&out);
             assert!((f - 440.0).abs() < 4.0, "rate {rate}: pitch drifted to {f} Hz");
         }
+    }
+
+    /// A split stretcher stretches the same, one interval later.
+    #[test]
+    fn split_computation_keeps_pitch_at_one_interval_more_latency() {
+        let plain = Stretcher::new(1, SR, 512, Quality::Default).unwrap();
+        let mut split = Stretcher::with_split(1, SR, 512, Quality::Default, true).unwrap();
+        assert!(split.output_latency() > plain.output_latency());
+        let src = sine(440.0, SR as usize * 2);
+        let mut out = Vec::new();
+        for c in src.as_chunks::<512>().0 {
+            let mut o = vec![vec![0.0; 512]];
+            split.process(&[c], 512, &mut o, 512, 1.0).unwrap();
+            out.extend_from_slice(&o[0]);
+        }
+        let f = freq(&out[split.output_latency()..]);
+        assert!((f - 440.0).abs() < 4.0, "pitch {f} Hz");
     }
 
     #[test]

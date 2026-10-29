@@ -731,7 +731,7 @@ impl Column<'_> {
             if entry.is_none() && !crate::on_audio_thread() {
                 // Offline (tests, renders without a host): built here. The audio thread never
                 // builds one; until it arrives the slot is silent.
-                *entry = WarpPlayer::build(src.len(), sr, false);
+                *entry = WarpPlayer::build_live(src.len(), sr, false);
             }
             let Some(pl) = entry.as_mut() else { continue };
             if catch_up {
@@ -990,7 +990,7 @@ mod tests {
             "16 stem players: worst {worst} stretched frames per {BLOCK}-frame callback ({:.2} blocks per player); worst {worst_us} µs, p99 {p99} µs, mean {} µs; a full warm-up per player at once would be {}",
             worst as f64 / (players * BLOCK) as f64,
             total_us / blocks.max(1),
-            players * (BLOCK + 2_880)
+            players * (BLOCK + 4_320)
         );
         assert!(worst <= 3 * players * BLOCK, "worst callback stretched {worst} frames");
         assert!(eng.live_state().iter().take(4).all(|c| c.playing.is_some_and(|p| p.slot == 1)));

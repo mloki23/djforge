@@ -11,8 +11,7 @@ struct RawStretch {
 }
 
 unsafe extern "C" {
-    fn signalsmith_stretch_create_preset_default(channel_count: c_int, sample_rate: f32) -> *mut RawStretch;
-    fn signalsmith_stretch_create_preset_cheaper(channel_count: c_int, sample_rate: f32) -> *mut RawStretch;
+    fn signalsmith_stretch_create_preset(channel_count: c_int, sample_rate: f32, cheaper: c_int, split_computation: c_int) -> *mut RawStretch;
     fn signalsmith_stretch_destroy(handle: *mut RawStretch);
     fn signalsmith_stretch_reset(handle: *mut RawStretch);
     fn signalsmith_stretch_input_latency(handle: *mut RawStretch) -> usize;
@@ -33,16 +32,11 @@ pub(crate) struct Handle {
 unsafe impl Send for Handle {}
 
 impl Handle {
-    pub(crate) fn new(channels: usize, sample_rate: f32, cheaper: bool) -> Option<Handle> {
+    /// `split`: spread each interval's spectral work over the next interval's blocks.
+    pub(crate) fn new(channels: usize, sample_rate: f32, cheaper: bool, split: bool) -> Option<Handle> {
         let ch = c_int::try_from(channels).ok()?;
         // SAFETY: plain constructor; a null return (allocation failure) is mapped to None.
-        let raw = unsafe {
-            if cheaper {
-                signalsmith_stretch_create_preset_cheaper(ch, sample_rate)
-            } else {
-                signalsmith_stretch_create_preset_default(ch, sample_rate)
-            }
-        };
+        let raw = unsafe { signalsmith_stretch_create_preset(ch, sample_rate, c_int::from(cheaper), c_int::from(split)) };
         NonNull::new(raw).map(|ptr| Handle { ptr })
     }
 
