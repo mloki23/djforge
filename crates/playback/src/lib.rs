@@ -104,32 +104,45 @@ pub struct LiveColumnState {
     pub playing: Option<(usize, Samples)>,
     /// A launch (`Some(row)`) or stop (`None`) waiting for its sample.
     pub queued: Option<(Option<usize>, Samples)>,
+    /// Launches the audio thread saw only after their sample, so far (they missed their start
+    /// and play on the grid from where they were seen).
+    pub late: u32,
 }
 
 impl LiveColumnState {
     fn of(c: &ColumnPlay) -> LiveColumnState {
-        LiveColumnState { playing: c.playing.map(|p| (p.slot, p.start)), queued: c.queued.map(|q| (q.slot, q.at)) }
+        LiveColumnState { playing: c.playing.map(|p| (p.slot, p.start)), queued: c.queued.map(|q| (q.slot, q.at)), late: c.late }
     }
 }
 
 /// [`LiveColumnState`]s shared lock-free by the audio thread: a sequence counter (odd while it
-/// writes) around four words per column (playing row or -1, its start, queued row or -1 for a
-/// stop or -2 for none, its sample).
+/// writes) around five words per column (playing row or -1, its start, queued row or -1 for a
+/// stop or -2 for none, its sample, late launches).
 struct LiveShared {
     seq: AtomicU64,
-    words: [[AtomicI64; 4]; MAX_LIVE_COLUMNS],
+    words: [[AtomicI64; 5]; MAX_LIVE_COLUMNS],
+    /// The last snapshot read whole, for a read that keeps meeting a write (UI side only).
+    last: Mutex<[LiveColumnState; MAX_LIVE_COLUMNS]>,
+    /// The longest audio callback seen, in session samples.
+    max_callback: AtomicI64,
 }
 
 impl Default for LiveShared {
     fn default() -> Self {
-        LiveShared { seq: AtomicU64::new(0), words: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI64::new(-2))) }
+        LiveShared {
+            seq: AtomicU64::new(0),
+            words: std::array::from_fn(|_| std::array::from_fn(|i| AtomicI64::new(if i == 4 { 0 } else { -2 }))),
+            last: Mutex::new([LiveColumnState::default(); MAX_LIVE_COLUMNS]),
+            max_callback: AtomicI64::new(0),
+        }
     }
 }
 
 impl LiveShared {
     /// Publishes `state` (audio thread: no allocation, no lock).
     fn publish(&self, state: &[ColumnPlay]) {
-        self.seq.fetch_add(1, Ordering::AcqRel);
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
         for (w, c) in self.words.iter().zip(state.iter().map(LiveColumnState::of).chain(std::iter::repeat(LiveColumnState::default()))) {
             let row = |r: usize| i64::try_from(r).unwrap_or(-1);
             let (p, start) = c.playing.map_or((-1, 0), |(r, at)| (row(r), at));
@@ -138,20 +151,22 @@ impl LiveShared {
                 Some((None, at)) => (-1, at),
                 Some((Some(r), at)) => (row(r), at),
             };
-            for (a, v) in w.iter().zip([p, start, q, at]) {
+            for (a, v) in w.iter().zip([p, start, q, at, i64::from(c.late)]) {
                 a.store(v, Ordering::Relaxed);
             }
         }
         self.seq.fetch_add(1, Ordering::Release);
     }
 
-    /// The last state published (a few retries when a write is under way; then what was read).
+    /// The last state published (a few retries when a write is under way; then the last state
+    /// read whole).
     fn read(&self) -> [LiveColumnState; MAX_LIVE_COLUMNS] {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out = [LiveColumnState::default(); MAX_LIVE_COLUMNS];
         for _ in 0..64 {
             let before = self.seq.load(Ordering::Acquire);
             for (o, w) in out.iter_mut().zip(&self.words) {
-                let [p, start, q, at] = [0, 1, 2, 3].map(|i| w.get(i).map_or(-2, |a| a.load(Ordering::Relaxed)));
+                let [p, start, q, at, late] = [0, 1, 2, 3, 4].map(|i| w.get(i).map_or(-2, |a| a.load(Ordering::Relaxed)));
                 let row = |r: i64| usize::try_from(r).ok();
                 *o = LiveColumnState {
                     playing: row(p).map(|r| (r, start)),
@@ -160,14 +175,17 @@ impl LiveShared {
                         -1 => Some((None, at)),
                         r => Some((row(r), at)),
                     },
+                    late: u32::try_from(late).unwrap_or(0),
                 };
             }
-            if before.is_multiple_of(2) && self.seq.load(Ordering::Acquire) == before {
-                break;
+            std::sync::atomic::fence(Ordering::Acquire);
+            if before.is_multiple_of(2) && self.seq.load(Ordering::Relaxed) == before {
+                *last = out;
+                return out;
             }
             std::hint::spin_loop();
         }
-        out
+        *last
     }
 }
 
@@ -412,6 +430,8 @@ impl AudioState {
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Live(cmd) => self.mix.live(cmd),
                 Cmd::Play { from, end, looped } => {
+                    // Live slots restart across the transport's loop wraps like at their own.
+                    self.mix.set_live_loop(looped.filter(|r| r.len() > 64));
                     if self.playing {
                         self.mix.live_locate(self.pos, from, false);
                     } else {
@@ -574,6 +594,11 @@ impl AudioState {
 
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
+        // The longest callback, in session samples, for the UI's launch margin.
+        let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
+        let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
+        let span = ((out.len() / channels.max(1)) as f64 * step - 1e-6).ceil() as i64;
+        self.shared.live.max_callback.fetch_max(span, Ordering::Relaxed);
         self.fill_block(out, channels);
         // What the Live columns play, for the UI: published only when it changed.
         if self.mix.live_state() != self.live_seen.as_slice() {
@@ -679,12 +704,12 @@ struct Side {
     failed_warps: HashSet<WarpKey>,
 }
 
-/// What a warp player plays for: a clip by id, or one of the two players of a Live slot by row
-/// and side (the column is its track).
+/// What a warp player plays for: a clip by id, or a player of a Live column's pool (on its
+/// track) by index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum WarpFor {
     Clip(u64),
-    Slot(usize, usize),
+    Pool(usize),
 }
 
 /// A warp player's key on the UI side: its track, what it plays for and which audio.
@@ -1064,6 +1089,13 @@ impl Player {
         self.shared.live.read()
     }
 
+    /// The longest audio callback seen so far, in session samples (device frames × session rate
+    /// / device rate × speed): a launch must be sent at least this far (plus a mix block) ahead
+    /// of its sample to be heard from its start.
+    pub fn max_callback_samples(&self) -> Samples {
+        self.shared.live.max_callback.load(Ordering::Relaxed)
+    }
+
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
         let _ = self.tx.send(Cmd::Input(ring));
@@ -1227,30 +1259,26 @@ impl Side {
                 }
             }
         }
-        // Live slots that loop: ready before anything, since a launch can come at any moment.
-        for (column, row, slot) in s.live.slots() {
-            // A lost column plays nothing.
-            let Some(track) = s.live.column_track(column, &s.tracks) else { continue };
-            if !soundcraft_mix::slot_loops(slot) {
+        // Live columns' player pools (three players per audio their loops play, as wide as the
+        // widest): ready before anything, since a launch can come at any moment. A lost column
+        // plays nothing.
+        for track in (0..s.live.columns.len()).filter_map(|c| s.live.column_track(c, &s.tracks)) {
+            let (keys, ch) = soundcraft_mix::pool_needs(s, track);
+            if ch == 0 {
                 continue;
             }
             let mut missing = Vec::new();
-            for (stem, source) in soundcraft_mix::slot_sources(slot) {
-                let ch = s.pool.get(source).map_or(0, |a| a.buffer.channels.len());
-                if ch == 0 {
-                    continue;
-                }
-                // Two players each: one plays while the other warms up for the next restart.
-                for side in 0..2 {
-                    let key = (track, WarpFor::Slot(row, side), stem);
+            for stem in keys {
+                for index in 0..3 {
+                    let key = (track, WarpFor::Pool(index), stem);
                     live.insert(key);
-                    if self.prepared_warps.get(&key) != Some(&(source, ch, sr)) {
-                        missing.push((WarpFor::Slot(row, side), stem, source, ch));
+                    if self.prepared_warps.get(&key) != Some(&(SourceId(0), ch, sr)) {
+                        missing.push((WarpFor::Pool(index), stem, SourceId(0), ch));
                     }
                 }
             }
             if !missing.is_empty() {
-                todo.push((-1, track, WarpFor::Slot(row, 0), missing));
+                todo.push((-1, track, WarpFor::Pool(0), missing));
             }
         }
         let before = self.prepared_warps.len();
@@ -1267,7 +1295,7 @@ impl Side {
                 let rate = s.sample_rate.as_f64() as f32;
                 let made = match owner {
                     WarpFor::Clip(id) => PreparedWarp::new(track, soundcraft_model::ClipId(id), stem, ch, rate),
-                    WarpFor::Slot(row, side) => PreparedWarp::for_slot(track, row, side, stem, ch, rate),
+                    WarpFor::Pool(index) => PreparedWarp::for_pool(track, stem, index, ch, rate),
                 };
                 match made {
                     Some(w) => {
@@ -1833,6 +1861,11 @@ mod tests {
         s
     }
 
+    /// [`live_session`], for the live state tests.
+    pub(super) fn live_session_for_state() -> (Session, TrackId) {
+        live_session()
+    }
+
     /// A session with a Live column whose slots 0 (a loop) and 1 (a split loop) are filled.
     fn live_session() -> (Session, TrackId) {
         use soundcraft_model::{ChannelFormat, LiveColumn, Slot, SlotMode, SourceAudio, StemSet, TrackKind, WarpMap};
@@ -1862,13 +1895,16 @@ mod tests {
         let (s, t) = live_session();
         let mut side = Side::new(48_000.0, bin().1);
         let warps = side.prepare_warps(&s, 0, 1);
-        let mut got: Vec<_> = warps.iter().map(|w| (w.slot(), w.side(), w.stem())).collect();
+        let mut got: Vec<_> = warps.iter().map(|w| (w.pool_index(), w.stem())).collect();
         got.sort_unstable();
         let sp = soundcraft_mix::SOURCE_PLAYER;
-        assert_eq!(got, [(Some(0), 0, sp), (Some(0), 1, sp)], "a slot (two players per audio) counts as one in a batch");
+        let want: Vec<_> = [0, 1, 2, 3, sp].into_iter().flat_map(|k| (0..3).map(move |i| (Some(i), k))).collect();
+        let mut want = want;
+        want.sort_unstable();
+        assert_eq!(got, want, "a column's pool (three players per audio its loops play) comes as one in a batch");
+        assert!(warps.iter().all(|w| w.player_channels() == 2), "as wide as its widest audio");
         let more = side.prepare_warps(&s, 0, WARP_BATCH);
-        assert_eq!(more.iter().filter(|w| w.slot() == Some(1)).count(), 8, "a split slot gets two players per stem");
-        assert!(side.prepare_warps(&s, 0, WARP_BATCH).is_empty(), "built once");
+        assert!(more.is_empty(), "built once");
         let (gtx, _grx) = bin();
         let (tx, mut st) = audio_state(gtx);
         let mut batch = warps;
@@ -1878,7 +1914,7 @@ mod tests {
         mark_audio_thread();
         let mut out = vec![0.0f32; 1024];
         st.fill(&mut out, 2);
-        assert_eq!(st.mix.slot_players().count(), 10);
+        assert_eq!(st.mix.slot_players().count(), 15);
         let cap = st.mix.slot_table_capacity(t);
         tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 1, at: 2_000 })).unwrap();
         for _ in 0..8 {
@@ -2267,8 +2303,50 @@ mod live_state_tests {
         mix.live(LiveCmd::Stop { column: 0, at: 4_800 });
         shared.publish(mix.live_state());
         let read = shared.read();
-        assert_eq!(read[0], LiveColumnState { playing: None, queued: Some((None, 4_800)) });
-        assert_eq!(read[2], LiveColumnState { playing: None, queued: Some((Some(7), 9_600)) });
+        assert_eq!(read[0], LiveColumnState { playing: None, queued: Some((None, 4_800)), late: 0 });
+        assert_eq!(read[2], LiveColumnState { playing: None, queued: Some((Some(7), 9_600)), late: 0 });
         assert!(read.iter().enumerate().all(|(c, s)| c == 0 || c == 2 || *s == LiveColumnState::default()));
+    }
+
+    /// A read that keeps meeting a write under way returns the last state read whole, never a
+    /// torn one.
+    #[test]
+    fn a_read_during_a_write_returns_the_last_whole_state() {
+        let shared = LiveShared::default();
+        let mut mix = new_engine(48_000.0);
+        mix.live(LiveCmd::Stop { column: 0, at: 4_800 });
+        shared.publish(mix.live_state());
+        let good = shared.read();
+        // A writer stuck half way: the sequence is odd and the words half new.
+        shared.seq.fetch_add(1, Ordering::Relaxed);
+        shared.words[0][3].store(9_999, Ordering::Relaxed);
+        assert_eq!(shared.read(), good);
+    }
+
+    /// The longest callback is published in session samples (device frames at the session rate
+    /// and speed); late launches are published per column.
+    #[test]
+    fn the_longest_callback_and_late_launches_are_published() {
+        let (s, _) = super::tests::live_session_for_state();
+        let (tx, rx) = channel();
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
+        });
+        // A 44.1 kHz device under a 48 kHz session: 441 frames are 480 session samples.
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 44_100.0, bin().0);
+        tx.send(session_cmd(Arc::new(s), Vec::new(), Vec::new())).unwrap();
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut vec![0.0f32; 2 * 441], 2);
+        st.fill(&mut vec![0.0f32; 2 * 100], 2);
+        assert_eq!(shared.live.max_callback.load(Ordering::Relaxed), 480);
+        // A launch for a sample already played is late.
+        tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 0, at: 10 })).unwrap();
+        st.fill(&mut vec![0.0f32; 2 * 441], 2);
+        assert_eq!(shared.live.read()[0].late, 1);
+        assert_eq!(shared.live.read()[0].playing.map(|p| p.1), Some(10), "on the grid from its own sample");
     }
 }

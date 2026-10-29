@@ -8,27 +8,32 @@
 //!
 //! - **Launches and stops** take effect exactly at their sample: the block is split there. The
 //!   slot that was playing fades out over [`XFADE_S`] from that sample (its tail), so it does not
-//!   click; the new one starts hard on the launch sample, its downbeat whole.
+//!   click; the new one starts hard on the launch sample, its downbeat whole. A launch the audio
+//!   thread sees only after its sample keeps its phase on the grid (only its start is missed) and
+//!   is counted ([`crate::MixEngine::live_late`]).
 //! - **Loops** follow session beats: at timeline sample `t` a loop plays track beat
 //!   `start_beat + (beat(t) − beat at launch) mod length_beats` through its warp map, so tempo
 //!   changes hold. Slots hold whole 4/4 bars, so a loop launched on a bar line restarts on bar
-//!   lines. At a restart the pass that ends fades out over [`XFADE_S`] while the next fades in
-//!   (equal power).
+//!   lines. A restart crossfades (equal power, [`XFADE_S`]) in the samples before it, from the
+//!   pass that ends into the next one, so the next pass's downbeat sounds whole on its sample.
+//!   A transport loop's wrap is a restart too: where the slot's phase after the wrap differs from
+//!   before it, it crossfades the same way; where it is the same, the slot just plays on.
 //! - **One-shots** (and slots without a warp map) play their source once, sample for sample:
 //!   sources are at the session rate (they are resampled on import).
 //!
-//! **Players.** Each audio of a slot (its source, or each stem) has two warp players, A and B,
-//! prepared off the audio thread and handed over in a [`crate::WarpRoom`] with the column's
-//! [`LiveStore`] (a fixed table: nothing on the audio thread allocates). One plays; the other is
-//! warmed up for the next restart or launch in the blocks before it (a stretcher just restarted
-//! would put the first transient out at a fraction of its level), at most about one block of
-//! extra stretching per player per block, and takes over at the restart. A warm-up that cannot
-//! finish in time (a launch with too little lead) finishes at the restart, for that player only.
-//! On the audio thread a slot without its players is silent.
+//! **Players.** A column has a small pool of warp players, built off the audio thread for the
+//! widest audio its loops play and handed over in a [`crate::WarpRoom`] with the column's
+//! [`LiveStore`] (a fixed table: nothing on the audio thread allocates): three per audio a slot
+//! may play (its source, or each of four stems). One plays; one warms up for the next restart and
+//! one for the queued launch, in the blocks before them (a stretcher just restarted would put the
+//! first transient out at a fraction of its level), at most about one block of extra stretching
+//! per player per block, and takes over there. A warm-up that cannot finish in time (a launch
+//! with too little lead) finishes when it is needed, for that player only. On the audio thread
+//! a slot without its players is silent.
 
 use crate::warp::{self, PlayerStem, SOURCE_PLAYER, WarpPlayer};
 use soundcraft_dsp::db_to_gain;
-use soundcraft_model::{LIVE_SLOTS, MAX_LIVE_COLUMNS, STEMS, Session, Slot, SlotMode, SourceId, Track, TrackId};
+use soundcraft_model::{MAX_LIVE_COLUMNS, STEMS, Session, Slot, SlotMode, SourceId, Track, TrackId};
 use soundcraft_time::{Samples, TICKS_PER_QUARTER};
 
 /// Length of the crossfades at loop restarts, launches and stops, in seconds.
@@ -40,18 +45,21 @@ const CARRY: usize = 512;
 /// Frames rendered at once (the gain scratch's length).
 const CHUNK: usize = 512;
 
-/// Players per slot audio: the one playing and the one warming up for the next restart.
-pub(crate) const SIDES: usize = 2;
+/// Players per audio key in a column's pool: playing, restart spare and launch spare.
+pub(crate) const ROLES: usize = 3;
+const PLAYING: usize = 0;
+const RESTART: usize = 1;
+const LAUNCH: usize = 2;
 
-/// Player keys per slot: one per stem and one for the unsplit source.
+/// Audio keys: one per stem and one for an unsplit source.
 const KEYS: usize = STEMS.len() + 1;
 
-/// Players a column's storage holds.
-const SLOT_PLAYERS: usize = LIVE_SLOTS * KEYS * SIDES;
+/// Players a column's pool holds.
+const POOL_PLAYERS: usize = KEYS * ROLES;
 
-/// How far ahead (samples) a column looks for its next restart or launch to warm up for: twice
-/// the longest warm-up, so one block of warm-up per block finishes in time.
-const LOOKAHEAD: Samples = 2 * 4096;
+/// How far ahead (seconds) a column looks for its next restart or launch to warm up for: more
+/// than twice the longest warm-up, so one block of warm-up per block finishes in time.
+const LOOKAHEAD_S: f64 = 0.25;
 
 /// A launch or stop for the audio thread, at a timeline sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,14 +77,11 @@ pub enum LiveCmd {
 pub struct LivePlaying {
     /// Its row.
     pub slot: usize,
-    /// The sample it started at.
+    /// The sample it started at (the launch's, also when it was late).
     pub start: Samples,
     /// Session beat at the start (snapped to the tick it was launched on).
     pub(crate) beat0: f64,
-    /// Where its current fade-in starts: the latest loop restart (a launch starts hard, on its
-    /// sample).
-    pub(crate) fade_at: Option<Samples>,
-    /// Where its players last restarted: the launch or the latest loop restart.
+    /// Where its playing players started: they finish a warm-up there if they have to.
     pub(crate) head_at: Samples,
 }
 
@@ -92,8 +97,10 @@ pub struct LiveQueued {
 pub struct ColumnPlay {
     pub playing: Option<LivePlaying>,
     pub queued: Option<LiveQueued>,
-    /// Which of its two players each row plays through (bit per row).
-    pub(crate) sides: u8,
+    /// Launches the audio thread saw only after their sample (so their start was missed), so far.
+    pub late: u32,
+    /// Which pool player (per audio key) plays, is the restart spare and the launch spare.
+    pub(crate) roles: [u8; ROLES],
     /// The column track's arrangement clips are heard (fading in) from `arr_since`, or muted
     /// (fading out) from it.
     pub(crate) arr_on: bool,
@@ -102,22 +109,24 @@ pub struct ColumnPlay {
 
 impl Default for ColumnPlay {
     fn default() -> Self {
-        ColumnPlay { playing: None, queued: None, sides: 0, arr_on: true, arr_since: Samples::MIN }
+        ColumnPlay { playing: None, queued: None, late: 0, roles: [0, 1, 2], arr_on: true, arr_since: Samples::MIN }
     }
 }
 
 impl ColumnPlay {
-    /// Which of its two players row `row` plays through.
-    pub(crate) fn side_of(&self, row: usize) -> usize {
-        self.side(row)
+    /// The pool player that has `role`.
+    pub(crate) fn player(&self, role: usize) -> usize {
+        self.roles.get(role).map_or(0, |r| usize::from(*r))
     }
 
-    fn side(&self, row: usize) -> usize {
-        usize::from((self.sides >> (row % 8)) & 1)
+    /// At a restart the spare plays on and the player that played becomes the spare.
+    fn restart(&mut self) {
+        self.roles.swap(PLAYING, RESTART);
     }
 
-    fn flip(&mut self, row: usize) {
-        self.sides ^= 1 << (row % 8);
+    /// At a launch the launch spare plays and the player that played becomes the launch spare.
+    fn launch(&mut self) {
+        self.roles.swap(PLAYING, LAUNCH);
     }
 
     /// What plays from `at`; the arrangement fades out when a slot starts and back in when the
@@ -136,7 +145,6 @@ impl ColumnPlay {
         if let Some(p) = &mut self.playing {
             // A loop's phase counts session beats from its launch beat, which stays.
             p.start = p.start.saturating_add(by);
-            p.fade_at = p.fade_at.map(|f| f.saturating_add(by));
             p.head_at = p.head_at.saturating_add(by);
         }
         if self.arr_since != Samples::MIN {
@@ -145,7 +153,7 @@ impl ColumnPlay {
     }
 }
 
-/// Index of `stem`'s players in a row.
+/// Index of `stem`'s audio key.
 fn key(stem: PlayerStem) -> Option<usize> {
     if stem == SOURCE_PLAYER {
         return Some(STEMS.len());
@@ -154,20 +162,19 @@ fn key(stem: PlayerStem) -> Option<usize> {
     (k < STEMS.len()).then_some(k)
 }
 
-fn index(row: usize, stem: PlayerStem, side: usize) -> Option<usize> {
-    (row < LIVE_SLOTS && side < SIDES).then_some(())?;
-    Some((row * KEYS + key(stem)?) * SIDES + side)
+fn index(stem: PlayerStem, player: usize) -> Option<usize> {
+    (player < ROLES).then_some(())?;
+    Some(key(stem)? * ROLES + player)
 }
 
-/// The row, stem and side of player `i`.
-fn unindex(i: usize) -> (usize, PlayerStem, usize) {
-    let (k, side) = (i / SIDES, i % SIDES);
-    let (row, s) = (k / KEYS, k % KEYS);
-    (row, if s == STEMS.len() { SOURCE_PLAYER } else { s as PlayerStem }, side)
+/// The stem and pool player of index `i`.
+fn unindex(i: usize) -> (PlayerStem, usize) {
+    let (k, player) = (i / ROLES, i % ROLES);
+    (if k == STEMS.len() { SOURCE_PLAYER } else { k as PlayerStem }, player)
 }
 
-/// A column track's storage for its slots: two players per slot audio, and the tail of a slot
-/// fading out. Built off the audio thread at its full size, so playing never grows it.
+/// A column track's storage for its slots: the pool of players, and the tail of a slot fading
+/// out. Built off the audio thread at its full size, so playing never grows it.
 pub struct LiveStore {
     players: Vec<Option<WarpPlayer>>,
     /// Audio still to be added from `carry_at` on: tails reach past the block they start in.
@@ -180,12 +187,18 @@ pub struct LiveStore {
     pub(crate) stretched: usize,
 }
 
+impl Default for LiveStore {
+    fn default() -> Self {
+        LiveStore::new()
+    }
+}
+
 impl LiveStore {
-    /// Storage for a column track of `channels` channels (allocates).
-    pub fn new(channels: usize) -> LiveStore {
+    /// Storage for a column (allocates).
+    pub fn new() -> LiveStore {
         LiveStore {
-            players: std::iter::repeat_with(|| None).take(SLOT_PLAYERS).collect(),
-            carry: vec![vec![0.0; CARRY]; channels.clamp(1, crate::MAX_CHANNELS)],
+            players: std::iter::repeat_with(|| None).take(POOL_PLAYERS).collect(),
+            carry: vec![vec![0.0; CARRY]; crate::MAX_CHANNELS],
             carry_at: 0,
             carry_len: 0,
             gain: vec![0.0; CHUNK],
@@ -202,11 +215,11 @@ impl LiveStore {
         self.players.iter().filter(|p| p.is_some()).count()
     }
 
-    /// The players held, with their row, stem and side.
-    pub(crate) fn players(&self) -> impl Iterator<Item = (usize, PlayerStem, usize, &WarpPlayer)> {
+    /// The players held, with their stem and pool index.
+    pub(crate) fn players(&self) -> impl Iterator<Item = (PlayerStem, usize, &WarpPlayer)> {
         self.players.iter().enumerate().filter_map(|(i, p)| {
-            let (row, stem, side) = unindex(i);
-            p.as_ref().map(|p| (row, stem, side, p))
+            let (stem, player) = unindex(i);
+            p.as_ref().map(|p| (stem, player, p))
         })
     }
 
@@ -215,11 +228,10 @@ impl LiveStore {
         self.players.iter_mut().filter_map(Option::take)
     }
 
-    /// Moves the players of the rows and stems `keep` rejects into `out`.
-    pub(crate) fn retire_where(&mut self, keep: impl Fn(usize, PlayerStem) -> bool, out: &mut Vec<WarpPlayer>) {
+    /// Moves the players of the stems `keep` rejects into `out`.
+    pub(crate) fn retire_where(&mut self, keep: impl Fn(PlayerStem) -> bool, out: &mut Vec<WarpPlayer>) {
         for (i, p) in self.players.iter_mut().enumerate() {
-            let (row, stem, _) = unindex(i);
-            if p.is_some() && !keep(row, stem) {
+            if p.is_some() && !keep(unindex(i).0) {
                 out.extend(p.take());
             }
         }
@@ -227,10 +239,18 @@ impl LiveStore {
 
     /// Puts `player` in its place, returning what is to be retired: the player it replaces, or
     /// `player` itself when the place doesn't exist.
-    pub(crate) fn place(&mut self, row: usize, stem: PlayerStem, side: usize, player: WarpPlayer) -> Option<WarpPlayer> {
-        match index(row, stem, side).and_then(|i| self.players.get_mut(i)) {
+    pub(crate) fn place(&mut self, stem: PlayerStem, index_in_pool: usize, player: WarpPlayer) -> Option<WarpPlayer> {
+        match index(stem, index_in_pool).and_then(|i| self.players.get_mut(i)) {
             Some(p) => p.replace(player),
             None => Some(player),
+        }
+    }
+
+    /// The players' time moves by `by` (the transport wrapped): one whose audio goes on the same
+    /// after the jump plays on without a restart.
+    pub(crate) fn shift_players(&mut self, by: Samples) {
+        for p in self.players.iter_mut().flatten() {
+            p.shift_time(by);
         }
     }
 
@@ -292,9 +312,8 @@ pub fn slot_loops(slot: &Slot) -> bool {
     slot.mode == SlotMode::Loop && slot.warp.as_ref().is_some_and(|w| w.is_usable())
 }
 
-/// The audio a slot plays, one entry per player key it needs (as [`crate::played_sources`] for
-/// clips): `(SOURCE_PLAYER, source)`, or `(i, stem)` for each of a split slot's four stems. Each
-/// key has two players (see the module docs).
+/// The audio a slot plays, one entry per audio key (as [`crate::played_sources`] for clips):
+/// `(SOURCE_PLAYER, source)`, or `(i, stem)` for each of a split slot's four stems.
 pub fn slot_sources(slot: &Slot) -> impl Iterator<Item = (PlayerStem, SourceId)> + '_ {
     let source = slot.stems.is_none().then_some((SOURCE_PLAYER, slot.source));
     source.into_iter().chain(slot.stems.iter().flat_map(|set| set.sources.iter().enumerate().map(|(i, s)| (i as PlayerStem, *s))))
@@ -306,11 +325,29 @@ pub fn column_of(s: &Session, track: TrackId) -> Option<usize> {
     s.live.columns.iter().position(|c| c.track == track).filter(|c| *c < MAX_LIVE_COLUMNS && s.live.column_track(*c, &s.tracks) == Some(track))
 }
 
-/// True when the engine plays the warp players `stem` of row `row` of the column on `track`: the
-/// column that plays into the track (not a lost one), whose slot there loops
-/// ([`slot_loops`]) and plays `stem`.
-pub fn slot_player_plays(s: &Session, track: TrackId, row: usize, stem: PlayerStem) -> bool {
-    column_of(s, track).and_then(|c| s.live.slot(c, row)).is_some_and(|sl| slot_loops(sl) && slot_sources(sl).any(|(k, _)| k == stem))
+/// The pool a column track needs: the audio keys its looping slots play, and the most channels
+/// among their audio (the pool is built that wide). Empty for a track no column plays into.
+pub fn pool_needs(s: &Session, track: TrackId) -> (Vec<PlayerStem>, usize) {
+    let Some(c) = column_of(s, track) else { return (Vec::new(), 0) };
+    let mut keys = Vec::new();
+    let mut channels = 0;
+    for slot in s.live.columns.get(c).into_iter().flat_map(|col| col.slots.iter().flatten()).filter(|sl| slot_loops(sl)) {
+        for (stem, id) in slot_sources(slot) {
+            if !keys.contains(&stem) {
+                keys.push(stem);
+            }
+            channels = channels.max(s.pool.get(id).map_or(0, |a| a.buffer.channels.len()));
+        }
+    }
+    (keys, channels)
+}
+
+/// True when the column on `track` plays its pool players for `stem`: some looping slot of it
+/// plays that audio key.
+pub fn pool_player_plays(s: &Session, track: TrackId, stem: PlayerStem) -> bool {
+    column_of(s, track)
+        .and_then(|c| s.live.columns.get(c))
+        .is_some_and(|col| col.slots.iter().flatten().any(|sl| slot_loops(sl) && slot_sources(sl).any(|(k, _)| k == stem)))
 }
 
 /// Session beat (quarter notes) at timeline sample `t`.
@@ -335,6 +372,10 @@ fn start_beat(s: &Session, at: Samples) -> f64 {
 
 pub(crate) fn xfade_len(s: &Session) -> usize {
     ((XFADE_S * s.sample_rate.as_f64()).round() as usize).clamp(1, CARRY)
+}
+
+fn lookahead(s: &Session) -> Samples {
+    ((LOOKAHEAD_S * s.sample_rate.as_f64()) as Samples).max(8_192)
 }
 
 /// Equal-power fade-in gain of frame `i` of an `n`-frame crossfade (the fade-out is its
@@ -369,29 +410,32 @@ fn next_pass_start(from: Samples, to: Samples, pass: impl Fn(Samples) -> i64) ->
 }
 
 impl LivePlaying {
-    pub(crate) fn new(s: &Session, slot: usize, at: Samples) -> LivePlaying {
-        LivePlaying { slot, start: at, beat0: start_beat(s, at), fade_at: None, head_at: at }
+    /// A slot launched at `at`, first heard at `heard_from` (later than `at` when the launch
+    /// came late).
+    pub(crate) fn new(s: &Session, slot: usize, at: Samples, heard_from: Samples) -> LivePlaying {
+        LivePlaying { slot, start: at, beat0: start_beat(s, at), head_at: heard_from }
     }
 
     /// Which pass of a loop `length` beats long sample `t` plays.
     fn pass(&self, s: &Session, length: f64, t: Samples) -> i64 {
         ((mid_beat(s, t) - self.beat0) / length).floor() as i64
     }
-
-    /// The fade-in gain at `t`.
-    fn fade(&self, t: Samples, xf: usize) -> f32 {
-        self.fade_at.and_then(|f| usize::try_from(t.saturating_sub(f)).ok()).map_or(1.0, |i| fade_in(i, xf))
-    }
 }
 
-/// A restart or launch a player is warmed up for: row, side, launch beat, pass and sample.
-#[derive(Clone, Copy)]
-struct Target {
-    row: usize,
-    side: usize,
+/// What a pool player plays: pass `pass` of a loop launched on `beat0`, on a timeline moved by
+/// `shift` (after a transport wrap, warmed up before it).
+#[derive(Clone, Copy, Debug)]
+struct Pass {
     beat0: f64,
     pass: i64,
+    shift: Samples,
+}
+
+/// A restart of the playing loop at `at` (crossfaded in the samples before it) into `next`.
+#[derive(Clone, Copy, Debug)]
+struct Restart {
     at: Samples,
+    next: Pass,
 }
 
 /// What a render needs about the column.
@@ -399,6 +443,8 @@ pub(crate) struct Column<'a> {
     pub s: &'a Session,
     pub track: &'a Track,
     pub column: usize,
+    /// The transport's loop range (start, end), when it loops.
+    pub wrap: Option<(Samples, Samples)>,
 }
 
 impl Column<'_> {
@@ -406,22 +452,27 @@ impl Column<'_> {
         self.s.live.slot(self.column, row)
     }
 
+    /// The slot that launches at `at` (heard from `heard_from`), when it can play.
+    fn launching(&self, q: LiveQueued, heard_from: Samples) -> Option<LivePlaying> {
+        q.slot.filter(|r| self.slot(*r).is_some_and(|sl| self.playable(sl))).map(|r| LivePlaying::new(self.s, r, q.at, heard_from))
+    }
+
     /// Applies the queued launch or stop when it is due by `end`, without playing anything:
     /// for a column whose track is not rendered.
     pub(crate) fn advance(&self, play: &mut ColumnPlay, end: Samples) {
         if let Some(q) = play.queued.filter(|q| q.at < end) {
             play.queued = None;
-            let next = q.slot.filter(|r| self.slot(*r).is_some()).map(|r| LivePlaying::new(self.s, r, q.at));
+            let next = self.launching(q, q.at);
             play.set_playing(next, q.at);
         }
     }
 
-    /// The source position heard at `t` in pass `pass` of loop `slot` launched on `beat0`.
-    fn heard<'b>(&'b self, slot: &'b Slot, beat0: f64, pass: i64) -> Option<impl Fn(Samples) -> f64 + 'b> {
+    /// The source position heard at `t` playing `p` of loop `slot`.
+    fn heard<'b>(&'b self, slot: &'b Slot, p: Pass) -> Option<impl Fn(Samples) -> f64 + 'b> {
         let warp = slot.warp.as_ref()?;
-        let first = slot.start_beat - beat0 - pass as f64 * slot.length_beats.max(1.0);
+        let first = slot.start_beat - p.beat0 - p.pass as f64 * slot.length_beats.max(1.0);
         let s = self.s;
-        Some(move |x: Samples| warp.source_at(first + beat(s, x)))
+        Some(move |x: Samples| warp.source_at(first + beat(s, x.saturating_add(p.shift))))
     }
 
     /// Where a one-shot started at `p` ends (its longest audio runs out).
@@ -440,15 +491,45 @@ impl Column<'_> {
         slot_sources(slot).all(|(_, id)| self.s.pool.contains(id))
     }
 
+    /// The playing loop's next restart within reach of `pos`: its next pass, or the transport's
+    /// wrap where the slot's phase after it differs (where it is the same the slot plays on and
+    /// the restart after the wrap comes later). None when a launch or stop comes first.
+    fn next_restart(&self, play: &ColumnPlay, pos: Samples, horizon: Samples) -> Option<Restart> {
+        let p = play.playing?;
+        let slot = self.slot(p.slot).filter(|sl| slot_loops(sl))?;
+        let length = slot.length_beats.max(1.0);
+        let pass = |t: Samples| p.pass(self.s, length, t);
+        let seam = next_pass_start(pos, horizon, pass);
+        let wrap = self.wrap.filter(|(l0, l1)| *l1 > pos && *l1 <= horizon && l0 < l1);
+        let restart = match wrap {
+            Some((l0, l1)) if seam.is_none_or(|sm| l1 <= sm) => {
+                let before = Pass { beat0: p.beat0, pass: pass(l1), shift: 0 };
+                let after = Pass { beat0: p.beat0, pass: pass(l0), shift: l0 - l1 };
+                let (h0, h1) = (self.heard(slot, before)?, self.heard(slot, after)?);
+                if (h0(l1) - h1(l1)).abs() > 1.0 {
+                    Some(Restart { at: l1, next: after })
+                } else {
+                    // The same audio goes on after the wrap: a restart there is a plain one.
+                    seam.filter(|sm| *sm == l1).map(|at| Restart { at, next: Pass { beat0: p.beat0, pass: pass(at), shift: 0 } })
+                }
+            }
+            _ => seam.map(|at| Restart { at, next: Pass { beat0: p.beat0, pass: pass(at), shift: 0 } }),
+        };
+        restart.filter(|r| !play.queued.is_some_and(|q| q.at <= r.at))
+    }
+
     /// Adds the column's slots for `[pos, pos + frames)` into `buf` (which holds the track's
-    /// arrangement clips, muted while a slot plays).
+    /// arrangement clips, muted while a slot plays). Launches that came late are counted in
+    /// `play.late`.
     pub(crate) fn render(&self, play: &mut ColumnPlay, store: &mut LiveStore, buf: &mut [Vec<f32>], pos: Samples, frames: usize) {
         if store.carry_len > 0 && store.carry_at != pos {
             store.clear_carry();
         }
         let end = pos.saturating_add(frames as i64);
         let xf = xfade_len(self.s);
-        self.prewarm(play, store, pos, frames);
+        let horizon = end.saturating_add(lookahead(self.s));
+        let mut restart = self.next_restart(play, pos, horizon);
+        self.prewarm(play, restart, store, pos, frames, horizon);
         let mut a = pos;
         loop {
             let due = play.queued.filter(|q| q.at < end);
@@ -457,25 +538,26 @@ impl Column<'_> {
             let b = [due_at, shot_end].into_iter().flatten().fold(end, Samples::min);
             mute_arrangement(play, buf, pos, a, b, xf);
             if b > a {
-                // A restart exactly at the block's end is left to the next block when a launch or
-                // stop waits for that sample, which then takes over from the pass that ends.
-                let seam_at_end = b == end && !play.queued.is_some_and(|q| q.at == end);
-                self.render_playing(play, store, buf, pos, a, b, seam_at_end);
+                self.render_playing(play, &mut restart, store, buf, pos, a, b);
             }
             if shot_end == Some(b) {
                 play.set_playing(None, b);
             }
             if let Some(q) = due.filter(|_| due_at == Some(b)) {
                 store.mix_carry(buf, pos, b);
-                // A restart handled right at `b` already put the ending pass's tail there.
-                if let Some(p) = play.playing.filter(|p| p.fade_at != Some(b)) {
-                    self.tail(p, play.side(p.slot), store, b);
+                if let Some(p) = play.playing {
+                    self.tail(p, play.player(PLAYING), store, b);
                 }
                 play.queued = None;
-                let next = q.slot.filter(|r| self.slot(*r).is_some_and(|sl| self.playable(sl))).map(|r| LivePlaying::new(self.s, r, b));
-                if let Some(n) = next {
-                    play.flip(n.slot);
+                if q.slot.is_some() && q.at < b {
+                    play.late = play.late.saturating_add(1);
                 }
+                // A late launch keeps its phase from its own sample: only its start is missed.
+                let next = self.launching(q, b);
+                if next.is_some() {
+                    play.launch();
+                }
+                restart = None;
                 play.set_playing(next, b);
             }
             if b >= end {
@@ -486,122 +568,122 @@ impl Column<'_> {
         store.mix_carry(buf, pos, end);
     }
 
-    /// Warms the idle players up for the column's next loop restart and its queued launch,
-    /// when they fall within [`LOOKAHEAD`]: about one block of stretching per player, more
-    /// (up to twice) once the restart is nearer than the warm-up is long.
-    fn prewarm(&self, play: &ColumnPlay, store: &mut LiveStore, pos: Samples, frames: usize) {
-        let horizon = pos.saturating_add(frames as i64).saturating_add(LOOKAHEAD);
-        let mut targets: [Option<Target>; 2] = [None, None];
-        if let Some(p) = play.playing
-            && let Some(slot) = self.slot(p.slot).filter(|sl| slot_loops(sl))
-        {
-            let length = slot.length_beats.max(1.0);
-            let k = p.pass(self.s, length, pos);
-            if let Some(at) = next_pass_start(pos, horizon, |t| p.pass(self.s, length, t))
-                && !play.queued.is_some_and(|q| q.at <= at)
-            {
-                targets[0] = Some(Target { row: p.slot, side: 1 - play.side(p.slot), beat0: p.beat0, pass: k + 1, at });
-            }
+    /// Warms the spare players up for the playing loop's next restart (up to where its
+    /// crossfade starts) and for the queued launch, when they fall before `horizon`: about one
+    /// block of stretching per player, up to twice that once the target is nearer than the
+    /// warm-up is long.
+    fn prewarm(&self, play: &ColumnPlay, restart: Option<Restart>, store: &mut LiveStore, pos: Samples, frames: usize, horizon: Samples) {
+        let xf = xfade_len(self.s) as i64;
+        let mut targets: [Option<(usize, usize, Pass, Samples)>; 2] = [None, None];
+        if let (Some(r), Some(p)) = (restart, play.playing) {
+            targets[0] = Some((p.slot, play.player(RESTART), r.next, r.at.saturating_sub(xf)));
         }
         if let Some(q) = play.queued
             && let Some(row) = q.slot
             && (pos..=horizon).contains(&q.at)
             && self.slot(row).is_some_and(slot_loops)
-            && !targets[0].is_some_and(|t| t.row == row)
         {
-            targets[1] = Some(Target { row, side: 1 - play.side(row), beat0: start_beat(self.s, q.at), pass: 0, at: q.at });
+            targets[1] = Some((row, play.player(LAUNCH), Pass { beat0: start_beat(self.s, q.at), pass: 0, shift: 0 }, q.at));
         }
-        for t in targets.into_iter().flatten() {
-            let Some(slot) = self.slot(t.row) else { continue };
-            let Some(heard) = self.heard(slot, t.beat0, t.pass) else { continue };
+        for (row, player, pass, at) in targets.into_iter().flatten() {
+            let Some(slot) = self.slot(row) else { continue };
+            let Some(heard) = self.heard(slot, pass) else { continue };
             for (stem, source) in slot_sources(slot) {
                 if stem != SOURCE_PLAYER && !slot.stem_mask.get(usize::from(stem)).copied().unwrap_or(false) {
                     continue;
                 }
                 let Some(audio) = self.s.pool.get(source) else { continue };
-                let Some(Some(player)) = index(t.row, stem, t.side).and_then(|i| store.players.get_mut(i)) else { continue };
-                let late = t.at.saturating_sub(pos) < warp::warm_span(player) as i64;
+                let Some(Some(pl)) = index(stem, player).and_then(|i| store.players.get_mut(i)) else { continue };
+                let late = at.saturating_sub(pos) < warp::warm_span(pl) as i64;
                 let budget = if late { 2 * frames } else { frames };
-                store.stretched += warp::warm_toward(player, &audio.buffer.channels, source, &heard, t.at, budget);
+                store.stretched += warp::warm_toward(pl, &audio.buffer.channels, source, &heard, at, budget);
             }
         }
     }
 
-    /// Renders what `play` plays over `[a, b)`; a loop restart at `b` itself is handled when
-    /// `seam_at_end`. A slot that is gone or whose audio is missing stops the column.
+    /// Renders what `play` plays over `[a, b)`: through `restart` when it comes. A slot that is
+    /// gone or whose audio is missing stops the column.
     #[allow(clippy::too_many_arguments)]
     fn render_playing(
         &self,
         play: &mut ColumnPlay,
+        restart: &mut Option<Restart>,
         store: &mut LiveStore,
         buf: &mut [Vec<f32>],
         pos: Samples,
         a: Samples,
         b: Samples,
-        seam_at_end: bool,
     ) {
-        let Some(mut p) = play.playing else { return };
+        let Some(p) = play.playing else { return };
         let Some(slot) = self.slot(p.slot).filter(|sl| self.playable(sl)) else {
             play.set_playing(None, a);
             return;
         };
-        let xf = xfade_len(self.s);
         if !slot_loops(slot) {
             let mut t = a;
             while t < b {
                 let n = usize::try_from(b - t).unwrap_or(0).min(CHUNK);
                 let off = usize::try_from(t - pos).unwrap_or(0);
-                self.one_shot(slot, &p, store, t, n, Out::Buf(buf, off), |at| p.fade(at, xf));
+                self.one_shot(slot, &p, store, t, n, Out::Buf(buf, off), |_| 1.0);
                 t = t.saturating_add(n as i64);
             }
             return;
         }
         let length = slot.length_beats.max(1.0);
+        let xf = xfade_len(self.s);
         let mut t = a;
         while t < b {
-            let c = t.saturating_add(CHUNK as i64).min(b);
-            let k = p.pass(self.s, length, t);
-            // The first sample of the next pass, if it falls in (t, c) (or at c, when the block
-            // ends there and nothing takes over at that sample).
-            let last = if seam_at_end && c == b { c } else { c - 1 };
-            let seam = next_pass_start(t, last, |x| p.pass(self.s, length, x));
-            let e = seam.unwrap_or(c).min(c);
-            if e > t {
-                let off = usize::try_from(t - pos).unwrap_or(0);
-                let n = usize::try_from(e - t).unwrap_or(0);
-                let side = play.side(p.slot);
-                self.loop_pass(slot, &p, k, side, t == p.head_at, store, t, n, Out::Buf(buf, off), |at| p.fade(at, xf));
+            let off = usize::try_from(t - pos).unwrap_or(0);
+            let fade_from = restart.map(|r| r.at.saturating_sub(xf as i64));
+            match (*restart, fade_from) {
+                (Some(r), Some(x0)) if t >= x0 && t < r.at => {
+                    // The crossfade: the pass that ends fades out, the next fades in on the
+                    // warmed-up spare, so its first sample after `r.at` is whole.
+                    let e = r.at.min(b).min(t.saturating_add(CHUNK as i64));
+                    let n = usize::try_from(e - t).unwrap_or(0);
+                    let now = Pass { beat0: p.beat0, pass: p.pass(self.s, length, t), shift: 0 };
+                    let i0 = |at: Samples| usize::try_from(at - x0).unwrap_or(0);
+                    self.loop_pass(slot, now, play.player(PLAYING), false, store, t, n, Out::Buf(buf, off), |at| fade_out(i0(at), xf));
+                    self.loop_pass(slot, r.next, play.player(RESTART), true, store, t, n, Out::Buf(buf, off), |at| fade_in(i0(at), xf));
+                    if e == r.at {
+                        play.restart();
+                        *restart = None;
+                    }
+                    t = e;
+                }
+                (Some(r), _) if t >= r.at => {
+                    // Past it already (a block started there): the spare takes over.
+                    play.restart();
+                    *restart = None;
+                }
+                _ => {
+                    // Plain playing, up to the crossfade (or a pass change nothing planned for,
+                    // where the player re-seeks).
+                    let stop = fade_from.unwrap_or(b).min(b).min(t.saturating_add(CHUNK as i64));
+                    let stop = if stop <= t { b.min(t.saturating_add(CHUNK as i64)) } else { stop };
+                    let k = p.pass(self.s, length, t);
+                    let e = next_pass_start(t, stop - 1, |x| p.pass(self.s, length, x)).unwrap_or(stop);
+                    let n = usize::try_from(e - t).unwrap_or(0);
+                    let now = Pass { beat0: p.beat0, pass: k, shift: 0 };
+                    self.loop_pass(slot, now, play.player(PLAYING), t == p.head_at, store, t, n, Out::Buf(buf, off), |_| 1.0);
+                    t = e;
+                }
             }
-            if let Some(seam) = seam {
-                // Restart: the pass that ends fades out into the carry; the warmed-up player of
-                // the other side plays the next, fading in.
-                store.mix_carry(buf, pos, seam);
-                store.begin_tail(seam);
-                let side = play.side(p.slot);
-                self.loop_pass(slot, &p, k, side, false, store, seam, xf, Out::Carry, |at| {
-                    usize::try_from(at - seam).map_or(0.0, |i| fade_out(i, xf))
-                });
-                store.carry_len = store.carry_len.max(xf);
-                play.flip(p.slot);
-                p.fade_at = Some(seam);
-                p.head_at = seam;
-            }
-            t = e;
         }
-        play.playing = Some(p);
     }
 
-    /// Fades `p` (playing through `side`) out from `at` into the carry (it stops there).
-    pub(crate) fn tail(&self, p: LivePlaying, side: usize, store: &mut LiveStore, at: Samples) {
+    /// Fades `p` (playing through pool player `player`) out from `at` into the carry (it stops
+    /// there).
+    pub(crate) fn tail(&self, p: LivePlaying, player: usize, store: &mut LiveStore, at: Samples) {
         let Some(slot) = self.slot(p.slot).filter(|sl| self.playable(sl)) else { return };
         store.begin_tail(at);
         let xf = xfade_len(self.s);
-        let gain = |t: Samples| usize::try_from(t - at).map_or(0.0, |i| fade_out(i, xf)) * p.fade(t, xf);
+        let gain = |t: Samples| usize::try_from(t - at).map_or(0.0, |i| fade_out(i, xf));
         if slot_loops(slot) {
             let length = slot.length_beats.max(1.0);
             // The pass heard just before `at` goes on (at a restart sample too).
             let k = p.pass(self.s, length, if at > p.start { at - 1 } else { at });
-            self.loop_pass(slot, &p, k, side, false, store, at, xf, Out::Carry, gain);
+            self.loop_pass(slot, Pass { beat0: p.beat0, pass: k, shift: 0 }, player, false, store, at, xf, Out::Carry, gain);
         } else {
             self.one_shot(slot, &p, store, at, xf, Out::Carry, gain);
         }
@@ -619,24 +701,23 @@ impl Column<'_> {
         crate::stem_gains(Some(self.track), &slot.stem_mask, scale, usize::from(stem), t, n, out)
     }
 
-    /// Adds `n` frames from `t` of pass `k` of loop `slot` through its `side` players into
-    /// `out`, times `fade(t)`. At a `head` (a launch or restart) a player not warmed up in time
-    /// finishes its warm-up first.
+    /// Adds `n` frames from `t` of `pass` of loop `slot` (row `row`) through pool player
+    /// `player` into `out`, times `fade(t)`. When `catch_up`, a player not warmed up for `t` in
+    /// time finishes its warm-up first.
     #[allow(clippy::too_many_arguments)]
     fn loop_pass(
         &self,
         slot: &Slot,
-        p: &LivePlaying,
-        k: i64,
-        side: usize,
-        head: bool,
+        pass: Pass,
+        player: usize,
+        catch_up: bool,
         store: &mut LiveStore,
         t: Samples,
         n: usize,
         mut out: Out<'_>,
         fade: impl Fn(Samples) -> f32,
     ) {
-        let Some(heard) = self.heard(slot, p.beat0, k) else { return };
+        let Some(heard) = self.heard(slot, pass) else { return };
         let g = db_to_gain(slot.gain_db);
         let sr = self.s.sample_rate.as_f64() as f32;
         let LiveStore { players, carry, gain, stretched, .. } = store;
@@ -646,15 +727,15 @@ impl Column<'_> {
             if src.is_empty() || !self.stem_gain(slot, stem, t, n, gain) {
                 continue;
             }
-            let Some(entry) = index(p.slot, stem, side).and_then(|i| players.get_mut(i)) else { continue };
+            let Some(entry) = index(stem, player).and_then(|i| players.get_mut(i)) else { continue };
             if entry.is_none() && !crate::on_audio_thread() {
                 // Offline (tests, renders without a host): built here. The audio thread never
                 // builds one; until it arrives the slot is silent.
                 *entry = WarpPlayer::build(src.len(), sr, false);
             }
-            let Some(player) = entry.as_mut() else { continue };
-            if head {
-                *stretched += warp::warm_toward(player, src, source, &heard, t, usize::MAX);
+            let Some(pl) = entry.as_mut() else { continue };
+            if catch_up {
+                *stretched += warp::warm_toward(pl, src, source, &heard, t, usize::MAX);
             }
             let gain = &*gain;
             let gain_at = |i: usize| g * fade(t.saturating_add(i as i64)) * gain.get(i).copied().unwrap_or(0.0);
@@ -662,7 +743,7 @@ impl Column<'_> {
                 Out::Buf(b, off) => (&mut **b, *off),
                 Out::Carry => (carry.as_mut_slice(), 0),
             };
-            *stretched += warp::stretch_into(player, src, source, &heard, t, n, dst, off, gain_at);
+            *stretched += warp::stretch_into(pl, src, source, &heard, t, n, dst, off, gain_at);
         }
     }
 
@@ -740,7 +821,7 @@ mod tests {
         }
         let bar = |n: i64| s.tempo.tick_to_samples(s.tempo.bar_start_tick(n), s.sample_rate);
         for (launch, len) in [(2, 4.0), (3, 8.0), (5, 16.0)] {
-            let p = LivePlaying::new(&s, 0, bar(launch));
+            let p = LivePlaying::new(&s, 0, bar(launch), bar(launch));
             let bars = (len / 4.0) as i64;
             for k in 1..8 {
                 let line = bar(launch + k * bars);
@@ -798,9 +879,11 @@ mod tests {
         let back = eng.adopt_room(&s, WarpRoom::for_session(&s, 0));
         assert_eq!(back.live_stores(), 0, "the strip took it");
         let cap = eng.slot_table_capacity(t);
-        assert!(cap >= SLOT_PLAYERS);
-        let mut batch: Vec<_> = (0..SIDES).map(|side| crate::PreparedWarp::for_slot(t, 0, side, SOURCE_PLAYER, 1, 48_000.0).unwrap()).collect();
-        batch.extend((0..4).flat_map(|k| (0..SIDES).map(move |side| crate::PreparedWarp::for_slot(t, 1, side, k, 1, 48_000.0).unwrap())));
+        assert_eq!(cap, POOL_PLAYERS);
+        let (keys, ch) = crate::pool_needs(&s, t);
+        assert_eq!((keys.len(), ch), (5, 1), "the source and four stems, mono");
+        let batch: Vec<_> =
+            keys.iter().flat_map(|k| (0..ROLES).map(move |i| crate::PreparedWarp::for_pool(t, *k, i, ch, 48_000.0).unwrap())).collect();
         eng.adopt_warps(batch);
         let retired = eng.retired_warps.capacity();
         let mut pos = 0;
@@ -817,8 +900,8 @@ mod tests {
                 pos += 512;
             }
         });
-        assert_eq!(eng.slot_players().count(), 10, "two players per slot audio");
-        assert!(eng.slot_players().all(|(_, _, _, _, p)| p.is_prepared()));
+        assert_eq!(eng.slot_players().count(), 15, "three players per audio the column plays");
+        assert!(eng.slot_players().all(|(_, _, _, p)| p.is_prepared()));
         assert_eq!(eng.slot_table_capacity(t), cap, "never grew");
         assert_eq!(eng.retired_warps.capacity(), retired);
         assert!(eng.live_state()[0].playing.is_none());
@@ -828,8 +911,8 @@ mod tests {
         assert_eq!(back.live_stores(), 1, "the strip keeps its own");
         s.live.columns[0].slots[1] = None;
         eng.retire_stale_warps(&s);
-        assert_eq!(eng.take_retired_warps().len(), 8);
-        assert_eq!(eng.slot_players().count(), 2);
+        assert_eq!(eng.take_retired_warps().len(), 12, "the stems' players go");
+        assert_eq!(eng.slot_players().count(), 3);
     }
 
     /// Four columns of split loops (4 stems each): a scene launch over a playing scene, with
@@ -865,8 +948,8 @@ mod tests {
         eng.ensure_synced(&s);
         let batch: Vec<_> = tracks
             .iter()
-            .flat_map(|t| (0..2).flat_map(move |row| (0..4).flat_map(move |k| (0..SIDES).map(move |side| (*t, row, k, side)))))
-            .map(|(t, row, k, side)| crate::PreparedWarp::for_slot(t, row, side, k, 2, 48_000.0).unwrap())
+            .flat_map(|t| (0..4).flat_map(move |k| (0..ROLES).map(move |i| (*t, k, i))))
+            .map(|(t, k, i)| crate::PreparedWarp::for_pool(t, k, i, 2, 48_000.0).unwrap())
             .collect();
         eng.adopt_warps(batch);
         let bar = |n: i64| s.tempo.tick_to_samples(s.tempo.bar_start_tick(n), s.sample_rate);
@@ -875,6 +958,7 @@ mod tests {
         let (mut worst, mut worst_us, mut total_us, mut blocks) = (0usize, 0u128, 0u128, 0u128);
         let mut pos = 0;
         let mut sent = [false; 2];
+        let mut times = Vec::new();
         as_audio_thread(true, || {
             while pos < bar(8) {
                 for (i, (row, at)) in [(0, bar(2)), (1, bar(5))].into_iter().enumerate() {
@@ -893,14 +977,17 @@ mod tests {
                     worst_us = worst_us.max(us);
                     total_us += us;
                     blocks += 1;
+                    times.push(us);
                 }
                 worst = worst.max(eng.take_live_stretched());
                 pos += BLOCK as i64;
             }
         });
         let players = 16;
+        times.sort_unstable();
+        let p99 = times.get(times.len() * 99 / 100).copied().unwrap_or(0);
         println!(
-            "16 stem players: worst {worst} stretched frames per {BLOCK}-frame callback ({:.2} blocks per player); worst {worst_us} µs, mean {} µs; a full warm-up per player at once would be {}",
+            "16 stem players: worst {worst} stretched frames per {BLOCK}-frame callback ({:.2} blocks per player); worst {worst_us} µs, p99 {p99} µs, mean {} µs; a full warm-up per player at once would be {}",
             worst as f64 / (players * BLOCK) as f64,
             total_us / blocks.max(1),
             players * (BLOCK + 2_880)

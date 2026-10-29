@@ -482,3 +482,78 @@ fn a_launch_on_a_restart_at_a_block_boundary_has_one_tail() {
     let around = out[(target - 200) as usize..(target + 300) as usize].iter().fold(0.0f32, |m, x| m.max(x.abs()));
     assert!(around < 2.05 * amp, "peak {around} around the relaunch (one tail plus the new pass)");
 }
+
+/// Renders a transport loop over `[l0, l1)` from `l0`, `len` samples of output in all, wrapping
+/// the way playback does (blocks end on `l1`, then `live_locate(l1, l0, true)`). Returns the left
+/// channel as heard.
+fn run_looped(eng: &mut MixEngine, s: &Session, (l0, l1): (Samples, Samples), len: usize, cmds: &[LiveCmd]) -> Vec<f32> {
+    eng.set_live_loop(Some(Range::new(l0, l1)));
+    for c in cmds {
+        eng.live(*c);
+    }
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    let mut heard = Vec::with_capacity(len);
+    let mut pos = l0;
+    while heard.len() < len {
+        if pos >= l1 {
+            eng.live_locate(pos, l0, true);
+            pos = l0;
+        }
+        let n = BLOCK.min((l1 - pos) as usize);
+        eng.render(s, pos, n, &mut out);
+        heard.extend_from_slice(&out[0][..n]);
+        pos += n as i64;
+    }
+    heard
+}
+
+/// A 1-bar loop under a 4-bar transport loop (its phase the same after the wrap) and a 3.5-bar one
+/// (half a bar off): the wrap has no step, and the downbeat after it sounds whole on its sample.
+#[test]
+fn a_transport_loop_wrap_is_seamless() {
+    let amp = 0.5f32;
+    let slope = amp * std::f32::consts::TAU * 441.0 / 48_000.0;
+    for bars in [4.0, 3.5] {
+        let (mut s, _) = session(false);
+        let l1 = (bars * 96_000.0) as i64;
+        let sine: Vec<f32> = (0..48_000 * 12).map(|i| amp * (i as f32 * std::f32::consts::TAU * 441.0 / 48_000.0).sin()).collect();
+        s.pool.insert(SourceId(903), audio(vec![sine]));
+        let beats = (0..20).map(|k| 1_000.0 + k as f64 * 24_000.0).collect();
+        put(&mut s, 0, loop_slot(SourceId(903), WarpMap::new(beats, 0.0).unwrap(), 4.0));
+        let mut eng = engine();
+        let out = run_looped(&mut eng, &s, (0, l1), 2 * l1 as usize + 20_000, &[LiveCmd::Launch { column: 0, slot: 0, at: 0 }]);
+        for wrap in [l1 as usize, 2 * l1 as usize] {
+            let step = max_step(&out[wrap - 300..wrap + 300]);
+            println!("{bars} bars: step {step:.4} at the wrap (sine slope {slope:.4})");
+            assert!(step < 1.5 * slope, "{bars}-bar loop, wrap at {wrap}: step {step:.4}");
+        }
+
+        let (mut s, _) = session(false);
+        let (_, warp) = clicks();
+        put(&mut s, 0, loop_slot(LOOP, warp, 4.0));
+        let mut eng = engine();
+        let out = run_looped(&mut eng, &s, (0, l1), 2 * l1 as usize + 20_000, &[LiveCmd::Launch { column: 0, slot: 0, at: 0 }]);
+        for wrap in [l1, 2 * l1] {
+            let err = loud_click(&out, wrap);
+            assert!(err.abs() < 1.0, "{bars}-bar loop: the downbeat after the wrap is {err:+.3} ms off");
+        }
+    }
+}
+
+/// A launch the audio thread sees after its sample keeps the loop on the grid (its passes still
+/// start on bar lines) and is counted as late.
+#[test]
+fn a_late_launch_stays_on_the_grid() {
+    let (mut s, _) = session(false);
+    let (_, warp) = clicks();
+    put(&mut s, 0, loop_slot(LOOP, warp, 4.0));
+    let at = bar(&s, 2);
+    let mut eng = engine();
+    let out = run(&mut eng, &s, bar(&s, 5) + 4_800, &[(at + 3 * BLOCK as i64, LiveCmd::Launch { column: 0, slot: 0, at })]);
+    let p = eng.live_state()[0].playing.unwrap();
+    assert_eq!((p.start, eng.live_late()), (at, 1));
+    for n in 3..5 {
+        let err = loud_click(&out, bar(&s, n));
+        assert!(err.abs() < 1.0, "bar {n}: {err:+.3} ms off the grid");
+    }
+}

@@ -84,6 +84,14 @@ impl WarpPlayer {
         self.input.len()
     }
 
+    /// Moves the player's time by `by` (the transport wrapped): where its audio goes on the same
+    /// after the jump, it plays on without a restart.
+    pub(crate) fn shift_time(&mut self, by: Samples) {
+        if self.next_pos != Samples::MIN {
+            self.next_pos = self.next_pos.saturating_add(by);
+        }
+    }
+
     /// True when the player was built off the audio thread and handed over.
     pub fn is_prepared(&self) -> bool {
         self.prepared
@@ -94,9 +102,8 @@ impl WarpPlayer {
 pub struct PreparedWarp {
     pub(crate) track: TrackId,
     pub(crate) clip: ClipId,
-    /// The Live slot (row of the track's column) and which of its two players (see
-    /// [`crate::live`]) the player is for, instead of a clip.
-    pub(crate) slot: Option<(u8, u8)>,
+    /// The Live column pool player (on `track`'s column) it is, instead of a clip's.
+    pub(crate) pool: Option<u8>,
     pub(crate) stem: PlayerStem,
     pub(crate) player: WarpPlayer,
 }
@@ -105,26 +112,24 @@ impl PreparedWarp {
     /// Builds the stretcher now (allocates; call off the audio thread). `stem` says which of
     /// the clip's audio it plays (see [`played_sources`]).
     pub fn new(track: TrackId, clip: ClipId, stem: PlayerStem, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
-        Some(PreparedWarp { track, clip, slot: None, stem, player: WarpPlayer::build(channels, sample_rate, true)? })
+        Some(PreparedWarp { track, clip, pool: None, stem, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 
-    /// Builds the stretcher for row `slot` of the Live column on `track`, one of the two (`side`
-    /// 0 or 1) each of the slot's audio has (allocates; call off the audio thread). `stem` says
-    /// which of the slot's audio it plays (see [`crate::slot_sources`]).
-    pub fn for_slot(track: TrackId, slot: usize, side: usize, stem: PlayerStem, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
-        let slot = u8::try_from(slot).ok().filter(|r| usize::from(*r) < soundcraft_model::LIVE_SLOTS)?;
-        let side = u8::try_from(side).ok().filter(|s| usize::from(*s) < crate::live::SIDES)?;
-        Some(PreparedWarp { track, clip: ClipId(0), slot: Some((slot, side)), stem, player: WarpPlayer::build(channels, sample_rate, true)? })
+    /// Builds player `index` (of [`crate::live`]'s three per audio) of the Live column pool on
+    /// `track`, for the audio `stem` of its slots (allocates; call off the audio thread).
+    pub fn for_pool(track: TrackId, stem: PlayerStem, index: usize, channels: usize, sample_rate: f32) -> Option<PreparedWarp> {
+        let index = u8::try_from(index).ok().filter(|i| usize::from(*i) < crate::live::ROLES)?;
+        Some(PreparedWarp { track, clip: ClipId(0), pool: Some(index), stem, player: WarpPlayer::build(channels, sample_rate, true)? })
     }
 
-    /// The Live slot row the player is for, when it is for a slot rather than a clip.
-    pub fn slot(&self) -> Option<usize> {
-        self.slot.map(|(r, _)| usize::from(r))
+    /// Source channels the player was built for.
+    pub fn player_channels(&self) -> usize {
+        self.player.input.len()
     }
 
-    /// Which of the slot's two players it is (0 for a clip's).
-    pub fn side(&self) -> usize {
-        self.slot.map_or(0, |(_, s)| usize::from(s))
+    /// The Live column pool player it is, when it is not a clip's.
+    pub fn pool_index(&self) -> Option<usize> {
+        self.pool.map(usize::from)
     }
 
     /// The clip the player is for.
@@ -162,7 +167,7 @@ impl WarpRoom {
     pub fn for_session_with(s: &Session, retire: usize, need_store: impl Fn(TrackId) -> bool) -> WarpRoom {
         let cols: Vec<TrackId> = (0..s.live.columns.len()).filter_map(|c| s.live.column_track(c, &s.tracks)).filter(|t| need_store(*t)).collect();
         let mut live = Vec::with_capacity(cols.len());
-        live.extend(cols.into_iter().map(|t| (t, Some(crate::live::LiveStore::new(s.track(t).map_or(2, |t| t.channels()))))));
+        live.extend(cols.into_iter().map(|t| (t, Some(crate::live::LiveStore::new()))));
         let tables = s
             .tracks
             .iter()
@@ -385,8 +390,11 @@ pub(crate) fn stretch_into(
 /// stretcher just restarted puts out its first transient at a fraction of its level): its
 /// output latency.
 pub(crate) fn warm_span(player: &WarpPlayer) -> usize {
-    player.st.output_latency().clamp(1, PLAYER_BLOCK)
+    player.st.output_latency().clamp(1, MAX_WARM)
 }
+
+/// Longest warm-up: the output latency at 192 kHz.
+const MAX_WARM: usize = 16_384;
 
 /// Runs `player` (its output unheard) towards a restart at timeline sample `target`, where it
 /// will play `heard`: from [`warm_span`] frames before it, or from where an earlier call left
