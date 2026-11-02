@@ -98,7 +98,7 @@ impl SoundApp {
         };
         let state = p.live_state();
         for (status, c) in self.engine.live_status.iter_mut().zip(state.iter()) {
-            *status = soundcraft_engine::LiveStatus { playing: c.playing, queued: c.queued };
+            *status = soundcraft_engine::LiveStatus { playing: c.playing, queued: c.queued, origin: c.origin };
         }
         let late: u64 = state.iter().map(|c| u64::from(c.late)).sum();
         if late > self.live_late_seen {

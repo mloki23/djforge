@@ -744,9 +744,10 @@ fn state(e: &mut Engine, _: &Value) -> Result<Value> {
             let status = e.live_status.get(c).copied().unwrap_or_default();
             let playing = status.playing.map(|(row, start)| {
                 let slot = s.live.slot(c, row);
-                // Where a loop is: session beats since its launch, wrapped to its length.
+                // Where a loop is: session beats since its launch beat, wrapped to its length, as
+                // the mixer plays it (counted from `origin`, which transport jumps don't move).
                 let looping = slot.filter(|x| soundcraft_mix::slot_loops(x));
-                let position = looping.map(|x| (beat(now) - beat(start)).max(0.0).rem_euclid(x.length_beats.max(1.0)));
+                let position = looping.map(|x| (beat(now) - beat(status.origin)).rem_euclid(x.length_beats.max(1.0)));
                 json!({"slot": row, "name": slot.map(|x| x.name.as_str()), "start": start, "loop_beat": position,
                     "length_beats": looping.map(|x| x.length_beats)})
             });

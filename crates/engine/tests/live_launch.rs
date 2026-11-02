@@ -173,8 +173,8 @@ fn state_reports_what_plays_queued_and_where_a_loop_is() {
     e.execute("live.slot_from_file", &json!({"column": 3, "slot": 4, "path": path, "bpm": 120})).unwrap();
     e.execute("live.slot_set", &json!({"column": 3, "slot": 4, "length_bars": 2})).unwrap();
     // As the host reports it: launched at beat 4, now at beat 14.5; column 0 queued to stop.
-    e.live_status[3] = LiveStatus { playing: Some((4, 96_000)), queued: None };
-    e.live_status[0] = LiveStatus { playing: Some((0, 0)), queued: Some((None, 192_000)) };
+    e.live_status[3] = LiveStatus { playing: Some((4, 96_000)), queued: None, origin: 96_000 };
+    e.live_status[0] = LiveStatus { playing: Some((0, 0)), queued: Some((None, 192_000)), origin: 0 };
     e.transport.playing = true;
     e.transport.position = 348_000;
     let state = e.execute("live.state", &json!({})).unwrap();
@@ -188,6 +188,35 @@ fn state_reports_what_plays_queued_and_where_a_loop_is() {
     assert_eq!(state["columns"][0]["queued"], json!({"slot": null, "at": 192_000, "stop": true}));
     assert!(state["columns"][0]["playing"]["loop_beat"].is_null(), "a one-shot has no loop position");
     assert_eq!(state["columns"][3]["track"], json!(e.session().live.columns[3].track.0));
+}
+
+/// After transport wraps and locates the reported start moves with the audio, but a loop's phase
+/// still counts from the sample its launch beat fell on (`origin`): the ring follows the audio.
+#[test]
+fn the_loop_position_counts_from_the_launch_beat_after_wraps_and_locates() {
+    let dir = std::env::temp_dir().join(format!("djforge-live-origin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _gone = Gone(dir.clone());
+    let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 4 * 48_000]; 2] };
+    let path = dir.join("loop.wav");
+    std::fs::write(&path, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
+    let mut e = engine(true);
+    e.execute("live.slot_from_file", &json!({"column": 0, "slot": 0, "path": path, "bpm": 120})).unwrap();
+    // Launched on beat 0, then a 7-beat transport loop wrapped twice: the start the host reports
+    // moved back 14 beats, the phase did not.
+    e.live_status[0] = LiveStatus { playing: Some((0, -336_000)), queued: None, origin: 0 };
+    e.transport.playing = true;
+    e.transport.position = 24_000 * 5;
+    let state = e.execute("live.state", &json!({})).unwrap();
+    let beat = state["columns"][0]["playing"]["loop_beat"].as_f64().unwrap();
+    // Counted from the moved start it would read (5 + 14) mod 8 = 3.
+    assert!((beat - 5.0).abs() < 1e-9, "5 beats from the launch beat in the 8-beat loop: {state}");
 }
 
 #[test]

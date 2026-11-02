@@ -77,8 +77,13 @@ pub enum LiveCmd {
 pub struct LivePlaying {
     /// Its row.
     pub slot: usize,
-    /// The sample it started at (the launch's, also when it was late).
+    /// The sample it started at (the launch's, also when it was late), moved with the audio when
+    /// the transport jumps.
     pub start: Samples,
+    /// The sample its loop phase counts from: where its launch beat fell. A transport jump does
+    /// not move it (a loop's phase follows session beats), so a loop's position at `t` is
+    /// `(beat(t) − beat(origin)) mod length_beats`.
+    pub origin: Samples,
     /// Session beat at the start (snapped to the tick it was launched on).
     pub(crate) beat0: f64,
     /// Where its playing players started: they finish a warm-up there if they have to.
@@ -413,7 +418,7 @@ impl LivePlaying {
     /// A slot launched at `at`, first heard at `heard_from` (later than `at` when the launch
     /// came late).
     pub(crate) fn new(s: &Session, slot: usize, at: Samples, heard_from: Samples) -> LivePlaying {
-        LivePlaying { slot, start: at, beat0: start_beat(s, at), head_at: heard_from }
+        LivePlaying { slot, start: at, origin: at, beat0: start_beat(s, at), head_at: heard_from }
     }
 
     /// Which pass of a loop `length` beats long sample `t` plays.

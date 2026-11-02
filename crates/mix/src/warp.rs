@@ -405,7 +405,7 @@ pub(crate) fn warm_span(player: &WarpPlayer) -> usize {
 }
 
 /// Longest warm-up: the output latency at 192 kHz.
-const MAX_WARM: usize = 16_384;
+const MAX_WARM: usize = 24_576;
 
 /// Runs `player` (its output unheard) towards a restart at timeline sample `target`, where it
 /// will play `heard`: from [`warm_span`] frames before it, or from where an earlier call left

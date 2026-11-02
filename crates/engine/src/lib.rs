@@ -89,6 +89,9 @@ pub struct LiveStatus {
     pub playing: Option<(usize, Samples)>,
     /// A launch (`Some(row)`) or stop (`None`) waiting for its sample.
     pub queued: Option<(Option<usize>, Samples)>,
+    /// The sample the playing loop's phase counts from (its launch beat). Transport wraps and
+    /// locates move `playing`'s start with the audio but not this.
+    pub origin: Samples,
 }
 
 /// Snapshot of the transport reported back by the host (playback position etc.).

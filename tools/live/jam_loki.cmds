@@ -5,16 +5,19 @@ session.new {"name": "loki jam", "sample_rate": 48000}
 dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json"}
 dj.split_stems {"clip": 7}
 live.setup {}
+# Column 0: two loops from deck track 1 (Quest), unsplit.
 edit.select {"tracks": [1], "start": 3000000, "end": 3700000}
 live.slot_from_selection {"column": 0}
 edit.select {"tracks": [1], "start": 9000000, "end": 9700000}
 live.slot_from_selection {"column": 0}
+# Columns 1 and 2: clip 7, on deck track 2 (split above). A slot keeps the stem mask its clip
+# has when it is made, so each selection sets the mask first: the acapella, then the drums.
 clip.stem_mask {"clip": 7, "mask": ["vocals"]}
 edit.select {"tracks": [2], "start": 30000000, "end": 31400000}
 live.slot_from_selection {"column": 1}
-clip.stem_mask {"clip": 7, "mask": ["vocals", "drums", "bass", "other"]}
 clip.stem_mask {"clip": 7, "mask": ["drums"]}
 edit.select {"tracks": [2], "start": 33000000, "end": 33700000}
 live.slot_from_selection {"column": 2}
+# Clip 7 plays all its stems again in the arrangement.
 clip.stem_mask {"clip": 7, "mask": ["vocals", "drums", "bass", "other"]}
 live.state {}

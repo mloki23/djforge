@@ -557,3 +557,47 @@ fn a_late_launch_stays_on_the_grid() {
         assert!(err.abs() < 1.0, "bar {n}: {err:+.3} ms off the grid");
     }
 }
+
+/// A loop's position counted from its `origin` (what the Session view's ring shows) follows the
+/// audio across transport wraps that aren't a multiple of its length and across a locate: at
+/// every downbeat heard it reads 0. Counted from its (moved) start it would drift.
+#[test]
+fn the_loop_position_from_its_origin_follows_the_audio() {
+    let (mut s, _) = session(false);
+    let (_, warp) = clicks();
+    put(&mut s, 0, loop_slot(LOOP, warp, 4.0));
+    let beat = |t: Samples| s.tempo.samples_to_ticks_f(t, s.sample_rate) / TICKS_PER_QUARTER as f64;
+    let l1 = 336_000; // 3.5 bars
+    let mut eng = engine();
+    let _ = run_looped(&mut eng, &s, (0, l1), 3 * l1 as usize, &[LiveCmd::Launch { column: 0, slot: 0, at: 0 }]);
+    let p = eng.live_state()[0].playing.unwrap();
+    assert_ne!(p.start, p.origin, "three wraps moved the start");
+    // After the wraps (the timeline back at 0) and then after a locate to bar 6, the downbeats
+    // heard are on bar lines, where the position from the origin reads 0.
+    let heard_at = |eng: &mut MixEngine, from: Samples, n: i64| {
+        let mut out = vec![vec![0.0; BLOCK]; 2];
+        let mut left = Vec::new();
+        let mut pos = from;
+        while pos < from + n {
+            eng.render(&s, pos, BLOCK, &mut out);
+            left.extend_from_slice(&out[0]);
+            pos += BLOCK as i64;
+        }
+        left
+    };
+    eng.live_locate(l1, 0, true);
+    let out = heard_at(&mut eng, 0, 200_000);
+    for n in [2, 3] {
+        let at = bar(&s, n);
+        assert!(loud_click(&out, at).abs() < 1.0);
+        let pos = (beat(at) - beat(p.origin)).rem_euclid(4.0);
+        assert!(pos.min(4.0 - pos) < 1e-6, "bar {n} after the wraps: position {pos}");
+    }
+    eng.live_locate(200_000, bar(&s, 6) - 30_000, false);
+    let from = bar(&s, 6) - 30_000;
+    let out = heard_at(&mut eng, from, 150_000);
+    let at = bar(&s, 7);
+    assert!(loud_click(&out, at - from).abs() < 1.0);
+    let pos = (beat(at) - beat(eng.live_state()[0].playing.unwrap().origin)).rem_euclid(4.0);
+    assert!(pos.min(4.0 - pos) < 1e-6, "after the locate: position {pos}");
+}

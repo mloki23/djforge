@@ -107,20 +107,28 @@ pub struct LiveColumnState {
     /// Launches the audio thread saw only after their sample, so far (they missed their start
     /// and play on the grid from where they were seen).
     pub late: u32,
+    /// Where the playing slot's loop phase counts from (see `soundcraft_mix::LivePlaying::origin`):
+    /// unlike its start, a transport wrap or locate does not move it.
+    pub origin: Samples,
 }
 
 impl LiveColumnState {
     fn of(c: &ColumnPlay) -> LiveColumnState {
-        LiveColumnState { playing: c.playing.map(|p| (p.slot, p.start)), queued: c.queued.map(|q| (q.slot, q.at)), late: c.late }
+        LiveColumnState {
+            playing: c.playing.map(|p| (p.slot, p.start)),
+            queued: c.queued.map(|q| (q.slot, q.at)),
+            late: c.late,
+            origin: c.playing.map_or(0, |p| p.origin),
+        }
     }
 }
 
 /// [`LiveColumnState`]s shared lock-free by the audio thread: a sequence counter (odd while it
-/// writes) around five words per column (playing row or -1, its start, queued row or -1 for a
-/// stop or -2 for none, its sample, late launches).
+/// writes) around six words per column (playing row or -1, its start, queued row or -1 for a
+/// stop or -2 for none, its sample, late launches, the phase origin).
 struct LiveShared {
     seq: AtomicU64,
-    words: [[AtomicI64; 5]; MAX_LIVE_COLUMNS],
+    words: [[AtomicI64; 6]; MAX_LIVE_COLUMNS],
     /// The last snapshot read whole, for a read that keeps meeting a write (UI side only).
     last: Mutex<[LiveColumnState; MAX_LIVE_COLUMNS]>,
     /// The longest audio callback seen, in session samples.
@@ -131,7 +139,7 @@ impl Default for LiveShared {
     fn default() -> Self {
         LiveShared {
             seq: AtomicU64::new(0),
-            words: std::array::from_fn(|_| std::array::from_fn(|i| AtomicI64::new(if i == 4 { 0 } else { -2 }))),
+            words: std::array::from_fn(|_| std::array::from_fn(|i| AtomicI64::new(if i >= 4 { 0 } else { -2 }))),
             last: Mutex::new([LiveColumnState::default(); MAX_LIVE_COLUMNS]),
             max_callback: AtomicI64::new(0),
         }
@@ -151,7 +159,7 @@ impl LiveShared {
                 Some((None, at)) => (-1, at),
                 Some((Some(r), at)) => (row(r), at),
             };
-            for (a, v) in w.iter().zip([p, start, q, at, i64::from(c.late)]) {
+            for (a, v) in w.iter().zip([p, start, q, at, i64::from(c.late), c.origin]) {
                 a.store(v, Ordering::Relaxed);
             }
         }
@@ -166,7 +174,7 @@ impl LiveShared {
         for _ in 0..64 {
             let before = self.seq.load(Ordering::Acquire);
             for (o, w) in out.iter_mut().zip(&self.words) {
-                let [p, start, q, at, late] = [0, 1, 2, 3, 4].map(|i| w.get(i).map_or(-2, |a| a.load(Ordering::Relaxed)));
+                let [p, start, q, at, late, origin] = [0, 1, 2, 3, 4, 5].map(|i| w.get(i).map_or(-2, |a| a.load(Ordering::Relaxed)));
                 let row = |r: i64| usize::try_from(r).ok();
                 *o = LiveColumnState {
                     playing: row(p).map(|r| (r, start)),
@@ -176,6 +184,7 @@ impl LiveShared {
                         r => Some((row(r), at)),
                     },
                     late: u32::try_from(late).unwrap_or(0),
+                    origin,
                 };
             }
             std::sync::atomic::fence(Ordering::Acquire);
@@ -2303,8 +2312,8 @@ mod live_state_tests {
         mix.live(LiveCmd::Stop { column: 0, at: 4_800 });
         shared.publish(mix.live_state());
         let read = shared.read();
-        assert_eq!(read[0], LiveColumnState { playing: None, queued: Some((None, 4_800)), late: 0 });
-        assert_eq!(read[2], LiveColumnState { playing: None, queued: Some((Some(7), 9_600)), late: 0 });
+        assert_eq!(read[0], LiveColumnState { playing: None, queued: Some((None, 4_800)), late: 0, origin: 0 });
+        assert_eq!(read[2], LiveColumnState { playing: None, queued: Some((Some(7), 9_600)), late: 0, origin: 0 });
         assert!(read.iter().enumerate().all(|(c, s)| c == 0 || c == 2 || *s == LiveColumnState::default()));
     }
 
