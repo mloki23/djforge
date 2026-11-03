@@ -101,6 +101,11 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
     ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
+    // Production parts over the set, each with its kind's default trance preset.
+    ("DJ > New Drums Part", "prod.new_part"),
+    ("DJ > New Bass Part", "prod.new_part"),
+    ("DJ > New Synth Part", "prod.new_part"),
+    ("DJ > New FX Part", "prod.new_part"),
 ];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
@@ -426,6 +431,7 @@ fn params_for(path: &str, id: &str) -> Value {
         "audiosuite.process" => json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == path).map_or("", |(_, x)| *x)}),
         "dj.move_transition" => json!({"bars": if leaf.contains("Earlier") { -4 } else { 4 }}),
         "dj.nudge" => json!({"ms": if leaf.contains("Earlier") { -5.0 } else { 5.0 }}),
+        "prod.new_part" => json!({"kind": leaf.trim_start_matches("New ").trim_end_matches(" Part").to_ascii_lowercase()}),
         _ => json!({}),
     }
 }
@@ -733,6 +739,18 @@ mod tests {
         app.dialogs.open = None;
         invoke_menu(&mut app, "ui.bounce_dialog", "File > Bounce Mix...");
         assert_eq!(app.dialogs.open_name(), Some("bounce"));
+    }
+
+    #[test]
+    fn the_dj_menus_new_part_items_make_a_part_of_their_kind() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        for (path, name) in
+            [("DJ > New Drums Part", "Drums 1"), ("DJ > New Bass Part", "Bass 1"), ("DJ > New Synth Part", "Synth 1"), ("DJ > New FX Part", "FX 1")]
+        {
+            assert_eq!(command_for_path(path, &ui_aliases()).as_deref(), Some("prod.new_part"), "{path}");
+            invoke_menu(&mut app, "prod.new_part", path);
+            assert_eq!(app.engine.session().tracks.last().map(|t| t.name.as_str()), Some(name), "{path}");
+        }
     }
 
     #[test]

@@ -28,6 +28,8 @@ mod more_util;
 mod options;
 mod plugin_state;
 pub(crate) mod prep;
+mod prod;
+mod prod_presets;
 mod query;
 pub(crate) mod sampler;
 mod setup_more;
@@ -159,6 +161,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(export::specs());
         v.extend(stems::specs());
         v.extend(live::specs());
+        v.extend(prod::specs());
         v
     })
 }
