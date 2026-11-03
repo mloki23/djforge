@@ -172,3 +172,47 @@ fn setup_gives_a_lost_instrument_column_an_instrument_track() {
     assert!(s.live.midi_slot(4, 0).is_some());
     assert_eq!(s.track(s.live.columns[4].track).and_then(|t| t.instrument.as_ref()).map(|i| i.plugin.as_str()), Some("drum_synth"));
 }
+
+/// Slots hold at most 256 bars: a longer pattern or clip is refused, not cut.
+#[test]
+fn slots_hold_at_most_256_bars() {
+    let mut e = engine();
+    let r = run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "bars": 256, "slot": {"column": 4, "slot": 0}}));
+    assert_eq!(r["length_beats"].as_f64(), Some(1024.0));
+    assert!(
+        err(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "bars": 257, "slot": {"column": 4, "slot": 1}}))
+            .contains("at most 256")
+    );
+    // 257 bars at 120 bpm.
+    midi_clip(&mut e, 257.0 * 4.0);
+    assert!(err(&mut e, "live.slot_from_clip", json!({"column": 4, "slot": 1})).contains("at most 256"));
+    assert!(e.session().live.slot(4, 1).is_none());
+}
+
+/// Copying a clip into a filled slot needs `replace`, as a pattern does.
+#[test]
+fn a_clip_replaces_a_filled_slot_only_when_asked() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    midi_clip(&mut e, 8.0);
+    assert!(err(&mut e, "live.slot_from_clip", json!({"column": 4, "slot": 0})).contains("replace"));
+    run(&mut e, "live.slot_from_clip", json!({"column": 4, "slot": 0, "replace": true}));
+    assert_eq!(e.session().live.midi_slot(4, 0).map(|x| x.name.as_str()), Some("Lead"));
+}
+
+/// A lost column holding both kinds comes back as an instrument column: its audio slots, which
+/// could not play there, are emptied and reported.
+#[test]
+fn setup_empties_the_audio_slots_of_a_lost_mixed_column() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    let lost = e.session().live.columns[4].track;
+    let s = e.session_mut();
+    s.tracks.retain(|t| t.id != lost);
+    s.live.columns[4].slots[3] = Some(soundcraft_engine::model::Slot::one_shot("Vox", [0; 3], soundcraft_engine::model::SourceId(77)).into());
+    let r = run(&mut e, "live.setup", json!({}));
+    assert_eq!(r["emptied"], json!([{"column": 4, "slot": 3, "name": "Vox"}]));
+    let s = e.session();
+    assert_eq!(s.live.column_kind(4, &s.tracks), Some(SlotKind::Midi));
+    assert!(s.live.slot(4, 3).is_none() && s.live.midi_slot(4, 0).is_some());
+}

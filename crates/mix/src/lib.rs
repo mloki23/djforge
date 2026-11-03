@@ -1402,18 +1402,34 @@ fn process_strip(
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
-                if std::mem::take(&mut strip.chase) {
-                    chase_controllers(s, t, pos, inst);
-                }
-                // An instrument column's slot mutes the track's arrangement notes while it plays;
-                // the arrangement goes first so its notes are released before the slot's start.
+                // An instrument column's slot mutes the track's arrangement notes and controllers
+                // while it plays. On a sample both send on, the instrument applies events in the
+                // order sent: first the slot's releases (and its notes before a launch or stop in
+                // the block), then the arrangement (which releases its own where a slot starts),
+                // then the slot's notes from there.
                 let end = pos.saturating_add(frames as i64);
-                let column = strip.live_play.as_mut().filter(|_| !live.monitor_only);
-                let gate =
-                    column.map_or(live::ArrGate::OPEN, |(c, play)| live::Column { s, track: t, column: *c, wrap: None }.midi_gate(play, pos, end));
+                let mut gate = live::ArrGate::OPEN;
+                let mut split = end;
+                if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
+                    let column = live::Column { s, track: t, column: *c, wrap: None };
+                    gate = column.midi_gate(play, pos, end);
+                    split = column.midi_head(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, end);
+                }
+                let reopen = gate.reopen().filter(|at| (pos..end).contains(at));
+                if std::mem::take(&mut strip.chase) && reopen != Some(pos) {
+                    if gate.heard(pos) {
+                        chase_controllers(s, t, pos, 0, inst);
+                    } else {
+                        // Muted: the controllers wait for the slot to stop (chased there).
+                        reset_controllers(inst, 0);
+                    }
+                }
+                if let Some(at) = reopen {
+                    chase_controllers(s, t, at, usize::try_from(at - pos).unwrap_or(0), inst);
+                }
                 schedule_notes(s, t, pos, frames, inst, &mut strip.held, gate);
                 if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
-                    live::Column { s, track: t, column: *c, wrap: None }.schedule_midi(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, frames);
+                    live::Column { s, track: t, column: *c, wrap: None }.midi_tail(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, split, end);
                     midi_live = true;
                 }
                 if strip.buf.len() >= 2 {
@@ -2060,9 +2076,12 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
     let gate = gate.shifted(offset.saturating_neg());
     let cut = gate.cut().filter(|x| *x >= pos && *x < end);
     if let Some(x) = cut {
+        let at = usize::try_from(x - pos).unwrap_or(0);
         for p in held.drain(..) {
-            inst.plugin.note_off(usize::try_from(x - pos).unwrap_or(0), p);
+            inst.plugin.note_off(at, p);
         }
+        // No pedal or bend of the arrangement's carries into the slot.
+        reset_controllers(inst, at);
     }
     for clip in t.clips() {
         if clip.muted {
@@ -2144,10 +2163,16 @@ fn ctrl_message(kind: CtrlKind, value: i32, transpose: i64) -> [u8; 3] {
     }
 }
 
-/// Before an instrument plays from `pos`: reset its controllers, then send each one the last value
-/// it had on this track before `pos`.
-fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot) {
-    inst.plugin.midi(0, [0xB0, 121, 0]);
+/// Sustain off, then every controller reset, at `offset` in the block.
+fn reset_controllers(inst: &mut PluginSlot, offset: usize) {
+    inst.plugin.midi(offset, [0xB0, 64, 0]);
+    inst.plugin.midi(offset, [0xB0, 121, 0]);
+}
+
+/// Before an instrument plays from `pos` (at `offset` in the block): reset its controllers, then
+/// send each one the last value it had on this track before `pos`.
+fn chase_controllers(s: &Session, t: &Track, pos: Samples, offset: usize, inst: &mut PluginSlot) {
+    inst.plugin.midi(offset, [0xB0, 121, 0]);
     let pos = pos.saturating_sub(midi_offset(s, t));
     const BEND: usize = 128;
     const PRESSURE: usize = 129;
@@ -2186,7 +2211,7 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
             n => CtrlKind::Cc(u8::try_from(n).unwrap_or(0)),
         };
         if at != i64::MIN {
-            inst.plugin.midi(0, ctrl_message(kind, value, 0));
+            inst.plugin.midi(offset, ctrl_message(kind, value, 0));
         }
     }
 }

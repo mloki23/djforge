@@ -26,8 +26,8 @@ pub use dj::{
 };
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use live::{
-    LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, LiveState, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, MidiSlot, Quantise, SLOT_GAIN_DB, Slot, SlotContent, SlotKind,
-    SlotMode,
+    LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, LiveState, MAX_LIVE_COLUMNS, MAX_SLOT_BARS, MAX_SLOT_BEATS, MidiSlot, Quantise, SLOT_GAIN_DB, Slot,
+    SlotContent, SlotKind, SlotMode,
 };
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use mixer::{

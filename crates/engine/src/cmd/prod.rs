@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Starter Pattern",
             [],
             None,
-            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?, slot?: {column, slot} (0-based: an instrument column's slot instead of a clip)} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. A sweep written onto an empty lane makes that param follow automation over the whole timeline: outside the bars it holds the part's setting at the time, and the knob no longer changes it (edit the lane instead). With the track's automation off, the sweep doesn't play. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}. With `slot`, it writes a looping MIDI slot of `bars` (default 4) bars instead, in the key at the playhead (or `key`), named the same; `track`, `start` and `end` don't apply, an occupied slot is refused unless `replace`, and FX sweeps are left out (slots play no automation). Returns {column, slot, key, camelot, bars, length_beats, notes, automation_dropped: [params]}",
+            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?, slot?: {column, slot} (0-based: an instrument column's slot instead of a clip)} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. A sweep written onto an empty lane makes that param follow automation over the whole timeline: outside the bars it holds the part's setting at the time, and the knob no longer changes it (edit the lane instead). With the track's automation off, the sweep doesn't play. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}. With `slot`, it writes a looping MIDI slot of `bars` (default 4, at most 256) bars instead, in the key at the playhead (or `key`), named the same; `track`, `start` and `end` don't apply, an occupied slot is refused unless `replace`, and FX sweeps are left out (slots play no automation). Returns {column, slot, key, camelot, bars, length_beats, notes, automation_dropped: [params]}",
             always,
             pattern
         ),
@@ -399,6 +399,9 @@ fn pattern_slot(e: &mut Engine, p: &Value, target: &Value, mut spec: PatternSpec
     if let Some(k) = ["track", "start", "end"].iter().find(|k| p.get(**k).is_some_and(|v| !v.is_null())) {
         return Err(bad(CMD, format!("`{k}` is for clips: a slot pattern takes `bars` (default {SLOT_BARS})")));
     }
+    if spec.bars > soundcraft_model::MAX_SLOT_BARS {
+        return Err(bad(CMD, format!("a slot holds at most {} bars", soundcraft_model::MAX_SLOT_BARS)));
+    }
     let column = super::live::column_param(e, CMD, target)?;
     super::live::takes(e, CMD, column, soundcraft_model::SlotKind::Midi)?;
     let row = super::live::slot_param(CMD, target)?.ok_or_else(|| bad(CMD, "`slot` needs {column, slot} (0-based)"))?;
@@ -433,8 +436,9 @@ fn pattern_slot(e: &mut Engine, p: &Value, target: &Value, mut spec: PatternSpec
     };
     let color = e.session().live.column_track(column, &e.session().tracks).and_then(|t| e.session().track(t)).map_or([128, 128, 128], |t| t.color);
     let length_beats = f64::from(spec.bars) * 4.0;
-    let notes = g.sequence.notes.len();
-    super::live::put(e, column, row, soundcraft_model::MidiSlot { name, color, sequence: g.sequence, length_beats, gain_db: 0.0 });
+    let slot = soundcraft_model::MidiSlot::new(name, color, g.sequence, length_beats, 0.0);
+    let notes = slot.sequence.notes.len();
+    super::live::put(e, column, row, slot);
     Ok(json!({
         "column": column,
         "slot": row,
@@ -875,6 +879,19 @@ mod tests {
         select(&mut e, a, b);
         let r = pattern(&mut e, json!({"kind": "synth", "style": "stabs", "track": bass.0, "key": "1d"}));
         assert_eq!((r["camelot"].as_str(), r["key"].as_str()), (Some("8B"), Some("C")));
+    }
+
+    /// Into a slot, a keyed pattern takes the key the set plays at the playhead.
+    #[test]
+    fn a_slot_pattern_takes_the_key_at_the_playhead_across_a_transition() {
+        let mut e = set("8A", "Em");
+        e.execute("live.add_column", &json!({"kind": "instrument"})).unwrap();
+        for (at, camelot) in [(30, "8A"), (37, "8A"), (41, "9A"), (50, "9A")] {
+            e.session_mut().edit.playhead = bar(&e, at) + 1_000;
+            let r = pattern(&mut e, json!({"kind": "bass", "style": "rolling", "replace": true, "slot": {"column": 0, "slot": 0}}));
+            assert_eq!(r["camelot"].as_str(), Some(camelot), "bar {at}: {r}");
+            assert_eq!(e.session().live.midi_slot(0, 0).map(|x| x.name.clone()), Some(format!("Rolling ({camelot})")));
+        }
     }
 
     #[test]

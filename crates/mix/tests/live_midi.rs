@@ -1,15 +1,15 @@
 //! MIDI slots on an instrument column: notes land on the launch sample and the bar lines of
 //! every pass (under tempo steps too), notes crossing the seam are cut there, nothing is left
 //! sounding after a stop, a switch, a transport stop or a locate, and the track's arrangement
-//! notes are muted while a slot plays.
+//! notes and controllers are muted while a slot plays (and chased back when it stops).
 //!
-//! The instrument is a recorder: it logs every note-on, note-off and all-notes-off at its
-//! timeline sample.
+//! The instrument is a recorder: it logs every note-on, note-off, all-notes-off and controller
+//! message at its timeline sample, in the order sent.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_dsp::Plugin;
-use soundcraft_midi::{Note, Sequence};
-use soundcraft_mix::{INSTRUMENT_SLOT, LiveCmd, MixEngine, PreparedInstance};
+use soundcraft_midi::{CtrlEvent, CtrlKind, Note, Sequence};
+use soundcraft_mix::{INSTRUMENT_SLOT, LiveCmd, MixEngine, PreparedInstance, render_range};
 use soundcraft_model::{ChannelFormat, Clip, Insert, LiveColumn, MidiSlot, Session, TrackId, TrackKind};
 use soundcraft_time::{Samples, TICKS_PER_QUARTER};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -27,6 +27,7 @@ enum Ev {
     On(Samples, u8),
     Off(Samples, u8),
     AllOff(Samples),
+    Midi(Samples, [u8; 3]),
 }
 
 /// Logs what the instrument is sent, at the timeline sample of the block it was sent for.
@@ -73,6 +74,10 @@ impl Plugin for Recorder {
         let at = self.pos.load(Ordering::Relaxed);
         self.push(Ev::AllOff(at));
     }
+    fn midi(&mut self, offset: usize, msg: [u8; 3]) {
+        let at = self.pos.load(Ordering::Relaxed) + offset as i64;
+        self.push(Ev::Midi(at, msg));
+    }
 }
 
 fn note(pitch: u8, start: i64, length: i64) -> Note {
@@ -100,14 +105,38 @@ struct Rig {
     track: TrackId,
 }
 
-/// A 120 bpm session (stepped up by 2 bpm every beat from beat 8 when `ramp`) with an
-/// instrument column holding [`kicks`] and [`longs`], and an engine whose instrument records.
-fn rig(ramp: bool) -> Rig {
+/// The tempo map under a rig.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tempo {
+    /// 120 bpm throughout.
+    Constant,
+    /// Stepped up by 2 bpm every beat from beat 8.
+    Steps,
+    /// A glide from 120 to 150 bpm over bars 3..19, a tempo change every 1/16 beat at odd
+    /// values (as smooth as the tempo map gets): the continuous ramp `dj.tempo_ramp` steps.
+    Glide,
+}
+
+/// A 120 bpm session under `tempo` with an instrument column holding [`kicks`] and [`longs`],
+/// and an engine whose instrument records.
+fn rig_with(tempo: Tempo) -> Rig {
     let mut s = Session::default();
     s.tempo.set_tempo(0, 120.0).unwrap();
-    if ramp {
-        for b in 8..60 {
-            s.tempo.set_tempo(b * Q, 120.0 + 2.0 * (b - 7) as f64).unwrap();
+    match tempo {
+        Tempo::Constant => {}
+        Tempo::Steps => {
+            for b in 8..60 {
+                s.tempo.set_tempo(b * Q, 120.0 + 2.0 * (b - 7) as f64).unwrap();
+            }
+        }
+        Tempo::Glide => {
+            let (from, to) = (s.tempo.bar_start_tick(3), s.tempo.bar_start_tick(19));
+            let step = Q / 16;
+            let steps = (to - from) / step;
+            for k in 0..steps {
+                s.tempo.set_tempo(from + k * step, 120.0 + 30.0 * (k as f64 + 0.5) / steps as f64).unwrap();
+            }
+            s.tempo.set_tempo(to, 150.0).unwrap();
         }
     }
     let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
@@ -123,6 +152,22 @@ fn rig(ramp: bool) -> Rig {
     eng.set_external_instances(true);
     eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }]);
     Rig { s, eng, pos, log, track: t }
+}
+
+fn rig(ramp: bool) -> Rig {
+    rig_with(if ramp { Tempo::Steps } else { Tempo::Constant })
+}
+
+/// Adds an arrangement MIDI clip over bars 1..9 of `notes` (and `ctrls`) on the rig's track.
+fn arrangement(r: &mut Rig, notes: Vec<Note>, ctrls: Vec<CtrlEvent>) {
+    let cid = r.s.new_clip_id();
+    let len = r.bar(9) - r.bar(1);
+    let t = r.track;
+    r.s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "arr", 0, len, Sequence { notes, ctrls }));
+}
+
+fn ctrl(tick: i64, kind: CtrlKind, value: i32) -> CtrlEvent {
+    CtrlEvent { tick, channel: 0, kind, value }
 }
 
 impl Rig {
@@ -162,6 +207,11 @@ impl Rig {
         sounding(&self.log.lock().unwrap())
     }
 
+    /// Everything sent, with the block it was sent for, in the order sent.
+    fn log(&self) -> Vec<(u64, Ev)> {
+        self.log.lock().unwrap().clone()
+    }
+
     fn ons(&self, pitch: u8) -> Vec<Samples> {
         self.events().iter().filter(|e| matches!(e, Ev::On(_, p) if *p == pitch)).map(|e| at(*e)).collect()
     }
@@ -169,39 +219,58 @@ impl Rig {
 
 fn at(e: Ev) -> Samples {
     match e {
-        Ev::On(t, _) | Ev::Off(t, _) | Ev::AllOff(t) => t,
+        Ev::On(t, _) | Ev::Off(t, _) | Ev::AllOff(t) | Ev::Midi(t, _) => t,
     }
 }
 
-/// The pitches still sounding after `events`, played as an instrument plays them: block by
-/// block, each block's events in sample order (a note-off before a note-on on the same sample,
-/// as the slots send them).
-fn sounding(events: &[(u64, Ev)]) -> Vec<u8> {
+/// `events` as an instrument applies them: block by block, each block's in sample order, and
+/// events on the same sample in the order they were sent (the built-in instruments' stable sort).
+fn applied(events: &[(u64, Ev)]) -> Vec<Ev> {
     let mut ev = events.to_vec();
-    ev.sort_by_key(|(block, e)| (*block, at(*e), !matches!(e, Ev::AllOff(_) | Ev::Off(..))));
-    let ev = ev.into_iter().map(|(_, e)| e);
+    ev.sort_by_key(|(block, e)| (*block, at(*e)));
+    ev.into_iter().map(|(_, e)| e).collect()
+}
+
+/// The pitches still sounding after `events`, applied as an instrument applies them.
+fn sounding(events: &[(u64, Ev)]) -> Vec<u8> {
     let mut on = [0u32; 128];
-    for e in ev {
+    for e in applied(events) {
         match e {
             Ev::On(_, p) => on[usize::from(p)] += 1,
             Ev::Off(_, p) => on[usize::from(p)] = 0,
             Ev::AllOff(_) => on = [0; 128],
+            Ev::Midi(..) => {}
         }
     }
     (0..128u8).filter(|p| on[usize::from(*p)] > 0).collect()
+}
+
+/// The sustain pedal and pitch bend after `events`, applied as an instrument applies them (a
+/// controller reset clears both): (pedal down, bend value).
+fn controllers(events: &[(u64, Ev)]) -> (bool, i32) {
+    let (mut pedal, mut bend) = (false, 0);
+    for e in applied(events) {
+        match e {
+            Ev::Midi(_, [0xB0, 64, v]) => pedal = v >= 64,
+            Ev::Midi(_, [0xB0, 121, _]) => (pedal, bend) = (false, 0),
+            Ev::Midi(_, [0xE0, lo, hi]) => bend = (i32::from(hi) << 7 | i32::from(lo)) - 8192,
+            _ => {}
+        }
+    }
+    (pedal, bend)
 }
 
 /// A drum slot launched for bar 3: its first kick lands exactly on the bar's sample and every
 /// kick of the next three passes on its beat, at a constant tempo and under tempo steps.
 #[test]
 fn a_drum_slot_lands_on_the_bar_and_loops_on_the_beats() {
-    for ramp in [false, true] {
-        let mut r = rig(ramp);
+    for ramp in [Tempo::Constant, Tempo::Steps, Tempo::Glide] {
+        let mut r = rig_with(ramp);
         let launch = r.bar(3);
         r.run(0, r.bar(7), &[(0, LiveCmd::Launch { column: 0, slot: 0, at: launch })]);
         let want: Vec<Samples> = (3..7).flat_map(|n| (0..4).map(move |b| (n, b))).map(|(n, b)| r.beat(n, b)).collect();
-        assert_eq!(r.ons(KICK).first(), Some(&launch), "ramp {ramp}: the first kick is on the bar sample");
-        assert_eq!(r.ons(KICK), want, "ramp {ramp}: four passes, every kick on its beat");
+        assert_eq!(r.ons(KICK).first(), Some(&launch), "{ramp:?}: the first kick is on the bar sample");
+        assert_eq!(r.ons(KICK), want, "{ramp:?}: four passes, every kick on its beat");
         assert!(r.eng.live_state()[0].playing.is_some());
     }
 }
@@ -290,10 +359,7 @@ fn a_playing_slot_mutes_the_tracks_arrangement_notes() {
     // An arrangement clip: a long note over bar 2's last beats into bar 3, then a note per beat.
     let mut notes = vec![note(ARR, 2 * Q, 4 * Q)];
     notes.extend((8..32).map(|b| note(ARR, b * Q, Q / 2)));
-    let cid = r.s.new_clip_id();
-    let len = r.bar(9) - r.bar(1);
-    let t = r.track;
-    r.s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "arr", 0, len, Sequence { notes, ctrls: Vec::new() }));
+    arrangement(&mut r, notes, Vec::new());
     let (launch, stop) = (r.bar(2), r.bar(5));
     r.run(0, r.bar(8), &[(0, LiveCmd::Launch { column: 0, slot: 0, at: launch }), (r.bar(4), LiveCmd::Stop { column: 0, at: stop })]);
     let ev = r.events();
@@ -345,4 +411,97 @@ fn a_playing_slot_cleared_by_a_snapshot_is_released() {
     assert!(r.events().contains(&Ev::Off(mid, LONG)));
     assert_eq!(r.sounding(), Vec::<u8>::new());
     assert!(r.eng.live_state()[0].playing.is_none());
+}
+
+/// The instrument applies a sample's events in the order sent. A slot stopping on the sample an
+/// arrangement note of its held pitch starts on releases its note first, so the arrangement note
+/// sounds on; and a slot starting on the sample an arrangement note of its pitch is released
+/// starts after that release.
+#[test]
+fn releases_on_a_shared_sample_come_before_the_notes_starting_there() {
+    let mut r = rig(false);
+    let (launch, stop) = (r.bar(2), r.beat(3, 1));
+    // An arrangement note of the slot's held pitch sounding into the launch, and one starting on
+    // the stop sample (beat 1 of bar 3, where the slot's long note still sounds).
+    let notes = vec![note(LONG, 2 * Q, 4 * Q), note(LONG, 9 * Q, 4 * Q)];
+    arrangement(&mut r, notes, Vec::new());
+    r.run(
+        0,
+        stop + 2 * BLOCK as i64,
+        &[(0, LiveCmd::Launch { column: 0, slot: 1, at: launch }), (r.bar(3) - 5_000, LiveCmd::Stop { column: 0, at: stop })],
+    );
+    let sent = r.log();
+    let ev = applied(&sent);
+    let index = |e: Ev| ev.iter().position(|x| *x == e).unwrap_or_else(|| panic!("{e:?} not sent"));
+    assert!(index(Ev::Off(launch, LONG)) < index(Ev::On(launch, LONG)), "the arrangement's note ends before the slot's starts");
+    assert!(index(Ev::Off(stop, LONG)) < index(Ev::On(stop, LONG)), "the slot's note ends before the arrangement's starts");
+    assert_eq!(sounding(&sent), [LONG], "the arrangement note started on the stop sample sounds");
+}
+
+/// A slot note starting while the same pitch still sounds (overlapping notes) ends it first.
+#[test]
+fn a_pitch_held_again_is_released_first() {
+    let mut r = rig(false);
+    let notes = vec![note(ARR, 0, 2 * Q), note(ARR, Q, Q)];
+    r.s.live.columns[0].slots[2] = Some(MidiSlot::new("over", [0; 3], Sequence { notes, ctrls: Vec::new() }, 4.0, 0.0).into());
+    let launch = r.bar(2);
+    r.run(0, r.bar(3), &[(0, LiveCmd::Launch { column: 0, slot: 2, at: launch })]);
+    let ev = applied(&r.log());
+    let again = r.beat(2, 1);
+    let index = |e: Ev| ev.iter().position(|x| *x == e).unwrap_or_else(|| panic!("{e:?} not sent"));
+    assert!(index(Ev::Off(again, ARR)) < index(Ev::On(again, ARR)));
+}
+
+/// The arrangement's sustain pedal and pitch bend don't carry into a slot (reset where it
+/// starts), its controllers are muted while the slot plays, and where it stops they are chased
+/// back to what the arrangement holds there.
+#[test]
+fn arrangement_controllers_are_reset_under_a_slot_and_chased_after_it() {
+    // Sustain down before the launch, lifted while the slot plays.
+    let mut r = rig(false);
+    arrangement(&mut r, Vec::new(), vec![ctrl(2 * Q, CtrlKind::Cc(64), 127), ctrl(5 * Q, CtrlKind::Cc(64), 0), ctrl(13 * Q, CtrlKind::Cc(64), 127)]);
+    let (launch, stop) = (r.bar(2), r.bar(3));
+    r.run(0, launch, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: launch })]);
+    assert_eq!(controllers(&r.log()), (true, 0), "down before the launch");
+    r.run(launch, launch + 1_000, &[]);
+    assert_eq!(controllers(&r.log()), (false, 0), "lifted at the launch");
+    r.run(launch + 1_000, stop + 1_000, &[(launch + 1_000, LiveCmd::Stop { column: 0, at: stop })]);
+    assert!(!r.events().contains(&Ev::Midi(r.beat(2, 1), [0xB0, 64, 0])), "muted under the slot");
+    assert_eq!(controllers(&r.log()), (false, 0), "chased at the stop: lifted at beat 1 of bar 2 by then");
+    r.run(stop + 1_000, r.beat(4, 1) + 1_000, &[]);
+    assert_eq!(controllers(&r.log()), (true, 0), "the arrangement's next pedal plays");
+
+    // A pitch bend held across the launch: reset there, back at the stop.
+    let mut r = rig(false);
+    arrangement(&mut r, Vec::new(), vec![ctrl(2 * Q, CtrlKind::PitchBend, 4_000)]);
+    r.run(0, launch, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: launch })]);
+    assert_eq!(controllers(&r.log()), (false, 4_000));
+    r.run(launch, launch + 1_000, &[]);
+    assert_eq!(controllers(&r.log()), (false, 0), "reset at the launch");
+    r.run(launch + 1_000, stop + 1_000, &[(launch + 1_000, LiveCmd::Stop { column: 0, at: stop })]);
+    assert_eq!(controllers(&r.log()), (false, 4_000), "chased back at the stop");
+    assert!(r.events().contains(&Ev::Midi(stop, [0xE0, ((4_000 + 8_192) & 0x7F) as u8, ((4_000 + 8_192) >> 7) as u8])));
+}
+
+/// Bounces and offline renders have no live state: a playing MIDI slot never reaches them.
+#[test]
+fn bounces_ignore_a_playing_midi_slot() {
+    let mut s = Session::default();
+    s.tempo.set_tempo(0, 120.0).unwrap();
+    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    s.track_mut(t).unwrap().instrument = Some(Insert::new("drum_synth"));
+    let mut col = LiveColumn::new(t);
+    col.slots[0] = Some(kicks().into());
+    s.live.columns.push(col);
+    let mut eng = MixEngine::new(48_000.0, BLOCK);
+    eng.live(LiveCmd::Launch { column: 0, slot: 0, at: 0 });
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    let mut loud = 0.0f32;
+    for k in 0..40 {
+        eng.render(&s, k * BLOCK as i64, BLOCK, &mut out);
+        loud = loud.max(out[0].iter().fold(0.0, |m, x| m.max(x.abs())));
+    }
+    assert!(loud > 0.01, "the slot plays live");
+    let bounce = render_range(&s, soundcraft_time::Range::new(0, 40 * BLOCK as i64), BLOCK);
+    assert!(bounce.iter().flatten().all(|x| *x == 0.0), "the bounce is silent");
 }

@@ -6,8 +6,8 @@ use super::*;
 use crate::{TransportRequest, cmd};
 use serde_json::json;
 use soundcraft_model::{
-    ChannelFormat, ClipContent, LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, MidiSlot, Quantise, SLOT_GAIN_DB, Session,
-    Slot, SlotContent, SlotKind, SlotMode, TrackKind,
+    ChannelFormat, ClipContent, LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, MAX_LIVE_COLUMNS, MAX_SLOT_BARS, MAX_SLOT_BEATS, MidiSlot, Quantise,
+    SLOT_GAIN_DB, Session, Slot, SlotContent, SlotKind, SlotMode, TrackKind,
 };
 
 const SETUP: &str = "live.setup";
@@ -29,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Up Session View",
             [],
             None,
-            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track with the trance_kit preset when it holds MIDI slots). Returns {columns: [track ids], created}",
+            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track with the trance_kit preset when it holds MIDI slots, its audio slots emptied). Returns {columns: [track ids], created, emptied: [{column, slot, name}]}",
             always,
             setup
         ),
@@ -47,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Copy MIDI Clip to Slot",
             [],
             None,
-            "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (at least 1); notes starting past that end are left out, and controllers are not copied. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
+            "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip), replace?: bool (default false)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (1..=256); notes starting past that end are left out (those running past it end there), and controllers are not copied. Refuses an occupied slot unless `replace`. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
             has_live,
             from_clip
         ),
@@ -145,6 +145,7 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
     let lost = s.live.lost_columns(&s.tracks);
     let more = want.saturating_sub(s.live.columns.len());
     let mut created = 0usize;
+    let mut emptied = Vec::new();
     if !lost.is_empty() || more > 0 {
         let s = e.session_mut();
         let mut make = |s: &mut Session, i: usize, kind: SlotKind| {
@@ -152,11 +153,18 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
             column_track(s, i, kind, None)
         };
         // A column whose track was lost keeps its slots on a new track of the kind they play.
+        // A column holding both kinds becomes an instrument column, and its audio slots (which
+        // could not play there) are emptied and reported.
         for i in lost {
             let midi = s.live.columns.get(i).is_some_and(|c| c.slots.iter().flatten().any(|x| x.kind() == SlotKind::Midi));
             let track = make(s, i, if midi { SlotKind::Midi } else { SlotKind::Audio });
             if let Some(c) = s.live.columns.get_mut(i) {
                 c.track = track;
+                for (row, cell) in c.slots.iter_mut().enumerate().filter(|_| midi) {
+                    if let Some(x) = cell.take_if(|x| x.kind() == SlotKind::Audio) {
+                        emptied.push(json!({"column": i, "slot": row, "name": x.name()}));
+                    }
+                }
             }
         }
         for i in s.live.columns.len()..want {
@@ -165,7 +173,7 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     let columns: Vec<u64> = e.session().live.columns.iter().map(|c| c.track.0).collect();
-    Ok(json!({"columns": columns, "created": created}))
+    Ok(json!({"columns": columns, "created": created, "emptied": emptied}))
 }
 
 /// The track for column `i`: "Live {i + 1}", a stereo audio track, or for MIDI an instrument track
@@ -379,8 +387,15 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, FROM_CLIP, p)?;
     takes(e, FROM_CLIP, column, SlotKind::Midi)?;
     let row = target(e, FROM_CLIP, p, column)?;
+    let replace = match p.get("replace") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(FROM_CLIP, "`replace` must be true or false"))?,
+    };
     let s = e.session();
     four_four(FROM_CLIP, s)?;
+    if let Some(x) = s.live.slot(column, row).filter(|_| !replace) {
+        return Err(bad(FROM_CLIP, format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name())));
+    }
     let id = match p.get("clip") {
         None | Some(Value::Null) => {
             let midi: Vec<ClipId> = s
@@ -405,15 +420,16 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     // The clip's length in session beats, snapped to whole bars.
     let ticks = |t: Samples| s.tempo.samples_to_ticks_f(t, s.sample_rate);
     let beats = (ticks(clip.end()) - ticks(clip.start)) / soundcraft_time::TICKS_PER_QUARTER as f64;
-    let bars = (beats / BAR).round().clamp(1.0, (MAX_SLOT_BEATS / BAR).floor());
+    let bars = (beats / BAR).round().max(1.0);
+    if bars > f64::from(MAX_SLOT_BARS) {
+        return Err(bad(FROM_CLIP, format!("`{}` is {bars} bars: a slot holds at most {MAX_SLOT_BARS}", clip.name)));
+    }
     let length_beats = bars * BAR;
-    let len_ticks = (length_beats * soundcraft_time::TICKS_PER_QUARTER as f64).round() as i64;
-    let mut sequence = sequence.clone();
-    // What a start trim hid (before tick 0) and what starts past the loop never play.
-    sequence.notes.retain(|n| (0..len_ticks).contains(&n.start));
-    let controllers_dropped = std::mem::take(&mut sequence.ctrls).len();
+    // What a start trim hid (before tick 0) and what starts past the loop never play: the slot
+    // keeps only what it plays (see `MidiSlot::sanitize`).
+    let controllers_dropped = sequence.ctrls.len();
     let color = clip.color.or_else(|| s.track(track).map(|t| t.color)).unwrap_or([128, 128, 128]);
-    let slot = MidiSlot { name: clip.name.clone(), color, sequence, length_beats, gain_db: 0.0 };
+    let slot = MidiSlot::new(clip.name.clone(), color, sequence.clone(), length_beats, 0.0);
     let out = json!({"column": column, "slot": row, "clip": id, "name": slot.name, "bars": bars, "length_beats": length_beats,
         "notes": slot.sequence.notes.len(), "controllers_dropped": controllers_dropped});
     put(e, column, row, slot);

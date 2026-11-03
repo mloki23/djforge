@@ -223,20 +223,56 @@ fn one_bar() -> f64 {
     BAR_BEATS
 }
 
+/// Most whole bars a slot holds ([`MAX_SLOT_BEATS`] of 4/4).
+pub const MAX_SLOT_BARS: u32 = (MAX_SLOT_BEATS / BAR_BEATS) as u32;
+
 impl MidiSlot {
+    /// A MIDI slot of `sequence` over `length_beats`, held as [`MidiSlot::sanitize`] keeps it:
+    /// commands make slots through this, so what they write is what a saved session reloads as.
+    pub fn new(name: impl Into<String>, color: [u8; 3], sequence: Sequence, length_beats: f64, gain_db: f32) -> MidiSlot {
+        let mut slot = MidiSlot { name: name.into(), color, sequence, length_beats, gain_db };
+        slot.sanitize();
+        slot
+    }
+
     /// Repair invariants after loading untrusted data: whole bars within [`MAX_SLOT_BEATS`], a
-    /// usable gain and notes within the model's bounds.
+    /// usable gain, and only notes that can play: starting inside the loop, ending at most at
+    /// its end (where the mixer cuts them anyway), with MIDI-range pitches, velocities and
+    /// channels, sorted by start (the mixer finds a block's notes by binary search).
+    /// Controllers are dropped: slots play none.
     pub fn sanitize(&mut self) {
         truncate_chars(&mut self.name, MAX_NAME_CHARS);
         let bars = if self.length_beats.is_finite() { (self.length_beats / BAR_BEATS).round() } else { 1.0 };
-        self.length_beats = bars.clamp(1.0, (MAX_SLOT_BEATS / BAR_BEATS).floor()) * BAR_BEATS;
+        self.length_beats = bars.clamp(1.0, f64::from(MAX_SLOT_BARS)) * BAR_BEATS;
         self.gain_db = if self.gain_db.is_finite() { self.gain_db.clamp(SLOT_GAIN_DB.0, SLOT_GAIN_DB.1) } else { 0.0 };
         crate::clip::bound_sequence(&mut self.sequence);
+        let len = self.length_ticks();
+        self.sequence.ctrls.clear();
+        self.sequence.notes.retain(|n| (0..len).contains(&n.start));
+        for n in &mut self.sequence.notes {
+            n.length = n.length.clamp(1, len - n.start);
+            n.pitch = n.pitch.min(127);
+            n.velocity = n.velocity.clamp(1, 127);
+            n.release_velocity = n.release_velocity.min(127);
+            n.channel = n.channel.min(15);
+        }
+        self.sequence.sort();
+    }
+
+    /// The loop's length in session ticks.
+    pub fn length_ticks(&self) -> i64 {
+        (self.length_beats * soundcraft_time::TICKS_PER_QUARTER as f64).round() as i64
     }
 }
 
 /// What a slot holds: audio or MIDI. Saved without a tag: a MIDI slot is the one with a
 /// `sequence` (an audio slot has a `source`), so sessions from before MIDI slots load unchanged.
+///
+/// The trade-off of no tag: which kind a slot is depends on which fields it has, tried audio
+/// first. A malformed slot of either kind fails both and reads as empty (as a malformed slot
+/// always has, see [`LiveColumn::slots`]) with no word of which kind it was meant to be, and an
+/// object with both a `source` and a `sequence` reads as audio. A tag would have made every
+/// stage 6 session's slots unreadable, or needed a second, versioned format.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum SlotContent {
@@ -568,5 +604,30 @@ mod tests {
         let tracks_of: Vec<_> = (0..5).map(|c| live.column_track(c, &tracks)).collect();
         assert_eq!(tracks_of, [Some(TrackId(1)), None, None, Some(TrackId(3)), None]);
         assert_eq!(live.lost_columns(&tracks), [1, 2, 4]);
+    }
+    /// A MIDI slot keeps only what it plays, sorted by start: notes inside the loop, ending at
+    /// most at its end, with MIDI-range values; no controllers.
+    #[test]
+    fn a_midi_slot_is_sorted_and_bounded() {
+        let note = |pitch: u8, velocity: u8, channel: u8, start: i64, length: i64| soundcraft_midi::Note {
+            pitch,
+            velocity,
+            release_velocity: 200,
+            channel,
+            start,
+            length,
+        };
+        let q = soundcraft_time::TICKS_PER_QUARTER;
+        let mut sequence = Sequence {
+            notes: vec![note(200, 0, 40, 3 * q, 9 * q), note(60, 100, 0, -q, q), note(62, 100, 0, 0, q), note(64, 100, 0, 4 * q, q)],
+            ctrls: vec![soundcraft_midi::CtrlEvent { tick: 0, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(1), value: 3 }],
+        };
+        sequence.notes.push(note(65, 100, 0, q, q));
+        let slot = MidiSlot::new("m", [0; 3], sequence, 4.0, 0.0);
+        let got: Vec<(u8, u8, u8, u8, i64, i64)> =
+            slot.sequence.notes.iter().map(|n| (n.pitch, n.velocity, n.release_velocity, n.channel, n.start, n.length)).collect();
+        assert_eq!(got, [(62, 100, 127, 0, 0, q), (65, 100, 127, 0, q, q), (127, 1, 127, 15, 3 * q, q)]);
+        assert!(slot.sequence.ctrls.is_empty());
+        assert_eq!(slot.length_ticks(), 4 * q);
     }
 }
