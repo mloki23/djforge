@@ -265,10 +265,12 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     assert_eq!(s.live.slot(0, 0).unwrap().start_beat, 0.0);
 
     // mixforge's analysis (a fake here): the loop starts on its first downbeat, 0.5 s in.
-    let (fake, asked) = fake_analysis(Ok(json!({"bpm": 120.0, "first_downbeat": 0.5})));
+    let (fake, asked) = fake_analysis(Ok(json!({"bpm": 120.0, "first_downbeat": 0.5, "camelot": "4B"})));
     e.set_analyse(fake);
     let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path}));
     assert_eq!((r["grid"].as_str(), r["length_beats"].as_f64()), (Some("mixforge"), Some(16.0)), "{r}");
+    let key_of = |e: &Engine, r: &Value| e.session().source(SourceId(r["source"].as_u64().unwrap())).unwrap().key.clone();
+    assert_eq!(key_of(&e, &r).as_deref(), Some("4B"), "the analysed key is kept");
     assert_eq!(*asked.lock().unwrap(), std::slice::from_ref(&path));
     let slot = e.session().live.slot(0, 1).unwrap();
     assert_eq!(slot.warp.as_ref().unwrap().beats[0], 24_000.0, "beat 0 is the first downbeat");
@@ -278,8 +280,16 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     e.set_analyse(fake);
     let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path}));
     assert_eq!((r["mode"].as_str(), &r["grid"]), (Some("one_shot"), &Value::Null), "{r}");
+    assert_eq!(key_of(&e, &r), None);
     assert!(e.session().live.slot(0, 2).unwrap().warp.is_none());
     assert!(err(&mut e, "live.slot_set", json!({"column": 0, "slot": 2, "mode": "loop"})).contains("only as a one-shot"));
+    // A key without a usable grid is kept all the same.
+    let mut keyed = Engine::default();
+    run(&mut keyed, "live.setup", json!({}));
+    let (fake, _) = fake_analysis(Ok(json!({"key": "Am"})));
+    keyed.set_analyse(fake);
+    let r = run(&mut keyed, "live.slot_from_file", json!({"column": 0, "path": path}));
+    assert_eq!((r["mode"].as_str(), key_of(&keyed, &r).as_deref()), (Some("one_shot"), Some("8A")), "{r}");
     let mut plain = Engine::default();
     run(&mut plain, "live.setup", json!({}));
     assert_eq!(run(&mut plain, "live.slot_from_file", json!({"column": 0, "path": path}))["mode"], "one_shot", "no analysis set up");

@@ -30,15 +30,20 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             load_warped
         ),
-        cmd!(
-            query "dj.analyze",
-            "Analyse Track (mixforge)",
-            [],
-            None,
-            "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder); the key is remembered on the session's sources of that file (not an undo step)",
-            always,
-            analyze
-        ),
+        // Not journaled (it runs mixforge, which a replay shouldn't), but an undo step of its own
+        // when it gives a source a new key.
+        CommandSpec {
+            id: "dj.analyze",
+            label: "Analyse Track (mixforge)",
+            menu: &[],
+            shortcut: None,
+            params: "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder); the key is remembered on the session's sources of that file, as an undo step when it changes one",
+            enabled: always,
+            run: analyze,
+            journal: false,
+            undoable: true,
+            view: false,
+        },
         cmd!(
             query "dj.key_at",
             "Key At Position",
@@ -232,6 +237,10 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
     let target = track_param(e, CMD, p, "track")?;
     let from_beat = p.get("from_beat").and_then(Value::as_f64);
     let placed = place_warped(e, CMD, &path, source, at_bar, target, from_beat)?;
+    // The analysed key over any the file's tag gave.
+    if let Some(key) = analysis.as_ref().and_then(analysed_key) {
+        set_clip_key(e.session_mut(), placed.clip, &key);
+    }
     let mut out = json!({"track": placed.track, "clip": placed.clip, "start": placed.start, "length": placed.length, "beats": placed.beats, "anchor": placed.anchor, "downbeat_bar": placed.downbeat_bar});
     if let (Some(a), Some(o)) = (analysis, out.as_object_mut()) {
         for k in ["bpm", "key", "camelot", "lufs", "stale_cache"] {
@@ -324,12 +333,29 @@ pub(super) fn place_warped(
 fn analyze(e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "dj.analyze";
     let path = str_param(p, "path").ok_or_else(|| bad(CMD, "`path` required"))?;
-    let a = analyze_file(CMD, path)?;
-    let key_in = |k: &str| a.get(k).and_then(Value::as_str).and_then(soundcraft_model::camelot_of);
-    if let Some(key) = key_in("camelot").or_else(|| key_in("key")) {
+    // Through the engine's analysis when the app set one up (a fake in tests).
+    let a = match e.analyse().cloned() {
+        Some(analyse) => analyse(path, &|| false).map_err(|msg| bad(CMD, msg))?,
+        None => analyze_file(CMD, path)?,
+    };
+    if let Some(key) = analysed_key(&a) {
         remember_key(e, path, &key);
     }
     Ok(a)
+}
+
+/// The Camelot key of a mixforge analysis: its `camelot`, else its `key` name, when one reads.
+pub(crate) fn analysed_key(a: &Value) -> Option<String> {
+    let key_in = |k: &str| a.get(k).and_then(Value::as_str).and_then(soundcraft_model::camelot_of);
+    key_in("camelot").or_else(|| key_in("key"))
+}
+
+/// Sets Camelot key `key` on the source clip `clip` plays.
+fn set_clip_key(s: &mut Session, clip: ClipId, key: &str) {
+    let src = s.find_clip(clip).and_then(|(_, c)| c.source());
+    if let Some(x) = s.sources.iter_mut().find(|x| Some(x.id) == src) {
+        x.key = Some(key.to_string());
+    }
 }
 
 /// Sets Camelot key `key` on every source of the file at `path` (imported from it, or
@@ -837,6 +863,34 @@ mod tests {
         let rev = e.revision;
         remember_key(&mut e, &file, "9A");
         assert_eq!(e.revision, rev);
+    }
+
+    #[test]
+    fn an_analysed_key_is_an_undo_step_of_its_own_and_only_when_it_changes() {
+        let file = std::env::temp_dir().join("sc-dj-analyze").join("a.wav").to_string_lossy().into_owned();
+        let mut s = Session::default();
+        let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.0; 10]] };
+        crate::io::add_source(&mut s, "a", buf, Some(&file), FileFormat::Wav);
+        let mut e = Engine::new(s);
+        e.set_analyse(std::sync::Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(json!({"bpm": 128.0, "camelot": "9A"}))));
+        let key = |e: &Engine| e.session().sources.first().and_then(|x| x.key.clone());
+        let r = e.execute("dj.analyze", &json!({"path": file})).unwrap();
+        assert_eq!(r["camelot"], "9A");
+        assert_eq!(key(&e).as_deref(), Some("9A"));
+        assert!(e.is_dirty() && e.can_undo());
+        assert!(e.journal.is_empty(), "not journaled");
+        // The same key again: no new undo step, so one undo takes the key away.
+        e.execute("dj.analyze", &json!({"path": file})).unwrap();
+        assert!(e.undo());
+        assert_eq!(key(&e), None);
+        assert!(!e.can_undo());
+        assert!(e.redo());
+        assert_eq!(key(&e).as_deref(), Some("9A"));
+        // A failed analysis changes nothing.
+        e.set_analyse(std::sync::Arc::new(|_: &str, _: &dyn Fn() -> bool| Err("no luck".to_string())));
+        let err = e.execute("dj.analyze", &json!({"path": file})).unwrap_err();
+        assert!(err.to_string().contains("no luck"), "{err}");
+        assert_eq!(key(&e).as_deref(), Some("9A"));
     }
 
     /// A 30 s source with a 125 bpm beat list (a beat every 0.48 s from 0.1 s), played from 1 s

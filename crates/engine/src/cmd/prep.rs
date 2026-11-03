@@ -1000,44 +1000,10 @@ fn level(bytes: &[u8], range: std::result::Result<(i32, i32), GainError>, target
     Some(copy)
 }
 
-/// `k` as a Camelot key (`1A`–`12B`): Camelot itself (`4B`, `04b`) or musical notation (`Am`,
-/// `F#m`, `Db`, `Ebmin`, `C major`).
+/// `k` as a Camelot key (`1A`–`12B`): Camelot itself (`4B`, `04b`), Open Key (`1m`) or musical
+/// notation (`Am`, `F#m`, `Db`, `Ebmin`, `C major`), read as sources' keys are.
 pub(crate) fn to_camelot(k: &str) -> Option<String> {
-    let k = k.trim();
-    let upper = k.to_ascii_uppercase();
-    if let Some(digits) = upper.strip_suffix(['A', 'B']).filter(|d| !d.is_empty() && d.len() <= 2 && d.bytes().all(|b| b.is_ascii_digit())) {
-        let n: u8 = digits.parse().ok()?;
-        let letter = upper.chars().last()?;
-        return (1..=12).contains(&n).then(|| format!("{n}{letter}"));
-    }
-    let mut chars = k.chars();
-    let root: u32 = match chars.next()?.to_ascii_uppercase() {
-        'C' => 0,
-        'D' => 2,
-        'E' => 4,
-        'F' => 5,
-        'G' => 7,
-        'A' => 9,
-        'B' => 11,
-        _ => return None,
-    };
-    let rest = chars.as_str();
-    let (shift, rest) = match (rest.strip_prefix(['#', '♯']), rest.strip_prefix(['b', '♭'])) {
-        (Some(r), _) => (1, r),
-        (_, Some(r)) => (11, r),
-        _ => (0, rest),
-    };
-    let minor = match rest.trim().to_ascii_lowercase().as_str() {
-        "" | "maj" | "major" => false,
-        "m" | "min" | "minor" => true,
-        _ => return None,
-    };
-    let pc = (root + shift) % 12;
-    // Camelot numbers follow the circle of fifths from C major = 8B; a minor key is its
-    // relative major's number with A.
-    let major = if minor { (pc + 3) % 12 } else { pc };
-    let n = (major * 7 % 12 + 7) % 12 + 1;
-    Some(format!("{n}{}", if minor { 'A' } else { 'B' }))
+    soundcraft_model::camelot_of(k)
 }
 
 /// mixforge's key and BPM for `src`, when usable; the doubts otherwise.

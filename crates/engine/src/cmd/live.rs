@@ -1,7 +1,7 @@
 //! Session view commands: the Live columns and what their clip slots hold. Launching is not here:
 //! what plays is live state, never part of the document.
 
-use super::dj::{Beats, grid, grid_of};
+use super::dj::{Beats, analysed_key, grid, grid_of};
 use super::*;
 use crate::{TransportRequest, cmd};
 use serde_json::json;
@@ -323,6 +323,8 @@ struct Loaded {
     beats: Option<Beats>,
     how: Option<&'static str>,
     analysis_error: Option<String>,
+    /// The Camelot key mixforge's analysis gave, if any.
+    key: Option<String>,
 }
 
 /// Reads and decodes the file (so one that won't decode is refused before mixforge runs), then
@@ -331,10 +333,10 @@ struct Loaded {
 fn load(f: &FileParams, rate: u32, analyse: Option<&super::PrepAnalyse>) -> Result<Loaded> {
     let bytes = crate::io::read_file(&f.path)?;
     let decoded = crate::io::decode_import(&file_name(&f.path), &bytes, rate)?;
-    let mut analysis_error = None;
+    let (mut analysis_error, mut key) = (None, None);
     let (beats, how) = match f.bpm {
         Some(bpm) => (Some(Beats::Constant { bpm, first: f.first_beat }), Some("given")),
-        None => match analysed(analyse, &f.path) {
+        None => match analysed(analyse, &f.path, &mut key) {
             Ok(b) => (Some(b), Some("mixforge")),
             Err(why) => {
                 analysis_error = Some(why);
@@ -345,7 +347,7 @@ fn load(f: &FileParams, rate: u32, analyse: Option<&super::PrepAnalyse>) -> Resu
             }
         },
     };
-    Ok(Loaded { path: f.path.clone(), decoded, beats, how, analysis_error })
+    Ok(Loaded { path: f.path.clone(), decoded, beats, how, analysis_error, key })
 }
 
 fn file_name(path: &str) -> String {
@@ -367,10 +369,16 @@ fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
             load(&f, e.session().sample_rate.hz(), analyse.as_ref())?
         }
     };
-    let Loaded { decoded, beats, how, analysis_error, .. } = loaded;
+    let Loaded { decoded, beats, how, analysis_error, key, .. } = loaded;
     let (column, row) = (f.column, f.row);
     // A failure from here on is rolled back with the import.
     let (source, frames, _) = crate::io::add_import(e, &file_name(&f.path), decoded, Some(&f.path))?;
+    // The analysed key over any the file's tag gave.
+    if let Some(k) = key
+        && let Some(x) = e.session_mut().sources.iter_mut().find(|x| x.id == source)
+    {
+        x.key = Some(k);
+    }
     let s = e.session();
     let label = s.source(source).map(|x| x.name.clone()).unwrap_or_default();
     let color = s.live.column_track(column, &s.tracks).and_then(|t| s.track(t)).map_or([128, 128, 128], |t| t.color);
@@ -397,11 +405,13 @@ fn from_file(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// The beat grid mixforge's analysis (`analyse`) gives the file at `path`, or why there is none.
-/// It runs to the end: there is no cancel, and the sidecar has its time limit.
-fn analysed(analyse: Option<&super::PrepAnalyse>, path: &str) -> std::result::Result<Beats, String> {
+/// The beat grid mixforge's analysis (`analyse`) gives the file at `path`, or why there is none;
+/// the key it gives goes into `key` either way. It runs to the end: there is no cancel, and the
+/// sidecar has its time limit.
+fn analysed(analyse: Option<&super::PrepAnalyse>, path: &str, key: &mut Option<String>) -> std::result::Result<Beats, String> {
     let analyse = analyse.ok_or("no mixforge analysis is set up")?;
     let a = analyse(path, &|| false)?;
+    *key = analysed_key(&a);
     let (bpm, first) = grid_of(&a).ok_or("mixforge's analysis has no usable bpm/first_downbeat")?;
     Ok(Beats::Constant { bpm, first })
 }
