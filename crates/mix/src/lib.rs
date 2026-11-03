@@ -54,8 +54,8 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, LIVE_SLOTS, MAX_LIVE_COLUMNS, Route, Session, SourceAudio, Speaker, SurroundPan, Track,
-    TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, LIVE_SLOTS, MAX_LIVE_COLUMNS, Route, Session, SlotContent, SourceAudio, Speaker, SurroundPan,
+    Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
@@ -248,6 +248,8 @@ struct Strip {
     live_store: Option<LiveStore>,
     /// The column this strip plays and its state, for the block being rendered.
     live_play: Option<(usize, ColumnPlay)>,
+    /// An instrument column's MIDI slot notes sounding on the instrument.
+    live_midi: live::LiveMidi,
     /// Total latency of the active inserts (samples).
     latency: usize,
     /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
@@ -324,7 +326,8 @@ impl Strip {
             plugins: Vec::new(),
             instrument: None,
             sample: None,
-            held: Vec::new(),
+            // Room for every pitch: the audio thread never grows it.
+            held: Vec::with_capacity(128),
             chase: true,
             muted: false,
             gr: 0.0,
@@ -333,6 +336,7 @@ impl Strip {
             warps: HashMap::with_capacity(16),
             live_store: None,
             live_play: None,
+            live_midi: live::LiveMidi::default(),
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -593,13 +597,17 @@ impl MixEngine {
                 continue;
             };
             let now = new.live.column_track(c, &new.tracks);
-            let same_audio = |a: &soundcraft_model::Slot, b: &soundcraft_model::Slot| {
-                a.source == b.source && a.stems.as_ref().map(|x| x.sources) == b.stems.as_ref().map(|x| x.sources)
+            // The same audio, all of it in the pool; or the same notes over the same length.
+            let same = |n: &SlotContent, o: &SlotContent| match (n, o) {
+                (SlotContent::Audio(a), SlotContent::Audio(b)) => {
+                    a.source == b.source
+                        && a.stems.as_ref().map(|x| x.sources) == b.stems.as_ref().map(|x| x.sources)
+                        && live::slot_sources(a).all(|(_, id)| new.pool.contains(id))
+                }
+                (SlotContent::Midi(a), SlotContent::Midi(b)) => a.sequence == b.sequence && a.length_beats == b.length_beats,
+                _ => false,
             };
-            let keeps = now.is_some()
-                && now == was
-                && new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot)).is_some_and(|(n, o)| same_audio(n, o))
-                && new.live.slot(c, p.slot).is_some_and(|sl| live::slot_sources(sl).all(|(_, id)| new.pool.contains(id)));
+            let keeps = now.is_some() && now == was && new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot)).is_some_and(|(n, o)| same(n, o));
             if keeps {
                 continue;
             }
@@ -863,6 +871,7 @@ impl MixEngine {
                 i.failed = false;
             }
             s.held.clear();
+            s.live_midi.forget(Samples::MIN);
             s.chase = true;
             s.align.clear();
             s.align_pre.clear();
@@ -980,6 +989,7 @@ impl MixEngine {
                     i.plugin.all_notes_off();
                 }
                 st.held.clear();
+                st.live_midi.forget(pos);
                 st.chase = true;
             }
         }
@@ -1309,6 +1319,8 @@ fn process_strip(
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
     }
     let transport = transport_at(s, pos, !live.monitor_only, live.recording);
+    // An instrument column's slots were scheduled on its instrument (not rendered as audio).
+    let mut midi_live = false;
     match t.kind {
         TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
             // Input monitoring: the track hears its hardware input instead of its clips.
@@ -1393,7 +1405,17 @@ fn process_strip(
                 if std::mem::take(&mut strip.chase) {
                     chase_controllers(s, t, pos, inst);
                 }
-                schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+                // An instrument column's slot mutes the track's arrangement notes while it plays;
+                // the arrangement goes first so its notes are released before the slot's start.
+                let end = pos.saturating_add(frames as i64);
+                let column = strip.live_play.as_mut().filter(|_| !live.monitor_only);
+                let gate =
+                    column.map_or(live::ArrGate::OPEN, |(c, play)| live::Column { s, track: t, column: *c, wrap: None }.midi_gate(play, pos, end));
+                schedule_notes(s, t, pos, frames, inst, &mut strip.held, gate);
+                if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
+                    live::Column { s, track: t, column: *c, wrap: None }.schedule_midi(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, frames);
+                    midi_live = true;
+                }
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
                 } else if let Some(c0) = strip.buf.first_mut() {
@@ -1415,7 +1437,12 @@ fn process_strip(
         _ => {}
     }
     // Live slots play into the column track's input, before trim, inserts and fader.
-    if !live.monitor_only
+    if t.kind == TrackKind::Instrument {
+        // No instrument to play the column's MIDI slots: silent, but launches and stops keep time.
+        if !midi_live && let Some((column, play)) = strip.live_play.as_mut() {
+            live::Column { s, track: t, column: *column, wrap: None }.advance(play, pos.saturating_add(frames as i64));
+        }
+    } else if !live.monitor_only
         && let (Some((column, play)), Some(store)) = (strip.live_play.as_mut(), strip.live_store.as_mut())
     {
         live::Column { s, track: t, column: *column, wrap: live.wrap }.render(play, store, &mut strip.buf, pos, frames);
@@ -2020,14 +2047,23 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
         .map_or(0, |v| v as i64)
 }
 
-/// Send note on/offs and controllers for MIDI clips overlapping the block.
-fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>) {
+/// Send note on/offs and controllers for MIDI clips overlapping the block, where `gate` hears
+/// them: none start (and no controllers are sent) while a Live slot mutes them, and the notes
+/// sounding where it starts are released there.
+fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>, gate: live::ArrGate) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
     // the block looks that far back into the clips.
     let offset = midi_offset(s, t);
     let pos = pos.saturating_sub(offset);
     let end = pos.saturating_add(frames as i64);
+    let gate = gate.shifted(offset.saturating_neg());
+    let cut = gate.cut().filter(|x| *x >= pos && *x < end);
+    if let Some(x) = cut {
+        for p in held.drain(..) {
+            inst.plugin.note_off(usize::try_from(x - pos).unwrap_or(0), p);
+        }
+    }
     for clip in t.clips() {
         if clip.muted {
             continue;
@@ -2060,13 +2096,18 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             if on >= clip.end() {
                 continue;
             }
-            if on >= pos && on < end {
+            if on >= pos && on < end && gate.heard(on) {
                 inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
                 if !held.contains(&n.pitch) && held.len() < 128 {
                     held.push(n.pitch);
                 }
             }
-            if off >= pos && off < end {
+            // A note sounding where a slot starts ends there; none ends while it plays.
+            let off = match cut {
+                Some(x) if on < x && off >= x => x,
+                _ => off,
+            };
+            if off >= pos && off < end && (gate.heard(off) || Some(off) == cut) {
                 inst.plugin.note_off(usize::try_from(off - pos).unwrap_or(0), n.pitch);
                 held.retain(|p| *p != n.pitch);
             }
@@ -2080,7 +2121,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 continue;
             }
             let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
-            if at >= pos && at < end && at < clip.end() {
+            if at >= pos && at < end && at < clip.end() && gate.heard(at) {
                 inst.plugin.midi(usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
             }
         }

@@ -72,7 +72,7 @@ fn engine(audio: bool) -> Engine {
     e.execute("live.setup", &json!({})).unwrap();
     let s = e.session_mut();
     for (c, r) in [(0, 0), (2, 0), (1, 3)] {
-        s.live.columns[c].slots[r] = Some(Slot::one_shot(format!("s{c}{r}"), [0; 3], SourceId(1)));
+        s.live.columns[c].slots[r] = Some(Slot::one_shot(format!("s{c}{r}"), [0; 3], SourceId(1)).into());
     }
     e.live_audio = audio;
     e.transport_requests.clear();

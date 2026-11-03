@@ -1,0 +1,174 @@
+//! Instrument columns and MIDI slots: `live.add_column` makes either kind of column,
+//! `live.slot_from_clip` and `prod.pattern {slot}` fill MIDI slots, each kind of slot goes only
+//! in its kind of column, and `live.state` reports the kinds.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use serde_json::{Value, json};
+use soundcraft_engine::Engine;
+use soundcraft_engine::model::{ChannelFormat, Clip, SlotKind, TrackId, TrackKind};
+use soundcraft_midi::{Note, Sequence};
+use soundcraft_time::TICKS_PER_QUARTER;
+
+const Q: i64 = TICKS_PER_QUARTER;
+
+fn run(e: &mut Engine, cmd: &str, p: Value) -> Value {
+    e.execute(cmd, &p).unwrap_or_else(|err| panic!("{cmd} {p}: {err}"))
+}
+
+fn err(e: &mut Engine, cmd: &str, p: Value) -> String {
+    e.execute(cmd, &p).err().unwrap_or_else(|| panic!("{cmd} {p} should be refused")).to_string()
+}
+
+/// A session with the four audio columns and one instrument column (column 4).
+fn engine() -> Engine {
+    let mut e = Engine::default();
+    run(&mut e, "live.setup", json!({}));
+    run(&mut e, "live.add_column", json!({"kind": "instrument"}));
+    e
+}
+
+fn note(pitch: u8, start: i64, length: i64) -> Note {
+    Note { pitch, velocity: 100, release_velocity: 64, channel: 0, start, length }
+}
+
+/// A MIDI clip on a new instrument track, selected: `beats` long at 120 bpm, a note per beat
+/// for 12 beats and a controller.
+fn midi_clip(e: &mut Engine, beats: f64) -> u64 {
+    let s = e.session_mut();
+    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+    let mut seq = Sequence { notes: (0..12).map(|b| note(60 + b as u8, b * Q, Q / 2)).collect(), ctrls: Vec::new() };
+    seq.ctrls.push(soundcraft_midi::CtrlEvent { tick: 0, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(1), value: 64 });
+    let id = s.new_clip_id();
+    let len = (beats * 24_000.0) as i64;
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(id, "Lead", 48_000, len, seq));
+    s.edit.selected_clips = vec![id];
+    id.0
+}
+
+#[test]
+fn add_column_makes_an_instrument_column_and_undoes() {
+    let mut e = Engine::default();
+    let r = run(&mut e, "live.add_column", json!({"kind": "instrument"}));
+    assert_eq!((r["column"].as_u64(), r["kind"].as_str(), r["preset"].as_str()), (Some(0), Some("instrument"), Some("trance_kit")));
+    let s = e.session();
+    let t = s.track(TrackId(r["track"].as_u64().unwrap())).unwrap();
+    assert_eq!((t.name.as_str(), t.kind), ("Live 1", TrackKind::Instrument));
+    assert_eq!(t.instrument.as_ref().map(|i| i.plugin.as_str()), Some("drum_synth"));
+    assert_eq!(s.live.column_kind(0, &s.tracks), Some(SlotKind::Midi));
+    let r = run(&mut e, "live.add_column", json!({"kind": "instrument", "preset": "rolling_bass"}));
+    assert_eq!((r["column"].as_u64(), r["preset"].as_str()), (Some(1), Some("rolling_bass")));
+    let r = run(&mut e, "live.add_column", json!({}));
+    assert_eq!((r["kind"].as_str(), r["preset"].as_str()), (Some("audio"), None));
+    assert_eq!(e.session().live.column_kind(2, &e.session().tracks), Some(SlotKind::Audio));
+    // Each is one undo step, taking its track with it.
+    let tracks = e.session().tracks.len();
+    assert!(e.undo());
+    assert_eq!((e.session().live.columns.len(), e.session().tracks.len()), (2, tracks - 1));
+    assert!(e.undo() && e.undo());
+    assert!(e.session().live.columns.is_empty());
+    assert!(err(&mut e, "live.add_column", json!({"kind": "midi"})).contains("audio or instrument"));
+    assert!(err(&mut e, "live.add_column", json!({"kind": "audio", "preset": "trance_kit"})).contains("instrument columns"));
+    assert!(err(&mut e, "live.add_column", json!({"kind": "instrument", "preset": "nope"})).contains("unknown preset"));
+    for _ in 0..16 {
+        run(&mut e, "live.add_column", json!({}));
+    }
+    assert!(err(&mut e, "live.add_column", json!({})).contains("most columns"));
+}
+
+#[test]
+fn a_selected_midi_clip_becomes_a_slot_of_whole_bars() {
+    let mut e = engine();
+    // 13.6 beats: 3.4 bars, snapped to 3 (the notes from beat 12 on are left out).
+    let clip = midi_clip(&mut e, 13.6);
+    let r = run(&mut e, "live.slot_from_clip", json!({"column": 4}));
+    assert_eq!((r["slot"].as_u64(), r["bars"].as_f64(), r["length_beats"].as_f64()), (Some(0), Some(3.0), Some(12.0)));
+    assert_eq!((r["notes"].as_u64(), r["controllers_dropped"].as_u64(), r["clip"].as_u64()), (Some(12), Some(1), Some(clip)));
+    let slot = e.session().live.midi_slot(4, 0).unwrap();
+    assert_eq!((slot.name.as_str(), slot.length_beats, slot.sequence.notes.len()), ("Lead", 12.0, 12));
+    // A shorter clip: one bar at least, and the notes past it are left out.
+    let short = midi_clip(&mut e, 1.0);
+    let r = run(&mut e, "live.slot_from_clip", json!({"column": 4, "slot": 3, "clip": short}));
+    assert_eq!((r["bars"].as_f64(), r["notes"].as_u64()), (Some(1.0), Some(4)));
+    assert!(e.undo());
+    assert!(e.session().live.slot(4, 3).is_none());
+    // Not into an audio column; nothing selected is refused.
+    assert!(err(&mut e, "live.slot_from_clip", json!({"column": 0})).contains("audio column"));
+    e.session_mut().edit.selected_clips.clear();
+    assert!(err(&mut e, "live.slot_from_clip", json!({"column": 4})).contains("select a MIDI clip"));
+}
+
+#[test]
+fn audio_goes_only_in_audio_columns() {
+    let mut e = engine();
+    assert!(err(&mut e, "live.slot_from_selection", json!({"column": 4})).contains("instrument column"));
+    assert!(err(&mut e, "live.slot_from_file", json!({"column": 4, "path": "x.wav"})).contains("instrument column"));
+    assert!(soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 4, "path": "x.wav"})).is_err());
+}
+
+#[test]
+fn a_pattern_fills_a_slot_and_refuses_an_occupied_one() {
+    let mut e = engine();
+    let r = run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "trance_full", "slot": {"column": 4, "slot": 2}}));
+    assert_eq!((r["column"].as_u64(), r["slot"].as_u64(), r["bars"].as_u64(), r["length_beats"].as_f64()), (Some(4), Some(2), Some(4), Some(16.0)));
+    let slot = e.session().live.midi_slot(4, 2).unwrap().clone();
+    assert_eq!(slot.name, "Trance Full");
+    assert!(slot.sequence.notes.iter().any(|n| n.pitch == soundcraft_midi::patterns::KICK && n.start == 0), "a kick on the downbeat");
+    assert!(slot.sequence.notes.iter().all(|n| n.start < 16 * Q));
+    assert!(err(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 2}})).contains("replace"));
+    let r = run(
+        &mut e,
+        "prod.pattern",
+        json!({"kind": "bass", "style": "rolling", "key": "8A", "bars": 2, "replace": true, "slot": {"column": 4, "slot": 2}}),
+    );
+    assert_eq!((r["camelot"].as_str(), r["length_beats"].as_f64()), (Some("8A"), Some(8.0)));
+    assert_eq!(e.session().live.midi_slot(4, 2).unwrap().name, "Rolling (8A)");
+    assert!(e.undo());
+    assert_eq!(e.session().live.midi_slot(4, 2), Some(&slot));
+    // FX sweeps are left out, and said so.
+    let r = run(&mut e, "prod.pattern", json!({"kind": "fx", "style": "riser", "slot": {"column": 4, "slot": 5}}));
+    assert!(!r["automation_dropped"].as_array().unwrap().is_empty(), "{r}");
+    // Keyed styles need a key: none plays at the playhead here.
+    assert!(err(&mut e, "prod.pattern", json!({"kind": "bass", "style": "rolling", "slot": {"column": 4, "slot": 6}})).contains("no key"));
+    assert!(err(&mut e, "prod.pattern", json!({"kind": "drums", "style": "fill", "slot": {"column": 0, "slot": 0}})).contains("audio column"));
+    assert!(err(&mut e, "prod.pattern", json!({"kind": "drums", "style": "fill", "track": 1, "slot": {"column": 4, "slot": 0}})).contains("`track`"));
+}
+
+#[test]
+fn slots_of_both_kinds_edit_clear_and_report_their_kind() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    let r = run(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "name": "Kicks", "gain_db": -6.0, "length_bars": 2}));
+    assert_eq!(
+        (r["kind"].as_str(), r["name"].as_str(), r["length_beats"].as_f64(), r["mode"].as_str()),
+        (Some("midi"), Some("Kicks"), Some(8.0), Some("loop"))
+    );
+    assert!(err(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "mode": "one_shot"})).contains("only loops"));
+    let s = e.session_mut();
+    s.live.columns[0].slots[1] = Some(soundcraft_engine::model::Slot::one_shot("Vox", [0; 3], soundcraft_engine::model::SourceId(77)).into());
+    let state = run(&mut e, "live.state", json!({}));
+    let cols = state["columns"].as_array().unwrap();
+    assert_eq!((cols[0]["kind"].as_str(), cols[4]["kind"].as_str()), (Some("audio"), Some("instrument")));
+    assert_eq!((cols[4]["slots"][0]["kind"].as_str(), cols[4]["slots"][0]["name"].as_str()), (Some("midi"), Some("Kicks")));
+    assert_eq!(cols[0]["slots"][1]["kind"].as_str(), Some("audio"));
+    assert!(cols[4]["slots"][1].is_null());
+    run(&mut e, "live.slot_clear", json!({"column": 4, "slot": 0}));
+    assert!(e.session().live.slot(4, 0).is_none());
+    assert!(e.undo());
+    assert_eq!(e.session().live.midi_slot(4, 0).map(|x| x.name.as_str()), Some("Kicks"));
+}
+
+/// A lost instrument column gets an instrument track back from `live.setup`, its MIDI slots
+/// kept; a lost audio column an audio track.
+#[test]
+fn setup_gives_a_lost_instrument_column_an_instrument_track() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    let lost = e.session().live.columns[4].track;
+    e.session_mut().tracks.retain(|t| t.id != lost);
+    assert_eq!(e.session().live.lost_columns(&e.session().tracks), [4]);
+    run(&mut e, "live.setup", json!({}));
+    let s = e.session();
+    assert_eq!(s.live.column_kind(4, &s.tracks), Some(SlotKind::Midi));
+    assert!(s.live.midi_slot(4, 0).is_some());
+    assert_eq!(s.track(s.live.columns[4].track).and_then(|t| t.instrument.as_ref()).map(|i| i.plugin.as_str()), Some("drum_synth"));
+}

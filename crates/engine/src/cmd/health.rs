@@ -100,7 +100,7 @@ fn report(e: &mut Engine, _: &Value) -> Result<Value> {
     }
     // Session view slots read their source and stems the same way.
     let mut slots = 0usize;
-    for (column, row, slot) in s.live.slots() {
+    for (column, row, slot) in s.live.slots().filter_map(|(c, r, x)| x.audio().map(|x| (c, r, x))) {
         slots += 1;
         let track = s.live.column_track(column, &s.tracks).and_then(|t| s.track(t));
         let stems = slot.stems.iter().flat_map(|set| STEMS.iter().zip(set.sources).map(|(name, id)| (Some(*name), id)));

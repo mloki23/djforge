@@ -1133,7 +1133,7 @@ fn stem_source(s: &Session, path: &Path, rate: u32, frames: u64, channels: usize
     let other_scale = |id: SourceId| {
         let other =
             |set: &Option<soundcraft_model::StemSet>| set.as_ref().is_some_and(|set| set.sources.contains(&id) && set.scale_log2 != scale_log2);
-        s.all_clips().any(|c| other(&c.stems)) || s.live.slots().any(|(_, _, slot)| other(&slot.stems))
+        s.all_clips().any(|c| other(&c.stems)) || s.live.slots().filter_map(|(_, _, x)| x.audio()).any(|slot| other(&slot.stems))
     };
     s.sources.iter().filter(|x| !other_scale(x.id)).find_map(|x| {
         let audio = s.pool.get(x.id)?;

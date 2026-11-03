@@ -76,7 +76,7 @@ fn session(ramp: bool) -> (Session, TrackId) {
 }
 
 fn put(s: &mut Session, row: usize, slot: Slot) {
-    s.live.columns[0].slots[row] = Some(slot);
+    s.live.columns[0].slots[row] = Some(slot.into());
 }
 
 fn bar(s: &Session, n: i64) -> Samples {
@@ -348,13 +348,13 @@ fn a_lost_column_plays_nothing() {
     s.live.columns.push(LiveColumn::new(t));
     s.live.columns.push(LiveColumn::new(aux));
     for c in 1..3 {
-        s.live.columns[c].slots[0] = Some(Slot::one_shot("dc", [0; 3], SourceId(901)));
+        s.live.columns[c].slots[0] = Some(Slot::one_shot("dc", [0; 3], SourceId(901)).into());
     }
     let mut eng = engine();
     let cmds = [(0, LiveCmd::Launch { column: 1, slot: 0, at: 1_000 }), (0, LiveCmd::Launch { column: 2, slot: 0, at: 1_000 })];
     let out = run(&mut eng, &s, 8_192, &cmds);
     assert!(out.iter().all(|x| *x == 0.0));
-    s.live.columns[0].slots[0] = Some(Slot::one_shot("dc", [0; 3], SourceId(901)));
+    s.live.columns[0].slots[0] = Some(Slot::one_shot("dc", [0; 3], SourceId(901)).into());
     let mut eng = engine();
     let out = run(&mut eng, &s, 8_192, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: 1_000 })]);
     assert!((out[4_000] - 0.25).abs() < 1e-6, "the owning column plays");

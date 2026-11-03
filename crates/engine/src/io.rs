@@ -1612,7 +1612,7 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
         .columns
         .iter_mut()
         .enumerate()
-        .flat_map(|(i, c)| c.slots.iter_mut().enumerate().filter_map(move |(r, x)| x.as_mut().map(|x| ((i, r), x))))
+        .flat_map(|(i, c)| c.slots.iter_mut().enumerate().filter_map(move |(r, x)| x.as_mut().and_then(|x| x.audio_mut()).map(|x| ((i, r), x))))
     {
         if slot.stems.as_ref().is_some_and(|set| set.sources.iter().any(|id| !s.pool.contains(*id))) {
             slot.unsplit();

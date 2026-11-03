@@ -5,7 +5,9 @@
 //! queued (blinking until its boundary), playing (a ring showing where its loop is) or loading
 //! (a file on its way in). A slot's right-click menu adds the time selection, loads a file, edits
 //! or clears it; a file dropped on a slot loads into it. Files load on another thread, so the
-//! app keeps playing while one is read and analysed.
+//! app keeps playing while one is read and analysed. An instrument column's slots hold MIDI
+//! (marked ♪): their menu copies the selected MIDI clip in or writes a trance drum pattern. A
+//! column name's right-click menu adds an audio or instrument column.
 //!
 //! While the window has focus (it was clicked last), 1–8 launch the selected column's slots, 0
 //! stops it, Shift+0 stops everything, ←/→ select the column and Shift+1–8 launch a scene. The
@@ -17,7 +19,7 @@ use crate::theme::{Tokens, bold, regular};
 use egui::{Color32, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, vec2};
 use serde_json::{Value, json};
 use soundcraft_engine::cmd::{SlotFileJob, slot_file_job};
-use soundcraft_model::{LIVE_SLOTS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, Slot, SlotMode};
+use soundcraft_model::{LIVE_SLOTS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, SlotContent, SlotKind, SlotMode};
 
 /// Size of a slot cell.
 const CELL: egui::Vec2 = vec2(116.0, 26.0);
@@ -59,7 +61,7 @@ pub struct SlotEdit {
     pub error: Option<String>,
     /// The slot when the dialog opened: what changed is sent, and the dialog closes if the slot
     /// itself changes meanwhile (cleared, undone, another session).
-    slot: Slot,
+    slot: SlotContent,
 }
 
 /// `window.session`: opens (or with `value`, shows or hides) the Session window. Opening it on a
@@ -320,9 +322,11 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
             .collect();
         for (c, name) in names.iter().enumerate() {
             let selected = c == app.session_view.column;
-            if ui.selectable_label(selected, egui::RichText::new(name).font(bold(11.0))).clicked() {
+            let header = ui.selectable_label(selected, egui::RichText::new(name).font(bold(11.0)));
+            if header.clicked() {
                 app.session_view.column = c;
             }
+            header.context_menu(|ui| column_menu(app, ui));
         }
         ui.label(egui::RichText::new("Scene").font(bold(11.0)).color(t.text_dim));
         ui.end_row();
@@ -355,11 +359,27 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
     ui.label(egui::RichText::new(KEYS_HELP).font(regular(10.0)).color(t.text_dim));
 }
 
+/// A column name's menu: add a column of either kind.
+fn column_menu(app: &mut SoundApp, ui: &mut egui::Ui) {
+    if ui.button("Add Instrument Column").clicked() {
+        let _ = app.run("live.add_column", json!({"kind": "instrument"}));
+        ui.close();
+    }
+    if ui.button("Add Audio Column").clicked() {
+        let _ = app.run("live.add_column", json!({"kind": "audio"}));
+        ui.close();
+    }
+}
+
 fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state: ColumnState, now: f64) {
     let t = Tokens::current();
     let (rect, resp) = ui.allocate_exact_size(CELL, Sense::click());
     let s = app.engine.session();
-    let filled = s.live.slot(column, row).map(|x| (x.name.clone(), x.color));
+    let instrument = s.live.column_kind(column, &s.tracks) == Some(SlotKind::Midi);
+    let filled = s.live.slot(column, row).map(|x| match x.kind() {
+        SlotKind::Midi => (format!("♪ {}", x.name()), x.color()),
+        SlotKind::Audio => (x.name().to_string(), x.color()),
+    });
     let loading = app.session_view.jobs.iter().any(|(j, _)| j.target() == (column, row));
     let label = format!("Live {} slot {}", column + 1, row + 1);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
@@ -413,6 +433,20 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
     }
     resp.context_menu(|ui| {
         app.session_view.column = column;
+        if instrument {
+            if ui.button("Copy Selected MIDI Clip Here").clicked() {
+                let _ = app.run("live.slot_from_clip", json!({"column": column, "slot": row}));
+                ui.close();
+            }
+            if ui.button("Trance Drums Pattern Here").clicked() {
+                let _ = app.run("prod.pattern", json!({"kind": "drums", "style": "trance_full", "slot": {"column": column, "slot": row}}));
+                ui.close();
+            }
+            slot_edit_items(app, ui, column, row, filled.is_some());
+            ui.separator();
+            column_menu(app, ui);
+            return;
+        }
         if ui.button("Add Selection Here").clicked() {
             let _ = app.run("live.slot_from_selection", json!({"column": column, "slot": row}));
             ui.close();
@@ -426,28 +460,43 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
                 let _ = start_load(app, column, row, &path);
             }
         }
-        if ui.add_enabled(filled.is_some(), egui::Button::new("Edit...")).clicked() {
-            app.session_view.edit = edit_of(app, column, row);
-            ui.close();
-        }
-        if ui.add_enabled(filled.is_some(), egui::Button::new("Clear")).clicked() {
-            let _ = app.run("live.slot_clear", json!({"column": column, "slot": row}));
-            ui.close();
-        }
+        slot_edit_items(app, ui, column, row, filled.is_some());
+        ui.separator();
+        column_menu(app, ui);
     });
+}
+
+/// A slot menu's Edit... and Clear (enabled when the slot is filled).
+fn slot_edit_items(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, filled: bool) {
+    if ui.add_enabled(filled, egui::Button::new("Edit...")).clicked() {
+        app.session_view.edit = edit_of(app, column, row);
+        ui.close();
+    }
+    if ui.add_enabled(filled, egui::Button::new("Clear")).clicked() {
+        let _ = app.run("live.slot_clear", json!({"column": column, "slot": row}));
+        ui.close();
+    }
+}
+
+/// A slot's length in whole bars; `None` for an audio slot without a beat grid (it has none).
+fn bars_of(x: &SlotContent) -> Option<u32> {
+    let bars = || (x.length_beats() / BAR_BEATS).round().max(1.0) as u32;
+    match x {
+        SlotContent::Audio(a) => a.warp.as_ref().map(|_| bars()),
+        SlotContent::Midi(_) => Some(bars()),
+    }
 }
 
 fn edit_of(app: &SoundApp, column: usize, row: usize) -> Option<SlotEdit> {
     let x = app.engine.session().live.slot(column, row)?;
-    let bars = x.warp.as_ref().map(|_| (x.length_beats / BAR_BEATS).round().max(1.0) as u32);
     Some(SlotEdit {
         column,
         row,
-        name: x.name.clone(),
-        color: x.color,
-        mode: x.mode,
-        length_bars: bars,
-        gain_db: x.gain_db,
+        name: x.name().to_string(),
+        color: x.color(),
+        mode: x.mode(),
+        length_bars: bars_of(x),
+        gain_db: x.gain_db(),
         error: None,
         slot: x.clone(),
     })
@@ -458,22 +507,22 @@ fn changes(e: &SlotEdit) -> Option<Value> {
     let first = &e.slot;
     let mut p = json!({"column": e.column, "slot": e.row});
     let o = p.as_object_mut()?;
-    if e.name != first.name {
+    if e.name != first.name() {
         o.insert("name".into(), json!(e.name));
     }
-    if e.color != first.color {
+    if e.color != first.color() {
         o.insert("color".into(), json!(e.color));
     }
-    if e.mode != first.mode {
+    if e.mode != first.mode() {
         o.insert("mode".into(), json!(e.mode.id()));
     }
-    let bars = first.warp.as_ref().map(|_| (first.length_beats / BAR_BEATS).round().max(1.0) as u32);
+    let bars = bars_of(first);
     if e.length_bars != bars
         && let Some(b) = e.length_bars
     {
         o.insert("length_bars".into(), json!(b));
     }
-    if e.gain_db != first.gain_db {
+    if e.gain_db != first.gain_db() {
         o.insert("gain_db".into(), json!(e.gain_db));
     }
     (o.len() > 2).then_some(p)
@@ -500,7 +549,8 @@ fn edit_dialog(app: &mut SoundApp, ctx: &egui::Context) {
             ui.label("Mode");
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(e.length_bars.is_some(), |ui| ui.radio_value(&mut e.mode, SlotMode::Loop, "Loop"));
-                ui.radio_value(&mut e.mode, SlotMode::OneShot, "One-shot");
+                // MIDI slots only loop.
+                ui.add_enabled_ui(e.slot.kind() == SlotKind::Audio, |ui| ui.radio_value(&mut e.mode, SlotMode::OneShot, "One-shot"));
             });
             ui.end_row();
             if let Some(bars) = &mut e.length_bars {

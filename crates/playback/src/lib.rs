@@ -1889,9 +1889,9 @@ mod tests {
         slot.warp = WarpMap::new((0..8).map(|k| f64::from(k) * 24_000.0).collect(), 0.0);
         slot.mode = SlotMode::Loop;
         slot.length_beats = 4.0;
-        col.slots[0] = Some(slot.clone());
+        col.slots[0] = Some(slot.clone().into());
         slot.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
-        col.slots[1] = Some(slot);
+        col.slots[1] = Some(slot.into());
         s.live.columns.push(col);
         (s, t)
     }

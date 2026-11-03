@@ -30,10 +30,21 @@
 //! per player per block, and takes over there. A warm-up that cannot finish in time (a launch
 //! with too little lead) finishes when it is needed, for that player only. On the audio thread
 //! a slot without its players is silent.
+//!
+//! **MIDI slots** (an instrument column's) play their sequence on the column track's instrument,
+//! scheduled before it renders the block ([`Column::schedule_midi`]). Pass `k` of a loop launched
+//! on session beat `b0` starts on the tick of beat `b0 + k · length_beats`, so it starts on the
+//! sample the tempo map puts that bar line at, as an audio loop's restart does; a note is cut at
+//! the end of its pass. The notes sounding are tracked per column ([`LiveMidi`], a fixed table)
+//! and released where the slot stops or is replaced; a seek or transport stop silences the
+//! instrument with `all_notes_off`, as for arrangement notes. While a slot plays, the track's
+//! arrangement notes are muted ([`ArrGate`]): none start, and those sounding are released where
+//! the slot starts. The sequence is read in place from the session snapshot (built off the audio
+//! thread), never copied.
 
 use crate::warp::{self, PlayerStem, SOURCE_PLAYER, WarpPlayer};
-use soundcraft_dsp::db_to_gain;
-use soundcraft_model::{MAX_LIVE_COLUMNS, STEMS, Session, Slot, SlotMode, SourceId, Track, TrackId};
+use soundcraft_dsp::{Plugin, db_to_gain};
+use soundcraft_model::{MAX_LIVE_COLUMNS, MidiSlot, STEMS, Session, Slot, SlotContent, SlotMode, SourceId, Track, TrackId, TrackKind};
 use soundcraft_time::{Samples, TICKS_PER_QUARTER};
 
 /// Length of the crossfades at loop restarts, launches and stops, in seconds.
@@ -336,7 +347,8 @@ pub fn pool_needs(s: &Session, track: TrackId) -> (Vec<PlayerStem>, usize) {
     let Some(c) = column_of(s, track) else { return (Vec::new(), 0) };
     let mut keys = Vec::new();
     let mut channels = 0;
-    for slot in s.live.columns.get(c).into_iter().flat_map(|col| col.slots.iter().flatten()).filter(|sl| slot_loops(sl)) {
+    let slots = s.live.columns.get(c).into_iter().flat_map(|col| col.slots.iter().flatten().filter_map(SlotContent::audio));
+    for slot in slots.filter(|sl| slot_loops(sl)) {
         for (stem, id) in slot_sources(slot) {
             if !keys.contains(&stem) {
                 keys.push(stem);
@@ -350,9 +362,9 @@ pub fn pool_needs(s: &Session, track: TrackId) -> (Vec<PlayerStem>, usize) {
 /// True when the column on `track` plays its pool players for `stem`: some looping slot of it
 /// plays that audio key.
 pub fn pool_player_plays(s: &Session, track: TrackId, stem: PlayerStem) -> bool {
-    column_of(s, track)
-        .and_then(|c| s.live.columns.get(c))
-        .is_some_and(|col| col.slots.iter().flatten().any(|sl| slot_loops(sl) && slot_sources(sl).any(|(k, _)| k == stem)))
+    column_of(s, track).and_then(|c| s.live.columns.get(c)).is_some_and(|col| {
+        col.slots.iter().flatten().filter_map(SlotContent::audio).any(|sl| slot_loops(sl) && slot_sources(sl).any(|(k, _)| k == stem))
+    })
 }
 
 /// Session beat (quarter notes) at timeline sample `t`.
@@ -453,13 +465,25 @@ pub(crate) struct Column<'a> {
 }
 
 impl Column<'_> {
+    /// The audio slot in `row` (none on an instrument column: it plays only MIDI).
     fn slot(&self, row: usize) -> Option<&Slot> {
-        self.s.live.slot(self.column, row)
+        self.s.live.audio_slot(self.column, row).filter(|_| self.track.kind == TrackKind::Audio)
+    }
+
+    /// The MIDI slot in `row` (none on an audio track's column).
+    fn midi_slot(&self, row: usize) -> Option<&MidiSlot> {
+        self.s.live.midi_slot(self.column, row).filter(|_| self.track.kind == TrackKind::Instrument)
+    }
+
+    /// True when the slot in `row` can play in this column: MIDI on an instrument column, audio
+    /// whose files are all in the pool on an audio one.
+    fn can_play(&self, row: usize) -> bool {
+        self.midi_slot(row).is_some() || self.slot(row).is_some_and(|sl| self.playable(sl))
     }
 
     /// The slot that launches at `at` (heard from `heard_from`), when it can play.
     fn launching(&self, q: LiveQueued, heard_from: Samples) -> Option<LivePlaying> {
-        q.slot.filter(|r| self.slot(*r).is_some_and(|sl| self.playable(sl))).map(|r| LivePlaying::new(self.s, r, q.at, heard_from))
+        q.slot.filter(|r| self.can_play(*r)).map(|r| LivePlaying::new(self.s, r, q.at, heard_from))
     }
 
     /// Applies the queued launch or stop when it is due by `end`, without playing anything:
@@ -781,6 +805,179 @@ impl Column<'_> {
     }
 }
 
+/// When a column track's arrangement notes are heard over a block: before `at`, and from it.
+/// A block holds at most one launch or stop, so at most one change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArrGate {
+    before: bool,
+    at: Samples,
+    after: bool,
+}
+
+impl ArrGate {
+    /// Heard throughout: a track no slot plays on.
+    pub(crate) const OPEN: ArrGate = ArrGate { before: true, at: Samples::MAX, after: true };
+
+    /// True when the arrangement is heard at sample `t`.
+    pub(crate) fn heard(&self, t: Samples) -> bool {
+        if t < self.at { self.before } else { self.after }
+    }
+
+    /// Where the arrangement falls silent in the block (a slot starts), if it does.
+    pub(crate) fn cut(&self) -> Option<Samples> {
+        (self.before && !self.after).then_some(self.at)
+    }
+
+    /// The same gate on a timeline moved by `by` samples (a MIDI Track Offset).
+    pub(crate) fn shifted(self, by: Samples) -> ArrGate {
+        ArrGate { at: if self.at == Samples::MAX { self.at } else { self.at.saturating_add(by) }, ..self }
+    }
+}
+
+/// An instrument column's MIDI notes on its instrument: which pitches sound, and from when the
+/// playing slot's notes were sent. A fixed table in the column track's strip, never resized; the
+/// column's [`ColumnPlay`] resets don't touch it, so whatever sounds is always released.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveMidi {
+    held: [bool; 128],
+    /// Notes starting before this sample were never sent (a late launch, a seek).
+    since: Samples,
+    /// The launch (row and origin) the held notes belong to.
+    owner: Option<(usize, Samples)>,
+}
+
+impl Default for LiveMidi {
+    fn default() -> Self {
+        LiveMidi { held: [false; 128], since: Samples::MIN, owner: None }
+    }
+}
+
+impl LiveMidi {
+    /// The instrument was silenced (`all_notes_off`) for a seek or stop to `at`: nothing
+    /// sounds, and notes before `at` were not sent.
+    pub(crate) fn forget(&mut self, at: Samples) {
+        self.held = [false; 128];
+        self.since = at;
+    }
+
+    /// Note-offs at `offset` for every note sounding.
+    fn release(&mut self, inst: &mut dyn Plugin, offset: usize) {
+        for (pitch, h) in self.held.iter_mut().enumerate() {
+            if std::mem::take(h) {
+                inst.note_off(offset, u8::try_from(pitch).unwrap_or(0));
+            }
+        }
+    }
+}
+
+impl Column<'_> {
+    /// Before an instrument column's block `[pos, end)`: stops a playing slot that is gone (or
+    /// no longer MIDI), and says when the track's arrangement notes are heard: not while a slot
+    /// plays, changing at the launch or stop due in the block.
+    pub(crate) fn midi_gate(&self, play: &mut ColumnPlay, pos: Samples, end: Samples) -> ArrGate {
+        if play.playing.is_some_and(|p| self.midi_slot(p.slot).is_none()) {
+            play.set_playing(None, pos);
+        }
+        let before = play.playing.is_none();
+        match play.queued.filter(|q| q.at < end) {
+            Some(q) => ArrGate { before, at: q.at.max(pos), after: self.launching(q, q.at).is_none() },
+            None => ArrGate { before, at: Samples::MAX, after: before },
+        }
+    }
+
+    /// Sends the instrument the playing MIDI slot's notes for `[pos, pos + frames)`, applying
+    /// the launch or stop due there: on its sample the notes sounding are released and the next
+    /// slot's start. Launches that came late are counted in `play.late`. Call after
+    /// [`Column::midi_gate`] and the arrangement's notes, before the instrument renders.
+    pub(crate) fn schedule_midi(&self, play: &mut ColumnPlay, midi: &mut LiveMidi, inst: &mut dyn Plugin, pos: Samples, frames: usize) {
+        let end = pos.saturating_add(frames as i64);
+        let owner = play.playing.map(|p| (p.slot, p.origin));
+        if midi.owner != owner {
+            // Stopped or replaced between blocks (a snapshot change, a transport stop): what it
+            // left sounding stops now, and nothing of what plays now was sent before this block.
+            midi.release(inst, 0);
+            midi.owner = owner;
+            midi.since = midi.since.max(pos);
+        }
+        let mut a = pos;
+        loop {
+            let due = play.queued.filter(|q| q.at < end);
+            let b = due.map_or(end, |q| q.at.max(a));
+            if b > a
+                && let Some(p) = play.playing
+            {
+                self.midi_notes(&p, midi, inst, pos, a, b);
+            }
+            let Some(q) = due else { break };
+            midi.release(inst, usize::try_from(b - pos).unwrap_or(0));
+            play.queued = None;
+            if q.slot.is_some() && q.at < b {
+                play.late = play.late.saturating_add(1);
+            }
+            // A late launch keeps its phase from its own sample: only its start is missed.
+            let next = self.launching(q, b);
+            if next.is_some() {
+                play.launch();
+            }
+            play.set_playing(next, b);
+            midi.owner = next.map(|p| (p.slot, p.origin));
+            midi.since = b;
+            a = b;
+        }
+    }
+
+    /// Note-ons and -offs of `p`'s passes in `[a, b)` (the block starts at `pos`): each pass's
+    /// note-offs first, so a note ending on the sample another starts on (at the seam, too) ends
+    /// before it starts.
+    fn midi_notes(&self, p: &LivePlaying, midi: &mut LiveMidi, inst: &mut dyn Plugin, pos: Samples, a: Samples, b: Samples) {
+        let Some(slot) = self.midi_slot(p.slot) else { return };
+        let (s, sr) = (self.s, self.s.sample_rate);
+        let tpq = TICKS_PER_QUARTER as f64;
+        let length = slot.length_beats.max(1.0);
+        let len_ticks = (length * tpq).round() as i64;
+        let g = db_to_gain(slot.gain_db);
+        // From the pass heard just before `a` (whose note-offs may fall on `a`).
+        let first = p.pass(s, length, a.saturating_sub(1).max(p.start)).max(0);
+        let last = p.pass(s, length, b - 1).clamp(first, first.saturating_add(4));
+        // The span in ticks, a tick wider each side: notes outside it are skipped unconverted.
+        let (ta, tb) = (s.tempo.samples_to_ticks(a, sr).saturating_sub(1), s.tempo.samples_to_ticks(b, sr).saturating_add(1));
+        let at = |t: Samples| usize::try_from(t - pos).unwrap_or(0);
+        for k in first..=last {
+            let base = ((p.beat0 + k as f64 * length) * tpq).round() as i64;
+            let seam = s.tempo.tick_to_samples(base.saturating_add(len_ticks), sr);
+            let near = ta.saturating_sub(base)..=tb.saturating_sub(base);
+            let notes = slot.sequence.notes.iter().filter(|n| (0..len_ticks).contains(&n.start));
+            // Where a note starts and ends in this pass: cut at the seam, and at least a sample.
+            let span = |n: &soundcraft_midi::Note| {
+                let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
+                let off = s.tempo.tick_to_samples(base.saturating_add(n.end().min(len_ticks)), sr).min(seam).max(on.saturating_add(1));
+                (on, off)
+            };
+            for n in notes.clone().filter(|n| near.contains(&n.start) || near.contains(&n.end().min(len_ticks))) {
+                let (on, off) = span(n);
+                if on >= midi.since && off >= a && off < b {
+                    inst.note_off(at(off), n.pitch);
+                    if let Some(h) = midi.held.get_mut(usize::from(n.pitch)) {
+                        *h = false;
+                    }
+                }
+            }
+            for n in notes.filter(|n| near.contains(&n.start)) {
+                let (on, off) = span(n);
+                if on >= midi.since && on >= a && on < b {
+                    let v = (f32::from(n.velocity) * g).round().clamp(1.0, 127.0) as u8;
+                    inst.note_on(at(on), n.pitch, v);
+                    if off >= b
+                        && let Some(h) = midi.held.get_mut(usize::from(n.pitch))
+                    {
+                        *h = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Mutes (fades) the column track's arrangement audio in `buf` over `[a, b)` while a slot plays.
 fn mute_arrangement(play: &ColumnPlay, buf: &mut [Vec<f32>], pos: Samples, a: Samples, b: Samples, xf: usize) {
     let since = play.arr_since;
@@ -812,7 +1009,7 @@ mod tests {
     use super::*;
     use crate::{MixEngine, WarpRoom, as_audio_thread};
     use soundcraft_audio_io::AudioBuffer;
-    use soundcraft_model::{ChannelFormat, LiveColumn, SourceAudio, StemSet, TrackKind, WarpMap};
+    use soundcraft_model::{ChannelFormat, LiveColumn, MidiSlot, SourceAudio, StemSet, TrackKind, WarpMap};
     use std::sync::Arc;
 
     /// Launched on a bar line, every pass of a loop starts on the sample the tempo map puts
@@ -847,9 +1044,9 @@ mod tests {
         slot.warp = warp;
         slot.mode = SlotMode::Loop;
         slot.length_beats = 1.0;
-        col.slots[0] = Some(slot.clone());
+        col.slots[0] = Some(slot.clone().into());
         slot.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
-        col.slots[1] = Some(slot);
+        col.slots[1] = Some(slot.into());
         s.live.columns.push(col);
         (s, t)
     }
@@ -944,7 +1141,7 @@ mod tests {
                 slot.length_beats = 4.0;
                 slot.start_beat = f64::from(row as u8) * 4.0;
                 slot.stems = Some(StemSet { scale_log2: 0, key: "k".into(), sources: [SourceId(901), SourceId(902), SourceId(903), SourceId(904)] });
-                col.slots[row] = Some(slot);
+                col.slots[row] = Some(slot.into());
             }
             s.live.columns.push(col);
             tracks.push(t);
@@ -999,5 +1196,55 @@ mod tests {
         );
         assert!(worst <= 3 * players * BLOCK, "worst callback stretched {worst} frames");
         assert!(eng.live_state().iter().take(4).all(|c| c.playing.is_some_and(|p| p.slot == 1)));
+    }
+    /// A drum slot on an instrument column, over the track's own arrangement notes: launching,
+    /// looping, switching and stopping on the audio thread read the sequence in place from the
+    /// snapshot and never grow the strip's note list, the strip table or the workspace.
+    #[test]
+    fn midi_slots_play_on_the_audio_thread_without_growing() {
+        let mut s = Session::default();
+        s.tempo.set_tempo(0, 120.0).unwrap();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(soundcraft_model::Insert::new("drum_synth"));
+        let q = TICKS_PER_QUARTER;
+        let note =
+            |pitch: u8, start: i64, length: i64| soundcraft_midi::Note { pitch, velocity: 110, release_velocity: 64, channel: 0, start, length };
+        let seq = |notes: Vec<soundcraft_midi::Note>| soundcraft_midi::Sequence { notes, ctrls: Vec::new() };
+        let arr = seq((0..64).map(|b| note(38, b * q, q / 2)).collect());
+        let cid = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::midi(cid, "arr", 0, 48_000 * 32, arr));
+        let mut col = LiveColumn::new(t);
+        for (row, pitch) in [(0, 36u8), (1, 42)] {
+            let notes = (0..8).map(|b| note(pitch, b * q / 2, q / 4)).collect();
+            col.slots[row] = Some(MidiSlot { name: "d".into(), color: [0; 3], sequence: seq(notes), length_beats: 4.0, gain_db: 0.0 }.into());
+        }
+        s.live.columns.push(col);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut out = vec![vec![0.0; 512]; 2];
+        // The first block (off the audio thread) sizes the workspace.
+        eng.render(&s, 0, 512, &mut out);
+        let held = eng.strips.get(&t).map(|st| st.held.capacity()).unwrap();
+        let (strips, work) = (eng.strips.len(), eng.work.capacity());
+        let bar = |n: i64| s.tempo.tick_to_samples(s.tempo.bar_start_tick(n), s.sample_rate);
+        let mut loud = 0.0f32;
+        let mut pos = 512;
+        as_audio_thread(true, || {
+            eng.live(LiveCmd::Launch { column: 0, slot: 0, at: bar(2) });
+            while pos < bar(9) {
+                if pos == 300 * 512 {
+                    eng.live(LiveCmd::Launch { column: 0, slot: 1, at: bar(5) + 7_000 });
+                }
+                if pos == 500 * 512 {
+                    eng.live(LiveCmd::Stop { column: 0, at: bar(7) + 123 });
+                }
+                eng.render(&s, pos, 512, &mut out);
+                loud = loud.max(out[0].iter().fold(0.0, |m, x| m.max(x.abs())));
+                pos += 512;
+            }
+        });
+        assert!(loud > 0.01, "the drums play");
+        assert!(eng.live_state()[0].playing.is_none());
+        assert_eq!(eng.strips.get(&t).map(|st| st.held.capacity()), Some(held), "the note list never grew");
+        assert_eq!((eng.strips.len(), eng.work.capacity()), (strips, work));
     }
 }

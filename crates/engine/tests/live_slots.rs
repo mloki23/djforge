@@ -129,7 +129,7 @@ fn setup_makes_four_stereo_live_tracks_once_and_rebinds_a_deleted_one() {
     assert!(s.live.lost_columns(&s.tracks).is_empty());
     assert_eq!(s.live.columns.len(), 6);
     assert!(s.track(s.live.columns[1].track).is_some_and(|t| t.name == "Live 2"));
-    assert!(s.live.slot(1, 0).is_some(), "the lost column kept its slot");
+    assert!(s.live.audio_slot(1, 0).is_some(), "the lost column kept its slot");
     // Undo takes the whole setup back.
     assert!(e.undo());
     assert_eq!(e.session().live.columns.len(), 4);
@@ -164,7 +164,7 @@ fn a_selection_becomes_a_loop_of_the_clips_own_bars() {
     assert_eq!(r, json!({"column": 2, "slot": 0, "start_beat": 8.0, "length_beats": 8.0, "bars": 2.0}));
     let s = e.session();
     let c = s.find_clip(clip).unwrap().1;
-    let slot = s.live.slot(2, 0).unwrap();
+    let slot = s.live.audio_slot(2, 0).unwrap();
     assert_eq!((slot.source, slot.mode, slot.stems.as_ref().map(|x| x.sources)), (c.source().unwrap(), SlotMode::Loop, Some(stems)));
     assert_eq!((slot.stem_mask, slot.name.as_str(), slot.color), (c.stem_mask, c.name.as_str(), s.track(t).unwrap().color));
     let w = slot.warp.as_ref().unwrap();
@@ -176,10 +176,10 @@ fn a_selection_becomes_a_loop_of_the_clips_own_bars() {
     assert_eq!(run(&mut e, "live.slot_from_selection", json!({"column": 2, "slot": 0}))["start_beat"], 0.0);
     // Each is an undo step.
     assert!(e.undo());
-    assert_eq!(e.session().live.slot(2, 0).unwrap().start_beat, 8.0);
+    assert_eq!(e.session().live.audio_slot(2, 0).unwrap().start_beat, 8.0);
     assert!(e.undo());
     assert!(e.undo());
-    assert!(e.session().live.slot(2, 0).is_none());
+    assert!(e.session().live.audio_slot(2, 0).is_none());
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     assert!(!source.unsaved && source.path == path && source.origin.is_some() && source.origin_len > 0, "{source:?}");
     assert!(s.pool.contains(src));
     assert!(s.tracks.iter().all(|t| t.clips().is_empty()), "a slot places no clip");
-    assert_eq!(s.live.slot(0, 0).unwrap().start_beat, 0.0);
+    assert_eq!(s.live.audio_slot(0, 0).unwrap().start_beat, 0.0);
 
     // mixforge's analysis (a fake here): the loop starts on its first downbeat, 0.5 s in.
     let (fake, asked) = fake_analysis(Ok(json!({"bpm": 120.0, "first_downbeat": 0.5, "camelot": "4B"})));
@@ -272,7 +272,7 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     let key_of = |e: &Engine, r: &Value| e.session().source(SourceId(r["source"].as_u64().unwrap())).unwrap().key.clone();
     assert_eq!(key_of(&e, &r).as_deref(), Some("4B"), "the analysed key is kept");
     assert_eq!(*asked.lock().unwrap(), std::slice::from_ref(&path));
-    let slot = e.session().live.slot(0, 1).unwrap();
+    let slot = e.session().live.audio_slot(0, 1).unwrap();
     assert_eq!(slot.warp.as_ref().unwrap().beats[0], 24_000.0, "beat 0 is the first downbeat");
 
     // No usable analysis and no BPM tag: a one-shot at its own rate, which can't loop.
@@ -281,7 +281,7 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": path}));
     assert_eq!((r["mode"].as_str(), &r["grid"]), (Some("one_shot"), &Value::Null), "{r}");
     assert_eq!(key_of(&e, &r), None);
-    assert!(e.session().live.slot(0, 2).unwrap().warp.is_none());
+    assert!(e.session().live.audio_slot(0, 2).unwrap().warp.is_none());
     assert!(err(&mut e, "live.slot_set", json!({"column": 0, "slot": 2, "mode": "loop"})).contains("only as a one-shot"));
     // A key without a usable grid is kept all the same.
     let mut keyed = Engine::default();
@@ -320,7 +320,7 @@ fn an_mp3_without_analysis_takes_its_bpm_tag() {
     let r = run(&mut e, "live.slot_from_file", json!({"column": 1, "path": path}));
     assert_eq!((r["mode"].as_str(), r["grid"].as_str()), (Some("loop"), Some("tag")), "{r}");
     // 124 bpm: a beat every 60/124 s, from the file start.
-    let w = e.session().live.slot(1, 0).unwrap().warp.clone().unwrap();
+    let w = e.session().live.audio_slot(1, 0).unwrap().warp.clone().unwrap();
     assert!((w.beats[1] - w.beats[0] - 48_000.0 * 60.0 / 124.0).abs() < 1e-6 && w.beats[0] == 0.0, "{:?}", &w.beats[..2]);
 }
 
@@ -335,7 +335,10 @@ fn a_slot_is_edited_and_cleared_as_undoable_steps() {
         "live.slot_set",
         json!({"column": 0, "slot": 0, "name": "Kick loop", "color": [1, 2, 3], "length_bars": 2, "gain_db": -6.0, "mode": "one_shot"}),
     );
-    assert_eq!(r, json!({"column": 0, "slot": 0, "name": "Kick loop", "color": [1, 2, 3], "mode": "one_shot", "length_beats": 8.0, "gain_db": -6.0}));
+    assert_eq!(
+        r,
+        json!({"column": 0, "slot": 0, "kind": "audio", "name": "Kick loop", "color": [1, 2, 3], "mode": "one_shot", "length_beats": 8.0, "gain_db": -6.0})
+    );
     let undo = e.undo_history().len();
     run(&mut e, "live.slot_set", json!({"column": 0, "slot": 0, "name": "Kick loop"}));
     assert_eq!(e.undo_history().len(), undo, "no change, no undo step");
@@ -352,12 +355,12 @@ fn a_slot_is_edited_and_cleared_as_undoable_steps() {
         assert!(err(&mut e, "live.slot_set", p.clone()).contains(why), "{p}");
     }
     run(&mut e, "live.slot_clear", json!({"column": 0, "slot": 0}));
-    assert!(e.session().live.slot(0, 0).is_none());
+    assert!(e.session().live.audio_slot(0, 0).is_none());
     assert!(err(&mut e, "live.slot_clear", json!({"column": 0, "slot": 0})).contains("empty"));
     assert!(e.undo());
-    assert_eq!(e.session().live.slot(0, 0).unwrap().name, "Kick loop");
+    assert_eq!(e.session().live.audio_slot(0, 0).unwrap().name, "Kick loop");
     assert!(e.undo());
-    let slot = e.session().live.slot(0, 0).unwrap();
+    let slot = e.session().live.audio_slot(0, 0).unwrap();
     assert_eq!((slot.name.as_str(), slot.mode, slot.length_beats), ("a", SlotMode::Loop, 20.0));
 }
 
@@ -393,7 +396,7 @@ fn slots_and_their_stems_survive_save_and_reopen() {
     let missing = soundcraft_engine::io::open_session(&mut back, file.to_str().unwrap()).unwrap();
     assert!(missing.is_empty(), "{missing:?}");
     assert_eq!(back.session().live, e.session().live);
-    let slot = back.session().live.slot(0, 3).unwrap();
+    let slot = back.session().live.audio_slot(0, 3).unwrap();
     assert!(slot.audio_sources().all(|x| back.session().pool.contains(x)), "the slot's source and stems load");
 
     // A stem file gone from disk: the slot plays its own audio, and says so.
@@ -402,7 +405,7 @@ fn slots_and_their_stems_survive_save_and_reopen() {
     let mut again = Engine::default();
     let missing = soundcraft_engine::io::open_session(&mut again, file.to_str().unwrap()).unwrap();
     assert!(missing.iter().any(|m| m.contains("Live 1 slot 4") && m.contains("stems missing")), "{missing:?}");
-    let slot = again.session().live.slot(0, 3).unwrap();
+    let slot = again.session().live.audio_slot(0, 3).unwrap();
     assert_eq!((&slot.stems, slot.stem_mask), (&None, [true; 4]));
 }
 
@@ -512,11 +515,11 @@ fn a_file_under_a_bar_from_its_downbeat_is_a_one_shot() {
     let src = SourceId(r["source"].as_u64().unwrap());
     let frames = e.session().source(src).unwrap().frames;
     assert!((10_000..20_000).contains(&frames), "about 0.3 s: {frames}");
-    assert!(e.session().live.slot(0, 0).unwrap().warp.is_none());
+    assert!(e.session().live.audio_slot(0, 0).unwrap().warp.is_none());
     // A first downbeat past the end of a 2 s file.
     let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "b.wav", 2.0), "bpm": 120, "first_beat": 5.0}));
     assert_eq!((r["mode"].as_str(), &r["grid"]), (Some("one_shot"), &Value::Null), "{r}");
-    assert!(e.session().live.slot(0, 1).unwrap().warp.is_none());
+    assert!(e.session().live.audio_slot(0, 1).unwrap().warp.is_none());
 }
 
 #[test]
@@ -593,7 +596,7 @@ fn a_slot_file_job_loads_off_the_thread_and_fills_the_slot_in_one_undo_step() {
     assert_eq!((r["grid"].as_str(), r["length_beats"].as_f64()), (Some("mixforge"), Some(20.0)), "{r}");
     assert_eq!(e.undo_history().len(), undo + 1);
     assert_eq!(asked.lock().unwrap().len(), 1, "applying doesn't analyse again");
-    assert!(e.session().live.slot(2, 0).is_some());
+    assert!(e.session().live.audio_slot(2, 0).is_some());
     // A file that won't decode fails in the job, leaving the session alone.
     let junk = dir.0.join("junk.wav");
     std::fs::write(&junk, "not audio").unwrap();

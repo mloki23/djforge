@@ -168,7 +168,7 @@ fn a_selection_fills_a_slot_that_launches_by_click_and_stops() {
         s.edit.selection = soundcraft_time::Range::new(0, 4 * 96_000);
     }
     menu(&mut h, "Live 1 slot 3", "Add Selection Here");
-    let slot = h.state().engine.session().live.slot(0, 2).cloned().unwrap();
+    let slot = h.state().engine.session().live.audio_slot(0, 2).cloned().unwrap();
     assert_eq!((slot.length_beats, slot.mode), (16.0, SlotMode::Loop));
     // Quantise to a quarter note so the test waits half a second, not a bar.
     h.state_mut().run("live.quantise", json!({"value": "1/4"})).unwrap();
@@ -278,7 +278,7 @@ fn a_dropped_file_loads_into_the_slot_under_the_pointer() {
         step(&mut h);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let slot = h.state().engine.session().live.slot(2, 5).cloned().unwrap();
+    let slot = h.state().engine.session().live.audio_slot(2, 5).cloned().unwrap();
     assert_eq!((slot.name.as_str(), slot.mode), ("hit", SlotMode::OneShot));
     assert!(h.state().ui.status.contains("Loaded hit.wav into Live 3 slot 6 as a one-shot"), "{}", h.state().ui.status);
     assert_eq!(h.state().engine.session().tracks.len(), tracks, "nothing was imported into the arrangement");
@@ -304,7 +304,7 @@ fn the_slot_menu_edits_and_clears() {
     let undo = h.state().engine.undo_history().len();
     h.get_by_label("OK").click();
     steps(&mut h, 3);
-    let slot = h.state().engine.session().live.slot(1, 0).cloned().unwrap();
+    let slot = h.state().engine.session().live.audio_slot(1, 0).cloned().unwrap();
     assert_eq!((slot.name.as_str(), slot.length_beats, slot.gain_db), ("Drums", 8.0, -6.0));
     assert_eq!(h.state().engine.undo_history().len(), undo + 1, "one undo step");
     assert!(h.state().session_view.edit.is_none());
@@ -368,4 +368,42 @@ fn the_edit_dialog_closes_when_its_slot_changes_and_keeps_refused_edits() {
     h.state_mut().run("live.slot_clear", json!({"column": 0, "slot": 0})).unwrap();
     steps(&mut h, 3);
     assert!(h.state().session_view.edit.is_none());
+}
+
+/// A column name's menu adds an instrument column; its slot menu writes a drum pattern or copies
+/// the selected MIDI clip, and a MIDI slot launches by click like an audio slot.
+#[test]
+fn an_instrument_columns_midi_slots_fill_from_the_menus_and_launch() {
+    let dir = Scratch::new("midi");
+    let (mut h, _) = harness(&dir.0);
+    open(&mut h);
+    menu(&mut h, "Live 1", "Add Instrument Column");
+    let s = h.state().engine.session();
+    assert_eq!(s.live.column_kind(4, &s.tracks), Some(soundcraft_model::SlotKind::Midi));
+    steps(&mut h, 2);
+    menu(&mut h, "Live 5 slot 1", "Trance Drums Pattern Here");
+    assert_eq!(h.state().engine.session().live.midi_slot(4, 0).map(|x| x.name.as_str()), Some("Trance Full"));
+    {
+        let s = h.state_mut().engine.session_mut();
+        let t = s.add_track(soundcraft_model::TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, Some("Keys"));
+        let notes = (0..4)
+            .map(|b| soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: b * 960, length: 480 })
+            .collect();
+        let id = s.new_clip_id();
+        let clip = soundcraft_model::Clip::midi(id, "Lead", 0, 96_000, soundcraft_midi::Sequence { notes, ctrls: Vec::new() });
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(clip);
+        s.edit.selected_clips = vec![id];
+    }
+    steps(&mut h, 2);
+    menu(&mut h, "Live 5 slot 2", "Copy Selected MIDI Clip Here");
+    assert_eq!(h.state().engine.session().live.midi_slot(4, 1).map(|x| (x.name.as_str(), x.length_beats)), Some(("Lead", 4.0)));
+    h.state_mut().run("live.quantise", json!({"value": "1/4"})).unwrap();
+    h.get_by_label("Live 5 slot 1").click();
+    let s = until(&mut h, |s| playing(s, 4) == Some(0));
+    assert_eq!(playing(&s, 4), Some(0), "{s}");
+    assert_eq!(s["columns"][4]["playing"]["kind"].as_str(), Some("midi"));
+    assert!(s["columns"][4]["playing"]["loop_beat"].as_f64().is_some(), "{s}");
+    h.get_by_label("■ Stop 5").click();
+    let s = until(&mut h, |s| playing(s, 4).is_none());
+    assert_eq!(playing(&s, 4), None, "{s}");
 }

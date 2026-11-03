@@ -6,10 +6,13 @@ use super::*;
 use crate::{TransportRequest, cmd};
 use serde_json::json;
 use soundcraft_model::{
-    ChannelFormat, LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, Session, Slot, SlotMode, TrackKind,
+    ChannelFormat, ClipContent, LIVE_COLUMNS, LIVE_SLOTS, LiveColumn, MAX_LIVE_COLUMNS, MAX_SLOT_BEATS, MidiSlot, Quantise, SLOT_GAIN_DB, Session,
+    Slot, SlotContent, SlotKind, SlotMode, TrackKind,
 };
 
 const SETUP: &str = "live.setup";
+const ADD_COLUMN: &str = "live.add_column";
+const FROM_CLIP: &str = "live.slot_from_clip";
 const FROM_SELECTION: &str = "live.slot_from_selection";
 const FROM_FILE: &str = "live.slot_from_file";
 const SET: &str = "live.slot_set";
@@ -26,9 +29,27 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Up Session View",
             [],
             None,
-            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one. Returns {columns: [track ids], created}",
+            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track with the trance_kit preset when it holds MIDI slots). Returns {columns: [track ids], created}",
             always,
             setup
+        ),
+        cmd!(
+            "live.add_column",
+            "Add Live Column",
+            [],
+            None,
+            "{kind?: audio|instrument (default audio), preset?: id (prod.presets; instrument columns, default trance_kit)} — adds a Live column after the others (\"Live N\", at most 16): a stereo audio track whose slots hold audio, or an instrument track with the preset's built-in instrument whose slots hold MIDI. One undo step. Returns {column, track, kind, preset}",
+            always,
+            add_column
+        ),
+        cmd!(
+            "live.slot_from_clip",
+            "Copy MIDI Clip to Slot",
+            [],
+            None,
+            "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (at least 1); notes starting past that end are left out, and controllers are not copied. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
+            has_live,
+            from_clip
         ),
         cmd!(
             "live.slot_from_selection",
@@ -53,7 +74,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Slot",
             [],
             None,
-            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1..=256 whole 4-beat bars; needs 4/4 throughout), gain_db? (-144..=24)} — edits a filled slot; a slot without a beat grid plays only as a one-shot",
+            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1..=256 whole 4-beat bars; needs 4/4 throughout), gain_db? (-144..=24)} — edits a filled slot, audio or MIDI; a slot without a beat grid plays only as a one-shot, and a MIDI slot only loops (its gain scales its velocities)",
             has_live,
             set
         ),
@@ -62,7 +83,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clear Slot",
             [],
             None,
-            "{column, slot (0-based)} — empties a slot; its audio file stays in the Clip List",
+            "{column, slot (0-based)} — empties a slot, audio or MIDI; an audio slot's file stays in the Clip List",
             has_live,
             clear
         ),
@@ -100,7 +121,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Session View State",
             [],
             None,
-            "{} — per column: its track, the slot playing (with where it is in its loop, in beats) and the launch or stop queued, as the audio engine last reported; plus the transport and the launch quantise",
+            "{} — per column: its track, its kind (audio|instrument, null when its track is lost), each slot's kind (audio|midi) and name, the slot playing (with where it is in its loop, in beats) and the launch or stop queued, as the audio engine last reported; plus the transport and the launch quantise",
             always,
             state
         ),
@@ -126,19 +147,20 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
     let mut created = 0usize;
     if !lost.is_empty() || more > 0 {
         let s = e.session_mut();
-        let mut make = |s: &mut Session, i: usize| {
+        let mut make = |s: &mut Session, i: usize, kind: SlotKind| {
             created += 1;
-            s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(&format!("Live {}", i + 1)))
+            column_track(s, i, kind, None)
         };
-        // A column whose track was lost keeps its slots on a new track.
+        // A column whose track was lost keeps its slots on a new track of the kind they play.
         for i in lost {
-            let track = make(s, i);
+            let midi = s.live.columns.get(i).is_some_and(|c| c.slots.iter().flatten().any(|x| x.kind() == SlotKind::Midi));
+            let track = make(s, i, if midi { SlotKind::Midi } else { SlotKind::Audio });
             if let Some(c) = s.live.columns.get_mut(i) {
                 c.track = track;
             }
         }
         for i in s.live.columns.len()..want {
-            let track = make(s, i);
+            let track = make(s, i, SlotKind::Audio);
             s.live.columns.push(LiveColumn::new(track));
         }
     }
@@ -146,8 +168,77 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"columns": columns, "created": created}))
 }
 
+/// The track for column `i`: "Live {i + 1}", a stereo audio track, or for MIDI an instrument track
+/// with `preset`'s built-in instrument (the drums default, `trance_kit`, when `None`).
+fn column_track(s: &mut Session, i: usize, kind: SlotKind, preset: Option<&'static super::prod_presets::Preset>) -> TrackId {
+    let name = format!("Live {}", i + 1);
+    match kind {
+        SlotKind::Audio => s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(&name)),
+        SlotKind::Midi => {
+            let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&name));
+            let preset = preset.or_else(|| super::prod_presets::preset(DEFAULT_PRESET));
+            let ins = preset
+                .and_then(|x| soundcraft_dsp::plugin_info(x.instrument).map(|info| super::instrument::plugin_with(info, x.params.iter().copied())));
+            if let Some(tr) = s.track_mut(t) {
+                tr.instrument = ins;
+            }
+            t
+        }
+    }
+}
+
+/// The preset an instrument column's track starts with.
+const DEFAULT_PRESET: &str = "trance_kit";
+
+fn add_column(e: &mut Engine, p: &Value) -> Result<Value> {
+    let kind = match p.get("kind") {
+        None | Some(Value::Null) => SlotKind::Audio,
+        Some(v) => match v.as_str() {
+            Some("audio") => SlotKind::Audio,
+            Some("instrument") => SlotKind::Midi,
+            _ => return Err(bad(ADD_COLUMN, "`kind` must be audio or instrument")),
+        },
+    };
+    let preset = match (p.get("preset"), kind) {
+        (None | Some(Value::Null), _) => None,
+        (Some(_), SlotKind::Audio) => return Err(bad(ADD_COLUMN, "`preset` is for instrument columns")),
+        (Some(v), SlotKind::Midi) => {
+            let id = v.as_str().ok_or_else(|| bad(ADD_COLUMN, "`preset` must be a preset id (prod.presets)"))?;
+            Some(super::prod_presets::preset(id).ok_or_else(|| bad(ADD_COLUMN, format!("unknown preset `{id}` (prod.presets lists them)")))?)
+        }
+    };
+    let column = e.session().live.columns.len();
+    if column >= MAX_LIVE_COLUMNS {
+        return Err(bad(ADD_COLUMN, format!("the Session view has its most columns ({MAX_LIVE_COLUMNS})")));
+    }
+    let s = e.session_mut();
+    let track = column_track(s, column, kind, preset);
+    s.live.columns.push(LiveColumn::new(track));
+    let preset = (kind == SlotKind::Midi).then(|| preset.map_or(DEFAULT_PRESET, |x| x.id));
+    let kind = if kind == SlotKind::Midi { "instrument" } else { "audio" };
+    Ok(json!({"column": column, "track": track, "kind": kind, "preset": preset}))
+}
+
+/// Refuses a slot of `kind` for column `column`: MIDI goes only in an instrument column, audio
+/// only in an audio track's. A lost column takes either (its track is made when it is set up).
+pub(super) fn takes(e: &Engine, cmd: &str, column: usize, kind: SlotKind) -> Result<()> {
+    let s = e.session();
+    match s.live.column_kind(column, &s.tracks) {
+        Some(k) if k != kind => Err(bad(
+            cmd,
+            match kind {
+                SlotKind::Midi => {
+                    format!("Live column {} is an audio column: MIDI goes in an instrument column (live.add_column kind: instrument)", column + 1)
+                }
+                SlotKind::Audio => format!("Live column {} is an instrument column: it holds MIDI slots, not audio", column + 1),
+            },
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The 0-based column `p` names, which must exist.
-fn column_param(e: &Engine, cmd: &str, p: &Value) -> Result<usize> {
+pub(super) fn column_param(e: &Engine, cmd: &str, p: &Value) -> Result<usize> {
     let n = e.session().live.columns.len();
     if n == 0 {
         return Err(bad(cmd, NO_COLUMNS));
@@ -157,7 +248,7 @@ fn column_param(e: &Engine, cmd: &str, p: &Value) -> Result<usize> {
 }
 
 /// The 0-based slot `p` names, if it names one.
-fn slot_param(cmd: &str, p: &Value) -> Result<Option<usize>> {
+pub(super) fn slot_param(cmd: &str, p: &Value) -> Result<Option<usize>> {
     match p.get("slot") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v
@@ -170,7 +261,7 @@ fn slot_param(cmd: &str, p: &Value) -> Result<Option<usize>> {
 }
 
 /// The slot a new slot goes into: the one `p` names, else the column's first empty one.
-fn target(e: &Engine, cmd: &str, p: &Value, column: usize) -> Result<usize> {
+pub(super) fn target(e: &Engine, cmd: &str, p: &Value, column: usize) -> Result<usize> {
     if let Some(r) = slot_param(cmd, p)? {
         return Ok(r);
     }
@@ -195,7 +286,7 @@ fn not_four_four(s: &Session) -> Option<String> {
 }
 
 /// Refuses a session whose meter is not 4/4 throughout, where slot bars would not be bars.
-fn four_four(cmd: &str, s: &Session) -> Result<()> {
+pub(super) fn four_four(cmd: &str, s: &Session) -> Result<()> {
     not_four_four(s).map_or(Ok(()), |why| Err(bad(cmd, why)))
 }
 
@@ -210,9 +301,9 @@ fn bar_at_or_before(beat: f64) -> f64 {
 }
 
 /// Puts `slot` at `column`, `row`.
-fn put(e: &mut Engine, column: usize, row: usize, slot: Slot) {
+pub(super) fn put(e: &mut Engine, column: usize, row: usize, slot: impl Into<SlotContent>) {
     if let Some(cell) = e.session_mut().live.columns.get_mut(column).and_then(|c| c.slots.get_mut(row)) {
-        *cell = Some(slot);
+        *cell = Some(slot.into());
     }
 }
 
@@ -270,6 +361,7 @@ fn slot_from_selection(s: &Session, tracks: &[TrackId], sel: Range) -> std::resu
 
 fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, FROM_SELECTION, p)?;
+    takes(e, FROM_SELECTION, column, SlotKind::Audio)?;
     let row = target(e, FROM_SELECTION, p, column)?;
     let tracks = match track_param(e, FROM_SELECTION, p, "track")? {
         Some(t) => vec![t],
@@ -279,6 +371,51 @@ fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
     four_four(FROM_SELECTION, s)?;
     let (slot, bars) = slot_from_selection(s, &tracks, s.edit.selection).map_err(|why| bad(FROM_SELECTION, why))?;
     let out = json!({"column": column, "slot": row, "start_beat": slot.start_beat, "length_beats": slot.length_beats, "bars": bars});
+    put(e, column, row, slot);
+    Ok(out)
+}
+
+fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
+    let column = column_param(e, FROM_CLIP, p)?;
+    takes(e, FROM_CLIP, column, SlotKind::Midi)?;
+    let row = target(e, FROM_CLIP, p, column)?;
+    let s = e.session();
+    four_four(FROM_CLIP, s)?;
+    let id = match p.get("clip") {
+        None | Some(Value::Null) => {
+            let midi: Vec<ClipId> = s
+                .edit
+                .selected_clips
+                .iter()
+                .copied()
+                .filter(|c| s.find_clip(*c).is_some_and(|(_, x)| matches!(x.content, ClipContent::Midi { .. })))
+                .collect();
+            match midi.as_slice() {
+                [one] => *one,
+                [] => return Err(bad(FROM_CLIP, "select a MIDI clip first (or pass `clip`)")),
+                _ => return Err(bad(FROM_CLIP, "several MIDI clips are selected: select one (or pass `clip`)")),
+            }
+        }
+        Some(v) => ClipId(v.as_u64().ok_or_else(|| bad(FROM_CLIP, "`clip` must be a clip id"))?),
+    };
+    let (track, clip) = s.find_clip(id).ok_or_else(|| bad(FROM_CLIP, format!("no clip with id {}", id.0)))?;
+    let ClipContent::Midi { sequence } = &clip.content else {
+        return Err(bad(FROM_CLIP, format!("`{}` is not a MIDI clip", clip.name)));
+    };
+    // The clip's length in session beats, snapped to whole bars.
+    let ticks = |t: Samples| s.tempo.samples_to_ticks_f(t, s.sample_rate);
+    let beats = (ticks(clip.end()) - ticks(clip.start)) / soundcraft_time::TICKS_PER_QUARTER as f64;
+    let bars = (beats / BAR).round().clamp(1.0, (MAX_SLOT_BEATS / BAR).floor());
+    let length_beats = bars * BAR;
+    let len_ticks = (length_beats * soundcraft_time::TICKS_PER_QUARTER as f64).round() as i64;
+    let mut sequence = sequence.clone();
+    // What a start trim hid (before tick 0) and what starts past the loop never play.
+    sequence.notes.retain(|n| (0..len_ticks).contains(&n.start));
+    let controllers_dropped = std::mem::take(&mut sequence.ctrls).len();
+    let color = clip.color.or_else(|| s.track(track).map(|t| t.color)).unwrap_or([128, 128, 128]);
+    let slot = MidiSlot { name: clip.name.clone(), color, sequence, length_beats, gain_db: 0.0 };
+    let out = json!({"column": column, "slot": row, "clip": id, "name": slot.name, "bars": bars, "length_beats": length_beats,
+        "notes": slot.sequence.notes.len(), "controllers_dropped": controllers_dropped});
     put(e, column, row, slot);
     Ok(out)
 }
@@ -295,6 +432,7 @@ struct FileParams {
 
 fn file_params(e: &Engine, p: &Value) -> Result<FileParams> {
     let column = column_param(e, FROM_FILE, p)?;
+    takes(e, FROM_FILE, column, SlotKind::Audio)?;
     let path = str_param(p, "path").ok_or_else(|| bad(FROM_FILE, "`path` required"))?.to_string();
     let row = target(e, FROM_FILE, p, column)?;
     let bpm = match p.get("bpm") {
@@ -509,7 +647,7 @@ fn tagged_bpm(path: &str) -> Option<f64> {
 }
 
 /// The filled slot `p` names (`column` and `slot` both required).
-fn filled(e: &Engine, cmd: &str, p: &Value) -> Result<(usize, usize, Slot)> {
+fn filled(e: &Engine, cmd: &str, p: &Value) -> Result<(usize, usize, SlotContent)> {
     let column = column_param(e, cmd, p)?;
     let row = slot_param(cmd, p)?.ok_or_else(|| bad(cmd, "`slot` required (0-based)"))?;
     let slot =
@@ -523,20 +661,19 @@ fn set(e: &mut Engine, p: &Value) -> Result<Value> {
         return Err(bad(SET, "nothing to set: pass name, color, mode, length_bars or gain_db"));
     }
     let mut slot = old.clone();
+    // The fields both kinds have.
+    let (name, color, length_beats, gain_db) = match &mut slot {
+        SlotContent::Audio(x) => (&mut x.name, &mut x.color, &mut x.length_beats, &mut x.gain_db),
+        SlotContent::Midi(x) => (&mut x.name, &mut x.color, &mut x.length_beats, &mut x.gain_db),
+    };
     if let Some(v) = p.get("name") {
-        let mut name = v.as_str().ok_or_else(|| bad(SET, "`name` must be text"))?.to_string();
-        soundcraft_model::truncate_chars(&mut name, soundcraft_model::MAX_NAME_CHARS);
-        slot.name = name;
+        let mut text = v.as_str().ok_or_else(|| bad(SET, "`name` must be text"))?.to_string();
+        soundcraft_model::truncate_chars(&mut text, soundcraft_model::MAX_NAME_CHARS);
+        *name = text;
     }
     if let Some(v) = p.get("color") {
         let rgb: Option<Vec<u8>> = v.as_array().and_then(|a| a.iter().map(|c| c.as_u64().and_then(|c| u8::try_from(c).ok())).collect());
-        slot.color = rgb.and_then(|c| <[u8; 3]>::try_from(c).ok()).ok_or_else(|| bad(SET, "`color` must be [r, g, b], each 0..=255"))?;
-    }
-    if let Some(v) = p.get("mode") {
-        slot.mode = v.as_str().and_then(SlotMode::from_id).ok_or_else(|| bad(SET, "`mode` must be loop or one_shot"))?;
-        if slot.mode == SlotMode::Loop && slot.warp.is_none() {
-            return Err(bad(SET, "this slot has no beat grid, so it plays only as a one-shot: load the file again with a `bpm`"));
-        }
+        *color = rgb.and_then(|c| <[u8; 3]>::try_from(c).ok()).ok_or_else(|| bad(SET, "`color` must be [r, g, b], each 0..=255"))?;
     }
     if let Some(v) = p.get("length_bars") {
         four_four(SET, e.session())?;
@@ -545,14 +682,26 @@ fn set(e: &mut Engine, p: &Value) -> Result<Value> {
             .as_f64()
             .filter(|b| b.fract() == 0.0 && (1.0..=most).contains(b))
             .ok_or_else(|| bad(SET, format!("`length_bars` must be a whole number 1..={most}")))?;
-        slot.length_beats = bars * BAR;
+        *length_beats = bars * BAR;
     }
     if let Some(v) = p.get("gain_db") {
         let (lo, hi) = SLOT_GAIN_DB;
-        slot.gain_db =
+        *gain_db =
             v.as_f64().map(|g| g as f32).filter(|g| (lo..=hi).contains(g)).ok_or_else(|| bad(SET, format!("`gain_db` must be {lo}..={hi}")))?;
     }
-    let out = json!({"column": column, "slot": row, "name": slot.name, "color": slot.color, "mode": slot.mode.id(), "length_beats": slot.length_beats, "gain_db": slot.gain_db});
+    if let Some(v) = p.get("mode") {
+        let mode = v.as_str().and_then(SlotMode::from_id).ok_or_else(|| bad(SET, "`mode` must be loop or one_shot"))?;
+        match &mut slot {
+            SlotContent::Audio(x) if mode == SlotMode::Loop && x.warp.is_none() => {
+                return Err(bad(SET, "this slot has no beat grid, so it plays only as a one-shot: load the file again with a `bpm`"));
+            }
+            SlotContent::Audio(x) => x.mode = mode,
+            SlotContent::Midi(_) if mode != SlotMode::Loop => return Err(bad(SET, "a MIDI slot only loops")),
+            SlotContent::Midi(_) => {}
+        }
+    }
+    let out = json!({"column": column, "slot": row, "kind": slot.kind().id(), "name": slot.name(), "color": slot.color(), "mode": slot.mode().id(),
+        "length_beats": slot.length_beats(), "gain_db": slot.gain_db()});
     if slot != old {
         put(e, column, row, slot);
     }
@@ -756,13 +905,19 @@ fn state(e: &mut Engine, _: &Value) -> Result<Value> {
                 let slot = s.live.slot(c, row);
                 // Where a loop is: session beats since its launch beat, wrapped to its length, as
                 // the mixer plays it (counted from `origin`, which transport jumps don't move).
-                let looping = slot.filter(|x| soundcraft_mix::slot_loops(x));
-                let position = looping.map(|x| (beat(now) - beat(status.origin)).rem_euclid(x.length_beats.max(1.0)));
-                json!({"slot": row, "name": slot.map(|x| x.name.as_str()), "start": start, "loop_beat": position,
-                    "length_beats": looping.map(|x| x.length_beats)})
+                let looping = slot.filter(|x| x.midi().is_some() || x.audio().is_some_and(soundcraft_mix::slot_loops));
+                let position = looping.map(|x| (beat(now) - beat(status.origin)).rem_euclid(x.length_beats().max(1.0)));
+                json!({"slot": row, "name": slot.map(SlotContent::name), "kind": slot.map(|x| x.kind().id()), "start": start, "loop_beat": position,
+                    "length_beats": looping.map(SlotContent::length_beats)})
             });
             let queued = status.queued.map(|(row, at)| json!({"slot": row, "at": at, "stop": row.is_none()}));
-            json!({"column": c, "track": s.live.column_track(c, &s.tracks), "playing": playing, "queued": queued})
+            let kind = s.live.column_kind(c, &s.tracks).map(|k| if k == SlotKind::Midi { "instrument" } else { "audio" });
+            let slots: Vec<Value> = (0..LIVE_SLOTS)
+                .map(|r| {
+                    s.live.slot(c, r).map_or(Value::Null, |x| json!({"name": x.name(), "kind": x.kind().id(), "length_beats": x.length_beats()}))
+                })
+                .collect();
+            json!({"column": c, "track": s.live.column_track(c, &s.tracks), "kind": kind, "slots": slots, "playing": playing, "queued": queued})
         })
         .collect();
     Ok(json!({"transport": {"playing": e.transport.playing, "position": now}, "quantise": s.live.quantise.id(),

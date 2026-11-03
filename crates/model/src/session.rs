@@ -442,7 +442,7 @@ impl Session {
 
     /// Session view slots that play `src`, as their source or as one of their stems, with their
     /// column and row.
-    pub fn slots_using(&self, src: SourceId) -> impl Iterator<Item = (usize, usize, &crate::Slot)> {
+    pub fn slots_using(&self, src: SourceId) -> impl Iterator<Item = (usize, usize, &crate::SlotContent)> {
         self.live.slots().filter(move |(_, _, s)| s.audio_sources().any(|x| x == src))
     }
 
@@ -668,7 +668,7 @@ impl Session {
             self.tracks.iter().flat_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| c.id.0))).collect();
         self.midi_originals.retain(|id, _| clip_ids.contains(id));
         self.dj.sanitize(&self.tracks);
-        self.live.sanitize(&self.sources);
+        self.live.sanitize(&self.sources, &self.tracks);
         if !self.edit.zoom.samples_per_px.is_finite() || self.edit.zoom.samples_per_px <= 0.0 {
             self.edit.zoom.samples_per_px = 1024.0;
         }
@@ -921,7 +921,7 @@ mod tests {
         slot.stems = Some(crate::StemSet { scale_log2: 2, key: "k".into(), sources: [SourceId(11), SourceId(12), SourceId(13), SourceId(14)] });
         slot.stem_mask = [true, false, false, false];
         let mut col = crate::LiveColumn::new(a);
-        col.slots[2] = Some(slot);
+        col.slots[2] = Some(slot.into());
         s.live.columns = vec![col, crate::LiveColumn::new(b)];
         s.live.quantise = crate::Quantise::Bar(2);
         s.sanitize();
@@ -951,9 +951,9 @@ mod tests {
         s.tracks.retain(|t| t.id != b);
         let mut stray = crate::Slot::one_shot("Gone", [0; 3], SourceId(99));
         stray.length_beats = -4.0;
-        s.live.columns[0].slots[0] = Some(stray);
+        s.live.columns[0].slots[0] = Some(stray.into());
         let mut lost_stem = s.live.columns[0].slots[2].clone();
-        if let Some(set) = lost_stem.as_mut().and_then(|x| x.stems.as_mut()) {
+        if let Some(set) = lost_stem.as_mut().and_then(|x| x.audio_mut().and_then(|a| a.stems.as_mut())) {
             set.sources[3] = SourceId(98);
         }
         s.live.columns[0].slots[5] = lost_stem;
@@ -966,9 +966,9 @@ mod tests {
         assert_eq!(back.live.lost_columns(&back.tracks), [1]);
         let col = &back.live.columns[0];
         assert!(col.slots[0].is_none(), "its source is missing");
-        let kept = col.slots[5].as_ref().unwrap();
+        let kept = col.slots[5].as_ref().and_then(crate::SlotContent::audio).unwrap();
         assert_eq!((&kept.stems, kept.stem_mask, kept.source), (&None, [true; 4], SourceId(7)), "a stem is missing: it plays its own audio");
-        assert!(col.slots[2].as_ref().unwrap().stems.is_some());
+        assert!(col.slots[2].as_ref().unwrap().audio().unwrap().stems.is_some());
     }
 
     #[test]
@@ -982,5 +982,63 @@ mod tests {
         }
         assert_eq!(s.slots_using(SourceId(8)).count(), 0);
         assert!(!s.used_sources().any(|x| x == SourceId(8)));
+    }
+    /// The `live` object exactly as stage 6 wrote it (audio slots only, no slot kinds).
+    const STAGE6_LIVE: &str = r#"{"columns": [
+        {"track": TRACK_A, "slots": [null, null, {"name": "Drums", "color": [10, 20, 30], "source": 7,
+            "warp": {"beats": [0.0, 24000.0, 48000.0], "anchor": 0.0}, "start_beat": 16.0, "length_beats": 16.0,
+            "stems": {"key": "k", "sources": [11, 12, 13, 14], "scale_log2": 2}, "stem_mask": [true, false, false, false],
+            "mode": "loop", "gain_db": -3.0}, null, null, null, null, null]},
+        {"track": TRACK_B, "slots": [null, null, null, null, null, null, null, null]}],
+        "quantise": {"Bar": 2}}"#;
+
+    #[test]
+    fn a_stage_6_session_loads_unchanged() {
+        let (s, a, b) = live_session();
+        let mut v = serde_json::to_value(&s).unwrap();
+        let live = STAGE6_LIVE.replace("TRACK_A", &a.0.to_string()).replace("TRACK_B", &b.0.to_string());
+        v["live"] = serde_json::from_str(&live).unwrap();
+        let back = Session::from_json(&v.to_string()).unwrap();
+        assert_eq!(back.live, s.live, "the same slot, columns and quantise as live_session builds");
+        assert_eq!(back.live.audio_slot(0, 2).map(|x| x.source), Some(SourceId(7)));
+        assert_eq!(back.live.column_kind(0, &back.tracks), Some(crate::SlotKind::Audio));
+    }
+
+    fn midi_slot(name: &str) -> crate::MidiSlot {
+        let mut sequence = soundcraft_midi::Sequence::default();
+        sequence.notes.push(soundcraft_midi::Note { pitch: 36, velocity: 110, release_velocity: 64, channel: 0, start: 0, length: 120 });
+        crate::MidiSlot { name: name.into(), color: [1, 2, 3], sequence, length_beats: 16.0, gain_db: -2.0 }
+    }
+
+    /// MIDI slots round-trip on an instrument column. A slot of the wrong kind for its column's
+    /// track is emptied on load (it could never play there); a lost column keeps both kinds.
+    #[test]
+    fn midi_slots_round_trip_and_a_slot_of_the_wrong_kind_is_emptied() {
+        let (mut s, a, _) = live_session();
+        let inst = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Live 3"));
+        let mut col = crate::LiveColumn::new(inst);
+        col.slots[0] = Some(midi_slot("Kick").into());
+        col.slots[1] = s.live.columns[0].slots[2].clone();
+        s.live.columns.push(col);
+        s.live.columns[0].slots[3] = Some(midi_slot("Stray").into());
+        let mut lost = crate::LiveColumn::new(TrackId(9_999));
+        lost.slots[0] = Some(midi_slot("Waits").into());
+        lost.slots[1] = s.live.columns[0].slots[2].clone();
+        s.live.columns.push(lost.clone());
+        let back = Session::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(back.live.midi_slot(2, 0), Some(&midi_slot("Kick")));
+        assert_eq!(back.live.column_kind(2, &back.tracks), Some(crate::SlotKind::Midi));
+        assert!(back.live.slot(2, 1).is_none(), "audio on an instrument column is emptied");
+        assert!(back.live.slot(0, 3).is_none(), "MIDI on an audio column is emptied");
+        assert!(back.live.audio_slot(0, 2).is_some());
+        assert_eq!(back.live.columns[3], lost, "a lost column keeps both");
+        assert_eq!(back.live.column_track(0, &back.tracks), Some(a));
+        // A MIDI slot's length is whole bars, at least one.
+        let mut m = midi_slot("m");
+        for (len, want) in [(5.9, 4.0), (0.5, 4.0), (f64::NAN, 4.0), (1e9, crate::MAX_SLOT_BEATS), (10.1, 12.0)] {
+            m.length_beats = len;
+            m.sanitize();
+            assert_eq!(m.length_beats, want, "{len}");
+        }
     }
 }
