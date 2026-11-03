@@ -536,6 +536,43 @@ fn synth_follows_the_sustain_pedal_and_pitch_bend() {
 }
 
 #[test]
+fn synth_noise_is_unpitched_and_differs_per_voice() {
+    // White noise on both oscillators, the filter wide open: no period to find, and two voices
+    // (two notes) are two different noises rather than one doubled.
+    let noise = |notes: &[u8]| {
+        let mut p = prepared("subtractive_synth");
+        for (k, v) in [("osc1_wave", 4.0), ("osc2_wave", 4.0), ("cutoff", 20_000.0), ("filter_env_amount", 0.0), ("amp_sustain", 100.0)] {
+            p.set_param(k, v);
+        }
+        for &n in notes {
+            p.note_on(0, n, 127);
+        }
+        run(p.as_mut(), &[vec![0.0; 48_000]])
+    };
+    let one = noise(&[60]);
+    let x = &one[0][4800..];
+    assert!(rms(x) > 0.05, "noise sounds: {}", rms(x));
+    let corr = |lag: usize| x.iter().zip(&x[lag..]).map(|(a, b)| a * b).sum::<f32>() / x.iter().map(|a| a * a).sum::<f32>();
+    // The low-pass, even wide open, smooths neighbouring samples a little; beyond that, nothing.
+    assert!(corr(1) < 0.4, "{}", corr(1));
+    for lag in [3, 37, 91, 183, 367] {
+        assert!(corr(lag).abs() < 0.1, "white noise repeats at lag {lag}: {}", corr(lag));
+    }
+    let two = noise(&[60, 72]);
+    assert!(rms(&two[0][4800..]) < rms(x) * 1.8, "two voices add as uncorrelated noise, not in phase");
+    // Pink noise leans to the lows: smoother sample to sample than white.
+    let mut p = prepared("subtractive_synth");
+    for (k, v) in [("osc1_wave", 5.0), ("osc2_wave", 5.0), ("cutoff", 20_000.0), ("filter_env_amount", 0.0), ("amp_sustain", 100.0)] {
+        p.set_param(k, v);
+    }
+    p.note_on(0, 60, 127);
+    let pink = run(p.as_mut(), &[vec![0.0; 48_000]]);
+    let y = &pink[0][4800..];
+    let lag1 = y.iter().zip(&y[1..]).map(|(a, b)| a * b).sum::<f32>() / y.iter().map(|a| a * a).sum::<f32>();
+    assert!(rms(y) > 0.01 && lag1 > 0.5, "pink: rms {}, lag-1 correlation {lag1}", rms(y));
+}
+
+#[test]
 fn synth_event_offsets_are_sample_accurate() {
     let mut p = prepared("subtractive_synth");
     p.set_param("amp_attack", 0.5);

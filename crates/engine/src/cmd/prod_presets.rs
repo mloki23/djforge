@@ -1,10 +1,9 @@
 //! The built-in trance presets `prod.new_part` puts on a part: a built-in instrument and the
 //! parameters it starts from (every other parameter keeps its default).
 //!
-//! The Subtractive Synth offers Saw, Square, Sine and Triangle oscillators only, so the FX
-//! presets build their wash from detuned oscillators rather than noise. FX patterns play one
-//! note (`patterns::FX_PITCH`) and sweep cutoff and volume over it, so every FX preset is a
-//! Subtractive Synth that sounds on that note.
+//! FX patterns play one note (`patterns::FX_PITCH`) and sweep cutoff and volume over it, so
+//! every FX preset is a Subtractive Synth (white noise through its low-pass) that sounds on that
+//! note.
 
 use soundcraft_midi::patterns::PatternKind;
 
@@ -25,6 +24,7 @@ const SYNTH: &str = "subtractive_synth";
 const SAW: f64 = 0.0;
 const SQUARE: f64 = 1.0;
 const SINE: f64 = 2.0;
+const WHITE_NOISE: f64 = 4.0;
 
 pub(crate) const PRESETS: &[Preset] = &[
     // A short punchy kick that leaves room for a rolling bass, a snappy snare, crisp hats.
@@ -197,20 +197,18 @@ pub(crate) const PRESETS: &[Preset] = &[
             ("level", 0.0),
         ],
     },
-    // A saw and a square a quarter-tone apart through a resonant low-pass that opens over five
-    // seconds; the pattern's cutoff and volume sweep ride on top, so the cutoff starts low.
+    // White noise through a resonant low-pass that opens over five seconds as it fades in; the
+    // pattern's cutoff and volume sweep ride on top, so the cutoff starts low.
     Preset {
         id: "noise_riser",
         kind: PatternKind::Fx,
         instrument: SYNTH,
         params: &[
-            ("osc1_wave", SAW),
-            ("osc2_wave", SQUARE),
-            ("osc2_semitones", 0.0),
-            ("osc2_detune", 50.0),
-            ("osc_mix", 50.0),
+            ("osc1_wave", WHITE_NOISE),
+            ("osc2_wave", WHITE_NOISE),
+            ("osc_mix", 0.0),
             ("cutoff", 300.0),
-            ("resonance", 60.0),
+            ("resonance", 45.0),
             ("filter_env_amount", 60.0),
             ("filter_attack", 5000.0),
             ("filter_decay", 1000.0),
@@ -221,21 +219,21 @@ pub(crate) const PRESETS: &[Preset] = &[
             ("amp_sustain", 100.0),
             ("amp_release", 800.0),
             ("velocity", 0.0),
-            ("level", 0.0),
+            ("level", 3.0),
         ],
     },
-    // The riser in reverse: open at once and closing over four seconds; the pattern's volume
-    // sweep fades it, so it holds while the note does.
+    // The riser in reverse: white noise with a detuned saw for body, open at once and closing
+    // over four seconds; the pattern's volume sweep fades it, so it holds while the note does.
     Preset {
         id: "downlifter",
         kind: PatternKind::Fx,
         instrument: SYNTH,
         params: &[
-            ("osc1_wave", SAW),
+            ("osc1_wave", WHITE_NOISE),
             ("osc2_wave", SAW),
             ("osc2_semitones", 0.0),
             ("osc2_detune", 30.0),
-            ("osc_mix", 50.0),
+            ("osc_mix", 30.0),
             ("cutoff", 5000.0),
             ("resonance", 30.0),
             ("filter_env_amount", -60.0),
@@ -248,28 +246,28 @@ pub(crate) const PRESETS: &[Preset] = &[
             ("amp_sustain", 100.0),
             ("amp_release", 1000.0),
             ("velocity", 0.0),
-            ("level", 0.0),
+            ("level", 2.0),
         ],
     },
-    // A filter-swept saw crack over a sine two octaves down, ringing out for seconds after the
-    // pattern's beat-long note.
+    // A burst of white noise the filter envelope sweeps shut, over a sine two octaves down,
+    // ringing out for seconds after the pattern's beat-long note.
     Preset {
         id: "impact",
         kind: PatternKind::Fx,
         instrument: SYNTH,
         params: &[
-            ("osc1_wave", SAW),
+            ("osc1_wave", WHITE_NOISE),
             ("osc2_wave", SINE),
             ("osc2_semitones", -24.0),
             ("osc2_detune", 0.0),
-            ("osc_mix", 75.0),
-            ("cutoff", 120.0),
+            ("osc_mix", 70.0),
+            ("cutoff", 150.0),
             ("resonance", 10.0),
-            ("filter_env_amount", 90.0),
+            ("filter_env_amount", 100.0),
             ("filter_attack", 0.5),
-            ("filter_decay", 250.0),
+            ("filter_decay", 200.0),
             ("filter_sustain", 0.0),
-            ("filter_release", 250.0),
+            ("filter_release", 200.0),
             ("amp_attack", 0.5),
             ("amp_decay", 3000.0),
             ("amp_sustain", 0.0),

@@ -1,5 +1,6 @@
-//! Subtractive Synth: 16-voice polyphonic, two PolyBLEP oscillators, resonant state-variable
-//! low-pass (TPT form) with its own ADSR, amp ADSR, optional glide.
+//! Subtractive Synth: 16-voice polyphonic, two PolyBLEP oscillators (or white / pink noise, each
+//! voice with its own generator), resonant state-variable low-pass (TPT form) with its own ADSR,
+//! amp ADSR, optional glide.
 
 use crate::osc::{Osc, Waveform};
 use crate::params::{Params, choice, lin, log, param_plumbing};
@@ -57,13 +58,16 @@ impl EventQueue {
     }
 }
 
-const WAVES: &[&str] = &["Saw", "Square", "Sine", "Triangle"];
+/// Oscillator choices. Sessions store the index, so new waveforms only ever go on the end.
+const WAVES: &[&str] = &["Saw", "Square", "Sine", "Triangle", "White Noise", "Pink Noise"];
 
 fn wave(i: usize) -> Waveform {
     match i {
         1 => Waveform::Square,
         2 => Waveform::Sine,
         3 => Waveform::Triangle,
+        4 => Waveform::WhiteNoise,
+        5 => Waveform::PinkNoise,
         _ => Waveform::Saw,
     }
 }
@@ -525,5 +529,23 @@ impl Plugin for SubtractiveSynth {
 
     fn all_notes_off(&mut self) {
         self.events.push(0, EventKind::AllOff);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_waveform_indexes_keep_their_meaning() {
+        // Sessions saved before the noise waveforms store these indexes.
+        let old = [(0, "Saw", Waveform::Saw), (1, "Square", Waveform::Square), (2, "Sine", Waveform::Sine), (3, "Triangle", Waveform::Triangle)];
+        for (i, name, w) in old {
+            assert_eq!((WAVES[i], wave(i)), (name, w));
+        }
+        assert_eq!((WAVES[4], wave(4)), ("White Noise", Waveform::WhiteNoise));
+        assert_eq!((WAVES[5], wave(5)), ("Pink Noise", Waveform::PinkNoise));
+        assert_eq!(WAVES.len(), 6);
+        assert_eq!(SYNTH_INFO.param("osc1_wave").map(|p| p.max), Some(5.0));
     }
 }
