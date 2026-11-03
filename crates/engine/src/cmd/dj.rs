@@ -227,7 +227,11 @@ fn load_warped(e: &mut Engine, p: &Value) -> Result<Value> {
         (Some(b), _) => Beats::List(b),
         (None, Some(bpm)) => Beats::Constant { bpm, first: first_beat },
         (None, None) => {
-            let a = analyze_file(CMD, &path)?;
+            // Through the engine's analysis when the app set one up (a fake in tests).
+            let a = match e.analyse().cloned() {
+                Some(analyse) => analyse(&path, &|| false).map_err(|msg| bad(CMD, msg))?,
+                None => analyze_file(CMD, &path)?,
+            };
             let (bpm, first) = grid_of(&a).ok_or_else(|| bad(CMD, "mixforge's analysis has no usable bpm/first_downbeat"))?;
             analysis = Some(a);
             Beats::Constant { bpm, first }
@@ -999,6 +1003,33 @@ mod tests {
         let tracks = e.session().tracks.len();
         assert!(e.execute("dj.load_warped", &json!({"path": path, "beats": [1.0, "x"]})).is_err());
         assert!(e.execute("dj.load_warped", &json!({"path": path, "beats": [2.0, 1.0]})).is_err());
+        assert_eq!(e.session().tracks.len(), tracks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_warped_grids_and_keys_the_clip_through_the_apps_analysis() {
+        let dir = std::env::temp_dir().join(format!("sc-dj-load-analysed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 10 * SR as usize]] };
+        let path = dir.join("track.wav");
+        std::fs::write(&path, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut e = Engine::default();
+        e.set_analyse(std::sync::Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(json!({"bpm": 120.0, "first_downbeat": 0.5, "key": "Am"}))));
+        let r = e.execute("dj.load_warped", &json!({"path": path})).unwrap();
+        assert_eq!(r["downbeat_bar"], 2, "the fake's grid placed the clip");
+        assert_eq!(r["bpm"], 120.0);
+        let clip = ClipId(r["clip"].as_u64().unwrap());
+        let s = e.session();
+        let src = s.find_clip(clip).and_then(|(_, c)| c.source()).unwrap();
+        assert_eq!(s.source(src).and_then(|x| x.key.as_deref()), Some("8A"), "the analysed key lands on the clip's source");
+        // A failed analysis is the command's error, and imports nothing.
+        e.set_analyse(std::sync::Arc::new(|_: &str, _: &dyn Fn() -> bool| Err("no luck".to_string())));
+        let tracks = e.session().tracks.len();
+        let err = e.execute("dj.load_warped", &json!({"path": path})).unwrap_err();
+        assert!(err.to_string().contains("no luck"), "{err}");
         assert_eq!(e.session().tracks.len(), tracks);
         let _ = std::fs::remove_dir_all(&dir);
     }

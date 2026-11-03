@@ -1308,10 +1308,11 @@ mod tests {
             ("Ebmin", "2A"),
             ("C major", "8B"),
             ("E", "12B"),
+            ("1m", "8A"),
         ] {
             assert_eq!(to_camelot(k).as_deref(), Some(want), "{k}");
         }
-        for bad in ["13A", "0A", "+4B", "A1", "4C", "", "H", "Am7", "100A"] {
+        for bad in ["13A", "0A", "+4B", "A1", "4C", "", "H", "Am7", "100A", "AM"] {
             assert_eq!(to_camelot(bad), None, "{bad}");
         }
     }
