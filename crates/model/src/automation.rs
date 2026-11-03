@@ -67,7 +67,16 @@ pub enum AutoParam {
     Stem(u8),
 }
 
+/// The [`AutoParam::Plugin`] slot addressing a track's instrument: past any insert slot and
+/// before trim's (`u8::MAX`), so the instrument's lanes never drive an insert or the reverse.
+pub const INSTRUMENT_SLOT: u8 = u8::MAX - 1;
+
 impl AutoParam {
+    /// The lane of the track instrument's parameter `param`.
+    pub fn instrument(param: &str) -> AutoParam {
+        AutoParam::Plugin { slot: INSTRUMENT_SLOT, param: param.to_string() }
+    }
+
     pub fn label(&self) -> String {
         match self {
             AutoParam::Volume => "volume".into(),
@@ -77,6 +86,7 @@ impl AutoParam {
             AutoParam::SendLevel(i) => format!("send {} level", slot_letter(*i)),
             AutoParam::SendPan(i) => format!("send {} pan", slot_letter(*i)),
             AutoParam::SendMute(i) => format!("send {} mute", slot_letter(*i)),
+            AutoParam::Plugin { slot: INSTRUMENT_SLOT, param } => format!("instrument {param}"),
             AutoParam::Plugin { slot, param } => format!("insert {} {param}", slot_letter(*slot)),
             AutoParam::Stem(i) => match crate::STEMS.get(usize::from(*i)) {
                 Some(name) => format!("stem {name}"),
@@ -85,7 +95,7 @@ impl AutoParam {
         }
     }
     /// Parse ids like `volume`, `pan`, `pan2`, `mute`, `send_a_level`, `plugin:a:threshold`,
-    /// `stem:vocals` (or `stem:0`).
+    /// `instrument:cutoff`, `stem:vocals` (or `stem:0`).
     pub fn parse(s: &str) -> Option<AutoParam> {
         let s = s.trim().to_ascii_lowercase();
         match s.as_str() {
@@ -108,6 +118,9 @@ impl AutoParam {
         if let Some(rest) = s.strip_prefix("plugin:") {
             let (slot, param) = rest.split_once(':')?;
             return Some(AutoParam::Plugin { slot: letter_slot(slot)?, param: param.to_string() });
+        }
+        if let Some(param) = s.strip_prefix("instrument:").filter(|p| !p.is_empty()) {
+            return Some(AutoParam::instrument(param));
         }
         if let Some(rest) = s.strip_prefix("stem:") {
             let i = crate::STEMS.iter().position(|name| *name == rest).or_else(|| rest.parse().ok().filter(|i| *i < crate::STEMS.len()))?;
@@ -215,6 +228,25 @@ impl AutomationLane {
         self.set_point(end.saturating_add(1), after);
     }
 
+    /// Write `points` (ascending, all within `start..=end`) in place of the curve over that span,
+    /// keeping the surrounding curve intact with anchor points just outside it, as
+    /// [`write_range`](Self::write_range) does.
+    pub fn write_curve(&mut self, start: Samples, end: Samples, points: &[(Samples, f32)], default: f32) {
+        if end < start {
+            return;
+        }
+        let before = self.value_at(start.saturating_sub(1), default);
+        let after = self.value_at(end.saturating_add(1), default);
+        self.clear_range(start, end.saturating_add(1));
+        if start > 0 {
+            self.set_point(start - 1, before);
+        }
+        for &(at, value) in points.iter().filter(|(at, _)| (start..=end).contains(at)) {
+            self.set_point(at, value);
+        }
+        self.set_point(end.saturating_add(1), after);
+    }
+
     /// Thin: remove points whose removal changes the curve by less than `tolerance`.
     pub fn thin(&mut self, tolerance: f32) -> usize {
         if self.points.len() < 3 || tolerance.is_nan() {
@@ -287,6 +319,34 @@ mod tests {
         assert_eq!(l.value_at(100, 0.0), 0.0);
         assert_eq!(l.value_at(300, 0.0), -20.0);
         assert_eq!(l.value_at(600, 0.0), 0.0);
+    }
+
+    #[test]
+    fn write_curve_replaces_the_span_and_anchors_the_curve_around_it() {
+        let mut l = AutomationLane::new(AutoParam::instrument("cutoff"));
+        l.set_point(0, 100.0);
+        l.set_point(250, 900.0);
+        l.set_point(1000, 100.0);
+        l.write_curve(200, 400, &[(200, 1.0), (300, 2.0), (400, 3.0), (500, 9.0)], 0.0);
+        assert!((l.value_at(100, 0.0) - 420.0).abs() < 1e-3, "before: unchanged");
+        assert_eq!((l.value_at(200, 0.0), l.value_at(400, 0.0)), (1.0, 3.0));
+        assert!(l.points.iter().all(|p| p.at != 250 && p.at != 500), "the old point inside goes, a point past the end is not written");
+        let after_was = 900.0 + (100.0 - 900.0) * ((401.0 - 250.0) / 750.0);
+        assert!((l.value_at(401, 0.0) - after_was).abs() < 1e-3);
+        assert_eq!(l.value_at(1000, 0.0), 100.0);
+        // An empty lane keeps `default` outside.
+        let mut e = AutomationLane::new(AutoParam::instrument("level"));
+        e.write_curve(10, 20, &[(10, -30.0), (20, -6.0)], -12.0);
+        assert_eq!((e.value_at(0, 0.0), e.value_at(15, 0.0), e.value_at(30, 0.0)), (-12.0, -18.0, -12.0));
+    }
+
+    #[test]
+    fn instrument_lanes_have_their_own_slot_id_and_label() {
+        let p = AutoParam::instrument("cutoff");
+        assert_eq!(AutoParam::parse("instrument:cutoff"), Some(p.clone()));
+        assert_eq!(p.label(), "instrument cutoff");
+        assert_ne!(p, AutoParam::Plugin { slot: 0, param: "cutoff".into() });
+        assert_eq!(AutoParam::parse("instrument:"), None);
     }
 
     #[test]

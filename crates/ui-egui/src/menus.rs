@@ -106,6 +106,9 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > New Bass Part", "prod.new_part"),
     ("DJ > New Synth Part", "prod.new_part"),
     ("DJ > New FX Part", "prod.new_part"),
+    // A stand-in until the pattern dialog: the full trance groove on the selected part over the
+    // selected bars.
+    ("DJ > Trance Drums over Selection", "prod.pattern"),
 ];
 
 /// The kind of part each DJ menu New Part item makes.
@@ -436,6 +439,7 @@ fn params_for(path: &str, id: &str) -> Value {
         "dj.move_transition" => json!({"bars": if leaf.contains("Earlier") { -4 } else { 4 }}),
         "dj.nudge" => json!({"ms": if leaf.contains("Earlier") { -5.0 } else { 5.0 }}),
         "prod.new_part" => json!({"kind": PART_KINDS.iter().find(|(p, _)| *p == path).map_or("", |(_, k)| *k)}),
+        "prod.pattern" => json!({"kind": "drums", "style": "trance_full"}),
         _ => json!({}),
     }
 }
@@ -755,6 +759,18 @@ mod tests {
             invoke_menu(&mut app, "prod.new_part", path);
             assert_eq!(app.engine.session().tracks.last().map(|t| t.name.as_str()), Some(name), "{path}");
         }
+    }
+
+    #[test]
+    fn the_dj_menus_trance_drums_item_fills_the_selected_bars_of_the_selected_part() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        let path = "DJ > Trance Drums over Selection";
+        assert_eq!(command_for_path(path, &ui_aliases()).as_deref(), Some("prod.pattern"));
+        invoke_menu(&mut app, "prod.new_part", "DJ > New Drums Part");
+        app.engine.session_mut().edit.selection = soundcraft_time::Range::new(0, 96_000);
+        invoke_menu(&mut app, "prod.pattern", path);
+        let names: Vec<String> = app.engine.session().tracks.iter().flat_map(|t| t.clips()).map(|c| c.name.clone()).collect();
+        assert_eq!(names, ["Trance Full"]);
     }
 
     #[test]

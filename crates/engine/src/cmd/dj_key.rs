@@ -34,6 +34,18 @@ pub(crate) fn owner_at(s: &Session, at: Samples, track: Option<TrackId>) -> Opti
     Some(pick)
 }
 
+/// The key source `id` carries; a stored key that doesn't read (a hand-edited session) counts as
+/// none.
+fn source_key(s: &Session, id: soundcraft_model::SourceId) -> Option<Key> {
+    s.source(id).and_then(|x| x.key.as_deref()).and_then(|k| Key::parse(k).ok())
+}
+
+/// The key playing at `at` (on `track` only, when given): that of the clip [`owner_at`] picks.
+pub(crate) fn key_playing(s: &Session, at: Samples, track: Option<TrackId>) -> Option<Key> {
+    let clip = owner_at(s, at, track)?;
+    s.find_clip(clip).and_then(|(_, c)| c.source()).and_then(|id| source_key(s, id))
+}
+
 /// `dj.key_at {at?, track?}`.
 pub(super) fn key_at(e: &mut Engine, p: &Value) -> Result<Value> {
     let at = position_param(e, CMD, p, "at")?.unwrap_or(e.session().edit.playhead);
@@ -43,8 +55,7 @@ pub(super) fn key_at(e: &mut Engine, p: &Value) -> Result<Value> {
         return Ok(json!({"key": null, "camelot": null, "source": null, "clip": null}));
     };
     let source = s.find_clip(clip).and_then(|(_, c)| c.source());
-    // A stored key that doesn't read (a hand-edited session) counts as none.
-    let key = source.and_then(|id| s.source(id)).and_then(|x| x.key.as_deref()).and_then(|k| Key::parse(k).ok());
+    let key = source.and_then(|id| source_key(s, id));
     Ok(json!({
         "key": key.map(|k| k.name()),
         "camelot": key.map(|k| k.camelot()),

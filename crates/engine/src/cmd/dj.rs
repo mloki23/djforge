@@ -11,7 +11,7 @@ mod align;
 #[path = "dj_import.rs"]
 mod import;
 #[path = "dj_key.rs"]
-mod key;
+pub(crate) mod key;
 #[path = "dj_move.rs"]
 mod moving;
 #[path = "dj_plan.rs"]

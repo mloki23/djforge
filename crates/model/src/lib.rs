@@ -18,7 +18,7 @@ mod source;
 mod track;
 mod warp;
 
-pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
+pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint, INSTRUMENT_SLOT};
 pub use clip::{Clip, ClipContent, Fade, FadeShape, STEMS, StemSet};
 pub use dj::{
     Applied, AppliedFade, AppliedPoint, DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource,

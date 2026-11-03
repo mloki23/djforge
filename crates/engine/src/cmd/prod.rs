@@ -1,13 +1,19 @@
 //! Production over a DJ set: "parts" are instrument tracks with a built-in instrument set to one
 //! of the trance presets in [`super::prod_presets`] (`prod.new_part`, `prod.presets`). Any
 //! hosted plugin can still go on a part through `mix.instrument` and the insert commands.
+//! `prod.pattern` writes a starter pattern onto a part over whole bars, in the key the set plays
+//! there.
 
+use super::dj::key::key_playing;
+use super::dj::recipe::bar_at_or_after;
 use super::prod_presets::{PRESETS, default_preset, preset};
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_midi::patterns::PatternKind;
-use soundcraft_model::{ChannelFormat, Session, TrackKind};
+use soundcraft_midi::Key;
+use soundcraft_midi::patterns::{self, AutoParam as Sweep, MAX_BARS, PatternKind, PatternSpec, PatternStyle};
+use soundcraft_model::{AutoParam, ChannelFormat, Clip, Session, TrackKind};
+use soundcraft_time::{Range, Samples};
 use std::collections::HashSet;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -20,6 +26,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{kind: drums|bass|synth|fx, preset?: id (prod.presets; default trance_kit, rolling_bass, stab, noise_riser), name?} — an instrument track after the DJ decks (Deck A/B), named \"Drums 1\", \"Bass 2\"… unless `name` is given, with the preset's built-in instrument and parameters. One undo step. Returns {track, name, preset, instrument}",
             always,
             new_part
+        ),
+        cmd!(
+            "prod.pattern",
+            "Starter Pattern",
+            [],
+            None,
+            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}",
+            always,
+            pattern
         ),
         cmd!(query "prod.presets", "Part Presets", [], None, "{kind?: drums|bass|synth|fx} — the presets prod.new_part takes: [{id, kind, instrument}]", always, presets),
     ]
@@ -131,6 +146,219 @@ fn new_part(e: &mut Engine, p: &Value) -> Result<Value> {
     s.tracks.insert(at, track);
     s.edit.selected_tracks = vec![t];
     Ok(json!({"track": t, "name": name, "preset": preset.id, "instrument": preset.instrument}))
+}
+
+/// Fields `prod.pattern` reads; anything else is refused rather than ignored.
+const PATTERN_FIELDS: [&str; 9] = ["kind", "style", "track", "start", "end", "bars", "key", "replace", "seed"];
+
+/// Ticks in a 4/4 bar, the only meter the generators write.
+const BAR_TICKS: i64 = 4 * soundcraft_time::TICKS_PER_QUARTER;
+
+/// The bars a pattern covers: `bars` whole 4/4 bars from bar `first`, from `start` to `end` on
+/// the timeline.
+struct Bars {
+    first: i64,
+    bars: u32,
+    start_tick: i64,
+    start: Samples,
+    end: Samples,
+}
+
+/// The part `prod.pattern` writes on: `track`, else the one selected instrument track.
+fn pattern_track(e: &Engine, cmd: &str, p: &Value) -> Result<TrackId> {
+    let s = e.session();
+    let t = match track_param(e, cmd, p, "track")? {
+        Some(t) => t,
+        None => {
+            let selected: Vec<&soundcraft_model::Track> = s.tracks.iter().filter(|t| s.edit.selected_tracks.contains(&t.id)).collect();
+            let parts: Vec<TrackId> = selected.iter().filter(|t| t.kind == TrackKind::Instrument).map(|t| t.id).collect();
+            match (parts.as_slice(), selected.first()) {
+                ([one], _) => *one,
+                // Refused below, naming the track.
+                ([], Some(t)) => t.id,
+                ([], None) => return Err(bad(cmd, "no track: pass `track` or select a part")),
+                _ => return Err(bad(cmd, "several parts are selected: pass `track`")),
+            }
+        }
+    };
+    match s.track(t) {
+        Some(tr) if tr.kind == TrackKind::Instrument => Ok(t),
+        Some(tr) => Err(bad(cmd, format!("`{}` is not an instrument track: patterns go on parts (prod.new_part)", tr.name))),
+        None => Err(bad(cmd, "no such track")),
+    }
+}
+
+/// The range snapped outward to whole bars: the selection (or `start`/`end`), else `bars` from the
+/// bar holding the playhead (or `start`). Only 4/4 bars are written.
+fn pattern_bars(e: &Engine, cmd: &str, p: &Value, bars: Option<u32>) -> Result<Bars> {
+    let sel = range_param(e, cmd, p)?;
+    let s = e.session();
+    let sr = s.sample_rate;
+    let (first, last) = if !sel.is_empty() {
+        let first = s.tempo.bar_beat_at(sel.start, sr).bar.max(1);
+        (first, bar_at_or_after(s, sel.end).max(first.saturating_add(1)))
+    } else if let Some(n) = bars {
+        let at = if p.get("start").is_some() { sel.start } else { s.edit.playhead };
+        let first = s.tempo.bar_beat_at(at, sr).bar.max(1);
+        (first, first.saturating_add(i64::from(n)))
+    } else {
+        return Err(bad(cmd, "no range: select the bars to fill, or pass `bars` to fill from the bar holding the playhead"));
+    };
+    let count = u32::try_from(last.saturating_sub(first))
+        .ok()
+        .filter(|n| (1..=MAX_BARS).contains(n))
+        .ok_or_else(|| bad(cmd, format!("a pattern is 1..={MAX_BARS} bars")))?;
+    let (start_tick, end_tick) = (s.tempo.bar_start_tick(first), s.tempo.bar_start_tick(last));
+    // The meter at the start and any change inside the range must all be 4/4.
+    let inside = s.tempo.meters().iter().copied().filter(|m| m.tick > start_tick && m.tick < end_tick);
+    for m in std::iter::once(s.tempo.meter_at_tick(start_tick)).chain(inside) {
+        if (m.numerator, m.denominator) != (4, 4) {
+            let bar = s.tempo.bar_beat_at_tick(m.tick.max(start_tick)).bar;
+            return Err(bad(cmd, format!("only 4/4 is supported: bar {bar} is in {}/{}", m.numerator, m.denominator)));
+        }
+    }
+    if end_tick - start_tick != i64::from(count) * BAR_TICKS {
+        return Err(bad(cmd, "only 4/4 is supported over the range"));
+    }
+    Ok(Bars { first, bars: count, start_tick, start: s.tempo.tick_to_samples(start_tick, sr), end: s.tempo.tick_to_samples(end_tick, sr) })
+}
+
+/// "Trance Full" for `trance_full`.
+fn title(style: PatternStyle) -> String {
+    let word = |w: &str| {
+        let mut c = w.chars();
+        c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
+    };
+    style.name().split('_').map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// A sweep's value (0..=1) as a value of the parameter it drives.
+type SweepMap = Box<dyn Fn(f32) -> f32>;
+
+/// Where a pattern's sweep lands on a built-in instrument: the parameter it drives and how a
+/// curve value maps onto it. Cutoff runs exponentially over the parameter's whole range (closed
+/// to open); volume is gain under the part's own `level`, so 1 is the level the part is set to
+/// and 0.5 is 6 dB under it.
+fn sweep_target(curve: Sweep, info: &'static soundcraft_dsp::PluginInfo, level: Option<f32>) -> Option<(&'static str, SweepMap)> {
+    match curve {
+        Sweep::Cutoff => {
+            let pi = info.param("cutoff")?;
+            let lo = pi.min.max(1.0);
+            let ratio = (pi.max / lo).max(1.0);
+            Some(("cutoff", Box::new(move |v: f32| pi.clamp(lo * ratio.powf(v.clamp(0.0, 1.0))))))
+        }
+        Sweep::Volume => {
+            let pi = info.param("level")?;
+            let base = level.unwrap_or(pi.default);
+            Some(("level", Box::new(move |v: f32| if v > 0.0 { pi.clamp(base + 20.0 * v.min(1.0).log10()) } else { pi.min })))
+        }
+    }
+}
+
+fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "prod.pattern";
+    if let Some(k) = p.as_object().and_then(|o| o.keys().find(|k| !PATTERN_FIELDS.contains(&k.as_str()))) {
+        return Err(bad(CMD, format!("unknown field `{k}`: a pattern takes {}", PATTERN_FIELDS.join(", "))));
+    }
+    let kind = kind_param(CMD, p)?.ok_or_else(|| bad(CMD, "`kind` required: drums, bass, synth or fx"))?;
+    let styles = || PatternStyle::of_kind(kind).map(PatternStyle::name).collect::<Vec<_>>().join(", ");
+    let style = match p.get("style") {
+        None | Some(Value::Null) => return Err(bad(CMD, format!("`style` required: {}", styles()))),
+        Some(v) => v
+            .as_str()
+            .and_then(|x| PatternStyle::parse(x).ok())
+            .ok_or_else(|| bad(CMD, format!("unknown style {v}: {} has {}", kind.name(), styles())))?,
+    };
+    if style.kind() != kind {
+        return Err(bad(CMD, format!("`{}` is a {} style: {} has {}", style.name(), style.kind().name(), kind.name(), styles())));
+    }
+    let bars = match p.get("bars") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| (1..=MAX_BARS).contains(n))
+                .ok_or_else(|| bad(CMD, format!("`bars` must be 1..={MAX_BARS}")))?,
+        ),
+    };
+    let replace = match p.get("replace") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(CMD, "`replace` must be true or false"))?,
+    };
+    let seed = match p.get("seed") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or_else(|| bad(CMD, "`seed` must be a whole number"))?),
+    };
+    let given_key = match p.get("key") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let text = v.as_str().ok_or_else(|| bad(CMD, "`key` must be a key like Am, F#, 8A or 1m"))?;
+            Some(Key::parse(text).map_err(|_| bad(CMD, format!("`{text}` is not a key: try Am, F#, 8A or 1m")))?)
+        }
+    };
+    let t = pattern_track(e, CMD, p)?;
+    let range = pattern_bars(e, CMD, p, bars)?;
+    let s = e.session();
+    // Only keyed styles use a key: the one given, else the set's at the start.
+    let key = match (style.needs_key(), given_key) {
+        (false, _) => None,
+        (true, Some(k)) => Some(k),
+        (true, None) => Some(key_playing(s, range.start, None).ok_or_else(|| bad(CMD, "no key here: pass key or set the track key"))?),
+    };
+    let tr = s.track(t).ok_or_else(|| bad(CMD, "no such track"))?;
+    let span = Range::new(range.start, range.end);
+    let under: Vec<String> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).map(|c| format!("`{}`", c.name)).collect();
+    if !under.is_empty() && !replace {
+        return Err(bad(CMD, format!("the bars overlap {} on `{}`: pass replace: true to replace what is there", under.join(", "), tr.name)));
+    }
+    // Stable by default: the same part and bars give the same pattern.
+    let seed = seed.unwrap_or_else(|| t.0.wrapping_mul(1_000_003).wrapping_add(range.first.unsigned_abs()));
+    let spec = PatternSpec { kind, style, bars: range.bars, beats_per_bar: 4, key, seed };
+    let g = patterns::generate(&spec).map_err(|err| bad(CMD, err.to_string()))?;
+    let name = match key {
+        Some(k) => format!("{} ({})", title(style), k.camelot()),
+        None => title(style),
+    };
+    let notes = g.sequence.notes.len();
+    // Each sweep point lands at its tick on the tempo map, so a ramp bends the curve with the bars.
+    let at = |tick: i64| s.tempo.tick_to_samples(range.start_tick.saturating_add(tick), s.sample_rate);
+    let ins = tr.instrument.as_ref();
+    let info = ins.and_then(|i| soundcraft_dsp::plugin_info(&i.plugin));
+    let stored = |k: &str| ins.and_then(|i| i.params.get(k).copied());
+    let mut lanes = Vec::new();
+    for curve in &g.automation {
+        let Some((param, value)) = info.and_then(|info| sweep_target(curve.param, info, stored("level"))) else { continue };
+        let points: Vec<(Samples, f32)> = curve.points.iter().map(|&(tick, v)| (at(tick), value(v))).collect();
+        // Outside the range an empty lane holds the part's own setting.
+        let base = stored(param).unwrap_or_else(|| value(1.0));
+        lanes.push((param, points, base));
+    }
+    if !g.automation.is_empty() && lanes.is_empty() {
+        let what = ins.map_or("the part has no instrument", |i| i.plugin.as_str());
+        e.message(format!("{}: {what} has no cutoff or level to sweep, so only the notes were written", title(style)));
+    }
+    let s = e.session_mut();
+    let cid = s.new_clip_id();
+    // Placing the clip clears (and trims) whatever was under it: refused above unless `replace`.
+    crate::edit::place_clip(s, t, Clip::midi(cid, name, range.start, range.end - range.start, g.sequence));
+    let mut automation = Vec::new();
+    if let Some(tr) = s.track_mut(t) {
+        for (param, points, base) in lanes {
+            tr.lane_mut(&AutoParam::instrument(param)).write_curve(range.start, range.end, &points, base);
+            automation.push(format!("instrument:{param}"));
+        }
+    }
+    Ok(json!({
+        "clip": cid,
+        "track": t,
+        "key": key.map(|k| k.name()),
+        "camelot": key.map(|k| k.camelot()),
+        "bars": range.bars,
+        "notes": notes,
+        "start": range.start,
+        "end": range.end,
+        "automation": automation,
+    }))
 }
 
 fn presets(_: &mut Engine, p: &Value) -> Result<Value> {
@@ -449,5 +677,282 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "clipped (peak >= 0 dBFS), nearly silent (rms < -40 dBFS) or too hot (rms > -6 dBFS): {failed:?}");
+    }
+
+    // ---- prod.pattern -------------------------------------------------------------------------
+
+    use super::super::dj::recipe::bar_sample;
+    use soundcraft_model::{AutoParam, ClipContent, Session};
+    use soundcraft_time::Samples;
+
+    fn bar(e: &Engine, n: i64) -> Samples {
+        bar_sample(e.session(), n)
+    }
+
+    /// Selects from `from` to `to` on the timeline.
+    fn select(e: &mut Engine, from: Samples, to: Samples) {
+        e.session_mut().edit.selection = Range::new(from, to);
+    }
+
+    fn pattern(e: &mut Engine, p: Value) -> Value {
+        e.execute("prod.pattern", &p).unwrap()
+    }
+
+    fn clip_of(e: &Engine, r: &Value) -> Clip {
+        e.session().find_clip(ClipId(r["clip"].as_u64().unwrap())).unwrap().1.clone()
+    }
+
+    fn sequence(c: &Clip) -> &Sequence {
+        match &c.content {
+            ClipContent::Midi { sequence } => sequence,
+            _ => panic!("not a MIDI clip"),
+        }
+    }
+
+    #[test]
+    fn a_pattern_over_a_selection_under_a_tempo_ramp_starts_and_ends_on_bar_lines() {
+        let mut e = Engine::default();
+        e.execute("dj.tempo_ramp", &json!({"from_bar": 1, "bars": 8, "from_bpm": 128.0, "to_bpm": 138.0})).unwrap();
+        let t = track_of(&part(&mut e, json!({"kind": "drums"})));
+        // Bar 2 beat 2 to bar 5 beat 3 snaps outward to bars 2..6.
+        let beat = |e: &Engine, n: i64, b: i64| {
+            let s = e.session();
+            s.tempo.tick_to_samples(s.tempo.bar_start_tick(n) + (b - 1) * TICKS_PER_QUARTER, s.sample_rate)
+        };
+        let (from, to) = (beat(&e, 2, 2), beat(&e, 5, 3));
+        select(&mut e, from, to);
+        let r = pattern(&mut e, json!({"kind": "drums", "style": "trance_full"}));
+        assert_eq!((r["start"].as_i64(), r["end"].as_i64(), r["bars"].as_u64()), (Some(bar(&e, 2)), Some(bar(&e, 6)), Some(4)), "{r}");
+        assert_eq!((r["key"].clone(), r["camelot"].clone(), r["track"].as_u64()), (Value::Null, Value::Null, Some(t.0)));
+        let c = clip_of(&e, &r);
+        assert_eq!((c.name.as_str(), c.start, c.end()), ("Trance Full", bar(&e, 2), bar(&e, 6)));
+        let s = e.session();
+        assert_eq!(s.tempo.samples_to_ticks(c.end(), s.sample_rate) - s.tempo.samples_to_ticks(c.start, s.sample_rate), 4 * 3840);
+        let seq = sequence(&c);
+        assert_eq!(r["notes"].as_u64(), Some(seq.notes.len() as u64));
+        assert!(seq.notes.iter().all(|n| n.start >= 0 && n.start + n.length <= 4 * 3840));
+        assert!(seq.notes.iter().any(|n| n.start == 0) && seq.notes.iter().any(|n| n.start == 15 * 960), "a kick on every beat");
+        // The same part and bars give the same pattern again.
+        let first = seq.clone();
+        e.execute("edit.undo", &json!({})).unwrap();
+        let r = pattern(&mut e, json!({"kind": "drums", "style": "trance_full", "track": t.0}));
+        let again = clip_of(&e, &r);
+        assert_eq!(*sequence(&again), first);
+    }
+
+    #[test]
+    fn without_a_selection_bars_count_from_the_bar_holding_the_playhead() {
+        let mut e = Engine::default();
+        part(&mut e, json!({"kind": "drums"}));
+        e.session_mut().edit.playhead = bar(&e, 3) + 1_000;
+        let r = pattern(&mut e, json!({"kind": "drums", "style": "four_floor", "bars": 2}));
+        assert_eq!((r["start"].as_i64(), r["end"].as_i64()), (Some(bar(&e, 3)), Some(bar(&e, 5))));
+        assert_eq!(r["notes"], 8);
+    }
+
+    /// A 128 bpm set: beat-locked deck A (bars 1..45, key `a`) and deck B (bars 25..65, key `b`)
+    /// mixed by a transition with its hit on bar 41, as the `dj.key_at` tests build it.
+    fn set(a: &str, b: &str) -> Engine {
+        let mut s = Session::default();
+        s.tempo.set_tempo(0, 128.0).unwrap();
+        let mut clips = Vec::new();
+        for (name, (from, to), key) in [("Deck A", (1, 45), a), ("Deck B", (25, 65), b)] {
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some(name));
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 80 * 48_000]] };
+            let src = crate::io::add_source(&mut s, name, buf, None, soundcraft_audio_io::FileFormat::Wav);
+            s.sources.last_mut().unwrap().set_key(key);
+            let id = s.new_clip_id();
+            let start = bar_sample(&s, from);
+            let mut c = Clip::audio(id, name, src, 0, start, bar_sample(&s, to) - start);
+            c.warp = WarpMap::new((0..160).map(|k| 4_800.0 + k as f64 * 22_500.0).collect(), 0.0);
+            crate::edit::place_clip(&mut s, t, c);
+            clips.push(id);
+        }
+        let mut e = Engine::new(s);
+        e.execute("dj.transition", &json!({"out_clip": clips[0].0, "in_clip": clips[1].0})).unwrap();
+        e
+    }
+
+    #[test]
+    fn the_key_is_the_one_the_set_plays_at_the_start_across_a_transition() {
+        let mut e = set("8A", "Em");
+        let bass = track_of(&part(&mut e, json!({"kind": "bass"})));
+        for (from, camelot, key) in [(30, "8A", "Am"), (37, "8A", "Am"), (41, "9A", "Em"), (50, "9A", "Em")] {
+            let (a, b) = (bar(&e, from), bar(&e, from + 4));
+            select(&mut e, a, b);
+            let r = pattern(&mut e, json!({"kind": "bass", "style": "rolling", "track": bass.0}));
+            assert_eq!((r["camelot"].as_str(), r["key"].as_str()), (Some(camelot), Some(key)), "bar {from}: {r}");
+            assert_eq!(clip_of(&e, &r).name, format!("Rolling ({camelot})"));
+        }
+        // A given key wins over the set's; an Open Key name reads too.
+        let (a, b) = (bar(&e, 55), bar(&e, 57));
+        select(&mut e, a, b);
+        let r = pattern(&mut e, json!({"kind": "synth", "style": "stabs", "track": bass.0, "key": "1d"}));
+        assert_eq!((r["camelot"].as_str(), r["key"].as_str()), (Some("8B"), Some("C")));
+    }
+
+    #[test]
+    fn refusals_leave_the_session_alone() {
+        let mut e = Engine::default();
+        let drums = track_of(&part(&mut e, json!({"kind": "drums"})));
+        let bass = track_of(&part(&mut e, json!({"kind": "bass"})));
+        let audio = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Vocal"));
+        let (a, b) = (bar(&e, 1), bar(&e, 5));
+        select(&mut e, a, b);
+        pattern(&mut e, json!({"kind": "drums", "style": "four_floor", "track": drums.0}));
+        let before = e.session().clone();
+        let undo = e.can_undo();
+        let journal = e.journal.len();
+        let refuse = |e: &mut Engine, p: Value, says: &str| {
+            let err = e.execute("prod.pattern", &p).unwrap_err().to_string();
+            assert!(err.contains(says), "{p}: {err}");
+        };
+        refuse(&mut e, json!({"kind": "bass", "style": "rolling", "track": bass.0}), "no key here: pass key or set the track key");
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": drums.0}), "replace: true");
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": audio.0}), "not an instrument track");
+        refuse(&mut e, json!({"kind": "bass", "style": "rolling", "track": bass.0, "key": "H minor"}), "not a key");
+        refuse(&mut e, json!({"kind": "bass", "style": "stabs", "track": bass.0, "key": "Am"}), "synth style");
+        refuse(&mut e, json!({"kind": "bass", "track": bass.0, "key": "Am"}), "`style` required");
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": bass.0, "bars": 0}), "`bars`");
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": bass.0, "pitch": 3}), "unknown field");
+        // A selected non-instrument track is refused by name; no track at all asks for one.
+        e.session_mut().edit.selected_tracks = vec![audio];
+        refuse(&mut e, json!({"kind": "drums", "style": "fill"}), "`Vocal` is not an instrument track");
+        e.session_mut().edit.selected_tracks.clear();
+        refuse(&mut e, json!({"kind": "drums", "style": "fill"}), "no track");
+        // No selection and no bars: no range.
+        e.session_mut().edit.selection = Range::point(0);
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": bass.0}), "no range");
+        // Only 4/4.
+        e.session_mut().tempo.set_meter(0, 3, 4).unwrap();
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": bass.0, "bars": 2}), "only 4/4 is supported: bar 1 is in 3/4");
+        e.session_mut().tempo.set_meter(0, 4, 4).unwrap();
+        e.session_mut().tempo.set_meter(3 * 3840, 7, 8).unwrap();
+        refuse(&mut e, json!({"kind": "drums", "style": "fill", "track": bass.0, "bars": 8}), "bar 4 is in 7/8");
+        e.session_mut().tempo.remove_meter(3 * 3840);
+        e.session_mut().edit.selection = Range::new(a, b);
+        e.session_mut().edit.selected_tracks = before.edit.selected_tracks.clone();
+        e.session_mut().edit.playhead = before.edit.playhead;
+        assert!(*e.session() == before, "a refusal changed the session");
+        assert_eq!((e.can_undo(), e.journal.len()), (undo, journal), "a refusal was recorded");
+    }
+
+    #[test]
+    fn replace_clears_and_trims_what_is_under_the_bars() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "drums"})));
+        let (a, b) = (bar(&e, 1), bar(&e, 9));
+        select(&mut e, a, b);
+        let old = pattern(&mut e, json!({"kind": "drums", "style": "four_floor"}));
+        let (a, b) = (bar(&e, 3), bar(&e, 5));
+        select(&mut e, a, b);
+        let r = pattern(&mut e, json!({"kind": "drums", "style": "fill", "replace": true}));
+        let clips: Vec<(String, Samples, Samples)> =
+            e.session().track(t).unwrap().clips().iter().map(|c| (c.name.clone(), c.start, c.end())).collect();
+        let want = [("Four Floor", bar(&e, 1), bar(&e, 3)), ("Fill", bar(&e, 3), bar(&e, 5)), ("Four Floor", bar(&e, 5), bar(&e, 9))];
+        assert_eq!(clips, want.map(|(n, a, b)| (n.to_string(), a, b)), "{old} then {r}");
+        // The kept pieces keep only their own kicks: 8 before, 16 after.
+        let kicks: Vec<usize> = e.session().track(t).unwrap().clips().iter().map(|c| sequence(c).notes.len()).collect();
+        assert_eq!((kicks[0], kicks[2]), (8, 16));
+    }
+
+    /// The level and cutoff lanes of `t`'s instrument.
+    fn sweeps(e: &Engine, t: TrackId) -> (Option<soundcraft_model::AutomationLane>, Option<soundcraft_model::AutomationLane>) {
+        let tr = e.session().track(t).unwrap();
+        (tr.lane(&AutoParam::instrument("cutoff")).cloned(), tr.lane(&AutoParam::instrument("level")).cloned())
+    }
+
+    #[test]
+    fn a_riser_sweeps_cutoff_and_level_up_to_the_range_end_leaving_the_rest_alone() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "fx", "preset": "noise_riser"})));
+        let ins = e.session().track(t).unwrap().instrument.clone().unwrap();
+        let (level, cutoff) = (ins.params["level"], ins.params["cutoff"]);
+        // A hand-drawn level dip on bar 1 and a point on bar 12 stay as they were.
+        let (b1, b12) = (bar(&e, 1), bar(&e, 12));
+        {
+            let lane = e.session_mut().track_mut(t).unwrap().lane_mut(&AutoParam::instrument("level"));
+            lane.set_point(b1, level - 20.0);
+            lane.set_point(b12, level - 10.0);
+        }
+        let (a, b) = (bar(&e, 5), bar(&e, 9));
+        select(&mut e, a, b);
+        let r = pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+        assert_eq!(r["automation"], json!(["instrument:cutoff", "instrument:level"]));
+        assert_eq!(clip_of(&e, &r).name, "Riser");
+        let (c, l) = sweeps(&e, t);
+        let (c, l) = (c.unwrap(), l.unwrap());
+        for lane in [&c, &l] {
+            let inside: Vec<f32> = lane.points.iter().filter(|p| (a..=b).contains(&p.at)).map(|p| p.value).collect();
+            assert!(inside.len() > 8, "{inside:?}");
+            assert!(inside.windows(2).all(|w| w[1] >= w[0]), "rising: {inside:?}");
+            assert!(lane.points.iter().any(|p| p.at == b), "a point on the range end");
+        }
+        // Cutoff opens fully and the level reaches the part's own level at the end.
+        assert_eq!(c.value_at(b, 0.0), 20_000.0);
+        assert!((l.value_at(b, 0.0) - level).abs() < 1e-4);
+        assert!(c.value_at(a, 0.0) < 100.0 && l.value_at(a, 0.0) < level - 6.0, "it starts low");
+        // Outside: the hand-drawn points are kept and the curve before and after is unchanged.
+        assert_eq!(l.value_at(b1, 0.0), level - 20.0);
+        assert_eq!(l.value_at(b12, 0.0), level - 10.0);
+        let was = |at: Samples| (level - 20.0) + 10.0 * ((at - b1) as f32 / (b12 - b1) as f32);
+        assert!((l.value_at(a - 1, 0.0) - was(a - 1)).abs() < 1e-3);
+        assert!((l.value_at(b + 1, 0.0) - was(b + 1)).abs() < 1e-3);
+        assert_eq!((c.value_at(a - 1, 0.0), c.value_at(b + 1, 0.0)), (cutoff, cutoff), "an empty lane holds the part's setting");
+    }
+
+    #[test]
+    fn a_downlifter_falls_and_a_sweep_drives_only_the_params_an_instrument_has() {
+        let mut e = Engine::default();
+        let fx = track_of(&part(&mut e, json!({"kind": "fx", "preset": "downlifter"})));
+        let drums = track_of(&part(&mut e, json!({"kind": "drums"})));
+        let (a, b) = (bar(&e, 1), bar(&e, 3));
+        select(&mut e, a, b);
+        pattern(&mut e, json!({"kind": "fx", "style": "downlifter", "track": fx.0}));
+        let (c, _) = sweeps(&e, fx);
+        let c = c.unwrap();
+        assert!(c.value_at(a, 0.0) > c.value_at(b, 0.0));
+        // The drum kit has a level but no cutoff; a hosted instrument has neither that is known.
+        let r = pattern(&mut e, json!({"kind": "fx", "style": "riser", "track": drums.0}));
+        assert_eq!(r["automation"], json!(["instrument:level"]));
+        assert!(matches!(sweeps(&e, drums), (None, Some(_))));
+        let hosted = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Hosted"));
+        e.session_mut().track_mut(hosted).unwrap().instrument = Some(soundcraft_model::Insert::new("clap:test.keys"));
+        let r = pattern(&mut e, json!({"kind": "fx", "style": "riser", "track": hosted.0}));
+        assert_eq!((r["automation"].clone(), r["notes"].as_u64()), (json!([]), Some(1)));
+        assert_eq!(sweeps(&e, hosted), (None, None));
+        assert!(e.messages.iter().any(|m| m.contains("only the notes")), "{:?}", e.messages);
+        let (a, b) = (bar(&e, 5), bar(&e, 6));
+        let r = pattern(&mut e, json!({"kind": "drums", "style": "fill", "track": fx.0, "start": a, "end": b}));
+        assert_eq!(r["automation"], json!([]));
+    }
+
+    #[test]
+    fn one_undo_removes_the_clip_and_the_automation() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "fx"})));
+        let (a, b) = (bar(&e, 2), bar(&e, 4));
+        select(&mut e, a, b);
+        let before = e.session().clone();
+        pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+        assert_eq!(e.session().track(t).unwrap().clips().len(), 1);
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert!(*e.session() == before, "one undo puts everything back");
+        assert!(e.session().track(t).unwrap().clips().is_empty() && sweeps(&e, t) == (None, None));
+        assert!(e.journal.iter().any(|(id, _)| id == "prod.pattern"), "journaled");
+    }
+
+    #[test]
+    fn a_trance_groove_sounds_inside_its_clip_and_not_before_it() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "drums"})));
+        let (a, b) = (bar(&e, 3), bar(&e, 5));
+        select(&mut e, a, b);
+        pattern(&mut e, json!({"kind": "drums", "style": "trance_full", "track": t.0}));
+        let out = soundcraft_mix::render_range(e.session(), Range::new(0, b), 512);
+        let peak =
+            |from: Samples, to: Samples| out.iter().flat_map(|c| c.iter().take(to as usize).skip(from as usize)).fold(0.0f32, |m, x| m.max(x.abs()));
+        assert_eq!(peak(0, a), 0.0, "silent before the clip");
+        assert!(peak(a, b) > 0.05, "the groove sounds: peak {}", peak(a, b));
     }
 }

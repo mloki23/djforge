@@ -2199,9 +2199,10 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
 }
 
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
-    // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has none, so it
-    // must not pick up slot A's lanes.
-    let Ok(slot_u8) = u8::try_from(i) else {
+    // Automation lanes address insert slots by index and the instrument by its own lane slot, so
+    // the instrument never picks up slot A's lanes.
+    let lane_slot = if i == INSTRUMENT_SLOT { Some(soundcraft_model::INSTRUMENT_SLOT) } else { u8::try_from(i).ok() };
+    let Some(slot_u8) = lane_slot else {
         return apply_values(slot, ins, |_, v| v);
     };
     let automated = t.mixer.automation_mode.reads()
@@ -2872,6 +2873,16 @@ mod tests {
         lane.set_point(0, -48.0);
         tr.automation.push(lane);
         assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
+    }
+
+    #[test]
+    fn instrument_lanes_drive_the_instrument() {
+        // An instrument level lane at -12 dB plays as a stored -12 dB does, over a stored -6 dB.
+        let mut s = synth_session(-6.0);
+        let mut lane = soundcraft_model::AutomationLane::new(AutoParam::instrument("level"));
+        lane.set_point(0, -12.0);
+        s.tracks[0].automation.push(lane);
+        assert_eq!(render_range(&s, Range::new(0, 12_000), 512), render_range(&synth_session(-12.0), Range::new(0, 12_000), 512));
     }
 
     /// A warped clip's beats land on the session's beats (within 2 ms) at another tempo, through

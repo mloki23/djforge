@@ -1415,6 +1415,16 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
             }
         });
     }
+    // A built-in instrument's parameters (a riser's cutoff and level sweeps, say).
+    if let Some(info) = track.instrument.as_ref().and_then(|ins| soundcraft_dsp::plugin_info(&ins.plugin)) {
+        ui.menu_button(info.name, |ui| {
+            for p in info.params {
+                if ui.button(p.name).clicked() {
+                    let _ = app.run("track.view", json!({"track": id, "view": format!("instrument:{}", p.id)}));
+                }
+            }
+        });
+    }
 }
 
 pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
@@ -1854,8 +1864,12 @@ fn draw_automation(painter: &egui::Painter, s: &Session, track: &Track, p: &Auto
 }
 
 fn plugin_range(track: &Track, p: &AutoParam) -> (f32, f32) {
+    let insert = |slot: u8| match slot {
+        soundcraft_model::INSTRUMENT_SLOT => track.instrument.as_ref(),
+        _ => track.mixer.inserts.get(usize::from(slot)).and_then(Option::as_ref),
+    };
     if let AutoParam::Plugin { slot, param } = p
-        && let Some(Some(ins)) = track.mixer.inserts.get(usize::from(*slot))
+        && let Some(ins) = insert(*slot)
         && let Some(info) = soundcraft_dsp::plugin_info(&ins.plugin)
         && let Some(pi) = info.param(param)
     {
@@ -2410,6 +2424,7 @@ pub(crate) fn automation_id(p: &AutoParam) -> String {
         AutoParam::SendLevel(i) => format!("send_{}_level", (b'a' + i) as char),
         AutoParam::SendPan(i) => format!("send_{}_pan", (b'a' + i) as char),
         AutoParam::SendMute(i) => format!("send_{}_mute", (b'a' + i) as char),
+        AutoParam::Plugin { slot: soundcraft_model::INSTRUMENT_SLOT, param } => format!("instrument:{param}"),
         AutoParam::Plugin { slot, param } => format!("plugin:{}:{param}", (b'a' + slot) as char),
         AutoParam::Stem(i) => match soundcraft_model::STEMS.get(usize::from(*i)) {
             Some(name) => format!("stem:{name}"),
@@ -3921,5 +3936,16 @@ mod tests {
         for o in view_options(s.track(audio).unwrap()).iter().filter(|o| o.starts_with("stem:")) {
             assert_eq!(automation_id(&AutoParam::parse(o).unwrap()), *o);
         }
+    }
+
+    #[test]
+    fn instrument_lanes_round_trip_and_use_the_instruments_range() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, soundcraft_model::ChannelFormat::Stereo, Some("Riser"));
+        s.track_mut(t).unwrap().instrument = Some(soundcraft_model::Insert::new("subtractive_synth"));
+        let p = AutoParam::instrument("cutoff");
+        assert_eq!(automation_id(&p), "instrument:cutoff");
+        assert_eq!(AutoParam::parse(&automation_id(&p)), Some(p.clone()));
+        assert_eq!(plugin_range(s.track(t).unwrap(), &p), (20.0, 20_000.0));
     }
 }
