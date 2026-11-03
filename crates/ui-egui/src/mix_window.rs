@@ -926,7 +926,7 @@ pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: us
     let route_r = Rect::from_min_max(r.min, pos2((level_r.min.x - 1.0).max(r.min.x), r.max.y));
     let route_resp = ui.interact(if snd.is_some() { route_r } else { r }, ui.id().with(("snd-route", id.0, slot)), Sense::click());
     route_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Send {}", (b'A' + slot as u8) as char)));
-    let mark = if compact { Mark::Arrow } else { Mark::Letter((b'a' + slot as u8) as char) };
+    let mark = if compact { Mark::Arrow } else { Mark::Letter(char::from(b'a'.saturating_add(u8::try_from(slot).unwrap_or(u8::MAX)))) };
     match &snd {
         Some(s) => {
             let name = route_name(app, &s.target);

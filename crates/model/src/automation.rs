@@ -107,7 +107,7 @@ impl AutoParam {
         }
         if let Some(rest) = s.strip_prefix("send_") {
             let mut it = rest.splitn(2, '_');
-            let slot = letter_slot(it.next()?)?;
+            let slot = letter_slot(it.next()?, crate::SEND_SLOTS)?;
             return match it.next()? {
                 "level" => Some(AutoParam::SendLevel(slot)),
                 "pan" => Some(AutoParam::SendPan(slot)),
@@ -117,7 +117,7 @@ impl AutoParam {
         }
         if let Some(rest) = s.strip_prefix("plugin:") {
             let (slot, param) = rest.split_once(':')?;
-            return Some(AutoParam::Plugin { slot: letter_slot(slot)?, param: param.to_string() });
+            return Some(AutoParam::Plugin { slot: letter_slot(slot, crate::INSERT_SLOTS)?, param: param.to_string() });
         }
         if let Some(param) = s.strip_prefix("instrument:").filter(|p| !p.is_empty()) {
             return Some(AutoParam::instrument(param));
@@ -145,9 +145,13 @@ pub fn slot_letter(i: u8) -> char {
     char::from(b'A'.saturating_add(i.min(25)))
 }
 
-fn letter_slot(s: &str) -> Option<u8> {
+/// Slot `s` (a letter, or a number) of `slots`; anything past the last slot is no slot. Trim's and
+/// the instrument's reserved slots have no letter or number: the instrument's id is
+/// `instrument:<param>` and trim's lane is never addressed by id.
+fn letter_slot(s: &str, slots: usize) -> Option<u8> {
     let c = s.chars().next()?.to_ascii_uppercase();
-    if s.len() == 1 && c.is_ascii_uppercase() { Some(c as u8 - b'A') } else { s.parse().ok() }
+    let slot = if s.len() == 1 && c.is_ascii_uppercase() { Some(c as u8 - b'A') } else { s.parse().ok() };
+    slot.filter(|&i| usize::from(i) < slots)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -347,6 +351,18 @@ mod tests {
         assert_eq!(p.label(), "instrument cutoff");
         assert_ne!(p, AutoParam::Plugin { slot: 0, param: "cutoff".into() });
         assert_eq!(AutoParam::parse("instrument:"), None);
+    }
+
+    #[test]
+    fn slots_past_the_last_insert_or_send_do_not_parse() {
+        for bad in
+            ["plugin:255:trim", "plugin:254:cutoff", "plugin:200:x", "plugin:10:x", "plugin:k:x", "send_10_level", "send_k_pan", "send_255_mute"]
+        {
+            assert_eq!(AutoParam::parse(bad), None, "{bad}");
+        }
+        assert_eq!(AutoParam::parse("plugin:9:x"), Some(AutoParam::Plugin { slot: 9, param: "x".into() }));
+        assert_eq!(AutoParam::parse("plugin:j:x"), Some(AutoParam::Plugin { slot: 9, param: "x".into() }));
+        assert_eq!(AutoParam::parse("send_j_level"), Some(AutoParam::SendLevel(9)));
     }
 
     #[test]

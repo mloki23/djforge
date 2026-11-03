@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Starter Pattern",
             [],
             None,
-            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}",
+            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. A sweep written onto an empty lane makes that param follow automation over the whole timeline: outside the bars it holds the part's setting at the time, and the knob no longer changes it (edit the lane instead). With the track's automation off, the sweep doesn't play. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}",
             always,
             pattern
         ),
@@ -217,7 +217,7 @@ fn pattern_bars(e: &Engine, cmd: &str, p: &Value, bars: Option<u32>) -> Result<B
             return Err(bad(cmd, format!("only 4/4 is supported: bar {bar} is in {}/{}", m.numerator, m.denominator)));
         }
     }
-    if end_tick - start_tick != i64::from(count) * BAR_TICKS {
+    if end_tick.saturating_sub(start_tick) != i64::from(count) * BAR_TICKS {
         return Err(bad(cmd, "only 4/4 is supported over the range"));
     }
     Ok(Bars { first, bars: count, start_tick, start: s.tempo.tick_to_samples(start_tick, sr), end: s.tempo.tick_to_samples(end_tick, sr) })
@@ -325,25 +325,43 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
     let ins = tr.instrument.as_ref();
     let info = ins.and_then(|i| soundcraft_dsp::plugin_info(&i.plugin));
     let stored = |k: &str| ins.and_then(|i| i.params.get(k).copied());
+    // Lanes that were empty: from now on they, not the knobs, set those params everywhere.
+    let mut pinned = Vec::new();
     let mut lanes = Vec::new();
     for curve in &g.automation {
         let Some((param, value)) = info.and_then(|info| sweep_target(curve.param, info, stored("level"))) else { continue };
         let points: Vec<(Samples, f32)> = curve.points.iter().map(|&(tick, v)| (at(tick), value(v))).collect();
         // Outside the range an empty lane holds the part's own setting.
         let base = stored(param).unwrap_or_else(|| value(1.0));
+        if tr.lane(&AutoParam::instrument(param)).is_none_or(|l| l.points.is_empty()) {
+            pinned.push(param);
+        }
         lanes.push((param, points, base));
+    }
+    let mut notices = Vec::new();
+    if !pinned.is_empty() {
+        notices.push(format!("{}'s {} now follow automation; edit the lane to change them", tr.name, pinned.join("/")));
+    }
+    if !lanes.is_empty() && !tr.mixer.automation_mode.reads() {
+        notices.push(format!("{}'s automation is off, so its {} sweep won't play until the track reads automation again", tr.name, title(style)));
     }
     if !g.automation.is_empty() && lanes.is_empty() {
         let what = ins.map_or("the part has no instrument", |i| i.plugin.as_str());
         e.message(format!("{}: {what} has no cutoff or level to sweep, so only the notes were written", title(style)));
     }
+    for n in notices {
+        e.message(n);
+    }
     let s = e.session_mut();
     let cid = s.new_clip_id();
     // Placing the clip clears (and trims) whatever was under it: refused above unless `replace`.
-    crate::edit::place_clip(s, t, Clip::midi(cid, name, range.start, range.end - range.start, g.sequence));
+    crate::edit::place_clip(s, t, Clip::midi(cid, name, range.start, range.end.saturating_sub(range.start), g.sequence));
     let mut automation = Vec::new();
     if let Some(tr) = s.track_mut(t) {
         for (param, points, base) in lanes {
+            // The curve's last point sits on the range end (tick == length_ticks), so the span is
+            // inclusive: the sweep peaks exactly on the bar line, and the anchor one sample later
+            // returns to what was there before.
             tr.lane_mut(&AutoParam::instrument(param)).write_curve(range.start, range.end, &points, base);
             automation.push(format!("instrument:{param}"));
         }
@@ -844,6 +862,7 @@ mod tests {
         let (a, b) = (bar(&e, 1), bar(&e, 9));
         select(&mut e, a, b);
         let old = pattern(&mut e, json!({"kind": "drums", "style": "four_floor"}));
+        let starts: Vec<i64> = sequence(&clip_of(&e, &old)).notes.iter().map(|n| n.start).collect();
         let (a, b) = (bar(&e, 3), bar(&e, 5));
         select(&mut e, a, b);
         let r = pattern(&mut e, json!({"kind": "drums", "style": "fill", "replace": true}));
@@ -854,6 +873,13 @@ mod tests {
         // The kept pieces keep only their own kicks: 8 before, 16 after.
         let kicks: Vec<usize> = e.session().track(t).unwrap().clips().iter().map(|c| sequence(c).notes.len()).collect();
         assert_eq!((kicks[0], kicks[2]), (8, 16));
+        // The right-hand piece starts on its first kick: its notes are the original's from bar 5
+        // on, moved back by the 4 bars before it.
+        let right = e.session().track(t).unwrap().clips()[2].clone();
+        let got: Vec<i64> = sequence(&right).notes.iter().map(|n| n.start).collect();
+        let want: Vec<i64> = starts.iter().filter(|&&x| x >= 4 * 3840).map(|x| x - 4 * 3840).collect();
+        assert_eq!(got.first(), Some(&0));
+        assert_eq!(got, want);
     }
 
     /// The level and cutoff lanes of `t`'s instrument.
@@ -880,6 +906,8 @@ mod tests {
         let r = pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
         assert_eq!(r["automation"], json!(["instrument:cutoff", "instrument:level"]));
         assert_eq!(clip_of(&e, &r).name, "Riser");
+        // The level lane already had points; the cutoff lane was empty, so the knob stops working.
+        assert!(e.messages.iter().any(|m| m == "FX 1's cutoff now follow automation; edit the lane to change them"), "{:?}", e.messages);
         let (c, l) = sweeps(&e, t);
         let (c, l) = (c.unwrap(), l.unwrap());
         for lane in [&c, &l] {
@@ -925,6 +953,22 @@ mod tests {
         let (a, b) = (bar(&e, 5), bar(&e, 6));
         let r = pattern(&mut e, json!({"kind": "drums", "style": "fill", "track": fx.0, "start": a, "end": b}));
         assert_eq!(r["automation"], json!([]));
+    }
+
+    #[test]
+    fn a_sweep_says_when_it_pins_the_knobs_or_will_not_play() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "fx"})));
+        let (a, b) = (bar(&e, 1), bar(&e, 3));
+        select(&mut e, a, b);
+        pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+        assert!(e.messages.iter().any(|m| m == "FX 1's cutoff/level now follow automation; edit the lane to change them"), "{:?}", e.messages);
+        e.messages.clear();
+        e.session_mut().track_mut(t).unwrap().mixer.automation_mode = soundcraft_model::AutomationMode::Off;
+        let (a, b) = (bar(&e, 5), bar(&e, 7));
+        select(&mut e, a, b);
+        pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+        assert_eq!(e.messages, ["FX 1's automation is off, so its Riser sweep won't play until the track reads automation again"]);
     }
 
     #[test]

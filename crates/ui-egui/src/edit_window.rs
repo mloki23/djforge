@@ -1408,7 +1408,7 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
         let Some(info) = soundcraft_dsp::plugin_info(&ins.plugin) else { continue };
         ui.menu_button(info.name, |ui| {
             for p in info.params {
-                let v = format!("plugin:{}:{}", (b'a' + slot as u8) as char, p.id);
+                let v = format!("plugin:{}:{}", slot_id(u8::try_from(slot).unwrap_or(u8::MAX), soundcraft_model::INSERT_SLOTS), p.id);
                 if ui.button(p.name).clicked() {
                     let _ = app.run("track.view", json!({"track": id, "view": v}));
                 }
@@ -1417,7 +1417,7 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
     }
     // A built-in instrument's parameters (a riser's cutoff and level sweeps, say).
     if let Some(info) = track.instrument.as_ref().and_then(|ins| soundcraft_dsp::plugin_info(&ins.plugin)) {
-        ui.menu_button(info.name, |ui| {
+        ui.menu_button(format!("Instrument: {}", info.name), |ui| {
             for p in info.params {
                 if ui.button(p.name).clicked() {
                     let _ = app.run("track.view", json!({"track": id, "view": format!("instrument:{}", p.id)}));
@@ -2415,17 +2415,24 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
     }
 }
 
+/// Slot `i`'s letter in an automation id, when it is one of `slots`; a number (which no id parses)
+/// past them, so a stray slot never overflows a letter.
+fn slot_id(i: u8, slots: usize) -> String {
+    if usize::from(i) < slots { char::from(b'a'.saturating_add(i)).to_string() } else { i.to_string() }
+}
+
 pub(crate) fn automation_id(p: &AutoParam) -> String {
+    use soundcraft_model::{INSERT_SLOTS, SEND_SLOTS};
     match p {
         AutoParam::Volume => "volume".into(),
         AutoParam::Pan(0) => "pan".into(),
         AutoParam::Pan(_) => "pan2".into(),
         AutoParam::Mute => "mute".into(),
-        AutoParam::SendLevel(i) => format!("send_{}_level", (b'a' + i) as char),
-        AutoParam::SendPan(i) => format!("send_{}_pan", (b'a' + i) as char),
-        AutoParam::SendMute(i) => format!("send_{}_mute", (b'a' + i) as char),
+        AutoParam::SendLevel(i) => format!("send_{}_level", slot_id(*i, SEND_SLOTS)),
+        AutoParam::SendPan(i) => format!("send_{}_pan", slot_id(*i, SEND_SLOTS)),
+        AutoParam::SendMute(i) => format!("send_{}_mute", slot_id(*i, SEND_SLOTS)),
         AutoParam::Plugin { slot: soundcraft_model::INSTRUMENT_SLOT, param } => format!("instrument:{param}"),
-        AutoParam::Plugin { slot, param } => format!("plugin:{}:{param}", (b'a' + slot) as char),
+        AutoParam::Plugin { slot, param } => format!("plugin:{}:{param}", slot_id(*slot, INSERT_SLOTS)),
         AutoParam::Stem(i) => match soundcraft_model::STEMS.get(usize::from(*i)) {
             Some(name) => format!("stem:{name}"),
             None => format!("stem:{i}"),
@@ -3947,5 +3954,23 @@ mod tests {
         assert_eq!(automation_id(&p), "instrument:cutoff");
         assert_eq!(AutoParam::parse(&automation_id(&p)), Some(p.clone()));
         assert_eq!(plugin_range(s.track(t).unwrap(), &p), (20.0, 20_000.0));
+    }
+
+    #[test]
+    fn ids_of_slots_past_the_last_insert_or_send_neither_panic_nor_parse() {
+        for p in [
+            AutoParam::Plugin { slot: u8::MAX, param: "trim".into() },
+            AutoParam::Plugin { slot: 200, param: "x".into() },
+            AutoParam::Plugin { slot: 10, param: "x".into() },
+            AutoParam::SendLevel(255),
+            AutoParam::SendPan(10),
+            AutoParam::SendMute(200),
+        ] {
+            let id = automation_id(&p);
+            assert_eq!(AutoParam::parse(&id), None, "{id}");
+        }
+        for p in [AutoParam::Plugin { slot: 9, param: "x".into() }, AutoParam::SendMute(9)] {
+            assert_eq!(AutoParam::parse(&automation_id(&p)), Some(p.clone()));
+        }
     }
 }
