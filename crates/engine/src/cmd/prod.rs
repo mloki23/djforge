@@ -2,12 +2,13 @@
 //! of the trance presets in [`super::prod_presets`] (`prod.new_part`, `prod.presets`). Any
 //! hosted plugin can still go on a part through `mix.instrument` and the insert commands.
 
-use super::prod_presets::{PRESETS, Preset, default_preset, preset};
+use super::prod_presets::{PRESETS, default_preset, preset};
 use super::*;
 use crate::cmd;
 use serde_json::json;
 use soundcraft_midi::patterns::PatternKind;
-use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
+use soundcraft_model::{ChannelFormat, Session, Track, TrackKind};
+use std::collections::HashSet;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -54,27 +55,49 @@ fn numbered_name(s: &Session, base: &str) -> String {
     (1u64..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
-/// Where a new part goes: after the last DJ deck track and any instrument tracks (earlier
-/// parts) right after it, so parts stack in the order they were made; with no decks, `None`
-/// (the end, before any master).
-fn part_position(s: &Session) -> Option<usize> {
-    let deck = s.tracks.iter().rposition(|t| t.kind == TrackKind::Audio && matches!(t.name.as_str(), "Deck A" | "Deck B"))?;
-    let after = s.tracks.iter().skip(deck + 1).take_while(|t| t.kind == TrackKind::Instrument).count();
-    Some(deck + 1 + after)
+/// The DJ deck tracks: those the set's transitions mix between and audio tracks holding
+/// beat-locked clips; failing both, tracks named "Deck A" / "Deck B" (as `dj.import_set` names
+/// them).
+fn deck_tracks(s: &Session) -> Vec<TrackId> {
+    let mixed: HashSet<TrackId> = s.dj.transitions.iter().flat_map(|t| [t.out_track, t.in_track]).collect();
+    let decks: Vec<TrackId> = s
+        .tracks
+        .iter()
+        .filter(|t| mixed.contains(&t.id) || (t.kind == TrackKind::Audio && t.clips().iter().any(|c| c.warp.is_some())))
+        .map(|t| t.id)
+        .collect();
+    if !decks.is_empty() {
+        return decks;
+    }
+    s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && matches!(t.name.as_str(), "Deck A" | "Deck B")).map(|t| t.id).collect()
 }
 
-/// `preset`'s instrument with every parameter at its default, then the preset's values.
-fn instrument_of(cmd: &str, preset: &Preset) -> Result<Insert> {
-    let info = soundcraft_dsp::plugin_info(preset.instrument).ok_or_else(|| bad(cmd, format!("the built-in `{}` is missing", preset.instrument)))?;
-    let mut ins = Insert::new(info.id);
-    for pi in info.params {
-        ins.params.insert(pi.id.to_string(), pi.default);
+/// The outermost folder holding `t`, or `t` itself when it is in none.
+fn outermost(s: &Session, t: TrackId) -> TrackId {
+    let mut root = t;
+    // The depth cap guards against a cyclic folder chain in a hostile session file.
+    for _ in 0..64 {
+        match s.track(root).and_then(|tr| tr.folder) {
+            Some(parent) if parent != t => root = parent,
+            _ => break,
+        }
     }
-    for (k, v) in preset.params {
-        let pi = info.param(k).ok_or_else(|| bad(cmd, format!("`{}` has no parameter `{k}`", info.id)))?;
-        ins.params.insert((*k).to_string(), pi.clamp(*v as f32));
-    }
-    Ok(ins)
+    root
+}
+
+/// Where a new part goes: after the last DJ deck track (after the whole of its outermost folder
+/// when it is in one, so the folder's members stay together below it) and after any instrument
+/// tracks outside folders right after that (earlier parts), so parts stack in the order they were
+/// made. With no decks, `None`: the end, before any master.
+fn part_position(s: &Session) -> Option<usize> {
+    let decks = deck_tracks(s);
+    let last = s.tracks.iter().rposition(|t| decks.contains(&t.id))?;
+    let root = outermost(s, s.tracks.get(last)?.id);
+    let at = s.track_index(root)?;
+    let block = s.tracks.iter().skip(at + 1).take_while(|t| super::track::in_folder(s, t.id, root)).count();
+    let end = at + 1 + block;
+    let parts = s.tracks.iter().skip(end).take_while(|t| t.kind == TrackKind::Instrument && t.folder.is_none()).count();
+    Some(end + parts)
 }
 
 fn new_part(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -95,18 +118,17 @@ fn new_part(e: &mut Engine, p: &Value) -> Result<Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(CMD, "`name` must be a non-empty string"))?),
     };
-    let ins = instrument_of(CMD, preset)?;
+    let info = soundcraft_dsp::plugin_info(preset.instrument).ok_or_else(|| bad(CMD, format!("the built-in `{}` is missing", preset.instrument)))?;
+    let ins = super::instrument::plugin_with(info, preset.params.iter().copied());
+    // The track is whole before it joins the session: nothing below can fail.
     let s = e.session_mut();
-    let name = name.map_or_else(|| numbered_name(s, label(kind)), str::to_string);
-    let at = part_position(s);
-    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&name));
-    if let (Some(at), Some(from)) = (at, s.track_index(t)) {
-        let tr = s.tracks.remove(from);
-        s.tracks.insert(at.min(s.tracks.len()), tr);
-    }
-    let track = s.track_mut(t).ok_or_else(|| bad(CMD, "the new track is missing"))?;
+    let name = s.unique_track_name(&name.map_or_else(|| numbered_name(s, label(kind)), str::to_string));
+    let t = TrackId(s.alloc());
+    let mut track = Track::new(t, name.clone(), TrackKind::Instrument, ChannelFormat::Stereo, s.next_track_color());
     track.instrument = Some(ins);
-    let name = track.name.clone();
+    let before_master = s.tracks.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(s.tracks.len());
+    let at = part_position(s).unwrap_or(before_master).min(s.tracks.len());
+    s.tracks.insert(at, track);
     s.edit.selected_tracks = vec![t];
     Ok(json!({"track": t, "name": name, "preset": preset.id, "instrument": preset.instrument}))
 }
@@ -128,7 +150,7 @@ mod tests {
     use serde_json::{Value, json};
     use soundcraft_midi::patterns::{CLAP, CLOSED_HAT, FX_PITCH, KICK, OPEN_HAT};
     use soundcraft_midi::{Note, Sequence};
-    use soundcraft_model::{ChannelFormat, Clip, TrackId, TrackKind};
+    use soundcraft_model::{ChannelFormat, Clip, ClipId, SourceId, TrackId, TrackKind, Transition, WarpMap};
     use soundcraft_time::{Range, TICKS_PER_QUARTER};
 
     fn part(e: &mut Engine, p: Value) -> Value {
@@ -154,7 +176,7 @@ mod tests {
             let ins = tr.instrument.as_ref().unwrap();
             assert_eq!(ins.plugin, x.instrument);
             for (k, v) in x.params {
-                assert_eq!(ins.params.get(*k).copied(), Some(*v as f32), "{}: {k}", x.id);
+                assert_eq!(ins.params.get(*k).copied(), Some(*v), "{}: {k}", x.id);
             }
             let info = soundcraft_dsp::plugin_info(x.instrument).unwrap();
             assert_eq!(ins.params.len(), info.params.len(), "{}: the rest at their defaults", x.id);
@@ -212,6 +234,62 @@ mod tests {
         let all = names(&e);
         assert_eq!(all[..2], ["Pad", "Synth 1"], "{all:?}");
         assert_eq!(e.session().tracks.last().map(|t| t.kind), Some(TrackKind::Master));
+    }
+
+    /// Audio track `name` holding one clip, beat-locked when `warped`.
+    fn deck(e: &mut Engine, name: &str, warped: bool) -> (TrackId, ClipId) {
+        let s = e.session_mut();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(name));
+        let c = s.new_clip_id();
+        let mut clip = Clip::audio(c, name, SourceId(90), 0, 0, 48_000);
+        if warped {
+            clip.warp = WarpMap::new(vec![0.0, 0.5, 1.0], 0.0);
+            assert!(clip.warp.is_some());
+        }
+        crate::edit::place_clip(s, t, clip);
+        (t, c)
+    }
+
+    #[test]
+    fn decks_are_the_tracks_a_transition_mixes_whatever_they_are_called() {
+        let mut e = Engine::default();
+        let (left, lc) = deck(&mut e, "Left", false);
+        let (right, rc) = deck(&mut e, "Right", false);
+        deck(&mut e, "Deck A", false);
+        let x: Transition =
+            serde_json::from_value(json!({"id": 1, "out_clip": lc.0, "in_clip": rc.0, "out_track": left.0, "in_track": right.0})).unwrap();
+        e.session_mut().dj.transitions.push(x);
+        part(&mut e, json!({"kind": "bass"}));
+        let all = names(&e);
+        assert_eq!(all, ["Left", "Right", "Bass 1", "Deck A"], "a track called Deck A is not a deck when the set says otherwise");
+    }
+
+    #[test]
+    fn a_track_with_a_beat_locked_clip_is_a_deck_without_a_transition() {
+        let mut e = Engine::default();
+        deck(&mut e, "Deck A", false);
+        deck(&mut e, "Locked", true);
+        deck(&mut e, "Loose", false);
+        part(&mut e, json!({"kind": "fx"}));
+        assert_eq!(names(&e), ["Deck A", "Locked", "FX 1", "Loose"]);
+    }
+
+    #[test]
+    fn a_part_goes_below_the_whole_folder_its_last_deck_is_in() {
+        let mut e = Engine::default();
+        deck(&mut e, "Deck A", true);
+        deck(&mut e, "Deck B", true);
+        deck(&mut e, "After", false);
+        e.execute("track.move_to_new_folder", &json!({"tracks": ["Deck A", "Deck B"], "name": "Set"})).unwrap();
+        e.execute("track.new", &json!({"kind": "folder", "name": "Inner"})).unwrap();
+        e.execute("track.move_to_folder", &json!({"tracks": ["Inner"], "folder": "Set"})).unwrap();
+        let before = names(&e);
+        assert_eq!(before, ["Set", "Deck A", "Deck B", "Inner", "After"]);
+        part(&mut e, json!({"kind": "drums"}));
+        part(&mut e, json!({"kind": "synth"}));
+        assert_eq!(names(&e), ["Set", "Deck A", "Deck B", "Inner", "Drums 1", "Synth 1", "After"]);
+        let s = e.session();
+        assert!(s.tracks.iter().filter(|t| t.name.ends_with(" 1")).all(|t| t.folder.is_none()), "parts stay out of the folder");
     }
 
     #[test]
@@ -310,10 +388,10 @@ mod tests {
             };
             let (peak, rms) = render(x.kind.name(), x.id, &notes, secs);
             println!("{:>13}: peak {peak:6.1} dBFS, rms {rms:6.1} dBFS", x.id);
-            if peak >= 0.0 || rms <= -40.0 {
+            if peak >= 0.0 || !(-40.0..=-6.0).contains(&rms) {
                 failed.push(x.id);
             }
         }
-        assert!(failed.is_empty(), "clipped (peak >= 0 dBFS) or nearly silent (rms <= -40 dBFS): {failed:?}");
+        assert!(failed.is_empty(), "clipped (peak >= 0 dBFS), nearly silent (rms < -40 dBFS) or too hot (rms > -6 dBFS): {failed:?}");
     }
 }

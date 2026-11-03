@@ -454,7 +454,7 @@ fn move_to_folder(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 /// Whether `track` sits inside `folder`, directly or through nested folders.
-fn in_folder(s: &Session, track: TrackId, folder: TrackId) -> bool {
+pub(super) fn in_folder(s: &Session, track: TrackId, folder: TrackId) -> bool {
     let mut current = s.track(track).and_then(|track| track.folder);
     // The depth cap guards against a cyclic folder chain in a hostile session file.
     for _ in 0..64 {

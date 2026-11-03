@@ -101,12 +101,16 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
     ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
-    // Production parts over the set, each with its kind's default trance preset.
+    // Production parts over the set (PART_KINDS), each with its kind's default trance preset.
     ("DJ > New Drums Part", "prod.new_part"),
     ("DJ > New Bass Part", "prod.new_part"),
     ("DJ > New Synth Part", "prod.new_part"),
     ("DJ > New FX Part", "prod.new_part"),
 ];
+
+/// The kind of part each DJ menu New Part item makes.
+const PART_KINDS: &[(&str, &str)] =
+    &[("DJ > New Drums Part", "drums"), ("DJ > New Bass Part", "bass"), ("DJ > New Synth Part", "synth"), ("DJ > New FX Part", "fx")];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
 fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
@@ -431,7 +435,7 @@ fn params_for(path: &str, id: &str) -> Value {
         "audiosuite.process" => json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == path).map_or("", |(_, x)| *x)}),
         "dj.move_transition" => json!({"bars": if leaf.contains("Earlier") { -4 } else { 4 }}),
         "dj.nudge" => json!({"ms": if leaf.contains("Earlier") { -5.0 } else { 5.0 }}),
-        "prod.new_part" => json!({"kind": leaf.trim_start_matches("New ").trim_end_matches(" Part").to_ascii_lowercase()}),
+        "prod.new_part" => json!({"kind": PART_KINDS.iter().find(|(p, _)| *p == path).map_or("", |(_, k)| *k)}),
         _ => json!({}),
     }
 }

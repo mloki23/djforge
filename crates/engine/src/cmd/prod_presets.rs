@@ -14,17 +14,17 @@ pub(crate) struct Preset {
     pub id: &'static str,
     pub kind: PatternKind,
     pub instrument: &'static str,
-    pub params: &'static [(&'static str, f64)],
+    pub params: &'static [(&'static str, f32)],
 }
 
 const DRUMS: &str = "drum_synth";
 const SYNTH: &str = "subtractive_synth";
 
 // Subtractive Synth oscillator choices.
-const SAW: f64 = 0.0;
-const SQUARE: f64 = 1.0;
-const SINE: f64 = 2.0;
-const WHITE_NOISE: f64 = 4.0;
+const SAW: f32 = 0.0;
+const SQUARE: f32 = 1.0;
+const SINE: f32 = 2.0;
+const WHITE_NOISE: f32 = 4.0;
 
 pub(crate) const PRESETS: &[Preset] = &[
     // A short punchy kick that leaves room for a rolling bass, a snappy snare, crisp hats.
@@ -304,7 +304,7 @@ mod tests {
             assert!(info.is_instrument, "{}", p.id);
             for (k, v) in p.params {
                 let pi = info.param(k).unwrap_or_else(|| panic!("{}: {} has no `{k}`", p.id, p.instrument));
-                assert_eq!(pi.clamp(*v as f32), *v as f32, "{}: `{k}` = {v} is out of range", p.id);
+                assert_eq!(pi.clamp(*v), *v, "{}: `{k}` = {v} is out of range", p.id);
             }
             assert_eq!(PRESETS.iter().filter(|q| q.id == p.id).count(), 1, "{} is listed once", p.id);
         }

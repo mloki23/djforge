@@ -5,6 +5,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
+use soundcraft_dsp::PluginInfo;
 use soundcraft_model::{Insert, TrackKind};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -57,20 +58,29 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
         for (k, v) in obj {
             let pi = info.params.iter().find(|pi| pi.id == k).ok_or_else(|| bad("mix.instrument", format!("`{plugin}` has no parameter `{k}`")))?;
             let x = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad("mix.instrument", format!("`{k}` must be a number")))?;
-            values.push((k.clone(), pi.clamp(x as f32)));
+            values.push((pi.id, x as f32));
         }
     }
+    let ins = plugin_with(info, values);
+    if let Some(tr) = e.session_mut().track_mut(t) {
+        tr.instrument = Some(ins);
+    }
+    Ok(json!({"track": t, "plugin": info.id}))
+}
+
+/// `info`'s plugin with every parameter at its default, then `values` (clamped into range, choices
+/// and toggles rounded). The caller has checked each id; one `info` lacks is skipped.
+pub(super) fn plugin_with<'a>(info: &PluginInfo, values: impl IntoIterator<Item = (&'a str, f32)>) -> Insert {
     let mut ins = Insert::new(info.id);
     for pi in info.params {
         ins.params.insert(pi.id.to_string(), pi.default);
     }
     for (k, v) in values {
-        ins.params.insert(k, v);
+        if let Some(pi) = info.param(k) {
+            ins.params.insert(pi.id.to_string(), pi.clamp(v));
+        }
     }
-    if let Some(tr) = e.session_mut().track_mut(t) {
-        tr.instrument = Some(ins);
-    }
-    Ok(json!({"track": t, "plugin": info.id}))
+    ins
 }
 
 fn set_instrument_param(e: &mut Engine, p: &Value) -> Result<Value> {

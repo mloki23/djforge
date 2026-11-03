@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, Insert, SEND_SLOTS, SendSlot, Session, TrackId};
+use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, SEND_SLOTS, SendSlot, Session, TrackId};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -334,23 +334,20 @@ fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     let info = super::clap::plugin_info(&plugin).ok_or_else(|| bad("mix.insert", format!("unknown plugin `{plugin}`")))?;
     let t = tracks_required(e, "mix.insert", p)?.first().copied().ok_or_else(|| bad("mix.insert", "no track"))?;
     let explicit = slot_of(p, "slot", INSERT_SLOTS);
-    let s = e.session_mut();
-    let tr = s.track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
-    let slot =
-        explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
-    let mut ins = Insert::new(info.id);
-    for pi in info.params {
-        ins.params.insert(pi.id.to_string(), pi.default);
-    }
+    let mut values = Vec::new();
     if let Some(obj) = p.get("params").and_then(Value::as_object) {
         for (k, v) in obj {
             let Some(pi) = info.params.iter().find(|x| x.id == k) else {
                 return Err(bad("mix.insert", format!("`{plugin}` has no parameter `{k}`")));
             };
-            let val = v.as_f64().map_or(pi.default, |f| (f as f32).clamp(pi.min, pi.max));
-            ins.params.insert(k.clone(), val);
+            values.push((pi.id, v.as_f64().map_or(pi.default, |f| f as f32)));
         }
     }
+    let ins = super::instrument::plugin_with(info, values);
+    let s = e.session_mut();
+    let tr = s.track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
+    let slot =
+        explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
     if let Some(sl) = tr.mixer.inserts.get_mut(slot) {
         *sl = Some(ins);
     }

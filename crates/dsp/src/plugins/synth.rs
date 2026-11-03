@@ -2,6 +2,8 @@
 //! voice with its own generator), resonant state-variable low-pass (TPT form) with its own ADSR,
 //! amp ADSR, optional glide.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::osc::{Osc, Waveform};
 use crate::params::{Params, choice, lin, log, param_plumbing};
 use crate::util::{Smoother, frames_in, ms_to_samples, note_hz, sane_channels, sane_sr, sort_events};
@@ -266,6 +268,17 @@ pub struct SubtractiveSynth {
     cutoff: Smoother,
     sustain: bool,
     bend: f32,
+    /// Where this instance's voice seeds start, so two synths don't play the same noise.
+    seed: u32,
+}
+
+/// Instances made so far: each takes the next value for its seed (at construction, never on the
+/// audio thread).
+static INSTANCES: AtomicU32 = AtomicU32::new(0);
+
+/// Seed of voice `i` of the instance seeded `seed`.
+fn voice_seed(seed: u32, i: usize) -> u32 {
+    seed.wrapping_add(i as u32 * 31)
 }
 
 impl Default for SubtractiveSynth {
@@ -276,9 +289,11 @@ impl Default for SubtractiveSynth {
 
 impl SubtractiveSynth {
     pub fn new() -> Self {
+        // A large odd step keeps instances' seed ranges well apart.
+        let seed = 0x1000u32.wrapping_add(INSTANCES.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9));
         let mut voices = [Voice::new(1); VOICES];
         for (i, v) in voices.iter_mut().enumerate() {
-            *v = Voice::new(0x1000 + i as u32 * 31);
+            *v = Voice::new(voice_seed(seed, i));
         }
         let mut s = Self {
             p: Params::new(&SYNTH_PARAMS),
@@ -295,6 +310,7 @@ impl SubtractiveSynth {
             cutoff: Smoother::new(2000.0),
             sustain: false,
             bend: 1.0,
+            seed,
         };
         s.update();
         s
@@ -455,7 +471,7 @@ impl Plugin for SubtractiveSynth {
 
     fn reset(&mut self) {
         for (i, v) in self.voices.iter_mut().enumerate() {
-            *v = Voice::new(0x1000 + i as u32 * 31);
+            *v = Voice::new(voice_seed(self.seed, i));
         }
         self.events.clear();
         self.last_freq = None;
