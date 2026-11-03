@@ -905,8 +905,13 @@ impl Column<'_> {
     /// The instrument applies events in the order sent on a sample, so this order lets an
     /// arrangement note start on the sample a slot stops on, and a slot note on the one it
     /// starts on (the arrangement releases its notes there before the tail is sent).
-    pub(crate) fn midi_head(&self, play: &mut ColumnPlay, midi: &mut LiveMidi, inst: &mut dyn Plugin, pos: Samples, end: Samples) -> Samples {
+    ///
+    /// Also returns true when a slot stopped between blocks (cleared by a snapshot, gone, the
+    /// transport stopped): the arrangement is heard again from the block's start, so its
+    /// controllers, reset where the slot started, are to be chased there.
+    pub(crate) fn midi_head(&self, play: &mut ColumnPlay, midi: &mut LiveMidi, inst: &mut dyn Plugin, pos: Samples, end: Samples) -> (Samples, bool) {
         let owner = play.playing.map(|p| (p.slot, p.origin));
+        let stopped = midi.owner.is_some() && owner.is_none();
         if midi.owner != owner {
             // Stopped or replaced between blocks (a snapshot change, a transport stop): what it
             // left sounding stops now, and nothing of what plays now was sent before this block.
@@ -936,7 +941,7 @@ impl Column<'_> {
             midi.owner = next.map(|p| (p.slot, p.origin));
             midi.since = x;
         }
-        x
+        (x, stopped)
     }
 
     /// The second half of the block: the playing slot's notes over `[x, end)`, sent after the

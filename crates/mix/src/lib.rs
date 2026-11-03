@@ -1410,13 +1410,15 @@ fn process_strip(
                 let end = pos.saturating_add(frames as i64);
                 let mut gate = live::ArrGate::OPEN;
                 let mut split = end;
+                // A slot that stopped between blocks leaves the arrangement's controllers to chase.
+                let mut stopped = false;
                 if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
                     let column = live::Column { s, track: t, column: *c, wrap: None };
                     gate = column.midi_gate(play, pos, end);
-                    split = column.midi_head(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, end);
+                    (split, stopped) = column.midi_head(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, end);
                 }
                 let reopen = gate.reopen().filter(|at| (pos..end).contains(at));
-                if std::mem::take(&mut strip.chase) && reopen != Some(pos) {
+                if (std::mem::take(&mut strip.chase) || stopped) && reopen != Some(pos) {
                     if gate.heard(pos) {
                         chase_controllers(s, t, pos, 0, inst);
                     } else {

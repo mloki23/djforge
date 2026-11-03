@@ -204,6 +204,9 @@ impl Slot {
 const BAR_BEATS: f64 = 4.0;
 
 /// A MIDI clip slot: a sequence its column's instrument plays, looped over whole bars.
+///
+/// Build one with [`MidiSlot::new`] (or run [`MidiSlot::sanitize`] after setting its fields):
+/// the mixer relies on the invariants it keeps, notes sorted by start among them.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiSlot {
     pub name: String,

@@ -505,3 +505,25 @@ fn bounces_ignore_a_playing_midi_slot() {
     let bounce = render_range(&s, soundcraft_time::Range::new(0, 40 * BLOCK as i64), BLOCK);
     assert!(bounce.iter().flatten().all(|x| *x == 0.0), "the bounce is silent");
 }
+
+/// A slot cleared by a new snapshot while it plays stops between blocks: the arrangement's
+/// controllers, reset where the slot started, are chased back at the next block.
+#[test]
+fn controllers_come_back_after_a_slot_is_cleared() {
+    let mut r = rig(false);
+    // The pedal goes down before the launch and stays down across it.
+    arrangement(&mut r, Vec::new(), vec![ctrl(2 * Q, CtrlKind::Cc(64), 127)]);
+    let launch = r.bar(2);
+    let mid = launch + 6_144;
+    r.run(0, mid, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: launch })]);
+    assert_eq!(controllers(&r.log()), (false, 0), "reset under the slot");
+    let old = r.s.clone();
+    let mut cleared = old.clone();
+    cleared.live.columns[0].slots[0] = None;
+    r.eng.live_snapshot(&old, &cleared, mid);
+    r.s = cleared;
+    r.run(mid, mid + BLOCK as i64, &[]);
+    assert!(r.eng.live_state()[0].playing.is_none());
+    assert_eq!(controllers(&r.log()), (true, 0), "the pedal is down again");
+    assert!(r.events().contains(&Ev::Midi(mid, [0xB0, 64, 127])), "chased on the block's first sample");
+}
