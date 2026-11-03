@@ -370,6 +370,50 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// An MP3 of 40 silent frames (MPEG-1 Layer III, 128 kbit/s, 44.1 kHz) after an ID3v2.3 tag
+    /// holding `TKEY` = `key` (no tag when `None`).
+    fn keyed_mp3(dir: &std::path::Path, name: &str, key: Option<&str>) -> String {
+        let mut bytes = Vec::new();
+        if let Some(k) = key {
+            let body = [&[0u8][..], k.as_bytes()].concat();
+            let frame = [&b"TKEY"[..], &(body.len() as u32).to_be_bytes(), &[0, 0], &body].concat();
+            let n = frame.len() as u32;
+            let size = [(n >> 21) & 0x7F, (n >> 14) & 0x7F, (n >> 7) & 0x7F, n & 0x7F].map(|b| b as u8);
+            bytes.extend_from_slice(&[b'I', b'D', b'3', 3, 0, 0]);
+            bytes.extend_from_slice(&size);
+            bytes.extend_from_slice(&frame);
+        }
+        for _ in 0..40 {
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            bytes.extend_from_slice(&[0; 413]);
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn an_mp3s_key_tag_becomes_its_sources_key() {
+        let dir = std::env::temp_dir().join(format!("sc-import-tkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Engine::default();
+        for (name, tag, want) in
+            [("am.mp3", Some("Am"), Some("8A")), ("mik.mp3", Some("4B"), Some("4B")), ("odd.mp3", Some("H#"), None), ("bare.mp3", None, None)]
+        {
+            let path = keyed_mp3(&dir, name, tag);
+            let r = e.execute("file.import_audio", &json!({"path": path})).unwrap();
+            let src = soundcraft_model::SourceId(r["imported"][0]["source"].as_u64().unwrap());
+            assert_eq!(e.session().source(src).unwrap().key.as_deref(), want, "{name}");
+        }
+        // Not read from other formats.
+        let wav = tone_wav(&dir, "tone.wav");
+        let r = e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        let src = soundcraft_model::SourceId(r["imported"][0]["source"].as_u64().unwrap());
+        assert_eq!(e.session().source(src).unwrap().key, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn import_audio_honours_new_tracks() {
         let dir = std::env::temp_dir().join(format!("sc-import-new-tracks-{}", std::process::id()));

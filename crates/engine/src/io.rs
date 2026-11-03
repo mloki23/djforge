@@ -341,6 +341,7 @@ pub(crate) fn add_file_source(s: &mut Session, name: &str, path: &Path, audio: A
         origin: None,
         origin_len: 0,
         origin_modified_ms: 0,
+        key: None,
     });
     s.pool.insert(id, audio);
     id
@@ -458,6 +459,7 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         origin: None,
         origin_len: 0,
         origin_modified_ms: 0,
+        key: None,
     });
     s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
     id
@@ -504,6 +506,8 @@ pub(crate) struct DecodedImport {
     info: soundcraft_audio_io::AudioInfo,
     buf: AudioBuffer,
     ext: Option<String>,
+    /// The Camelot key in an MP3's `TKEY` tag, when it holds a recognised one.
+    key: Option<String>,
 }
 
 /// Decodes the file `name` (`bytes`) at the session rate `rate`, as an import does.
@@ -514,12 +518,17 @@ pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<Decod
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
-    Ok(DecodedImport { info, buf, ext })
+    // Best-effort: a missing, unreadable or unrecognised tag leaves the key unknown.
+    let key = (info.format == FileFormat::Mp3)
+        .then(|| soundcraft_audio_io::mp3tags::read_basic(bytes).key)
+        .flatten()
+        .and_then(|k| soundcraft_model::camelot_of(&k));
+    Ok(DecodedImport { info, buf, ext, key })
 }
 
 /// Adds decoded audio as a new source, as [`import_source_bytes`] does.
 pub(crate) fn add_import(e: &mut Engine, name: &str, decoded: DecodedImport, path: Option<&str>) -> Result<(SourceId, Samples, usize)> {
-    let DecodedImport { info, buf, ext } = decoded;
+    let DecodedImport { info, buf, ext, key } = decoded;
     if buf.sample_rate != e.session().sample_rate.hz() {
         return Err(EngineError::Io(format!("{name}: the session's sample rate changed while it was read; load it again")));
     }
@@ -552,6 +561,7 @@ pub(crate) fn add_import(e: &mut Engine, name: &str, decoded: DecodedImport, pat
     }
     if let Some(sx) = s.sources.last_mut() {
         sx.unsaved = !in_place;
+        sx.key = key;
         // The file it came from, for exports that want the original rather than the session's
         // copy of it.
         sx.origin = path.map(|p| crate::cmd::prep::normalise(Path::new(p)).to_string_lossy().into_owned());

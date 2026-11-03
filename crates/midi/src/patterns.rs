@@ -69,6 +69,8 @@ pub enum PatternError {
     BadBars { bars: u32, max: u32 },
     #[error("style {0} needs a key")]
     KeyRequired(&'static str),
+    #[error("scale degree {degree} in octave {octave} is outside the MIDI note range")]
+    PitchOutOfRange { degree: i32, octave: i32 },
 }
 
 /// What a pattern is for.
@@ -274,11 +276,11 @@ pub fn generate(spec: &PatternSpec) -> Result<Generated, PatternError> {
             g.trance_groove();
             g.snare_roll();
         }
-        (PatternStyle::Rolling, Some(k)) => g.rolling_bass(k),
-        (PatternStyle::Offbeat, Some(k)) => g.offbeat_bass(k),
-        (PatternStyle::RootFifth, Some(k)) => g.root_fifth(k),
-        (PatternStyle::Stabs, Some(k)) => g.stabs(k),
-        (PatternStyle::Arp, Some(k)) => g.arp(k),
+        (PatternStyle::Rolling, Some(k)) => g.rolling_bass(k)?,
+        (PatternStyle::Offbeat, Some(k)) => g.offbeat_bass(k)?,
+        (PatternStyle::RootFifth, Some(k)) => g.root_fifth(k)?,
+        (PatternStyle::Stabs, Some(k)) => g.stabs(k)?,
+        (PatternStyle::Arp, Some(k)) => g.arp(k)?,
         (PatternStyle::Riser, _) => {
             g.push(MELODIC_CH, FX_PITCH, 0, length, 100);
             automation = sweep(length, false);
@@ -381,13 +383,13 @@ impl Gen {
         usize::try_from(index.rem_euclid(4)).ok().and_then(|i| prog.get(i).copied()).unwrap_or(0)
     }
 
-    fn pitch(key: Key, degree: i32, octave: i32) -> u8 {
-        // Degrees used here stay within a couple of octaves of 1..3, always in MIDI range.
-        key.degree(degree, octave).unwrap_or(60)
+    /// The MIDI note of scale `degree` of `key` in `octave`, or an error outside the MIDI range.
+    fn pitch(key: Key, degree: i32, octave: i32) -> Result<u8, PatternError> {
+        key.degree(degree, octave).ok_or(PatternError::PitchOutOfRange { degree, octave })
     }
 
-    fn rolling_bass(&mut self, key: Key) {
-        let root = Self::pitch(key, 0, BASS_OCTAVE);
+    fn rolling_bass(&mut self, key: Key) -> Result<(), PatternError> {
+        let root = Self::pitch(key, 0, BASS_OCTAVE)?;
         for t in sixteenths(self.bars) {
             let step = (t % BEAT) / SIXTEENTH;
             // The kick owns the beat; the bass fills the other three 16ths.
@@ -397,39 +399,43 @@ impl Gen {
             let v = self.vary(if step == 2 { 104 } else { 92 }, 4.0);
             self.push(MELODIC_CH, root, t, SIXTEENTH - 40, v);
         }
+        Ok(())
     }
 
-    fn offbeat_bass(&mut self, key: Key) {
-        let root = Self::pitch(key, 0, BASS_OCTAVE);
+    fn offbeat_bass(&mut self, key: Key) -> Result<(), PatternError> {
+        let root = Self::pitch(key, 0, BASS_OCTAVE)?;
         for beat in 0..self.bars * 4 {
             let v = self.vary(104, 4.0);
             self.push(MELODIC_CH, root, beat * BEAT + EIGHTH, EIGHTH - 120, v);
         }
+        Ok(())
     }
 
-    fn root_fifth(&mut self, key: Key) {
+    fn root_fifth(&mut self, key: Key) -> Result<(), PatternError> {
         for beat in 0..self.bars * 4 {
             let t = beat * BEAT + EIGHTH;
             let root = self.chord_root(key, t);
             // Root on beats 1 and 3, the chord's (diatonic) fifth on 2 and 4.
             let degree = if beat % 2 == 0 { root } else { root + 4 };
             let v = self.vary(104, 4.0);
-            self.push(MELODIC_CH, Self::pitch(key, degree, BASS_OCTAVE), t, EIGHTH - 120, v);
+            self.push(MELODIC_CH, Self::pitch(key, degree, BASS_OCTAVE)?, t, EIGHTH - 120, v);
         }
+        Ok(())
     }
 
-    fn stabs(&mut self, key: Key) {
+    fn stabs(&mut self, key: Key) -> Result<(), PatternError> {
         for beat in 0..self.bars * 4 {
             let t = beat * BEAT + EIGHTH;
             let root = self.chord_root(key, t);
             let v = self.vary(100, 5.0);
             for d in [root, root + 2, root + 4] {
-                self.push(MELODIC_CH, Self::pitch(key, d, SYNTH_OCTAVE), t, SIXTEENTH, v);
+                self.push(MELODIC_CH, Self::pitch(key, d, SYNTH_OCTAVE)?, t, SIXTEENTH, v);
             }
         }
+        Ok(())
     }
 
-    fn arp(&mut self, key: Key) {
+    fn arp(&mut self, key: Key) -> Result<(), PatternError> {
         for t in sixteenths(self.bars) {
             let root = self.chord_root(key, t);
             let step = (t % BEAT) / SIXTEENTH;
@@ -440,8 +446,9 @@ impl Gen {
                 _ => root + 7,
             };
             let v = self.vary(if step == 0 { 100 } else { 86 }, 5.0);
-            self.push(MELODIC_CH, Self::pitch(key, degree, SYNTH_OCTAVE), t, SIXTEENTH - 20, v);
+            self.push(MELODIC_CH, Self::pitch(key, degree, SYNTH_OCTAVE)?, t, SIXTEENTH - 20, v);
         }
+        Ok(())
     }
 }
 
@@ -476,4 +483,18 @@ fn sweep(length: i64, reverse: bool) -> Vec<AutoCurve> {
         AutoCurve { param, points }
     };
     vec![curve(AutoParam::Cutoff, 0.05), curve(AutoParam::Volume, 0.3)]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scale_degree_outside_the_midi_range_is_an_error() {
+        let am = Key::parse("Am").unwrap();
+        assert!(Gen::pitch(am, 0, BASS_OCTAVE).is_ok());
+        assert_eq!(Gen::pitch(am, 0, 20), Err(PatternError::PitchOutOfRange { degree: 0, octave: 20 }));
+        assert_eq!(Gen::pitch(am, -100, 0), Err(PatternError::PitchOutOfRange { degree: -100, octave: 0 }));
+    }
 }

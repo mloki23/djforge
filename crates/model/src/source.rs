@@ -39,6 +39,30 @@ pub struct Source {
     /// `origin`'s modification time then, in milliseconds since 1970 (0 = unknown).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub origin_modified_ms: u64,
+    /// The track's key as a Camelot code (`8A`), from the set plan, mixforge's analysis or the
+    /// file's `TKEY` tag (`None`: not known, or from a session older than this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl Source {
+    /// Records the key written `raw` (Camelot, Open Key or a key name) as its Camelot code; a
+    /// blank or unrecognised one leaves the key as it was. True when it was recognised.
+    pub fn set_key(&mut self, raw: &str) -> bool {
+        match camelot_of(raw) {
+            Some(k) => {
+                self.key = Some(k);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The Camelot code (`8A`) of the key written `raw` (Camelot, Open Key or a key name such as
+/// `Am`), or `None` when it is not one.
+pub fn camelot_of(raw: &str) -> Option<String> {
+    soundcraft_midi::Key::parse(raw).ok().map(|k| k.camelot())
 }
 
 fn is_zero(x: &u64) -> bool {
@@ -131,5 +155,38 @@ impl SourcePool {
 impl PartialEq for SourcePool {
     fn eq(&self, other: &Self) -> bool {
         self.map.len() == other.map.len() && self.map.iter().zip(other.map.iter()).all(|((a, x), (b, y))| a == b && Arc::ptr_eq(x, y))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn old_source() -> serde_json::Value {
+        serde_json::json!({"id": 3, "name": "a", "path": "a.wav", "channels": 2, "frames": 10, "sample_rate": 48000, "format": "Wav"})
+    }
+
+    #[test]
+    fn a_source_from_before_keys_loads_without_one_and_saves_without_one() {
+        let s: Source = serde_json::from_value(old_source()).unwrap();
+        assert_eq!(s.key, None);
+        assert!(serde_json::to_value(&s).unwrap().get("key").is_none());
+    }
+
+    #[test]
+    fn keys_are_kept_as_camelot_and_unrecognised_ones_ignored() {
+        let mut s: Source = serde_json::from_value(old_source()).unwrap();
+        assert!(s.set_key("Am"));
+        assert_eq!(s.key.as_deref(), Some("8A"));
+        for bad in ["", "  ", "H", "13A", "Am7"] {
+            assert!(!s.set_key(bad), "{bad}");
+        }
+        assert_eq!(s.key.as_deref(), Some("8A"), "an unrecognised key leaves the known one");
+        assert!(s.set_key(" 04b "));
+        assert_eq!(s.key.as_deref(), Some("4B"));
+        assert_eq!(camelot_of("1m").as_deref(), Some("8A"));
+        let back: Source = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.key.as_deref(), Some("4B"));
     }
 }

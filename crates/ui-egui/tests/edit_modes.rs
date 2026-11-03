@@ -59,6 +59,7 @@ fn tracks(mode: &str, tool: &str, lanes: &[&[(i64, i64)]]) -> (SoundApp, egui::C
         origin: None,
         origin_len: 0,
         origin_modified_ms: 0,
+        key: None,
     });
     let mut ids = Vec::new();
     for (t, spans) in tracks.iter().zip(lanes) {

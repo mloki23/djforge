@@ -294,6 +294,13 @@ pub(super) fn import_set(e: &mut Engine, p: &Value) -> Result<Value> {
         if let Some(c) = s.find_clip_mut(placed.clip) {
             c.gain_db = (t.gain_db as f32).clamp(-144.0, 36.0);
         }
+        // The plan's key (its Camelot code, else its key name) over any the file's tag gave.
+        let src = s.find_clip(placed.clip).and_then(|(_, c)| c.source());
+        if let Some(x) = s.sources.iter_mut().find(|x| Some(x.id) == src)
+            && !x.set_key(&t.camelot)
+        {
+            x.set_key(&t.key);
+        }
         let copied = s.find_clip(placed.clip).and_then(|(_, c)| c.source()).and_then(|src| s.source(src)).is_some_and(|src| src.unsaved);
         if copied {
             doubts.push(format!(
@@ -720,6 +727,36 @@ mod tests {
         assert!(*e.session() == after);
         assert!(e.undo());
         assert!(*e.session() == before, "undo left part of the import");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_track_keeps_its_planned_key_and_the_key_changes_on_the_hit_bars() {
+        let (dir, plan) = set("keys");
+        // B's key only as a name; C's not one at all.
+        let mut p: Value = serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+        p["tracks"][1]["camelot"] = json!("");
+        p["tracks"][1]["key"] = json!("Em");
+        p["tracks"][2]["camelot"] = json!("unknown");
+        std::fs::write(&plan, p.to_string()).unwrap();
+        let mut e = Engine::default();
+        let r = e.execute("dj.import_set", &json!({"plan": plan})).unwrap();
+        let s = e.session();
+        let clips: Vec<ClipId> = r["track_list"].as_array().unwrap().iter().map(|t| ClipId(t["clip"].as_u64().unwrap())).collect();
+        let key_of = |c: ClipId| s.source(s.find_clip(c).unwrap().1.source().unwrap()).unwrap().key.clone();
+        assert_eq!(clips.iter().map(|c| key_of(*c)).collect::<Vec<_>>(), vec![Some("8A".to_string()), Some("9A".to_string()), None]);
+        // Transitions hit on bars 33 (A -> B) and 57 (B -> C).
+        let mut key_at = |n: i64, back: Samples| {
+            let at = bar(&e, n) - back;
+            let v = e.execute("dj.key_at", &json!({"at": at})).unwrap();
+            (v["camelot"].as_str().map(str::to_string), v["clip"].as_u64())
+        };
+        assert_eq!(key_at(10, 0), (Some("8A".to_string()), Some(clips[0].0)));
+        assert_eq!(key_at(33, 1), (Some("8A".to_string()), Some(clips[0].0)), "before the hit");
+        assert_eq!(key_at(33, 0), (Some("9A".to_string()), Some(clips[1].0)), "on the hit");
+        assert_eq!(key_at(50, 0), (Some("9A".to_string()), Some(clips[1].0)), "three clips under, B's bass in");
+        assert_eq!(key_at(57, 1), (Some("9A".to_string()), Some(clips[1].0)));
+        assert_eq!(key_at(57, 0), (None, Some(clips[2].0)), "C has no key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -34,7 +34,7 @@ pub use session::{
     BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,
     TrackView, ZoomState, ZoomToggle, truncate_chars,
 };
-pub use source::{Source, SourceAudio, SourcePool, VideoSource};
+pub use source::{Source, SourceAudio, SourcePool, VideoSource, camelot_of};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};
 pub use warp::{MAX_WARP_BEATS, WarpLock, WarpMap, tempo_fingerprint};
 

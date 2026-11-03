@@ -10,6 +10,8 @@ use soundcraft_time::{MAX_POSITION, SampleRate, TICKS_PER_QUARTER, TempoMap};
 mod align;
 #[path = "dj_import.rs"]
 mod import;
+#[path = "dj_key.rs"]
+mod key;
 #[path = "dj_move.rs"]
 mod moving;
 #[path = "dj_plan.rs"]
@@ -33,9 +35,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Analyse Track (mixforge)",
             [],
             None,
-            "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder)",
+            "{path} — BPM, first downbeat, key and loudness from mixforge's analysis (needs DJFORGE_PYTHON: mixforge's python.exe, and DJFORGE_MIXFORGE: the mixforge folder); the key is remembered on the session's sources of that file (not an undo step)",
             always,
-            |_, p| analyze_file("dj.analyze", str_param(p, "path").ok_or_else(|| bad("dj.analyze", "`path` required"))?)
+            analyze
+        ),
+        cmd!(
+            query "dj.key_at",
+            "Key At Position",
+            [],
+            None,
+            "{at?: position (default: the playhead), track?} — the key playing at `at`: that of the beat-locked audio clip under it (on `track` only, when given; where a transition's two clips overlap, the outgoing one before its hit bar and the incoming one from it; otherwise the latest-started). Returns {key: name like `Am`, camelot: `8A`, source, clip}, or {key: null} when no keyed clip plays there. Changes nothing",
+            always,
+            key::key_at
         ),
         cmd!(
             "dj.tempo_ramp",
@@ -306,6 +317,35 @@ pub(super) fn place_warped(
     c.warp = Some(warp);
     c.length = length;
     Ok(Placed { track: r.get("track").cloned().unwrap_or(Value::Null), clip, start: at, length, beats: track_beats, anchor, downbeat_bar })
+}
+
+/// `dj.analyze {path}`: mixforge's analysis of the file, whose key (Camelot, else its key name)
+/// is remembered on every source imported from it.
+fn analyze(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "dj.analyze";
+    let path = str_param(p, "path").ok_or_else(|| bad(CMD, "`path` required"))?;
+    let a = analyze_file(CMD, path)?;
+    let key_in = |k: &str| a.get(k).and_then(Value::as_str).and_then(soundcraft_model::camelot_of);
+    if let Some(key) = key_in("camelot").or_else(|| key_in("key")) {
+        remember_key(e, path, &key);
+    }
+    Ok(a)
+}
+
+/// Sets Camelot key `key` on every source of the file at `path` (imported from it, or
+/// referencing it where it is), touching the session only when one changes.
+fn remember_key(e: &mut Engine, path: &str, key: &str) {
+    use std::path::Path;
+    let file = super::prep::normalise(Path::new(path));
+    let of_file = |x: &soundcraft_model::Source| {
+        x.origin.as_deref().is_some_and(|o| Path::new(o) == file)
+            || (Path::new(&x.path).is_absolute() && super::prep::normalise(Path::new(&x.path)) == file)
+    };
+    if e.session().sources.iter().any(|x| of_file(x) && x.key.as_deref() != Some(key)) {
+        for x in e.session_mut().sources.iter_mut().filter(|x| of_file(x)) {
+            x.key = Some(key.to_string());
+        }
+    }
 }
 
 /// The mixforge sidecar: prints one JSON object with a file's analysis, or `{error}`.
@@ -776,6 +816,28 @@ mod tests {
     use soundcraft_model::{ChannelFormat, TrackKind};
 
     const SR: i64 = 48_000;
+
+    #[test]
+    fn an_analysed_key_is_remembered_on_the_sources_of_that_file() {
+        let dir = std::env::temp_dir().join("sc-dj-key");
+        let file = dir.join("a.wav").to_string_lossy().into_owned();
+        let mut s = Session::default();
+        for (path, origin) in [(file.clone(), None), ("Audio Files/a.wav".to_string(), Some(file.clone())), ("b.wav".to_string(), None)] {
+            let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.0; 10]] };
+            crate::io::add_source(&mut s, "a", buf, Some(&path), FileFormat::Wav);
+            s.sources.last_mut().unwrap().origin = origin;
+        }
+        let mut e = Engine::new(s);
+        let rev = e.revision;
+        remember_key(&mut e, &dir.join(".").join("a.wav").to_string_lossy(), "9A");
+        let keys: Vec<Option<&str>> = e.session().sources.iter().map(|x| x.key.as_deref()).collect();
+        assert_eq!(keys, vec![Some("9A"), Some("9A"), None]);
+        // Known already: the session is left alone.
+        assert_ne!(e.revision, rev);
+        let rev = e.revision;
+        remember_key(&mut e, &file, "9A");
+        assert_eq!(e.revision, rev);
+    }
 
     /// A 30 s source with a 125 bpm beat list (a beat every 0.48 s from 0.1 s), played from 1 s
     /// for 20 s at the session's 120 bpm, with its lock recorded.
