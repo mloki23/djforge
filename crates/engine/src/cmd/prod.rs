@@ -7,7 +7,7 @@ use super::*;
 use crate::cmd;
 use serde_json::json;
 use soundcraft_midi::patterns::PatternKind;
-use soundcraft_model::{ChannelFormat, Session, Track, TrackKind};
+use soundcraft_model::{ChannelFormat, Session, TrackKind};
 use std::collections::HashSet;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -72,14 +72,15 @@ fn deck_tracks(s: &Session) -> Vec<TrackId> {
     s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && matches!(t.name.as_str(), "Deck A" | "Deck B")).map(|t| t.id).collect()
 }
 
-/// The outermost folder holding `t`, or `t` itself when it is in none.
+/// The outermost folder holding `t` that the session has, or `t` itself when it is in none.
 fn outermost(s: &Session, t: TrackId) -> TrackId {
     let mut root = t;
-    // The depth cap guards against a cyclic folder chain in a hostile session file.
+    // The depth cap guards against a cyclic folder chain in a hostile session file; a folder id
+    // naming no track ends the chain at the last folder that exists.
     for _ in 0..64 {
-        match s.track(root).and_then(|tr| tr.folder) {
-            Some(parent) if parent != t => root = parent,
-            _ => break,
+        match s.track(root).and_then(|tr| tr.folder).filter(|&parent| parent != t && s.track(parent).is_some()) {
+            Some(parent) => root = parent,
+            None => break,
         }
     }
     root
@@ -122,12 +123,11 @@ fn new_part(e: &mut Engine, p: &Value) -> Result<Value> {
     let ins = super::instrument::plugin_with(info, preset.params.iter().copied());
     // The track is whole before it joins the session: nothing below can fail.
     let s = e.session_mut();
-    let name = s.unique_track_name(&name.map_or_else(|| numbered_name(s, label(kind)), str::to_string));
-    let t = TrackId(s.alloc());
-    let mut track = Track::new(t, name.clone(), TrackKind::Instrument, ChannelFormat::Stereo, s.next_track_color());
+    let name = name.map_or_else(|| numbered_name(s, label(kind)), str::to_string);
+    let mut track = s.make_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&name));
     track.instrument = Some(ins);
-    let before_master = s.tracks.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(s.tracks.len());
-    let at = part_position(s).unwrap_or(before_master).min(s.tracks.len());
+    let (t, name) = (track.id, track.name.clone());
+    let at = part_position(s).unwrap_or_else(|| s.before_master()).min(s.tracks.len());
     s.tracks.insert(at, track);
     s.edit.selected_tracks = vec![t];
     Ok(json!({"track": t, "name": name, "preset": preset.id, "instrument": preset.instrument}))
@@ -234,6 +234,62 @@ mod tests {
         let all = names(&e);
         assert_eq!(all[..2], ["Pad", "Synth 1"], "{all:?}");
         assert_eq!(e.session().tracks.last().map(|t| t.kind), Some(TrackKind::Master));
+    }
+
+    #[test]
+    fn a_folder_id_naming_no_track_ends_the_folder_walk() {
+        let mut e = Engine::default();
+        let (a, _) = deck(&mut e, "Deck A", true);
+        deck(&mut e, "Loose", false);
+        if let Some(t) = e.session_mut().track_mut(a) {
+            t.folder = Some(TrackId(9_999));
+        }
+        part(&mut e, json!({"kind": "bass"}));
+        assert_eq!(names(&e), ["Deck A", "Bass 1", "Loose"]);
+    }
+
+    /// A noise riser part and an impact part, each holding a note over the first two seconds.
+    fn noisy_session() -> Engine {
+        let mut e = Engine::default();
+        for (kind, preset) in [("fx", "noise_riser"), ("fx", "impact")] {
+            let t = track_of(&part(&mut e, json!({"kind": kind, "preset": preset})));
+            let mut seq = Sequence::default();
+            seq.notes.push(Note { pitch: FX_PITCH, velocity: 120, release_velocity: 64, channel: 0, start: 0, length: 4 * TICKS_PER_QUARTER });
+            let s = e.session_mut();
+            let cid = s.new_clip_id();
+            crate::edit::place_clip(s, t, Clip::midi(cid, preset, 0, 96_000, seq));
+        }
+        e
+    }
+
+    #[test]
+    fn noise_bounces_repeat_and_a_normalised_bounce_stays_under_its_ceiling() {
+        let dir = std::env::temp_dir().join(format!("sc-prod-bounce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bounce = |name: &str, normalize: bool| {
+            let mut e = noisy_session();
+            let path = dir.join(name);
+            let r = e
+                .execute(
+                    "file.bounce_mix",
+                    &json!({"path": path.to_string_lossy(), "bit_depth": "32f", "start": 0, "end": 96_000, "normalize": normalize}),
+                )
+                .unwrap();
+            let (_, buf) = soundcraft_audio_io::decode(&std::fs::read(&path).unwrap(), Some("wav")).unwrap();
+            (r, buf.channels)
+        };
+        let (_, first) = bounce("a.wav", false);
+        let (_, second) = bounce("b.wav", false);
+        assert!(first.iter().flatten().any(|x| x.abs() > 0.01), "the noise sounds");
+        assert_eq!(first, second, "the same session bounces the same noise");
+        // The second pass plays exactly what the first measured, so the peak lands on -0.1 dBFS.
+        let (r, normalised) = bounce("n.wav", true);
+        let peak = normalised.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
+        let ceiling = soundcraft_dsp::db_to_gain(-0.1);
+        assert!(peak <= ceiling * 1.000_01, "normalised peak {peak} over {ceiling} ({r})");
+        assert!(peak >= ceiling * 0.999, "normalised peak {peak} short of {ceiling}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Audio track `name` holding one clip, beat-locked when `warped`.

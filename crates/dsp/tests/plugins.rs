@@ -573,18 +573,23 @@ fn synth_noise_is_unpitched_and_differs_per_voice() {
 }
 
 #[test]
-fn two_synths_play_different_noise() {
-    let noise = || {
+fn a_synths_noise_follows_its_seed() {
+    let noise = |seed: u64| {
         let mut p = prepared("subtractive_synth");
+        p.set_seed(seed);
         p.set_param("osc1_wave", 4.0);
         p.set_param("osc_mix", 0.0);
         p.note_on(0, 60, 127);
         run(p.as_mut(), &[vec![0.0; 4800]])
     };
-    let (a, b) = (noise(), noise());
-    assert!(rms(&a[0]) > 0.01 && rms(&b[0]) > 0.01);
+    // Two instances seeded alike play one noise: a render repeats.
+    let (a, again) = (noise(7), noise(7));
+    assert!(rms(&a[0]) > 0.01);
+    assert_eq!(a, again);
+    // Seeded differently (two tracks, two slots) they play two.
+    let b = noise(8);
     let same = a[0].iter().zip(&b[0]).filter(|(x, y)| x == y).count();
-    assert!(same < 100, "{same} of 4800 samples are equal: the two instances share a noise");
+    assert!(same < 100, "{same} of 4800 samples are equal: the two seeds share a noise");
 }
 
 #[test]

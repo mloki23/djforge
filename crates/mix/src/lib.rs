@@ -435,10 +435,28 @@ impl SlotCtx<'_> {
             }
         } else {
             let state = if third { ins.state_bytes() } else { None };
-            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
+            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| {
+                let mut plugin = n.plugin;
+                if !third {
+                    plugin.set_seed(instance_seed(t, idx));
+                }
+                plugin
+            })
         }?;
         Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false })
     }
+}
+
+/// The seed of the built-in in slot `idx` of track `t`: the same in every render of the session
+/// (bounces repeat, and a normalised bounce's second pass plays what its first measured), and
+/// different for every slot so two noise sources don't play one noise.
+pub fn instance_seed(t: TrackId, idx: usize) -> u64 {
+    // splitmix64 over the track id and slot.
+    let mut z = t.0 ^ (idx as u64).rotate_left(48);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl MixEngine {
@@ -3986,5 +4004,15 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+
+    #[test]
+    fn instance_seeds_are_stable_and_differ_per_track_and_slot() {
+        let (t, u) = (TrackId(3), TrackId(4));
+        assert_eq!(instance_seed(t, INSTRUMENT_SLOT), instance_seed(t, INSTRUMENT_SLOT));
+        let seeds: std::collections::HashSet<u64> =
+            [instance_seed(t, INSTRUMENT_SLOT), instance_seed(u, INSTRUMENT_SLOT), instance_seed(t, 0), instance_seed(t, 1), instance_seed(u, 0)]
+                .into();
+        assert_eq!(seeds.len(), 5);
     }
 }

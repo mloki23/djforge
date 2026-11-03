@@ -215,6 +215,10 @@ pub trait Plugin: Send {
     }
     /// The transport for the next block, given before `process`.
     fn set_transport(&mut self, _transport: &Transport) {}
+    /// Seeds whatever randomness the plugin makes (noise), so the same seed renders the same
+    /// output again: hosts derive it from the instance's place in the session. Restarts the
+    /// plugin's voices; called before playing, never mid-note. Does not allocate.
+    fn set_seed(&mut self, _seed: u64) {}
     /// Instruments: note events at sample offsets within the next block.
     fn note_on(&mut self, _offset: usize, _note: u8, _velocity: u8) {}
     fn note_off(&mut self, _offset: usize, _note: u8) {}

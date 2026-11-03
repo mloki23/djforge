@@ -499,6 +499,17 @@ impl Session {
 
     /// Add a track with defaults; returns its id.
     pub fn add_track(&mut self, kind: TrackKind, format: ChannelFormat, name: Option<&str>) -> TrackId {
+        let t = self.make_track(kind, format, name);
+        let id = t.id;
+        // Master faders sit at the bottom like the incumbent; others go before any master.
+        let pos = if kind == TrackKind::Master { self.tracks.len() } else { self.before_master() };
+        self.tracks.insert(pos, t);
+        id
+    }
+
+    /// A new track as [`Session::add_track`] makes it (its id taken, its name unique, its colour
+    /// the next), not yet in the session: finish it, then insert it into `tracks`.
+    pub fn make_track(&mut self, kind: TrackKind, format: ChannelFormat, name: Option<&str>) -> Track {
         let id = TrackId(self.alloc());
         let name = self.unique_track_name(name.unwrap_or(kind.default_name()));
         let color = if kind == TrackKind::Master { [140, 140, 140] } else { self.next_track_color() };
@@ -507,14 +518,12 @@ impl Session {
             t.mixer.output = crate::Route::Main;
             t.mixer.input = crate::Route::Main;
         }
-        // Master faders sit at the bottom like the incumbent; others go before any master.
-        let pos = if kind == TrackKind::Master {
-            self.tracks.len()
-        } else {
-            self.tracks.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(self.tracks.len())
-        };
-        self.tracks.insert(pos, t);
-        id
+        t
+    }
+
+    /// Index of the first master track, else the end: where a new non-master track goes.
+    pub fn before_master(&self) -> usize {
+        self.tracks.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(self.tracks.len())
     }
 
     pub fn add_bus(&mut self, name: &str, format: ChannelFormat) -> BusId {
