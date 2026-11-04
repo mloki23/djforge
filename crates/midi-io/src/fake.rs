@@ -1,95 +1,113 @@
-use crate::queue::{Hub, PortSink};
-use crate::{MidiClock, MidiIoError, MidiMessage, MidiSource, PortId, PortIds, PortInfo, Subscriber, port_infos, unique_names};
+use crate::ports::{PortChange, PortTable, listing};
+use crate::queue::{HopStats, Hub, PortSink};
+use crate::{MidiClock, MidiIoError, MidiMessage, MidiSource, PortId, PortInfo, Subscriber};
+
+/// A simulated connection: the sink, and whether its device has been pulled out.
+struct FakeConn {
+    sink: PortSink,
+    dead: bool,
+}
+
+/// A simulated device.
+struct FakeDevice {
+    name: String,
+    backend_id: String,
+}
 
 /// A [`MidiSource`] with simulated devices, for tests of this crate and of the layers above it.
 ///
-/// Plug and unplug devices by name, open them like real ports, and inject messages (or raw bytes,
-/// through the same parser as the real ports) with chosen times. Events go through the same router
-/// and subscriber queues as [`crate::MidiInputs`]; only the device end is simulated.
+/// Plug and unplug devices, open them like real ports, and inject messages (or raw bytes, through
+/// the same parser as the real ports) with chosen times. Events go through the same router and
+/// subscriber queues as [`crate::MidiInputs`]; only the device end is simulated.
+///
+/// Unplugging behaves like hardware: the device leaves the listing and its open connection goes
+/// dead (injecting into it delivers nothing), but the port stays open until [`MidiSource::refresh`]
+/// (or an `open` of the same name) notices and reports it [`PortChange::Closed`].
 pub struct FakeSource {
+    // Declared before `hub`, and cleared in `Drop`, so connections close before the router stops.
+    table: PortTable<FakeConn>,
     hub: Hub,
-    ids: PortIds,
-    /// Plugged devices in list order, by their raw (possibly duplicate) names.
-    devices: Vec<String>,
-    open: Vec<(String, PortSink)>,
+    devices: Vec<FakeDevice>,
+    next_backend: u32,
 }
 
 impl FakeSource {
     /// An empty source stamping events on `clock`.
     pub fn new(clock: MidiClock) -> Result<Self, MidiIoError> {
-        Ok(Self { hub: Hub::new(clock)?, ids: PortIds::default(), devices: Vec::new(), open: Vec::new() })
+        Ok(Self { table: PortTable::default(), hub: Hub::new(clock)?, devices: Vec::new(), next_backend: 0 })
     }
 
-    /// Plugs in a device; it is listed at the end.
-    pub fn plug(&mut self, raw_name: &str) {
-        self.devices.push(raw_name.to_string());
+    /// Plugs in a new device (listed at the end) and returns its backend id. Two devices plugged
+    /// with the same name are two distinct devices.
+    pub fn plug(&mut self, raw_name: &str) -> String {
+        let backend_id = format!("fake:{}", self.next_backend);
+        self.next_backend = self.next_backend.saturating_add(1);
+        self.plug_device(raw_name, &backend_id);
+        backend_id
     }
 
-    /// Unplugs the device listed as `name` (closing it if open); false if it is not listed.
+    /// Plugs in a device with a given backend id: use the id [`FakeSource::plug`] returned to plug
+    /// the same device back in.
+    pub fn plug_device(&mut self, raw_name: &str, backend_id: &str) {
+        self.devices.push(FakeDevice { name: raw_name.to_string(), backend_id: backend_id.to_string() });
+    }
+
+    /// Pulls out the device listed as `name`; false if it is not listed. Its connection, if open,
+    /// goes dead but stays open until `refresh`.
     pub fn unplug(&mut self, name: &str) -> bool {
-        let Some(i) = unique_names(self.devices.iter().cloned()).iter().position(|n| n == name) else {
+        let Some(info) = self.list().into_iter().find(|p| p.name == name) else {
             return false;
         };
-        if i < self.devices.len() {
-            self.devices.remove(i);
+        self.devices.retain(|d| d.backend_id != info.backend_id);
+        for p in self.table.iter_mut().filter(|p| p.backend_id == info.backend_id) {
+            p.conn.dead = true;
         }
-        self.close(name);
         true
     }
 
-    /// Sends a message on an open port, stamped `time_ns`; false (and nothing sent) if it is not open.
+    /// Sends a message on an open, live port, stamped `time_ns`; false (nothing sent) otherwise.
     pub fn inject(&mut self, name: &str, msg: MidiMessage, time_ns: u64) -> bool {
-        match self.sink(name) {
-            Some(sink) => {
-                sink.send(msg, time_ns);
-                true
-            }
-            None => false,
-        }
+        self.live_sink(name).map(|s| s.send(msg, time_ns)).is_some()
     }
 
-    /// Sends raw bytes on an open port through its parser, stamped `time_ns`; false if not open.
+    /// Sends raw bytes on an open, live port through its parser, stamped `time_ns`; false otherwise.
     pub fn inject_bytes(&mut self, name: &str, bytes: &[u8], time_ns: u64) -> bool {
-        match self.sink(name) {
-            Some(sink) => {
-                sink.feed_at(bytes, time_ns);
-                true
-            }
-            None => false,
-        }
+        self.live_sink(name).map(|s| s.feed_at(bytes, time_ns)).is_some()
     }
 
-    fn sink(&mut self, name: &str) -> Option<&mut PortSink> {
-        self.open.iter_mut().find(|(n, _)| n == name).map(|(_, s)| s)
+    fn live_sink(&mut self, name: &str) -> Option<&mut PortSink> {
+        self.table.get_mut(name).filter(|p| !p.conn.dead).map(|p| &mut p.conn.sink)
+    }
+}
+
+impl Drop for FakeSource {
+    fn drop(&mut self) {
+        self.table.close_all();
     }
 }
 
 impl MidiSource for FakeSource {
     fn list(&self) -> Vec<PortInfo> {
-        port_infos(unique_names(self.devices.iter().cloned()))
+        listing(self.devices.iter().map(|d| (d.name.clone(), d.backend_id.clone())))
     }
 
     fn open(&mut self, name: &str) -> Result<PortId, MidiIoError> {
-        if self.is_open(name) {
-            return Ok(self.ids.id_for(name));
-        }
-        if !self.list().iter().any(|p| p.name == name) {
-            return Err(MidiIoError::NoSuchPort(name.to_string()));
-        }
-        let id = self.ids.id_for(name);
-        let sink = self.hub.port_sink(id)?;
-        self.open.push((name.to_string(), sink));
-        Ok(id)
+        let now = self.list();
+        let hub = &self.hub;
+        self.table.open(&now, name, |c| !c.dead, |id, _| Ok(FakeConn { sink: hub.port_sink(id)?, dead: false }))
     }
 
     fn close(&mut self, name: &str) -> bool {
-        let before = self.open.len();
-        self.open.retain(|(n, _)| n != name);
-        self.open.len() != before
+        self.table.close(name).is_some()
     }
 
     fn is_open(&self, name: &str) -> bool {
-        self.open.iter().any(|(n, _)| n == name)
+        self.table.is_open(name)
+    }
+
+    fn refresh(&mut self) -> Vec<PortChange> {
+        let now = self.list();
+        self.table.refresh(&now, |c| !c.dead)
     }
 
     fn subscribe(&self, capacity: usize) -> Result<Subscriber, MidiIoError> {
@@ -97,7 +115,11 @@ impl MidiSource for FakeSource {
     }
 
     fn port_name(&self, id: PortId) -> Option<&str> {
-        self.ids.name(id)
+        self.table.port_name(id)
+    }
+
+    fn backend_id(&self, id: PortId) -> Option<&str> {
+        self.table.backend_id(id)
     }
 
     fn clock(&self) -> MidiClock {
@@ -106,6 +128,14 @@ impl MidiSource for FakeSource {
 
     fn dropped(&self) -> u64 {
         self.hub.dropped()
+    }
+
+    fn hop_stats(&self, reset: bool) -> HopStats {
+        self.hub.hop_stats(reset)
+    }
+
+    fn healthy(&self) -> bool {
+        self.hub.healthy()
     }
 }
 
@@ -127,22 +157,26 @@ mod tests {
     }
 
     #[test]
-    fn list_names_duplicates_uniquely() {
+    fn list_names_duplicates_uniquely_with_distinct_backend_ids() {
         let s = source(&["DJ Controller", "Pads", "DJ Controller"]);
         let names: Vec<_> = s.list().into_iter().map(|p| (p.name, p.index)).collect();
         assert_eq!(names, vec![("DJ Controller".into(), 0), ("Pads".into(), 1), ("DJ Controller #2".into(), 2)]);
+        let ids: Vec<_> = s.list().into_iter().map(|p| p.backend_id).collect();
+        assert_eq!(ids, vec!["fake:0", "fake:1", "fake:2"]);
     }
 
     #[test]
     fn open_and_close() {
         let mut s = source(&["Pads", "Keys"]);
         let mut sub = s.subscribe(64).unwrap();
+        assert!(s.healthy());
         assert!(!s.is_open("Pads"));
         assert!(!s.inject("Pads", on(36), 5), "a closed port delivers nothing");
         let id = s.open("Pads").unwrap();
         assert!(s.is_open("Pads"));
         assert_eq!(s.open("Pads").unwrap(), id, "opening twice is idempotent");
         assert_eq!(s.port_name(id), Some("Pads"));
+        assert_eq!(s.backend_id(id), Some("fake:0"));
         assert!(s.inject("Pads", on(36), 5));
         assert!(s.inject_bytes("Pads", &[0x80, 36, 0], 9));
         let got = recv(&mut sub, 2);
@@ -169,18 +203,97 @@ mod tests {
     }
 
     #[test]
-    fn reopen_by_name_after_replug_keeps_the_port_id() {
+    fn unplug_kills_the_connection_and_refresh_closes_it() {
         let mut s = source(&["Pads", "Keys"]);
         let mut sub = s.subscribe(64).unwrap();
         let id = s.open("Pads").unwrap();
         assert!(s.unplug("Pads"));
+        assert!(!s.unplug("Pads"));
+        // Like hardware: still "open" until noticed, but nothing arrives.
+        assert!(s.is_open("Pads"));
+        assert!(!s.inject("Pads", on(1), 0));
+        let changes = s.refresh();
+        assert!(changes.contains(&PortChange::Closed { port: id, name: "Pads".into() }), "{changes:?}");
         assert!(!s.is_open("Pads"));
-        // Plugged back in, now at a different index.
-        s.plug("Pads");
+        assert!(!changes.iter().any(|c| matches!(c, PortChange::Disappeared { .. })), "{changes:?}");
+        assert!(sub.pop().is_none());
+    }
+
+    #[test]
+    fn refresh_reports_appeared_and_disappeared_devices() {
+        let mut s = source(&["Pads"]);
+        let first = s.refresh();
+        assert_eq!(first, vec![PortChange::Appeared { name: "Pads".into(), backend_id: "fake:0".into() }]);
+        assert!(s.refresh().is_empty());
+        let keys = s.plug("Keys");
+        assert_eq!(s.refresh(), vec![PortChange::Appeared { name: "Keys".into(), backend_id: keys.clone() }]);
+        s.unplug("Keys");
+        assert_eq!(s.refresh(), vec![PortChange::Disappeared { name: "Keys".into(), backend_id: keys }]);
+    }
+
+    #[test]
+    fn replug_and_reopen_by_name_keeps_the_port_id() {
+        let mut s = source(&["Pads", "Keys"]);
+        let mut sub = s.subscribe(64).unwrap();
+        let id = s.open("Pads").unwrap();
+        s.unplug("Pads");
+        s.refresh();
+        // Plugged back in (same device), now at a different index.
+        s.plug_device("Pads", "fake:0");
         assert_eq!(s.list().iter().find(|p| p.name == "Pads").map(|p| p.index), Some(1));
         assert_eq!(s.open("Pads").unwrap(), id);
         assert!(s.inject("Pads", on(40), 1));
         assert_eq!(recv(&mut sub, 1).first().map(|e| e.port), Some(id));
+    }
+
+    #[test]
+    fn open_on_a_dead_connection_reconnects() {
+        // Unplugged and plugged back in between two refreshes: `open` must not hand back the dead one.
+        let mut s = source(&["Pads"]);
+        let mut sub = s.subscribe(64).unwrap();
+        let id = s.open("Pads").unwrap();
+        s.unplug("Pads");
+        s.plug_device("Pads", "fake:0");
+        assert!(!s.inject("Pads", on(1), 0), "the old connection is dead");
+        assert_eq!(s.open("Pads").unwrap(), id);
+        assert!(s.inject("Pads", on(2), 0));
+        assert_eq!(recv(&mut sub, 1).first().map(|e| e.msg), Some(on(2)));
+        // The dead connection's closing is still reported, so its held notes get released.
+        assert!(s.refresh().contains(&PortChange::Closed { port: id, name: "Pads".into() }));
+    }
+
+    #[test]
+    fn identical_devices_keep_their_ids_when_the_first_is_unplugged() {
+        let mut s = source(&["X", "X"]);
+        let mut sub = s.subscribe(64).unwrap();
+        let first = s.open("X").unwrap();
+        let second = s.open("X #2").unwrap();
+        assert_ne!(first, second);
+        s.unplug("X");
+        // The second device is now listed as plain "X".
+        assert_eq!(s.list().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["X"]);
+        let changes = s.refresh();
+        assert!(changes.contains(&PortChange::Closed { port: first, name: "X".into() }), "{changes:?}");
+        assert!(changes.contains(&PortChange::Renamed { port: second, from: "X #2".into(), to: "X".into() }), "{changes:?}");
+        // Opening "X" now finds the second device already open: same id, no second connection.
+        assert_eq!(s.open("X").unwrap(), second);
+        assert!(s.open_all().is_empty());
+        assert!(s.is_open("X") && !s.is_open("X #2"));
+        assert_eq!(s.port_name(second), Some("X"));
+        assert!(s.inject("X", on(9), 0));
+        assert_eq!(recv(&mut sub, 1).first().map(|e| e.port), Some(second));
+        assert!(eventually(|| s.hop_stats(false).count == 1));
+        assert!(sub.pop().is_none(), "delivered exactly once");
+    }
+
+    #[test]
+    fn the_same_device_is_never_open_twice_under_two_names() {
+        // The rename happens without a refresh: `open` reconciles first.
+        let mut s = source(&["X", "X"]);
+        let second = s.open("X #2").unwrap();
+        s.unplug("X");
+        assert_eq!(s.open("X").unwrap(), second);
+        assert!(!s.is_open("X #2"));
     }
 
     #[test]
@@ -209,5 +322,6 @@ mod tests {
         }
         assert!(eventually(|| s.dropped() == 3), "dropped {}", s.dropped());
         assert_eq!(sub.dropped(), 3);
+        assert!(eventually(|| s.hop_stats(false).count == 5));
     }
 }

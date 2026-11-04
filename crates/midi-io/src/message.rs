@@ -259,7 +259,65 @@ mod tests {
         assert_eq!(parse_all(&[0x90, 60, 0xB0, 1, 2]), vec![MidiMessage::ControlChange { ch: 0, cc: 1, value: 2 }]);
     }
 
+    /// Any message the parser can produce (note-on velocity is 1..=127: 0 parses as a note-off).
+    fn arb_message() -> impl Strategy<Value = MidiMessage> {
+        let ch = 0u8..16;
+        let d = || 0u8..128;
+        prop_oneof![
+            (ch.clone(), d(), d()).prop_map(|(ch, note, vel)| MidiMessage::NoteOff { ch, note, vel }),
+            (ch.clone(), d(), 1u8..128).prop_map(|(ch, note, vel)| MidiMessage::NoteOn { ch, note, vel }),
+            (ch.clone(), d(), d()).prop_map(|(ch, note, pressure)| MidiMessage::PolyPressure { ch, note, pressure }),
+            (ch.clone(), d(), d()).prop_map(|(ch, cc, value)| MidiMessage::ControlChange { ch, cc, value }),
+            (ch.clone(), d()).prop_map(|(ch, program)| MidiMessage::ProgramChange { ch, program }),
+            (ch.clone(), d()).prop_map(|(ch, pressure)| MidiMessage::ChannelPressure { ch, pressure }),
+            (ch, -8192i16..8192).prop_map(|(ch, value)| MidiMessage::PitchBend { ch, value }),
+        ]
+    }
+
+    /// Encodes with running status: a status byte only when it changes.
+    fn encode_running(msgs: &[MidiMessage]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut running = None;
+        for m in msgs {
+            let bytes = m.to_bytes();
+            let status = bytes[0];
+            if running != Some(status) {
+                out.push(status);
+                running = Some(status);
+            }
+            out.extend_from_slice(&bytes[1..]);
+        }
+        out
+    }
+
     proptest! {
+        #[test]
+        fn running_status_streams_with_real_time_bytes_parse_back_exactly(
+            msgs in proptest::collection::vec(arb_message(), 0..64),
+            rt in proptest::collection::vec(proptest::option::weighted(0.2, 0xF8u8..=0xFF), 0..512),
+            mut cuts in proptest::collection::vec(0usize..512, 0..8),
+        ) {
+            // Real-time bytes may sit before any byte, including between a status and its data.
+            let mut stream = Vec::new();
+            for (i, b) in encode_running(&msgs).into_iter().enumerate() {
+                if let Some(Some(r)) = rt.get(i) {
+                    stream.push(*r);
+                }
+                stream.push(b);
+            }
+            // Fed in several chunks split at arbitrary points.
+            cuts.iter_mut().for_each(|c| *c = (*c).min(stream.len()));
+            cuts.sort_unstable();
+            let mut p = MidiParser::new();
+            let mut got = Vec::new();
+            let mut start = 0;
+            for &c in cuts.iter().chain(std::iter::once(&stream.len())) {
+                p.feed(&stream[start..c], |m| got.push(m));
+                start = c;
+            }
+            prop_assert_eq!(got, msgs);
+        }
+
         #[test]
         fn random_bytes_never_panic_and_output_is_in_range(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             for m in parse_all(&bytes) {

@@ -1,7 +1,8 @@
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiInputPort};
 
-use crate::queue::{Hub, PortSink};
-use crate::{MidiClock, MidiIoError, MidiSource, PortId, PortIds, PortInfo, Subscriber, port_infos, unique_names};
+use crate::ports::{PortChange, PortTable, listing};
+use crate::queue::{HopStats, Hub, PortSink};
+use crate::{MidiClock, MidiIoError, MidiSource, PortId, PortInfo, Subscriber};
 
 /// Client name shown to the OS MIDI system.
 const CLIENT: &str = "djforge";
@@ -11,68 +12,99 @@ const CLIENT: &str = "djforge";
 /// Each open port has its own connection; its callback runs on the backend's thread, parses the
 /// bytes and pushes into the port's wait-free queue (it never blocks or locks). SysEx, clock and
 /// active sensing are filtered by the backend and again by the parser.
+///
+/// Unplug detection is by listing: [`MidiSource::refresh`] closes ports whose backend id is no
+/// longer listed. WinMM sends no notice when a device goes, so a device pulled out and plugged back
+/// in between two refreshes keeps a silent connection; `close` then `open` reconnects it.
 pub struct MidiInputs {
+    // Declared before `hub`, and cleared in `Drop`, so connections close before the router stops.
+    table: PortTable<MidiInputConnection<PortSink>>,
     hub: Hub,
-    ids: PortIds,
-    open: Vec<(String, MidiInputConnection<PortSink>)>,
 }
 
 impl MidiInputs {
     /// No ports open; events will be stamped on `clock`.
     pub fn new(clock: MidiClock) -> Result<Self, MidiIoError> {
-        Ok(Self { hub: Hub::new(clock)?, ids: PortIds::default(), open: Vec::new() })
+        Ok(Self { table: PortTable::default(), hub: Hub::new(clock)? })
     }
 
-    /// A fresh backend handle and its ports with unique names.
-    fn enumerate() -> Result<(MidiInput, Vec<(String, MidiInputPort)>), String> {
+    /// A fresh backend client and its ports, listed.
+    fn enumerate() -> Result<(MidiInput, Vec<(PortInfo, MidiInputPort)>), String> {
         let mut input = MidiInput::new(CLIENT).map_err(|e| e.to_string())?;
         input.ignore(Ignore::All);
         let ports = input.ports();
-        let names = unique_names(ports.iter().map(|p| input.port_name(p).unwrap_or_else(|_| "Unknown MIDI input".to_string())));
-        Ok((input, names.into_iter().zip(ports).collect()))
+        let infos = listing(ports.iter().map(|p| (input.port_name(p).unwrap_or_else(|_| "Unknown MIDI input".to_string()), p.id())));
+        Ok((input, infos.into_iter().zip(ports).collect()))
     }
-}
 
-impl MidiSource for MidiInputs {
-    fn list(&self) -> Vec<PortInfo> {
+    fn infos() -> Vec<PortInfo> {
         match Self::enumerate() {
-            Ok((_, ports)) => port_infos(ports.into_iter().map(|(n, _)| n).collect()),
+            Ok((_, ports)) => ports.into_iter().map(|(info, _)| info).collect(),
             Err(e) => {
                 log::warn!("listing MIDI inputs failed: {e}");
                 Vec::new()
             }
         }
     }
+}
+
+impl Drop for MidiInputs {
+    fn drop(&mut self) {
+        self.table.close_all();
+    }
+}
+
+impl MidiSource for MidiInputs {
+    fn list(&self) -> Vec<PortInfo> {
+        Self::infos()
+    }
 
     fn open(&mut self, name: &str) -> Result<PortId, MidiIoError> {
-        if self.is_open(name) {
-            return Ok(self.ids.id_for(name));
-        }
         let backend = |reason: String| MidiIoError::Backend { port: name.to_string(), reason };
         let (input, ports) = Self::enumerate().map_err(backend)?;
-        let port = ports.into_iter().find(|(n, _)| n == name).map(|(_, p)| p).ok_or_else(|| MidiIoError::NoSuchPort(name.to_string()))?;
-        let id = self.ids.id_for(name);
-        let sink = self.hub.port_sink(id)?;
-        // On failure the sink is dropped and the router retires its queue.
-        let conn = input
-            .connect(&port, "djforge-in", |_device_stamp, bytes, sink: &mut PortSink| sink.feed(bytes), sink)
-            .map_err(|e| backend(e.to_string()))?;
-        self.open.push((name.to_string(), conn));
-        Ok(id)
+        let now: Vec<PortInfo> = ports.iter().map(|(info, _)| info.clone()).collect();
+        let hub = &self.hub;
+        // midir gives no liveness signal: a connection is alive while its device is listed.
+        self.table.open(
+            &now,
+            name,
+            |_| true,
+            |id, info| {
+                let port = ports
+                    .iter()
+                    .find(|(i, _)| i.backend_id == info.backend_id)
+                    .map(|(_, p)| p)
+                    .ok_or_else(|| MidiIoError::NoSuchPort(name.to_string()))?;
+                let sink = hub.port_sink(id)?;
+                // On failure the sink is dropped and the router retires its queue.
+                input
+                    .connect(port, "djforge-in", |_device_stamp, bytes, sink: &mut PortSink| sink.feed(bytes), sink)
+                    .map_err(|e| backend(e.to_string()))
+            },
+        )
     }
 
     fn close(&mut self, name: &str) -> bool {
-        let Some(i) = self.open.iter().position(|(n, _)| n == name) else {
-            return false;
-        };
-        let (_, conn) = self.open.swap_remove(i);
         // Closing stops the callback; the returned sink is dropped, retiring the port's queue.
-        drop(conn.close());
-        true
+        self.table.close(name).map(|conn| drop(conn.close())).is_some()
     }
 
     fn is_open(&self, name: &str) -> bool {
-        self.open.iter().any(|(n, _)| n == name)
+        self.table.is_open(name)
+    }
+
+    fn refresh(&mut self) -> Vec<PortChange> {
+        match Self::enumerate() {
+            Ok((_, ports)) => {
+                let now: Vec<PortInfo> = ports.into_iter().map(|(info, _)| info).collect();
+                self.table.refresh(&now, |_| true)
+            }
+            Err(e) => {
+                // Not "every device vanished": keep the ports and try again next time.
+                log::warn!("listing MIDI inputs failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
     fn subscribe(&self, capacity: usize) -> Result<Subscriber, MidiIoError> {
@@ -80,7 +112,11 @@ impl MidiSource for MidiInputs {
     }
 
     fn port_name(&self, id: PortId) -> Option<&str> {
-        self.ids.name(id)
+        self.table.port_name(id)
+    }
+
+    fn backend_id(&self, id: PortId) -> Option<&str> {
+        self.table.backend_id(id)
     }
 
     fn clock(&self) -> MidiClock {
@@ -89,5 +125,13 @@ impl MidiSource for MidiInputs {
 
     fn dropped(&self) -> u64 {
         self.hub.dropped()
+    }
+
+    fn hop_stats(&self, reset: bool) -> HopStats {
+        self.hub.hop_stats(reset)
+    }
+
+    fn healthy(&self) -> bool {
+        self.hub.healthy()
     }
 }

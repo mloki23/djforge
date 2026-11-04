@@ -4,28 +4,34 @@
 //!   SysEx, clock, active sensing and the rest of the system messages are dropped.
 //! - [`MidiEvent`]: a message, the port it came from and its arrival time on a shared [`MidiClock`].
 //! - [`MidiSource`]: a set of input ports opened by name. [`MidiInputs`] is the real one (`midir`:
-//!   WinMM, CoreMIDI, ALSA); [`FakeSource`] lets tests inject events at chosen times.
+//!   WinMM, CoreMIDI, ALSA); [`FakeSource`] simulates devices and lets tests inject events at chosen
+//!   times.
 //! - [`Subscriber`]: one consumer's bounded, wait-free queue. Every open port's events fan out to
-//!   every subscriber through a router thread (see the `queue` module). Full queues drop and count.
+//!   every subscriber through a router thread (see the `queue` module). Full queues drop and count;
+//!   [`HopStats`] measures the router's delay.
 //!
-//! Ports are identified by name, so a controller that is unplugged and plugged back in (and comes
-//! back at a different index) reopens by the same name and keeps its [`PortId`].
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+//! Devices come and go. Poll [`MidiSource::refresh`] (about once a second, off the UI and audio
+//! threads): it closes ports whose device vanished, reporting [`PortChange::Closed`] so held notes
+//! can be released, and reports new and renamed devices. A port is identified by its backend id
+//! (stable per device, distinct for identical devices) and keeps its [`PortId`] across replugs; see
+//! the `ports` module for how listed names relate to it.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable, clippy::indexing_slicing)]
 
 mod fake;
 #[cfg(not(target_arch = "wasm32"))]
 mod inputs;
 mod message;
+mod ports;
 mod queue;
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 pub use fake::FakeSource;
 #[cfg(not(target_arch = "wasm32"))]
 pub use inputs::MidiInputs;
 pub use message::{MidiMessage, MidiParser, parse_all};
-pub use queue::{MAX_CAPACITY, PORT_CAPACITY, Subscriber};
+pub use ports::PortChange;
+pub use queue::{HOP_BUCKETS, HopStats, MAX_CAPACITY, PORT_CAPACITY, Subscriber};
 
 /// Errors from opening ports or setting up the queue.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -81,7 +87,8 @@ impl Default for MidiClock {
     }
 }
 
-/// A port's stable id within one source: the same name always gets the same id.
+/// A port's id within one source, keyed on the device's backend id: the same device always gets
+/// the same id, under whatever listed name and after replugs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortId(pub u32);
 
@@ -98,31 +105,48 @@ pub struct MidiEvent {
 /// An input port as listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortInfo {
-    /// The unique name to open it by. A second device with the same name is "Name #2", and so on.
+    /// The name to open it by, unique within this listing only: a second device with the same name
+    /// is "Name #2", and so on, and the suffix can change when devices come and go.
     pub name: String,
     /// Its position in the current device list (changes when devices come and go).
     pub index: usize,
+    /// The backend's stable id for the device (on WinMM, the device-interface path). Opaque.
+    pub backend_id: String,
 }
 
 /// A set of MIDI input ports, opened and closed by name, delivering to [`Subscriber`]s.
 pub trait MidiSource {
-    /// The ports present now.
+    /// The ports present now. On real hardware this creates a backend client and enumerates
+    /// devices: poll it (or [`MidiSource::refresh`]) at about 1 Hz, off the UI and audio threads.
     fn list(&self) -> Vec<PortInfo>;
-    /// Opens a port by its listed name. Opening an open port returns its id.
+    /// Opens a port by its listed name. If that device is already open (under any name) with a live
+    /// connection, returns its id and connects nothing; a dead connection is replaced, keeping the id.
     fn open(&mut self, name: &str) -> Result<PortId, MidiIoError>;
     /// Closes a port; false if it was not open.
     fn close(&mut self, name: &str) -> bool;
-    /// Whether the port is open.
+    /// Whether a port is open under this name (names follow renames seen by `open` / `refresh`).
     fn is_open(&self, name: &str) -> bool;
-    /// A new queue of `capacity` events (clamped to 1..=[`MAX_CAPACITY`]) receiving every event from
-    /// every port, from now on.
+    /// Re-lists the devices, closes open ports whose device has gone or whose connection died, and
+    /// returns every change since the last call (including ones noticed by `open`). Same cost as
+    /// [`MidiSource::list`].
+    fn refresh(&mut self) -> Vec<PortChange>;
+    /// A new queue of `capacity` events (clamped to 1..=[`MAX_CAPACITY`]). It receives every event
+    /// from every port that the router moves after the subscription is registered; nothing earlier
+    /// is replayed.
     fn subscribe(&self, capacity: usize) -> Result<Subscriber, MidiIoError>;
-    /// The name a port id was opened under.
+    /// A port id's current listed name.
     fn port_name(&self, id: PortId) -> Option<&str>;
+    /// A port id's backend id.
+    fn backend_id(&self, id: PortId) -> Option<&str>;
     /// The clock events are stamped with.
     fn clock(&self) -> MidiClock;
-    /// Events dropped so far because a queue was full.
+    /// Events dropped so far because a queue (port or subscriber) was full.
     fn dropped(&self) -> u64;
+    /// The router's hop delay. With `reset`, the counters restart, so successive calls give a
+    /// recent window (read e.g. once a second for a recent p99).
+    fn hop_stats(&self, reset: bool) -> HopStats;
+    /// False once the router thread has stopped: subscribers will receive nothing more.
+    fn healthy(&self) -> bool;
 
     /// Opens every listed port that is not open yet; one result per attempted port.
     fn open_all(&mut self) -> Vec<Result<PortId, MidiIoError>> {
@@ -131,70 +155,10 @@ pub trait MidiSource {
     }
 }
 
-/// Port name → [`PortId`], stable for the life of a source.
-#[derive(Debug, Default)]
-pub(crate) struct PortIds {
-    names: Vec<String>,
-}
-
-impl PortIds {
-    pub(crate) fn id_for(&mut self, name: &str) -> PortId {
-        if let Some(i) = self.names.iter().position(|n| n == name) {
-            return PortId(u32::try_from(i).unwrap_or(u32::MAX));
-        }
-        self.names.push(name.to_string());
-        PortId(u32::try_from(self.names.len().saturating_sub(1)).unwrap_or(u32::MAX))
-    }
-
-    pub(crate) fn name(&self, id: PortId) -> Option<&str> {
-        self.names.get(usize::try_from(id.0).ok()?).map(String::as_str)
-    }
-}
-
-/// Makes device names unique in list order: the second "X" becomes "X #2", the third "X #3".
-pub(crate) fn unique_names(raw: impl IntoIterator<Item = String>) -> Vec<String> {
-    let raw: Vec<String> = raw.into_iter().collect();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out = Vec::with_capacity(raw.len());
-    for name in raw {
-        let mut candidate = name.clone();
-        let mut n = 2u32;
-        while seen.contains(&candidate) {
-            candidate = format!("{name} #{n}");
-            n = n.saturating_add(1);
-        }
-        seen.insert(candidate.clone());
-        out.push(candidate);
-    }
-    out
-}
-
-/// Lists names as [`PortInfo`]s.
-pub(crate) fn port_infos(names: Vec<String>) -> Vec<PortInfo> {
-    names.into_iter().enumerate().map(|(index, name)| PortInfo { name, index }).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    #[test]
-    fn duplicate_names_get_a_suffix() {
-        let names = unique_names(["Pads", "Keys", "Pads", "Pads #2", "Pads"].map(String::from));
-        assert_eq!(names, vec!["Pads", "Keys", "Pads #2", "Pads #2 #2", "Pads #3"]);
-    }
-
-    #[test]
-    fn port_ids_are_stable_per_name() {
-        let mut ids = PortIds::default();
-        let a = ids.id_for("A");
-        let b = ids.id_for("B");
-        assert_ne!(a, b);
-        assert_eq!(ids.id_for("A"), a);
-        assert_eq!(ids.name(b), Some("B"));
-        assert_eq!(ids.name(PortId(99)), None);
-    }
 
     #[test]
     fn clock_measures_from_its_origin() {
