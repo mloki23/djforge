@@ -236,9 +236,14 @@ fn a_replace_offer_is_pinned_to_the_refused_bars_and_lapses_when_the_session_mov
     let d = h.state().produce.pattern.clone().unwrap();
     assert!(d.error.as_deref().is_some_and(|e| e.contains("overlap")), "{d:?}");
     // At 120 bpm a bar is 96 000 samples: the refused place is bars 1–4 of the part, pinned.
-    if let Some(o) = &d.offer {
-        assert_eq!((o.params["track"].as_u64(), o.params["start"].as_i64(), o.params["end"].as_i64()), (Some(drums.0), Some(0), Some(4 * 96_000)));
-    }
+    let o = d.offer.as_ref().expect("an overlap offers Replace");
+    assert_eq!((o.params["track"].as_u64(), o.params["start"].as_i64(), o.params["end"].as_i64()), (Some(drums.0), Some(0), Some(4 * 96_000)));
+    // Playback alone doesn't change the session: the offer stands while the set plays.
+    assert!(h.state().is_playing());
+    steps(&mut h, 4);
+    assert!(h.state().is_playing());
+    assert_eq!(h.state().produce.pattern.as_ref().and_then(|d| d.offer.clone()).map(|o| o.params), Some(o.params.clone()));
+    let _ = h.get_by_label("Replace");
     h.state_mut().engine.session_mut().edit.playhead = 2 * 96_000 + 100;
     steps(&mut h, 2);
     assert!(h.state().produce.pattern.as_ref().unwrap().offer.is_none(), "the session moved: the offer lapsed");
@@ -496,4 +501,44 @@ fn double_click(h: &mut Harness<'_, SoundApp>, label: &str) {
 /// Whether the drum grid cell `label` holds a note.
 fn on(h: &Harness<'_, SoundApp>, label: &str) -> bool {
     h.get_by_label(label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+}
+
+/// Two notes alike but for velocity share a step: each accent edit re-sorts the notes, and
+/// Shift+click still reaches both, as one undo step.
+#[test]
+fn shift_click_accents_every_note_on_a_step_even_identical_ones() {
+    let dir = Scratch::new("twins");
+    let mut h = harness(&dir);
+    h.state_mut().run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let t = track(&h, "Drums 1");
+    let r = h.state_mut().run("midi.new_clip", json!({"track": t.0, "start": 0, "end": 96_000})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    for velocity in [100, 115] {
+        h.state_mut()
+            .run("midi.note_add", json!({"clip": clip.0, "pitch": 38, "start_ticks": 960, "length_ticks": 120, "velocity": velocity}))
+            .unwrap();
+    }
+    edit_clip(&mut h, clip);
+    h.get_by_label("Grid").click();
+    steps(&mut h, 3);
+    let snares = |h: &Harness<'_, SoundApp>| {
+        let mut v: Vec<u8> = notes(h, clip).iter().filter(|n| n.pitch == 38).map(|n| n.velocity).collect();
+        v.sort_unstable();
+        v
+    };
+    let cell = "Acoustic Snare bar 1 step 5";
+    let before = undo_steps(&h);
+    // 115 is accented: off goes the accent, from both.
+    h.get_by_label(cell).click_modifiers(Modifiers::SHIFT);
+    steps(&mut h, 2);
+    assert_eq!(snares(&h), [96, 96]);
+    h.get_by_label(cell).click_modifiers(Modifiers::SHIFT);
+    steps(&mut h, 2);
+    assert_eq!(snares(&h), [127, 127]);
+    h.get_by_label(cell).click_modifiers(Modifiers::SHIFT);
+    steps(&mut h, 2);
+    assert_eq!(snares(&h), [96, 96]);
+    assert_eq!(undo_steps(&h), before + 3, "one undo step a click");
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(snares(&h), [127, 127], "a single undo restores both");
 }

@@ -166,7 +166,7 @@ pub fn run_or_offer_replace(app: &mut SoundApp, id: &str, params: Value) {
 }
 
 /// `params` with `replace: true` (`None` when they aren't an object).
-fn replacing(mut params: Value) -> Option<Value> {
+pub(crate) fn replacing(mut params: Value) -> Option<Value> {
     params.as_object_mut()?.insert("replace".into(), json!(true));
     Some(params)
 }

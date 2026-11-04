@@ -697,10 +697,7 @@ fn notes_window(app: &mut SoundApp, ctx: &egui::Context) {
         });
     // The place is pinned at the click: Replace reruns these very bars.
     let params = if replace {
-        n.offer.take().map(|(mut p, _)| {
-            p["replace"] = json!(true);
-            p
-        })
+        n.offer.take().and_then(|(p, _)| crate::produce::replacing(p))
     } else if copy {
         Some(json!({"column": column, "slot": row, "at": app.engine.session().edit.playhead}))
     } else {

@@ -600,7 +600,7 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
             let resp = ui.interact(cell, ui.id().with(("drum_cell", cid.0, pitch, step)), Sense::click());
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, velocity.is_some(), &label));
             if resp.clicked() {
-                clicked = Some((pitch, tick.max(0), hits));
+                clicked = Some((pitch, tick, hits));
             }
         }
     }
@@ -611,7 +611,8 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
     app.midi.selected.clear();
     if hits.is_empty() {
         let velocity = if shift { ACCENT } else { NORMAL };
-        let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick, "length_ticks": STEP, "velocity": velocity}));
+        let _ =
+            app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick.max(0), "length_ticks": STEP, "velocity": velocity}));
     } else if !shift {
         let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": hits}));
     } else {
@@ -621,7 +622,16 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
         let velocity = if accented { NORMAL } else { ACCENT };
         let key = format!("drum_accent:{}:{pitch}:{tick}:{}", cid.0, app.engine.revision);
         app.engine.end_merge();
-        for i in hits {
+        // Each edit re-sorts the notes, so the indices are found again after every one: the next
+        // note on the step still off the velocity. At most one edit per note found at the click.
+        for _ in 0..hits.len() {
+            let next = match app.engine.session().find_clip(cid).map(|(_, c)| &c.content) {
+                Some(ClipContent::Midi { sequence }) => {
+                    step_hits(sequence, pitch, tick).into_iter().find(|&i| sequence.notes.get(i).is_some_and(|n| n.velocity != velocity))
+                }
+                _ => None,
+            };
+            let Some(i) = next else { break };
             if let Err(e) = app.engine.execute_merged("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": velocity}), &key) {
                 app.ui.status = e.to_string();
                 break;
