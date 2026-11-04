@@ -1,0 +1,23 @@
+[package]
+name = "soundcraft-midi-io"
+description = "SoundCraft MIDI input: live MIDI message parsing, input devices (midir) and a lock-free event queue with fan-out to the audio and UI threads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+rtrb.workspace = true
+
+# The browser has no device MIDI here (Web MIDI is a later stage); everything except `MidiInputs` still builds for wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+midir.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

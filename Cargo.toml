@@ -15,6 +15,7 @@ repository = "https://github.com/storytold/soundcraft"
 soundcraft-time = { path = "crates/time" }
 soundcraft-audio-io = { path = "crates/audio-io" }
 soundcraft-midi = { path = "crates/midi" }
+soundcraft-midi-io = { path = "crates/midi-io" }
 soundcraft-video = { path = "crates/video" }
 soundcraft-dsp = { path = "crates/dsp" }
 soundcraft-stretch = { path = "crates/stretch" }
@@ -46,6 +47,9 @@ zip = { version = "9", default-features = false }
 # ID3v2 tags (MP3 prep fills missing key and BPM).
 id3 = { version = "1.17.2", default-features = false }
 cpal = "0.16"
+# MIDI input devices (WinMM / CoreMIDI / ALSA) and the realtime-safe SPSC ring buffer behind the MIDI event queue.
+midir = "0.11"
+rtrb = "0.4"
 
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
