@@ -49,6 +49,11 @@ pub enum EngineError {
     Unsupported(String),
     #[error("internal error in `{0}`: {1}")]
     Internal(String, String),
+    /// Refused because it would replace something (a clip, a slot or a file); the same command
+    /// with `replace: true` goes ahead. Reads as `BadParams` does, so callers that only show the
+    /// text see no difference.
+    #[error("bad parameters for `{cmd}`: {msg}")]
+    WouldReplace { cmd: String, msg: String },
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

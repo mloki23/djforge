@@ -3,10 +3,13 @@
 //!
 //! The Starter Pattern dialog runs `prod.pattern` on the selected part (over the timeline
 //! selection, else `bars` from the playhead's bar) or into a Session view slot. Its key starts as
-//! the key the set plays there (`dj.key_at`). A refusal shows in the dialog; one because the
-//! pattern would replace something offers Replace, which reruns the refused parameters with
-//! `replace: true`. Nothing is replaced without that click. Other commands that refuse to replace
-//! (the slot menu's Copy Selected MIDI Clip Here) ask the same in a small window.
+//! the key the set plays there (`dj.key_at`). Create pins the place as it is at the click: the
+//! selected part and the bars (`track`, `start`, `end`), or the slot. A refusal shows in the
+//! dialog; one because the pattern would replace something (`EngineError::WouldReplace`) offers
+//! Replace, which reruns exactly the refused parameters with `replace: true`. The offer lapses
+//! when a field changes or the session does (an edit, a moved playhead), so nothing is replaced
+//! without a click that saw it. Other commands that refuse to replace (the slot menu's Copy
+//! Selected MIDI Clip Here, Copy to Arrangement at Playhead) ask the same in a small window.
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
@@ -45,17 +48,31 @@ pub struct PatternDialog {
     pub slot: Option<(usize, usize)>,
     /// Why the last Create was refused.
     pub error: Option<String>,
-    /// The parameters last refused because they would replace something: Replace reruns them
-    /// with `replace: true`.
-    pub offer: Option<Value>,
+    /// The last Create, refused because it would replace something: what Replace reruns.
+    pub offer: Option<Offer>,
 }
 
-/// A refusal to replace, offered again with `replace: true`.
+/// A Create refused because it would replace something.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Offer {
+    /// The refused parameters, the place pinned: Replace reruns them with `replace: true`.
+    pub params: Value,
+    /// The dialog's fields at the refusal: changing one drops the offer.
+    fields: Value,
+    /// The document's revision at the refusal: any change since drops the offer.
+    revision: u64,
+}
+
+/// A refusal to replace, offered again with `replace: true` while the session stays as it was.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplaceAsk {
     pub id: String,
     pub params: Value,
     pub why: String,
+    /// The document's revision at the refusal: any change since closes the question.
+    revision: u64,
+    /// Why the rerun was refused.
+    pub error: Option<String>,
 }
 
 /// What a part of `kind` is called.
@@ -75,11 +92,6 @@ pub fn title(id: &str) -> String {
         c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
     };
     id.split('_').map(word).collect::<Vec<_>>().join(" ")
-}
-
-/// Whether a refusal is one that `replace: true` would get past.
-fn wants_replace(why: &str) -> bool {
-    why.contains("replace: true")
 }
 
 /// The Produce menu's contents.
@@ -141,15 +153,33 @@ pub fn open_pattern(app: &mut SoundApp, slot: Option<(usize, usize)>) {
 /// Runs `id`; when it refuses because it would replace something, asks whether to (Replace
 /// reruns it with `replace: true`).
 pub fn run_or_offer_replace(app: &mut SoundApp, id: &str, params: Value) {
-    if let Err(why) = app.run(id, params.clone())
-        && wants_replace(&why)
+    if !params.is_object() {
+        app.ui.status = format!("{id}: parameters must be an object");
+        return;
+    }
+    if let Err(e) = app.run_typed(id, params.clone())
+        && e.would_replace()
     {
-        app.produce.replace = Some(ReplaceAsk { id: id.to_string(), params, why });
+        let revision = app.engine.revision;
+        app.produce.replace = Some(ReplaceAsk { id: id.to_string(), params, why: e.to_string(), revision, error: None });
     }
 }
 
-/// The `prod.pattern` parameters for the dialog's fields: a key only for the styles that use one,
-/// and bars into a slot or when there is no selection.
+/// `params` with `replace: true` (`None` when they aren't an object).
+fn replacing(mut params: Value) -> Option<Value> {
+    params.as_object_mut()?.insert("replace".into(), json!(true));
+    Some(params)
+}
+
+/// The dialog's fields, to tell when one changes.
+fn fields(d: &PatternDialog) -> Value {
+    json!([d.kind.name(), d.style.name(), d.bars, d.key, d.seed, d.slot])
+}
+
+/// The `prod.pattern` parameters for the dialog's fields, the place pinned as it is now: the slot,
+/// or the one selected part (`track`) over the selection, else over `bars` from the playhead's
+/// bar (`start`, `end`). A key goes only with the styles that use one. Without exactly one part
+/// selected, `track` is left out and `prod.pattern` says why.
 pub fn pattern_params(app: &SoundApp, d: &PatternDialog) -> Value {
     let mut p = json!({"kind": d.kind.name(), "style": d.style.name()});
     if d.style.needs_key() && !d.key.trim().is_empty() {
@@ -158,14 +188,27 @@ pub fn pattern_params(app: &SoundApp, d: &PatternDialog) -> Value {
     if let Some(seed) = d.seed {
         p["seed"] = json!(seed);
     }
-    match d.slot {
-        Some((column, slot)) => {
-            p["slot"] = json!({"column": column, "slot": slot});
-            p["bars"] = json!(d.bars);
-        }
-        None if app.engine.session().edit.selection.is_empty() => p["bars"] = json!(d.bars),
-        None => {}
+    if let Some((column, slot)) = d.slot {
+        p["slot"] = json!({"column": column, "slot": slot});
+        p["bars"] = json!(d.bars);
+        return p;
     }
+    let s = app.engine.session();
+    let parts: Vec<_> =
+        s.tracks.iter().filter(|t| s.edit.selected_tracks.contains(&t.id) && t.kind == soundcraft_model::TrackKind::Instrument).collect();
+    if let [one] = parts.as_slice() {
+        p["track"] = json!(one.id.0);
+    }
+    let (start, end) = if s.edit.selection.is_empty() {
+        let sr = s.sample_rate;
+        let bar = s.tempo.bar_beat_at(s.edit.playhead, sr).bar.max(1);
+        let tick = |b: i64| s.tempo.tick_to_samples(s.tempo.bar_start_tick(b), sr);
+        (tick(bar), tick(bar.saturating_add(i64::from(d.bars))))
+    } else {
+        (s.edit.selection.start, s.edit.selection.end)
+    };
+    p["start"] = json!(start);
+    p["end"] = json!(end);
     p
 }
 
@@ -299,24 +342,22 @@ fn pattern_dialog(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
     });
-    let params = pattern_params(app, &d);
-    // The fields changed since the refusal: what Replace would replace no longer stands.
-    if d.offer.as_ref().is_some_and(|o| *o != params) {
+    // A field or the session changed since the refusal: what Replace would replace no longer
+    // stands.
+    let now = fields(&d);
+    if d.offer.as_ref().is_some_and(|o| o.fields != now || o.revision != app.engine.revision) {
         d.offer = None;
         d.error = None;
     }
-    let run = if replace {
-        d.offer.take().map(|mut p| {
-            p["replace"] = json!(true);
-            p
-        })
+    let params = if replace {
+        d.offer.take().and_then(|o| replacing(o.params))
     } else if create {
-        Some(params.clone())
+        Some(pattern_params(app, &d))
     } else {
         None
     };
-    if let Some(p) = run {
-        match app.run("prod.pattern", p) {
+    if let Some(p) = params {
+        match app.run_typed("prod.pattern", p.clone()) {
             Ok(v) => {
                 keep = false;
                 let what = v["clip"].as_u64().and_then(|c| app.engine.session().find_clip(soundcraft_model::ClipId(c)).map(|(_, c)| c.name.clone()));
@@ -326,10 +367,10 @@ fn pattern_dialog(app: &mut SoundApp, ctx: &egui::Context) {
                     (None, None) => "Wrote the pattern".to_string(),
                 };
             }
-            Err(why) => {
+            Err(e) => {
                 // Replace offers only to rerun what was refused for replacing, never anything else.
-                d.offer = (!replace && wants_replace(&why)).then_some(params);
-                d.error = Some(why);
+                d.offer = (!replace && e.would_replace()).then_some(Offer { params: p, fields: now, revision: app.engine.revision });
+                d.error = Some(e.to_string());
             }
         }
     }
@@ -339,24 +380,33 @@ fn pattern_dialog(app: &mut SoundApp, ctx: &egui::Context) {
 }
 
 fn replace_window(app: &mut SoundApp, ctx: &egui::Context) {
-    let Some(ask) = app.produce.replace.take() else { return };
+    let Some(mut ask) = app.produce.replace.take() else { return };
+    // The session changed since the refusal: what Replace would replace no longer stands.
+    if ask.revision != app.engine.revision {
+        return;
+    }
+    let t = Tokens::current();
     let (mut keep, mut replace) = (true, false);
     egui::Modal::new(egui::Id::new("replace_ask")).show(ctx, |ui| {
         ui.set_width(340.0);
         ui.label(egui::RichText::new("Replace?").font(bold(13.0)));
         ui.label(&ask.why);
+        if let Some(why) = &ask.error {
+            ui.colored_label(t.accent, why);
+        }
         ui.horizontal(|ui| {
-            replace = ui.button("Replace").clicked();
+            replace = ui.add_enabled(ask.error.is_none(), egui::Button::new("Replace")).clicked();
             if ui.button("Cancel").clicked() {
                 keep = false;
             }
         });
     });
-    if replace {
-        let mut p = ask.params.clone();
-        p["replace"] = json!(true);
-        let _ = app.run(&ask.id, p);
-        keep = false;
+    if replace && let Some(p) = replacing(ask.params.clone()) {
+        match app.run_typed(&ask.id, p) {
+            Ok(_) => keep = false,
+            // Refused again: the window says why (Cancel closes it).
+            Err(e) => ask.error = Some(e.to_string()),
+        }
     }
     if keep {
         app.produce.replace = Some(ask);

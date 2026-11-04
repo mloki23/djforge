@@ -212,6 +212,11 @@ pub fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams(cmd.to_string(), msg.into())
 }
 
+/// `cmd` refused because it would replace something; `replace: true` lets it.
+pub fn would_replace(cmd: &str, msg: impl Into<String>) -> EngineError {
+    EngineError::WouldReplace { cmd: cmd.to_string(), msg: msg.into() }
+}
+
 pub fn f64_or(p: &Value, key: &str, d: f64) -> f64 {
     p.get(key).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(d)
 }

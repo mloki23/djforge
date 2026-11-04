@@ -17,13 +17,13 @@
 //! digits go by the key pressed, whatever Shift or the keyboard layout makes of it. Elsewhere
 //! those keys keep their arrangement meaning.
 
-use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
+use crate::{RunError, SoundApp};
 use egui::{Color32, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, vec2};
 use serde_json::{Value, json};
 use soundcraft_engine::cmd::{SlotFileJob, slot_file_job};
-use soundcraft_model::{LIVE_SLOTS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, SlotContent, SlotKind, SlotMode, TrackId};
-use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
+use soundcraft_model::{LIVE_SLOTS, MAX_SLOT_BEATS, Quantise, SLOT_GAIN_DB, SlotContent, SlotKind, SlotMode};
+use soundcraft_time::TICKS_PER_QUARTER;
 
 /// Size of a slot cell.
 const CELL: egui::Vec2 = vec2(116.0, 26.0);
@@ -48,8 +48,8 @@ pub struct SessionView {
     pub edit: Option<SlotEdit>,
     /// Files loading into slots.
     pub jobs: Vec<(SlotFileJob, String)>,
-    /// The MIDI slot whose notes are shown (column, slot), and why its last copy out was refused.
-    pub notes: Option<(usize, usize, Option<String>)>,
+    /// The MIDI slot whose notes are shown.
+    pub notes: Option<SlotNotes>,
 }
 
 /// The Edit Slot dialog's fields.
@@ -439,7 +439,7 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
     }
     if resp.double_clicked() && instrument && filled.is_some() {
         // The first click launched it; the second shows its notes rather than launching again.
-        app.session_view.notes = Some((column, row, None));
+        app.session_view.notes = Some(SlotNotes::new(column, row));
     } else if resp.clicked() {
         app.session_view.column = column;
         if filled.is_some() {
@@ -601,75 +601,55 @@ fn edit_dialog(app: &mut SoundApp, ctx: &egui::Context) {
     }
 }
 
-/// Where a MIDI slot's notes go on the arrangement: its column's track, from the bar holding the
-/// playhead for the slot's length, as (track, start, end). Refused where a clip already is:
-/// nothing is replaced.
-fn copy_out_place(app: &SoundApp, column: usize, length_beats: f64) -> Result<(TrackId, Samples, Samples), String> {
-    let s = app.engine.session();
-    let track = s.live.column_track(column, &s.tracks).ok_or("the column has no track")?;
-    let sr = s.sample_rate;
-    let bar = s.tempo.bar_beat_at(s.edit.playhead, sr).bar.max(1);
-    let start_tick = s.tempo.bar_start_tick(bar);
-    let len_ticks = ((length_beats * TICKS_PER_QUARTER as f64).round() as i64).max(1);
-    let range = Range::new(s.tempo.tick_to_samples(start_tick, sr), s.tempo.tick_to_samples(start_tick.saturating_add(len_ticks), sr));
-    if let Some(c) = s.track(track).and_then(|t| t.clips().iter().find(|c| c.range().overlaps(&range))) {
-        return Err(format!("`{}` is on the column's track there: move the playhead to empty bars", c.name));
-    }
-    Ok((track, range.start, range.end))
+/// A MIDI slot's notes window: which slot, why its last copy out was refused, and the refusal to
+/// replace that Replace reruns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotNotes {
+    pub column: usize,
+    pub row: usize,
+    pub error: Option<String>,
+    /// The refused `live.slot_to_clip` parameters (the place pinned with `at`) and the document
+    /// revision then: any change since drops it.
+    offer: Option<(Value, u64)>,
 }
 
-/// Copy to Arrangement at Playhead: the MIDI slot's notes as a new MIDI clip on its column's
-/// track from the playhead's bar, named after the slot, as one undo step. The clip is selected
-/// and shown in the MIDI Editor.
+impl SlotNotes {
+    fn new(column: usize, row: usize) -> SlotNotes {
+        SlotNotes { column, row, error: None, offer: None }
+    }
+}
+
+/// Copy to Arrangement at Playhead (`live.slot_to_clip`): the MIDI slot's notes as a new MIDI
+/// clip on its column's track from the playhead's bar, as one undo step. The clip is selected and
+/// shown in the MIDI Editor.
 ///
 /// A slot isn't a clip, so the MIDI Editor's note commands can't edit it in place: the notes go
 /// out to the arrangement and come back with the slot menu's Copy Selected MIDI Clip Here.
-fn copy_out(app: &mut SoundApp, column: usize, row: usize) -> Result<(), String> {
-    let x = app.engine.session().live.midi_slot(column, row).cloned().ok_or("the slot holds no MIDI")?;
-    let (track, start, end) = copy_out_place(app, column, x.length_beats)?;
-    // The clip, its notes and its name join the first command's undo step.
-    let steps = app.engine.undo_history().len();
-    let key = format!("slot_copy_out:{column}:{row}:{steps}");
-    app.engine.end_merge();
-    let e = &mut app.engine;
-    let made = (|| -> Result<u64, String> {
-        let v = e.execute_merged("midi.new_clip", &json!({"track": track.0, "start": start, "end": end}), &key).map_err(|e| e.to_string())?;
-        let clip = v["clip"].as_u64().ok_or("no clip was made")?;
-        for n in &x.sequence.notes {
-            let p = json!({"clip": clip, "pitch": n.pitch, "start_ticks": n.start, "length_ticks": n.length, "velocity": n.velocity, "channel": n.channel});
-            e.execute_merged("midi.note_add", &p, &key).map_err(|e| e.to_string())?;
-        }
-        if !x.name.trim().is_empty() {
-            e.execute_merged("clip.rename", &json!({"clip": clip, "name": x.name}), &key).map_err(|e| e.to_string())?;
-        }
-        Ok(clip)
-    })();
-    app.engine.end_merge();
-    let clip = match made {
-        Ok(clip) => clip,
-        Err(why) => {
-            // Whatever was made before the refusal is one undo step: take it back.
-            if app.engine.undo_history().len() > steps {
-                app.engine.undo();
-            }
-            return Err(why);
-        }
-    };
-    let _ = app.run("edit.select", json!({"clips": [clip]}));
+fn copy_out(app: &mut SoundApp, params: Value) -> Result<(), RunError> {
+    let v = app.run_typed("live.slot_to_clip", params)?;
+    let _ = app.run("edit.select", json!({"clips": [v["clip"]]}));
     app.ui.show_midi_editor = true;
-    app.ui.status =
-        format!("Copied {} to the arrangement: edit it in the MIDI Editor, then bring it back with the slot's Copy Selected MIDI Clip Here", x.name);
+    app.ui.status = format!(
+        "Copied {} to the arrangement: edit it in the MIDI Editor, then bring it back with the slot's Copy Selected MIDI Clip Here",
+        v["name"].as_str().unwrap_or("the slot")
+    );
     Ok(())
 }
 
 /// A MIDI slot's notes, read-only, with Copy to Arrangement at Playhead to edit them.
 fn notes_window(app: &mut SoundApp, ctx: &egui::Context) {
-    let Some((column, row, mut error)) = app.session_view.notes.take() else { return };
+    let Some(mut n) = app.session_view.notes.take() else { return };
+    let (column, row) = (n.column, n.row);
     // The slot was cleared, undone or replaced by audio meanwhile: the window closes.
     let Some(x) = app.engine.session().live.midi_slot(column, row).cloned() else { return };
+    // The session changed since the refusal: what Replace would replace no longer stands.
+    if n.offer.as_ref().is_some_and(|(_, rev)| *rev != app.engine.revision) {
+        n.offer = None;
+        n.error = None;
+    }
     let t = Tokens::current();
     let mut open = true;
-    let mut copy = false;
+    let (mut copy, mut replace) = (false, false);
     egui::Window::new(egui::RichText::new(format!("Live {} Slot {}: {}", column + 1, row + 1, x.name)).font(bold(13.0)))
         .id(egui::Id::new("session_slot_notes"))
         .open(&mut open)
@@ -705,18 +685,37 @@ fn notes_window(app: &mut SoundApp, ctx: &egui::Context) {
                 .font(regular(11.0))
                 .color(t.text_dim),
             );
-            if let Some(why) = &error {
+            if let Some(why) = &n.error {
                 ui.colored_label(t.accent, why);
             }
-            copy = ui.button("Copy to Arrangement at Playhead").clicked();
+            ui.horizontal(|ui| {
+                copy = ui.button("Copy to Arrangement at Playhead").clicked();
+                if n.offer.is_some() {
+                    replace = ui.button("Replace").on_hover_text("Replace what is there with the slot's notes").clicked();
+                }
+            });
         });
-    if copy {
-        match copy_out(app, column, row) {
+    // The place is pinned at the click: Replace reruns these very bars.
+    let params = if replace {
+        n.offer.take().map(|(mut p, _)| {
+            p["replace"] = json!(true);
+            p
+        })
+    } else if copy {
+        Some(json!({"column": column, "slot": row, "at": app.engine.session().edit.playhead}))
+    } else {
+        None
+    };
+    if let Some(p) = params {
+        match copy_out(app, p.clone()) {
             Ok(()) => open = false,
-            Err(why) => error = Some(why),
+            Err(e) => {
+                n.offer = (!replace && e.would_replace()).then_some((p, app.engine.revision));
+                n.error = Some(e.to_string());
+            }
         }
     }
     if open {
-        app.session_view.notes = Some((column, row, error));
+        app.session_view.notes = Some(n);
     }
 }

@@ -221,7 +221,7 @@ fn refuse_replacing(e: &Engine, id: &str, file: &std::path::Path, p: &Value) -> 
     // First, so a path outside the write root is refused as such and never reported as existing.
     crate::file_access::check_write(file).map_err(EngineError::Io)?;
     if crate::io::replaces(e, id, file) && !bool_or(p, "replace", false) {
-        return Err(bad(id, format!("{} already exists: pass `replace: true` to replace it", file.display())));
+        return Err(would_replace(id, format!("{} already exists: pass `replace: true` to replace it", file.display())));
     }
     Ok(())
 }

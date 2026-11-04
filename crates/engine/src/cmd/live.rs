@@ -13,6 +13,7 @@ use soundcraft_model::{
 const SETUP: &str = "live.setup";
 const ADD_COLUMN: &str = "live.add_column";
 const FROM_CLIP: &str = "live.slot_from_clip";
+const TO_CLIP: &str = "live.slot_to_clip";
 const FROM_SELECTION: &str = "live.slot_from_selection";
 const FROM_FILE: &str = "live.slot_from_file";
 const SET: &str = "live.slot_set";
@@ -50,6 +51,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip), replace?: bool (default false)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (1..=256); notes starting past that end are left out (those running past it end there), and controllers are not copied. Refuses an occupied slot unless `replace`. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
             has_live,
             from_clip
+        ),
+        cmd!(
+            "live.slot_to_clip",
+            "Copy MIDI Slot to Arrangement",
+            [],
+            None,
+            "{column, slot (0-based; a MIDI slot), at? (position; default: the playhead), replace?: bool (default false)} — the mirror of live.slot_from_clip: the slot's notes (all of them, as they are) become a MIDI clip named and coloured after the slot on the column's track, from the start of the bar holding `at` for the slot's length, to edit in the MIDI Editor. Refuses when that overlaps a clip on the track unless `replace` (which clears what is under it). Needs 4/4 throughout. One undo step. Returns {clip, track, name, start, end, bars, notes}",
+            has_live,
+            to_clip
         ),
         cmd!(
             "live.slot_from_selection",
@@ -394,7 +404,10 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session();
     four_four(FROM_CLIP, s)?;
     if let Some(x) = s.live.slot(column, row).filter(|_| !replace) {
-        return Err(bad(FROM_CLIP, format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name())));
+        return Err(would_replace(
+            FROM_CLIP,
+            format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name()),
+        ));
     }
     let id = match p.get("clip") {
         None | Some(Value::Null) => {
@@ -434,6 +447,42 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
         "notes": slot.sequence.notes.len(), "controllers_dropped": controllers_dropped});
     put(e, column, row, slot);
     Ok(out)
+}
+
+fn to_clip(e: &mut Engine, p: &Value) -> Result<Value> {
+    let column = column_param(e, TO_CLIP, p)?;
+    let row = slot_param(TO_CLIP, p)?.ok_or_else(|| bad(TO_CLIP, "`slot` required (0-based)"))?;
+    let replace = match p.get("replace") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(TO_CLIP, "`replace` must be true or false"))?,
+    };
+    let at = position_param(e, TO_CLIP, p, "at")?;
+    let s = e.session();
+    four_four(TO_CLIP, s)?;
+    let x = match s.live.slot(column, row) {
+        Some(SlotContent::Midi(x)) => x.clone(),
+        Some(SlotContent::Audio(_)) => return Err(bad(TO_CLIP, format!("slot {} of Live column {} holds audio, not MIDI", row + 1, column + 1))),
+        None => return Err(bad(TO_CLIP, format!("slot {} of Live column {} is empty", row + 1, column + 1))),
+    };
+    let track = s.live.column_track(column, &s.tracks).ok_or_else(|| bad(TO_CLIP, format!("Live column {} has no track", column + 1)))?;
+    let sr = s.sample_rate;
+    let bar = s.tempo.bar_beat_at(at.unwrap_or(s.edit.playhead), sr).bar.max(1);
+    let start_tick = s.tempo.bar_start_tick(bar);
+    let len_ticks = ((x.length_beats * soundcraft_time::TICKS_PER_QUARTER as f64).round() as i64).max(1);
+    let span = Range::new(s.tempo.tick_to_samples(start_tick, sr), s.tempo.tick_to_samples(start_tick.saturating_add(len_ticks), sr));
+    let tr = s.track(track).ok_or_else(|| bad(TO_CLIP, "no such track"))?;
+    let under: Vec<String> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).map(|c| format!("`{}`", c.name)).collect();
+    if !under.is_empty() && !replace {
+        return Err(would_replace(TO_CLIP, format!("bar {bar} on `{}` holds {}: pass replace: true to replace it", tr.name, under.join(", "))));
+    }
+    let s = e.session_mut();
+    let id = s.new_clip_id();
+    let mut clip = soundcraft_model::Clip::midi(id, x.name.clone(), span.start, span.len(), x.sequence.clone());
+    clip.color = Some(x.color);
+    // Placing it clears (and trims) whatever was under it: refused above unless `replace`.
+    crate::edit::place_clip(s, track, clip);
+    Ok(json!({"clip": id, "track": track, "name": x.name, "start": span.start, "end": span.end, "bars": x.length_beats / BAR,
+        "notes": x.sequence.notes.len()}))
 }
 
 /// What `live.slot_from_file` was asked for, checked.

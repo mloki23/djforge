@@ -8,7 +8,7 @@
 
 use egui::{Modifiers, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable as _;
+use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use serde_json::json;
 use soundcraft_audio_io::{AudioBuffer, EncodeOptions};
 use soundcraft_engine::Engine;
@@ -216,6 +216,51 @@ fn an_overlap_offers_replace_and_nothing_is_replaced_without_the_click() {
     assert_eq!(undo_steps(&h), before + 1);
 }
 
+/// A refusal while the set plays pins the place it refused (the part and its bars); once the
+/// session moves on (here the playhead into another bar), Replace is gone rather than aimed
+/// somewhere new.
+#[test]
+fn a_replace_offer_is_pinned_to_the_refused_bars_and_lapses_when_the_session_moves() {
+    let dir = Scratch::new("pinned");
+    let mut h = harness(&dir);
+    h.state_mut().run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let drums = track(&h, "Drums 1");
+    h.state_mut().run("prod.pattern", json!({"kind": "drums", "style": "four_floor", "bars": 4})).unwrap();
+    let first = clips(&h, drums);
+    h.state_mut().run("transport.play", json!({})).unwrap();
+    produce(&mut h, None, "Starter Pattern...");
+    h.state_mut().produce.pattern.as_mut().unwrap().bars = 4;
+    steps(&mut h, 2);
+    h.get_by_label("Create").click();
+    step(&mut h);
+    let d = h.state().produce.pattern.clone().unwrap();
+    assert!(d.error.as_deref().is_some_and(|e| e.contains("overlap")), "{d:?}");
+    // At 120 bpm a bar is 96 000 samples: the refused place is bars 1–4 of the part, pinned.
+    if let Some(o) = &d.offer {
+        assert_eq!((o.params["track"].as_u64(), o.params["start"].as_i64(), o.params["end"].as_i64()), (Some(drums.0), Some(0), Some(4 * 96_000)));
+    }
+    h.state_mut().engine.session_mut().edit.playhead = 2 * 96_000 + 100;
+    steps(&mut h, 2);
+    assert!(h.state().produce.pattern.as_ref().unwrap().offer.is_none(), "the session moved: the offer lapsed");
+    assert!(h.query_by_label("Replace").is_none());
+    assert_eq!(clips(&h, drums), first, "nothing replaced");
+    // The same Copy Selected question lapses too.
+    h.state_mut().run("transport.stop", json!({})).unwrap();
+    h.state_mut().produce.pattern = None;
+    h.state_mut().run("window.session", json!({"value": true})).unwrap();
+    h.state_mut().run("live.add_column", json!({"kind": "instrument"})).unwrap();
+    h.state_mut().run("prod.pattern", json!({"kind": "drums", "style": "fill", "slot": {"column": 4, "slot": 0}})).unwrap();
+    h.state_mut().run("edit.select", json!({"clips": [first[0].id.0]})).unwrap();
+    steps(&mut h, 3);
+    soundcraft_ui_egui::produce::run_or_offer_replace(h.state_mut(), "live.slot_from_clip", json!({"column": 4, "slot": 0}));
+    steps(&mut h, 2);
+    let _ = h.get_by_label("Replace");
+    h.state_mut().engine.session_mut().edit.playhead = 0;
+    steps(&mut h, 2);
+    assert!(h.state().produce.replace.is_none(), "the session moved: the question closed");
+    assert_eq!(h.state().engine.session().live.midi_slot(4, 0).map(|x| x.name.as_str()), Some("Fill"));
+}
+
 /// Shows clip `clip` in the MIDI Editor.
 fn edit_clip(h: &mut Harness<'_, SoundApp>, clip: ClipId) {
     h.state_mut().run("edit.select", json!({"clips": [clip.0]})).unwrap();
@@ -264,6 +309,67 @@ fn a_drum_grid_cell_toggles_a_16th_and_shift_click_accents_it() {
     h.get_by_label("▶").click();
     steps(&mut h, 3);
     let _ = h.get_by_label("Bass Drum 1 bar 3 step 1");
+}
+
+/// A step holds the notes within half a step of it (a note played 10 ticks early is on its step);
+/// generated accents (kicks at 120) read as accented, and Shift+click takes the accent off every
+/// note on the step, then puts it back.
+#[test]
+fn a_drum_grid_step_is_centred_and_shift_click_accents_every_note_on_it() {
+    let dir = Scratch::new("centred");
+    let mut h = harness(&dir);
+    h.state_mut().run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let r = h.state_mut().run("prod.pattern", json!({"kind": "drums", "style": "four_floor", "bars": 1})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    // Claves 10 ticks before step 5 (beat 2), and two snares on step 9.
+    for (pitch, start, velocity) in [(75, 4 * 240 - 10, 100), (38, 8 * 240, 100), (38, 8 * 240 + 30, 115)] {
+        h.state_mut()
+            .run("midi.note_add", json!({"clip": clip.0, "pitch": pitch, "start_ticks": start, "length_ticks": 120, "velocity": velocity}))
+            .unwrap();
+    }
+    edit_clip(&mut h, clip);
+    h.get_by_label("Grid").click();
+    steps(&mut h, 3);
+    assert!(on(&h, "Claves bar 1 step 5"), "a note 10 ticks early shows on its step");
+    assert!(!on(&h, "Claves bar 1 step 4"));
+    // Clicking it removes the early note itself.
+    h.get_by_label("Claves bar 1 step 5").click();
+    steps(&mut h, 2);
+    assert!(!notes(&h, clip).iter().any(|n| n.pitch == 75));
+    let kick = notes(&h, clip).into_iter().find(|n| n.pitch == 36 && n.start == 0).unwrap();
+    assert!(kick.velocity >= 112, "the generated kick is accented: {}", kick.velocity);
+    // One snare is accented (115): Shift+click takes the accent off both, as one undo step.
+    let before = undo_steps(&h);
+    h.get_by_label("Acoustic Snare bar 1 step 9").click_modifiers(Modifiers::SHIFT);
+    steps(&mut h, 2);
+    let snares = |h: &Harness<'_, SoundApp>| notes(h, clip).iter().filter(|n| n.pitch == 38).map(|n| n.velocity).collect::<Vec<_>>();
+    assert_eq!(snares(&h), [96, 96]);
+    assert_eq!(undo_steps(&h), before + 1);
+    h.get_by_label("Acoustic Snare bar 1 step 9").click_modifiers(Modifiers::SHIFT);
+    steps(&mut h, 2);
+    assert_eq!(snares(&h), [127, 127]);
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(snares(&h), [96, 96], "undo takes back the whole step");
+}
+
+/// The grid counts the song's bars: a clip starting a beat into bar 3 shows bar 3's steps, its
+/// first beat before the clip left out.
+#[test]
+fn the_drum_grid_counts_song_bars() {
+    let dir = Scratch::new("songbars");
+    let mut h = harness(&dir);
+    h.state_mut().run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let t = track(&h, "Drums 1");
+    // Bar 3 starts at 192 000 samples; a beat is 24 000.
+    let r = h.state_mut().run("midi.new_clip", json!({"track": t.0, "start": 192_000 + 24_000, "end": 192_000 + 96_000})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    h.state_mut().run("midi.note_add", json!({"clip": clip.0, "pitch": 36, "start_ticks": 0, "velocity": 100})).unwrap();
+    edit_clip(&mut h, clip);
+    h.get_by_label("Grid").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("Bass Drum 1 bar 3 step 4").is_none(), "before the clip");
+    assert!(on(&h, "Bass Drum 1 bar 3 step 5"), "the clip's first beat");
+    let _ = h.get_by_label("Bar 3");
 }
 
 #[test]
@@ -345,7 +451,7 @@ fn double_clicking_a_midi_slot_shows_its_notes_to_copy_out_for_editing() {
     steps(&mut h, 3);
     double_click(&mut h, "Live 5 slot 1");
     steps(&mut h, 3);
-    assert_eq!(h.state().session_view.notes.as_ref().map(|n| (n.0, n.1)), Some((4, 0)));
+    assert_eq!(h.state().session_view.notes.as_ref().map(|n| (n.column, n.row)), Some((4, 0)));
     let _ = h.get_by_label("16 notes · 4 bars · read-only");
     let before = undo_steps(&h);
     h.get_by_label("Copy to Arrangement at Playhead").click();
@@ -360,13 +466,21 @@ fn double_clicking_a_midi_slot_shows_its_notes_to_copy_out_for_editing() {
     assert!(h.state().ui.show_midi_editor);
     assert_eq!(h.state().engine.session().edit.selected_clips, vec![made[0].id]);
     assert!(h.state().session_view.notes.is_none());
-    // Where a clip already is, nothing is replaced.
+    // Where a clip already is, nothing is replaced without Replace.
+    h.state_mut().run("midi.note_edit", json!({"clip": made[0].id.0, "index": 0, "velocity": 1})).unwrap();
+    let edited = notes(&h, made[0].id);
     double_click(&mut h, "Live 5 slot 1");
     steps(&mut h, 3);
     h.get_by_label("Copy to Arrangement at Playhead").click();
     steps(&mut h, 3);
     assert_eq!(clips(&h, column_track).len(), 1);
-    assert!(h.state().session_view.notes.as_ref().is_some_and(|n| n.2.as_deref().is_some_and(|e| e.contains("Four Floor"))));
+    assert_eq!(notes(&h, made[0].id), edited, "refused: the edited clip stays");
+    assert!(h.state().session_view.notes.as_ref().is_some_and(|n| n.error.as_deref().is_some_and(|e| e.contains("Four Floor"))));
+    h.get_by_label("Replace").click();
+    steps(&mut h, 3);
+    let replaced = clips(&h, column_track);
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(notes(&h, replaced[0].id), slot_notes, "Replace put the slot's notes back");
 }
 
 /// Double-clicks `label`: two clicks a frame apart, after a pause (egui counts a click within
@@ -377,4 +491,9 @@ fn double_click(h: &mut Harness<'_, SoundApp>, label: &str) {
         h.get_by_label(label).click();
         step(h);
     }
+}
+
+/// Whether the drum grid cell `label` holds a note.
+fn on(h: &Harness<'_, SoundApp>, label: &str) -> bool {
+    h.get_by_label(label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
 }

@@ -319,7 +319,10 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
     let span = Range::new(range.start, range.end);
     let under: Vec<String> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).map(|c| format!("`{}`", c.name)).collect();
     if !under.is_empty() && !replace {
-        return Err(bad(CMD, format!("the bars overlap {} on `{}`: pass replace: true to replace what is there", under.join(", "), tr.name)));
+        return Err(would_replace(
+            CMD,
+            format!("the bars overlap {} on `{}`: pass replace: true to replace what is there", under.join(", "), tr.name),
+        ));
     }
     // Stable by default: the same part and bars give the same pattern.
     let seed = seed.unwrap_or_else(|| t.0.wrapping_mul(1_000_003).wrapping_add(range.first.unsigned_abs()));
@@ -408,7 +411,10 @@ fn pattern_slot(e: &mut Engine, p: &Value, target: &Value, mut spec: PatternSpec
     let s = e.session();
     super::live::four_four(CMD, s)?;
     if let Some(x) = s.live.slot(column, row).filter(|_| !replace) {
-        return Err(bad(CMD, format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name())));
+        return Err(would_replace(
+            CMD,
+            format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name()),
+        ));
     }
     if spec.style.needs_key() && spec.key.is_none() {
         spec.key = Some(key_playing(s, s.edit.playhead, None).ok_or_else(|| bad(CMD, "no key at the playhead: pass key or set the track key"))?);

@@ -15,6 +15,12 @@ use soundcraft_model::{ClipContent, ClipId, Tool, TrackId};
 use soundcraft_time::TICKS_PER_QUARTER;
 
 const KEY_W: f32 = 48.0;
+/// A header row's height, the clip operations' width and the view controls' width.
+const HEADER_H: f32 = 22.0;
+const OPS_W: f32 = 230.0;
+const VIEW_W: f32 = 340.0;
+/// Narrower than this, the header takes two rows.
+const ONE_ROW_HEADER: f32 = 1000.0;
 const ROW_H: f32 = 9.0;
 const VEL_H: f32 = 64.0;
 /// A drum grid step: a 16th note.
@@ -23,9 +29,11 @@ const STEP: i64 = TICKS_PER_QUARTER / 4;
 const BAR: i64 = TICKS_PER_QUARTER * 4;
 /// The drum grid's kit rows, top down: kick, clap, snare, closed hat, open hat and two percs.
 const KIT_ROWS: [u8; 7] = [36, 39, 38, 42, 46, 37, 75];
-/// Velocities of a grid step and an accented one.
+/// Velocities of a grid step and an accented one, and the least that reads as accented (the
+/// generated patterns accent kicks at 120).
 const NORMAL: u8 = 96;
 const ACCENT: u8 = 127;
+const ACCENTED: u8 = 112;
 /// Width of the drum grid's row names, and the narrowest step that still shows two bars a page.
 const NAME_W: f32 = 104.0;
 const MIN_STEP_W: f32 = 18.0;
@@ -43,7 +51,8 @@ pub struct MidiEditorState {
     /// The key whose scale the rows show in place of the set's: a view setting, never a session
     /// edit. Cleared when another clip is edited.
     pub key_override: Option<Key>,
-    /// The key whose scale the rows were last shaded in.
+    /// The key whose scale the rows were last shaded in (kept for tests to read; nothing else
+    /// uses it).
     pub scale: Option<Key>,
     /// Drum clips show as a step grid.
     pub drum_grid: bool,
@@ -92,9 +101,13 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::current();
     let full = ui.max_rect();
     ui.painter().rect_filled(full, 0.0, t.panel_bg);
-    let header = Rect::from_min_size(full.min, vec2(full.width(), 22.0));
+    // On a narrow panel the view controls (key, scale, grid) take a second header row, so the
+    // clip's name keeps its room and nothing runs off the edge.
+    let narrow = full.width() < ONE_ROW_HEADER;
+    let header = Rect::from_min_size(full.min, vec2(full.width(), if narrow { 2.0 * HEADER_H } else { HEADER_H }));
     ui.painter().rect_filled(header, 0.0, t.panel_bg2);
-    ui.painter().text(pos2(header.min.x + 8.0, header.center().y), Align2::LEFT_CENTER, "MIDI EDITOR", bold(11.5), t.header_text);
+    let row1 = Rect::from_min_size(full.min, vec2(full.width(), HEADER_H));
+    ui.painter().text(pos2(row1.min.x + 8.0, row1.center().y), Align2::LEFT_CENTER, "MIDI EDITOR", bold(11.5), t.header_text);
     let Some(cid) = target_clip(app) else {
         let track = {
             let s = app.engine.session();
@@ -127,10 +140,17 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let set_key = app.engine.execute("dj.key_at", &json!({"at": clip.start})).ok().and_then(|v| v["key"].as_str().and_then(|k| Key::parse(k).ok()));
     let key = app.midi.key_override.or(set_key);
     app.midi.scale = key;
-    // Header toolbar: whole-clip MIDI operations, the key and the drum grid.
-    let bar = Rect::from_min_max(pos2(header.max.x - 640.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
-    ui.painter().with_clip_rect(Rect::from_min_max(header.min, pos2(bar.min.x - 6.0, header.max.y))).text(
-        pos2(header.min.x + 110.0, header.center().y),
+    // Header toolbars: whole-clip MIDI operations at the right of the first row; the key, scale
+    // and drum grid beside them, or along the second row on a narrow panel.
+    let ops = Rect::from_min_max(pos2(row1.max.x - OPS_W - 6.0, row1.min.y + 1.0), pos2(row1.max.x - 6.0, row1.max.y - 1.0));
+    let view = if narrow {
+        Rect::from_min_max(pos2(header.min.x + 8.0, row1.max.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0))
+    } else {
+        Rect::from_min_max(pos2(ops.min.x - VIEW_W, row1.min.y + 1.0), pos2(ops.min.x - 4.0, row1.max.y - 1.0))
+    };
+    let info_end = if narrow { ops.min.x } else { view.min.x } - 6.0;
+    ui.painter().with_clip_rect(Rect::from_min_max(row1.min, pos2(info_end, row1.max.y))).text(
+        pos2(row1.min.x + 110.0, row1.center().y),
         Align2::LEFT_CENTER,
         format!(
             "{} · {} notes · {} selected · Pencil: add · drag: move/select · arrows: move · Delete: remove",
@@ -154,20 +174,22 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         }
         _ => TICKS_PER_QUARTER / 4,
     };
-    let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    let mut vb = ui.new_child(egui::UiBuilder::new().max_rect(view).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    vb.set_clip_rect(view);
+    vb.spacing_mut().item_spacing.x = 4.0;
+    key_picker(app, &mut vb, set_key);
+    vb.label(
+        egui::RichText::new(key.map_or_else(|| "Key: none".to_string(), |k| format!("Key: {} ({})", k.name(), k.camelot()))).font(regular(11.0)),
+    );
+    if drums {
+        vb.separator();
+        vb.toggle_value(&mut app.midi.drum_grid, "Grid").on_hover_text("Show the drums as a 16-step grid");
+    }
+    let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(ops).layout(egui::Layout::right_to_left(egui::Align::Center)));
     tb.spacing_mut().item_spacing.x = 4.0;
     let mut op: Option<(&str, serde_json::Value)> = None;
     if tb.small_button("Legato").clicked() {
         op = Some(("event.change_duration", json!({"legato": 0})));
-    }
-    tb.separator();
-    key_picker(app, &mut tb, set_key);
-    tb.label(
-        egui::RichText::new(key.map_or_else(|| "Key: none".to_string(), |k| format!("Key: {} ({})", k.name(), k.camelot()))).font(regular(11.0)),
-    );
-    if drums {
-        tb.separator();
-        tb.toggle_value(&mut app.midi.drum_grid, "Grid").on_hover_text("Show the drums as a 16-step grid");
     }
     if tb.small_button("Vel −10").clicked() {
         op = Some(("event.change_velocity", json!({"add": -10})));
@@ -189,7 +211,10 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let base = egui::Color32::from_rgb(track_color[0], track_color[1], track_color[2]);
     if drums && app.midi.drum_grid {
         app.midi.clip = Some(cid);
-        drum_grid(app, ui, cid, sequence, len_ticks, base, Rect::from_min_max(pos2(full.min.x, header.max.y), full.max));
+        // The grid counts the song's bars: the clip's start is this far into its bar.
+        let bar = s.tempo.bar_beat_at_tick(base_tick).bar;
+        let place = GridPlace { first_bar: bar, offset: base_tick - s.tempo.bar_start_tick(bar), len: len_ticks };
+        drum_grid(app, ui, cid, sequence, place, base, Rect::from_min_max(pos2(full.min.x, header.max.y), full.max));
         return;
     }
     let roll = Rect::from_min_max(pos2(full.min.x + KEY_W, header.max.y), pos2(full.max.x - 4.0, full.max.y - VEL_H - 4.0));
@@ -489,18 +514,39 @@ fn row_name(pitch: u8) -> String {
     gm_drum_name(pitch).map_or_else(|| note_name(pitch), str::to_string)
 }
 
-/// The drum grid: a row per kit piece and 16 steps a bar, a page of bars at a time. A click adds
-/// or removes the step's 16th (`midi.note_add` / `midi.note_delete`), Shift+click accents it or
-/// takes the accent off (`midi.note_edit`); each is one undo step.
-fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, len_ticks: i64, color: Color32, area: Rect) {
+/// Where a clip sits on the song's bars, for the drum grid.
+#[derive(Debug, Clone, Copy)]
+struct GridPlace {
+    /// The song bar the clip starts in.
+    first_bar: i64,
+    /// Ticks from that bar's start to the clip's.
+    offset: i64,
+    /// The clip's length in ticks.
+    len: i64,
+}
+
+/// The notes of `pitch` a step at clip tick `tick` holds: those starting within half a step of
+/// it, so a note played a little early or late still shows on its step.
+fn step_hits(sequence: &Sequence, pitch: u8, tick: i64) -> Vec<usize> {
+    let (from, to) = (tick - STEP / 2, tick + STEP / 2);
+    sequence.notes.iter().enumerate().filter(|(_, n)| n.pitch == pitch && n.start >= from && n.start < to).map(|(i, _)| i).collect()
+}
+
+/// The drum grid: a row per kit piece and 16 steps to each of the song's bars, a page of bars at
+/// a time. A click adds or removes the step's 16th (`midi.note_add` / `midi.note_delete`);
+/// Shift+click accents every note on the step, or takes the accent off (`midi.note_edit`). Each
+/// click is one undo step.
+fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, place: GridPlace, color: Color32, area: Rect) {
     let t = Tokens::current();
-    let bars = u64::try_from(len_ticks).unwrap_or(0).div_ceil(BAR as u64).max(1) as usize;
+    let end = place.offset.saturating_add(place.len);
+    let bars = usize::try_from(u64::try_from(end).unwrap_or(0).div_ceil(BAR as u64)).unwrap_or(1).max(1);
     // Two bars a page when 32 steps fit comfortably, else one.
     let page_bars = if bars > 1 && (area.width() - NAME_W - 8.0) / 32.0 >= MIN_STEP_W { 2 } else { 1 };
     let pages = bars.div_ceil(page_bars);
     app.midi.grid_page = app.midi.grid_page.min(pages - 1);
-    let first_bar = app.midi.grid_page * page_bars;
-    let last_bar = (first_bar + page_bars).min(bars);
+    let first = app.midi.grid_page * page_bars;
+    let last = (first + page_bars).min(bars);
+    let song_bar = |i: usize| place.first_bar.saturating_add(i64::try_from(i).unwrap_or(0));
     let strip = Rect::from_min_max(area.min, pos2(area.max.x, area.min.y + 24.0));
     let mut nav =
         ui.new_child(egui::UiBuilder::new().max_rect(strip.shrink2(vec2(6.0, 2.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -508,56 +554,53 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
         if nav.add_enabled(app.midi.grid_page > 0, egui::Button::new("◀")).on_hover_text("Earlier bars").clicked() {
             app.midi.grid_page -= 1;
         }
-        nav.label(format!("Bars {}–{} of {bars}", first_bar + 1, last_bar));
+        nav.label(format!("Bars {}–{} of {}–{}", song_bar(first), song_bar(last - 1), song_bar(0), song_bar(bars - 1)));
         if nav.add_enabled(app.midi.grid_page + 1 < pages, egui::Button::new("▶")).on_hover_text("Later bars").clicked() {
             app.midi.grid_page += 1;
         }
+    } else if bars == 1 {
+        nav.label(format!("Bar {}", song_bar(0)));
     } else {
-        nav.label(if bars == 1 { "1 bar".to_string() } else { format!("{bars} bars") });
+        nav.label(format!("Bars {}–{}", song_bar(0), song_bar(bars - 1)));
     }
     nav.label(egui::RichText::new("Click: add or remove a 16th · Shift+click: accent").font(regular(10.5)).color(t.text_dim));
     let rows = grid_rows(sequence);
     let grid = Rect::from_min_max(pos2(area.min.x + NAME_W, strip.max.y + 2.0), pos2(area.max.x - 8.0, area.max.y - 4.0));
     let row_h = (grid.height() / rows.len().max(1) as f32).min(22.0);
-    let page_steps = page_bars * 16;
-    let step_w = grid.width() / page_steps as f32;
+    let step_w = grid.width() / (page_bars * 16) as f32;
     let painter = ui.painter().with_clip_rect(area);
     let mut clicked: Option<(u8, i64, Vec<usize>)> = None;
     for (r, &pitch) in rows.iter().enumerate() {
         let y = grid.min.y + r as f32 * row_h;
         let name = row_name(pitch);
         painter.text(pos2(area.min.x + 6.0, y + row_h / 2.0), Align2::LEFT_CENTER, &name, regular(10.5), t.text);
-        for s in 0..(last_bar - first_bar) * 16 {
-            let step = first_bar * 16 + s;
-            let tick = step as i64 * STEP;
-            if tick >= len_ticks {
-                break;
+        for s in 0..(last - first) * 16 {
+            let step = first * 16 + s;
+            // The step's tick in the clip (song bars count from the bar the clip starts in).
+            let tick = i64::try_from(step).unwrap_or(i64::MAX).saturating_mul(STEP) - place.offset;
+            // Steps before the clip (its first bar's lead-in) or past its end aren't the clip's.
+            if tick + STEP / 2 <= 0 || tick >= place.len {
+                continue;
             }
             let cell = Rect::from_min_size(pos2(grid.min.x + s as f32 * step_w, y), vec2(step_w, row_h)).shrink(1.0);
-            let hits: Vec<usize> = sequence
-                .notes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.pitch == pitch && n.start >= tick && n.start < tick + STEP)
-                .map(|(i, _)| i)
-                .collect();
+            let hits = step_hits(sequence, pitch, tick);
             let velocity = hits.iter().filter_map(|&i| sequence.notes.get(i)).map(|n| n.velocity).max();
             let fill = match velocity {
-                Some(v) if v >= ACCENT => color,
+                Some(v) if v >= ACCENTED => color,
                 Some(v) => color.gamma_multiply(0.35 + 0.4 * f32::from(v) / 127.0),
                 // Beats alternate, so the bar reads in fours.
                 None if (s / 4) % 2 == 0 => Color32::from_rgb(46, 46, 50),
                 None => Color32::from_rgb(36, 36, 40),
             };
             painter.rect_filled(cell, 2.0, fill);
-            if velocity.is_some_and(|v| v >= ACCENT) {
+            if velocity.is_some_and(|v| v >= ACCENTED) {
                 painter.rect_stroke(cell, 2.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
             }
-            let label = format!("{name} bar {} step {}", step / 16 + 1, step % 16 + 1);
+            let label = format!("{name} bar {} step {}", song_bar(step / 16), step % 16 + 1);
             let resp = ui.interact(cell, ui.id().with(("drum_cell", cid.0, pitch, step)), Sense::click());
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, velocity.is_some(), &label));
             if resp.clicked() {
-                clicked = Some((pitch, tick, hits));
+                clicked = Some((pitch, tick.max(0), hits));
             }
         }
     }
@@ -565,14 +608,25 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
     // The click's own modifiers count too: Shift may be up again by the end of the frame.
     let shift =
         ui.input(|i| i.modifiers.shift || i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.shift)));
-    let (id, p) = match (hits.first().and_then(|&i| sequence.notes.get(i).map(|n| (i, n.velocity))), shift) {
-        (Some((i, v)), true) => ("midi.note_edit", json!({"clip": cid.0, "index": i, "velocity": if v >= ACCENT { NORMAL } else { ACCENT }})),
-        (Some(_), false) => ("midi.note_delete", json!({"clip": cid.0, "indices": hits})),
-        (None, accent) => (
-            "midi.note_add",
-            json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick, "length_ticks": STEP, "velocity": if accent { ACCENT } else { NORMAL }}),
-        ),
-    };
-    let _ = app.run(id, p);
     app.midi.selected.clear();
+    if hits.is_empty() {
+        let velocity = if shift { ACCENT } else { NORMAL };
+        let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick, "length_ticks": STEP, "velocity": velocity}));
+    } else if !shift {
+        let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": hits}));
+    } else {
+        // Accented (any note at ACCENTED or more): every note goes back to NORMAL; else every
+        // note goes to ACCENT. Several notes on a step are one undo step.
+        let accented = hits.iter().filter_map(|&i| sequence.notes.get(i)).any(|n| n.velocity >= ACCENTED);
+        let velocity = if accented { NORMAL } else { ACCENT };
+        let key = format!("drum_accent:{}:{pitch}:{tick}:{}", cid.0, app.engine.revision);
+        app.engine.end_merge();
+        for i in hits {
+            if let Err(e) = app.engine.execute_merged("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": velocity}), &key) {
+                app.ui.status = e.to_string();
+                break;
+            }
+        }
+        app.engine.end_merge();
+    }
 }

@@ -216,3 +216,76 @@ fn setup_empties_the_audio_slots_of_a_lost_mixed_column() {
     assert_eq!(s.live.column_kind(4, &s.tracks), Some(SlotKind::Midi));
     assert!(s.live.slot(4, 3).is_none() && s.live.midi_slot(4, 0).is_some());
 }
+
+/// `live.slot_to_clip` mirrors `live.slot_from_clip`: the slot's notes (every field) become a
+/// clip on the column's track from the bar holding `at`, as one undo step, refusing to replace a
+/// clip there unless asked and refusing a slot without MIDI.
+#[test]
+fn a_midi_slot_copies_out_to_a_clip_on_its_columns_track() {
+    let mut e = engine();
+    let clip = midi_clip(&mut e, 16.0);
+    {
+        // Every note field survives the round trip, release velocity and channel included.
+        let s = e.session_mut();
+        let c = s.find_clip_mut(soundcraft_engine::model::ClipId(clip)).unwrap();
+        if let soundcraft_engine::model::ClipContent::Midi { sequence } = &mut c.content {
+            for (i, n) in sequence.notes.iter_mut().enumerate() {
+                n.release_velocity = 20 + i as u8;
+                n.channel = (i % 3) as u8;
+                n.velocity = 90 + i as u8;
+            }
+        }
+    }
+    run(&mut e, "live.slot_from_clip", json!({"column": 4, "slot": 0, "clip": clip}));
+    let slot = e.session().live.midi_slot(4, 0).unwrap().clone();
+    let track = e.session().live.column_track(4, &e.session().tracks).unwrap();
+    let undo = e.undo_history().len();
+    // At 120 bpm a bar is 96 000 samples: 100 000 is in bar 2.
+    let r = run(&mut e, "live.slot_to_clip", json!({"column": 4, "slot": 0, "at": 100_000}));
+    assert_eq!((r["start"].as_i64(), r["end"].as_i64(), r["bars"].as_f64()), (Some(96_000), Some(96_000 * 5), Some(4.0)));
+    assert_eq!(e.undo_history().len(), undo + 1, "one undo step");
+    let s = e.session();
+    let made = s.find_clip(soundcraft_engine::model::ClipId(r["clip"].as_u64().unwrap())).unwrap();
+    assert_eq!(made.0, track);
+    assert_eq!((made.1.name.as_str(), made.1.color), (slot.name.as_str(), Some(slot.color)));
+    match &made.1.content {
+        soundcraft_engine::model::ClipContent::Midi { sequence } => assert_eq!(sequence.notes, slot.sequence.notes),
+        _ => panic!("not MIDI"),
+    }
+    // Overlapping it: refused (typed, so a UI can offer Replace), then replaced when asked.
+    let refused = e.execute("live.slot_to_clip", &json!({"column": 4, "slot": 0, "at": 200_000})).unwrap_err();
+    assert!(matches!(refused, soundcraft_engine::EngineError::WouldReplace { .. }), "{refused:?}");
+    assert!(refused.to_string().starts_with("bad parameters for `live.slot_to_clip`: bar 3 on "), "{refused}");
+    assert!(refused.to_string().ends_with("pass replace: true to replace it"), "{refused}");
+    assert_eq!(e.session().track(track).unwrap().clips().len(), 1);
+    run(&mut e, "live.slot_to_clip", json!({"column": 4, "slot": 0, "at": 200_000, "replace": true}));
+    let starts: Vec<i64> = e.session().track(track).unwrap().clips().iter().map(|c| c.start).collect();
+    assert_eq!(starts, [96_000, 192_000], "the first is trimmed to what wasn't under the new one");
+    assert!(e.undo());
+    assert_eq!(e.session().track(track).unwrap().clips().len(), 1);
+    assert!(e.undo());
+    assert!(e.session().track(track).unwrap().clips().is_empty());
+    // An empty slot, an audio slot and a missing slot are refused.
+    assert!(err(&mut e, "live.slot_to_clip", json!({"column": 4, "slot": 3})).contains("is empty"));
+    assert!(err(&mut e, "live.slot_to_clip", json!({"column": 4})).contains("`slot` required"));
+    let wav = std::env::temp_dir().join(format!("djforge-slot-to-clip-{}.wav", std::process::id()));
+    let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 96_000]; 2] };
+    std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
+    let loaded = e.execute("live.slot_from_file", &json!({"column": 0, "slot": 0, "path": wav, "bpm": 120}));
+    let _ = std::fs::remove_file(&wav);
+    loaded.unwrap();
+    assert!(err(&mut e, "live.slot_to_clip", json!({"column": 0, "slot": 0})).contains("holds audio"));
+}
+
+/// Every refusal to replace is typed, reading as before.
+#[test]
+fn refusals_to_replace_are_typed() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    let r = e.execute("prod.pattern", &json!({"kind": "drums", "style": "fill", "slot": {"column": 4, "slot": 0}})).unwrap_err();
+    assert!(matches!(r, soundcraft_engine::EngineError::WouldReplace { .. }));
+    assert_eq!(r.to_string(), "bad parameters for `prod.pattern`: slot 1 of Live column 5 holds `Four Floor`: pass replace: true to replace it");
+    let clip = midi_clip(&mut e, 4.0);
+    let r = e.execute("live.slot_from_clip", &json!({"column": 4, "slot": 0, "clip": clip})).unwrap_err();
+    assert!(matches!(r, soundcraft_engine::EngineError::WouldReplace { .. }), "{r:?}");
+}

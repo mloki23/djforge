@@ -100,6 +100,31 @@ fn media_status(id: &str, v: &Value) -> Option<String> {
     }
 }
 
+/// Why [`SoundApp::run_typed`] didn't run a command: the engine refused it, or the app did (a
+/// background job, a UI command). Reads as the refusal's own text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunError {
+    Engine(soundcraft_engine::EngineError),
+    App(String),
+}
+
+impl RunError {
+    /// The engine refused because the command would replace something: `replace: true` would
+    /// let it.
+    pub fn would_replace(&self) -> bool {
+        matches!(self, RunError::Engine(soundcraft_engine::EngineError::WouldReplace { .. }))
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Engine(e) => e.fmt(f),
+            RunError::App(why) => f.write_str(why),
+        }
+    }
+}
+
 /// UI state (serde, so agents can read and set it).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -510,26 +535,32 @@ impl SoundApp {
 
     /// Run a command; errors go to the status line. Returns the result.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        self.run_typed(id, params).map_err(|e| e.to_string())
+    }
+
+    /// [`run`](Self::run), keeping the engine's own error, so a caller can tell a refusal to
+    /// replace (`EngineError::WouldReplace`) from any other.
+    pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, RunError> {
         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
-            return Err(self.ui.status.clone());
+            return Err(RunError::App(self.ui.status.clone()));
         }
         if prep::refuses_command(self, id) {
-            return Err(self.ui.status.clone());
+            return Err(RunError::App(self.ui.status.clone()));
         }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
-            return r;
+            return r.map_err(RunError::App);
         }
         // Splits run in the background, and both use the app's stem cache (and Demucs runner),
         // also when an agent or a script asks.
         if id == "dj.split_stems" {
-            return stems::start(self, &params);
+            return stems::start(self, &params).map_err(RunError::App);
         }
         if id == "dj.clear_stem_cache" {
-            return stems::clear(self);
+            return stems::clear(self).map_err(RunError::App);
         }
         // An export runs in the background too, into the app's prep root.
         if id == "dj.export_set" {
-            return export::start(self, &params);
+            return export::start(self, &params).map_err(RunError::App);
         }
         if id.starts_with("session.save") || id.starts_with("file.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
@@ -559,7 +590,7 @@ impl SoundApp {
             Err(e) => {
                 self.ui.status = e.to_string();
                 log::warn!("{id}: {e}");
-                Err(e.to_string())
+                Err(RunError::Engine(e))
             }
         }
     }
