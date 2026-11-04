@@ -169,11 +169,18 @@ fn a_selection_becomes_a_loop_of_the_clips_own_bars() {
     assert_eq!((slot.stem_mask, slot.name.as_str(), slot.color), (c.stem_mask, c.name.as_str(), s.track(t).unwrap().color));
     let w = slot.warp.as_ref().unwrap();
     assert_eq!((&w.beats, w.lock), (&c.warp.as_ref().unwrap().beats, None), "same grid, no lock");
-    // The next one goes in the next empty slot; a chosen slot is replaced.
+    // The next one goes in the next empty slot; a chosen filled slot is replaced only when asked.
     let (a, b) = (at(&e, 3, 0.0), at(&e, 4, 0.0));
     select(&mut e, a, b);
     assert_eq!(run(&mut e, "live.slot_from_selection", json!({"column": 2}))["slot"], 1);
-    assert_eq!(run(&mut e, "live.slot_from_selection", json!({"column": 2, "slot": 0}))["start_beat"], 0.0);
+    let refused = e.execute("live.slot_from_selection", &json!({"column": 2, "slot": 0})).unwrap_err();
+    assert!(matches!(refused, soundcraft_engine::EngineError::WouldReplace { .. }), "{refused:?}");
+    assert!(
+        refused.to_string().contains("slot 1 of Live column 3 holds `") && refused.to_string().ends_with("pass replace: true to replace it"),
+        "{refused}"
+    );
+    assert_eq!(e.session().live.audio_slot(2, 0).unwrap().start_beat, 8.0);
+    assert_eq!(run(&mut e, "live.slot_from_selection", json!({"column": 2, "slot": 0, "replace": true}))["start_beat"], 0.0);
     // Each is an undo step.
     assert!(e.undo());
     assert_eq!(e.session().live.audio_slot(2, 0).unwrap().start_beat, 8.0);
@@ -304,6 +311,11 @@ fn a_file_loads_as_a_bar_loop_from_its_grid_else_as_a_one_shot() {
     let sources_full = e.session().sources.len();
     assert!(err(&mut e, "live.slot_from_file", json!({"column": 0, "path": path})).contains("full"));
     assert_eq!(e.session().sources.len(), sources_full, "a full column imports nothing");
+    let refused = e.execute("live.slot_from_file", &json!({"column": 0, "slot": 0, "path": path, "bpm": 120})).unwrap_err();
+    assert!(matches!(refused, soundcraft_engine::EngineError::WouldReplace { .. }), "{refused:?}");
+    assert_eq!(e.session().sources.len(), sources_full, "a refused replace imports nothing");
+    let r = run(&mut e, "live.slot_from_file", json!({"column": 0, "slot": 0, "path": path, "bpm": 60, "replace": true}));
+    assert_eq!(r["length_beats"].as_f64(), Some(8.0));
     assert_eq!(sources_full, sources + 5);
 }
 
@@ -337,7 +349,8 @@ fn a_slot_is_edited_and_cleared_as_undoable_steps() {
     );
     assert_eq!(
         r,
-        json!({"column": 0, "slot": 0, "kind": "audio", "name": "Kick loop", "color": [1, 2, 3], "mode": "one_shot", "length_beats": 8.0, "gain_db": -6.0})
+        json!({"column": 0, "slot": 0, "kind": "audio", "name": "Kick loop", "color": [1, 2, 3], "mode": "one_shot", "length_beats": 8.0, "gain_db": -6.0,
+            "notes_dropped": 0})
     );
     let undo = e.undo_history().len();
     run(&mut e, "live.slot_set", json!({"column": 0, "slot": 0, "name": "Kick loop"}));
@@ -597,6 +610,18 @@ fn a_slot_file_job_loads_off_the_thread_and_fills_the_slot_in_one_undo_step() {
     assert_eq!(e.undo_history().len(), undo + 1);
     assert_eq!(asked.lock().unwrap().len(), 1, "applying doesn't analyse again");
     assert!(e.session().live.audio_slot(2, 0).is_some());
+    // A filled slot is refused before anything loads, unless the job is asked to replace it.
+    let refused = soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 2, "slot": 0, "path": path})).err().unwrap();
+    assert!(matches!(refused, soundcraft_engine::EngineError::WouldReplace { .. }), "{refused:?}");
+    assert_eq!(asked.lock().unwrap().len(), 1, "nothing analysed");
+    let mut job = soundcraft_engine::cmd::slot_file_job(&e, &json!({"column": 2, "slot": 0, "path": path, "bpm": 60, "replace": true})).unwrap();
+    let ready = loop {
+        if let Some(r) = job.poll() {
+            break r.unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(ready.apply(&mut e).unwrap()["length_beats"].as_f64(), Some(8.0), "replaced: 10 s at 60 bpm is 2 bars");
     // A file that won't decode fails in the job, leaving the session alone.
     let junk = dir.0.join("junk.wav");
     std::fs::write(&junk, "not audio").unwrap();

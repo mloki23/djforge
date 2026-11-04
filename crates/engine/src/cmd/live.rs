@@ -30,7 +30,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Up Session View",
             [],
             None,
-            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track with the trance_kit preset when it holds MIDI slots, its audio slots emptied). Returns {columns: [track ids], created, emptied: [{column, slot, name}]}",
+            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track when it holds MIDI slots, its audio slots emptied: the trance_kit preset when every note is a General MIDI drum on channel 10, else rolling_bass). Returns {columns: [track ids], created, emptied: [{column, slot, name}]}",
             always,
             setup
         ),
@@ -48,7 +48,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Copy MIDI Clip to Slot",
             [],
             None,
-            "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip), replace?: bool (default false)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (1..=256); notes starting past that end are left out (those running past it end there), and controllers are not copied. Refuses an occupied slot unless `replace`. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
+            "{column (0-based; an instrument column), slot? (0-based; default: the column's first empty slot), clip? (id; default: the one selected MIDI clip), replace?: bool (default false)} — copies the MIDI clip's notes into a looping MIDI slot, its length snapped to whole 4/4 bars (1..=256); notes starting past that end are left out (those running past it end there); controllers, the notes' MIDI real-time properties and the track's MIDI offset are not carried over (the slot plays the notes as they are stored). Refuses an occupied slot unless `replace`. Needs 4/4 throughout. Returns {column, slot, clip, name, bars, length_beats, notes, controllers_dropped}",
             has_live,
             from_clip
         ),
@@ -66,7 +66,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Selection to Slot",
             [],
             None,
-            "{column (0-based), slot? (0-based; default: the column's first empty slot), track? (default: the selected tracks)} — the time selection over one beat-locked clip becomes a looping slot: its source, beat grid, stems and stem mask, the selection in the clip's own track beats snapped to whole 4-beat bars (at least 1) inside what the clip plays. Needs 4/4 throughout. Returns {column, slot, start_beat, length_beats, bars}",
+            "{column (0-based), slot? (0-based; default: the column's first empty slot), track? (default: the selected tracks), replace?: bool (default false)} — the time selection over one beat-locked clip becomes a looping slot: its source, beat grid, stems and stem mask, the selection in the clip's own track beats snapped to whole 4-beat bars (at least 1) inside what the clip plays. Refuses an occupied `slot` unless `replace`. Needs 4/4 throughout. Returns {column, slot, start_beat, length_beats, bars}",
             has_live,
             from_selection
         ),
@@ -75,7 +75,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load File into Slot",
             [],
             None,
-            "{column (0-based), path, slot? (0-based; default: the column's first empty slot), bpm? + first_beat? (seconds of a downbeat; default: mixforge's analysis when the app has it, else the file's BPM tag with the first downbeat at 0)} — imports the audio file as the slot's source: a whole-bar loop from its first downbeat when it has a beat grid and at least a bar after it, else a one-shot at its own rate. Needs 4/4 throughout. Returns {column, slot, source, mode, grid: given|mixforge|tag|null, length_beats, analysis_error (why mixforge gave no grid), grid_error (why a grid was not used)}",
+            "{column (0-based), path, slot? (0-based; default: the column's first empty slot), replace?: bool (default false), bpm? + first_beat? (seconds of a downbeat; default: mixforge's analysis when the app has it, else the file's BPM tag with the first downbeat at 0)} — imports the audio file as the slot's source: a whole-bar loop from its first downbeat when it has a beat grid and at least a bar after it, else a one-shot at its own rate. Refuses an occupied `slot` unless `replace`. Needs 4/4 throughout. Returns {column, slot, source, mode, grid: given|mixforge|tag|null, length_beats, analysis_error (why mixforge gave no grid), grid_error (why a grid was not used)}",
             has_live,
             from_file
         ),
@@ -84,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Slot",
             [],
             None,
-            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1..=256 whole 4-beat bars; needs 4/4 throughout), gain_db? (-144..=24)} — edits a filled slot, audio or MIDI; a slot without a beat grid plays only as a one-shot, and a MIDI slot only loops (its gain scales its velocities)",
+            "{column, slot (0-based), name?, color?: [r, g, b], mode?: loop|one_shot, length_bars? (1..=256 whole 4-beat bars; needs 4/4 throughout), gain_db? (-144..=24), replace?: bool (default false)} — edits a filled slot, audio or MIDI; a slot without a beat grid plays only as a one-shot, and a MIDI slot only loops (its gain scales its velocities). Shortening a MIDI slot so notes start past its new end is refused unless `replace`, which drops them (and cuts notes running past the end there), as a saved session reloads it. Returns {column, slot, kind, name, color, mode, length_beats, gain_db, notes_dropped}",
             has_live,
             set
         ),
@@ -156,34 +156,58 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
     let more = want.saturating_sub(s.live.columns.len());
     let mut created = 0usize;
     let mut emptied = Vec::new();
+    let mut names = Vec::new();
     if !lost.is_empty() || more > 0 {
         let s = e.session_mut();
-        let mut make = |s: &mut Session, i: usize, kind: SlotKind| {
+        let mut make = |s: &mut Session, i: usize, kind: SlotKind, preset: Option<&'static super::prod_presets::Preset>| {
             created += 1;
-            column_track(s, i, kind, None)
+            column_track(s, i, kind, preset)
         };
         // A column whose track was lost keeps its slots on a new track of the kind they play.
         // A column holding both kinds becomes an instrument column, and its audio slots (which
         // could not play there) are emptied and reported.
         for i in lost {
             let midi = s.live.columns.get(i).is_some_and(|c| c.slots.iter().flatten().any(|x| x.kind() == SlotKind::Midi));
-            let track = make(s, i, if midi { SlotKind::Midi } else { SlotKind::Audio });
+            let preset = s.live.columns.get(i).filter(|_| midi).and_then(|c| super::prod_presets::preset(lost_column_preset(c)));
+            let track = make(s, i, if midi { SlotKind::Midi } else { SlotKind::Audio }, preset);
             if let Some(c) = s.live.columns.get_mut(i) {
                 c.track = track;
                 for (row, cell) in c.slots.iter_mut().enumerate().filter(|_| midi) {
                     if let Some(x) = cell.take_if(|x| x.kind() == SlotKind::Audio) {
+                        names.push(format!("`{}` (Live {} slot {})", x.name(), i + 1, row + 1));
                         emptied.push(json!({"column": i, "slot": row, "name": x.name()}));
                     }
                 }
             }
         }
         for i in s.live.columns.len()..want {
-            let track = make(s, i, SlotKind::Audio);
+            let track = make(s, i, SlotKind::Audio, None);
             s.live.columns.push(LiveColumn::new(track));
         }
     }
+    if !names.is_empty() {
+        e.message(format!(
+            "Session view: emptied {}: audio slots an instrument column can't play (their files stay in the Clip List)",
+            names.join(", ")
+        ));
+    }
     let columns: Vec<u64> = e.session().live.columns.iter().map(|c| c.track.0).collect();
     Ok(json!({"columns": columns, "created": created, "emptied": emptied}))
+}
+
+/// The preset a lost instrument column's new track gets, from what its MIDI slots hold: the drum
+/// kit when every note is a General MIDI drum (35..=81 on channel 10), else the bass. The channel
+/// counts as well as the pitch: a bass line's notes are often all in the drum range too (a rolling
+/// bass in A is all 45, a GM tom), and the starter patterns put drums, and only drums, on 10.
+fn lost_column_preset(c: &LiveColumn) -> &'static str {
+    /// MIDI channel 10, 0-based.
+    const DRUM_CHANNEL: u8 = 9;
+    let mut notes = c.slots.iter().flatten().filter_map(|x| match x {
+        SlotContent::Midi(m) => Some(m.sequence.notes.iter()),
+        SlotContent::Audio(_) => None,
+    });
+    let drums = notes.all(|mut slot| slot.all(|n| n.channel == DRUM_CHANNEL && (35..=81).contains(&n.pitch)));
+    if drums { DEFAULT_PRESET } else { "rolling_bass" }
 }
 
 /// The track for column `i`: "Live {i + 1}", a stereo audio track, or for MIDI an instrument track
@@ -287,6 +311,24 @@ pub(super) fn target(e: &Engine, cmd: &str, p: &Value, column: usize) -> Result<
     col.next_empty().ok_or_else(|| bad(cmd, format!("Live column {} is full: pass `slot` to replace one, or clear one", column + 1)))
 }
 
+/// `p`'s `replace` (default false).
+pub(super) fn replace_param(cmd: &str, p: &Value) -> Result<bool> {
+    match p.get("replace") {
+        None | Some(Value::Null) => Ok(false),
+        Some(v) => v.as_bool().ok_or_else(|| bad(cmd, "`replace` must be true or false")),
+    }
+}
+
+/// Refuses filling slot `row` of `column` while it holds something, unless `replace`.
+pub(super) fn refuse_occupied(e: &Engine, cmd: &str, column: usize, row: usize, replace: bool) -> Result<()> {
+    match e.session().live.slot(column, row).filter(|_| !replace) {
+        Some(x) => {
+            Err(would_replace(cmd, format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name())))
+        }
+        None => Ok(()),
+    }
+}
+
 /// Beats in a slot's bar. Slots count bars of four beats, so the session must be in 4/4
 /// throughout (as for set exports): see [`four_four`].
 const BAR: f64 = 4.0;
@@ -381,6 +423,7 @@ fn from_selection(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, FROM_SELECTION, p)?;
     takes(e, FROM_SELECTION, column, SlotKind::Audio)?;
     let row = target(e, FROM_SELECTION, p, column)?;
+    refuse_occupied(e, FROM_SELECTION, column, row, replace_param(FROM_SELECTION, p)?)?;
     let tracks = match track_param(e, FROM_SELECTION, p, "track")? {
         Some(t) => vec![t],
         None => e.session().edit.selected_tracks.clone(),
@@ -397,18 +440,10 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, FROM_CLIP, p)?;
     takes(e, FROM_CLIP, column, SlotKind::Midi)?;
     let row = target(e, FROM_CLIP, p, column)?;
-    let replace = match p.get("replace") {
-        None | Some(Value::Null) => false,
-        Some(v) => v.as_bool().ok_or_else(|| bad(FROM_CLIP, "`replace` must be true or false"))?,
-    };
+    let replace = replace_param(FROM_CLIP, p)?;
+    four_four(FROM_CLIP, e.session())?;
+    refuse_occupied(e, FROM_CLIP, column, row, replace)?;
     let s = e.session();
-    four_four(FROM_CLIP, s)?;
-    if let Some(x) = s.live.slot(column, row).filter(|_| !replace) {
-        return Err(would_replace(
-            FROM_CLIP,
-            format!("slot {} of Live column {} holds `{}`: pass replace: true to replace it", row + 1, column + 1, x.name()),
-        ));
-    }
     let id = match p.get("clip") {
         None | Some(Value::Null) => {
             let midi: Vec<ClipId> = s
@@ -452,10 +487,7 @@ fn from_clip(e: &mut Engine, p: &Value) -> Result<Value> {
 fn to_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let column = column_param(e, TO_CLIP, p)?;
     let row = slot_param(TO_CLIP, p)?.ok_or_else(|| bad(TO_CLIP, "`slot` required (0-based)"))?;
-    let replace = match p.get("replace") {
-        None | Some(Value::Null) => false,
-        Some(v) => v.as_bool().ok_or_else(|| bad(TO_CLIP, "`replace` must be true or false"))?,
-    };
+    let replace = replace_param(TO_CLIP, p)?;
     let at = position_param(e, TO_CLIP, p, "at")?;
     let s = e.session();
     four_four(TO_CLIP, s)?;
@@ -500,6 +532,7 @@ fn file_params(e: &Engine, p: &Value) -> Result<FileParams> {
     takes(e, FROM_FILE, column, SlotKind::Audio)?;
     let path = str_param(p, "path").ok_or_else(|| bad(FROM_FILE, "`path` required"))?.to_string();
     let row = target(e, FROM_FILE, p, column)?;
+    refuse_occupied(e, FROM_FILE, column, row, replace_param(FROM_FILE, p)?)?;
     let bpm = match p.get("bpm") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -722,6 +755,7 @@ fn filled(e: &Engine, cmd: &str, p: &Value) -> Result<(usize, usize, SlotContent
 
 fn set(e: &mut Engine, p: &Value) -> Result<Value> {
     let (column, row, old) = filled(e, SET, p)?;
+    let replace = replace_param(SET, p)?;
     if !["name", "color", "mode", "length_bars", "gain_db"].iter().any(|k| p.get(k).is_some()) {
         return Err(bad(SET, "nothing to set: pass name, color, mode, length_bars or gain_db"));
     }
@@ -765,8 +799,29 @@ fn set(e: &mut Engine, p: &Value) -> Result<Value> {
             SlotContent::Midi(_) => {}
         }
     }
+    // A MIDI slot holds only what it plays (as it reloads): notes starting past a shortened loop
+    // go, and those running past its end are cut there. Dropping notes needs `replace`.
+    let mut notes_dropped = 0usize;
+    if let SlotContent::Midi(x) = &mut slot {
+        let before = x.sequence.notes.len();
+        x.sanitize();
+        notes_dropped = before.saturating_sub(x.sequence.notes.len());
+    }
+    if notes_dropped > 0 && !replace {
+        let bars = slot.length_beats() / BAR;
+        return Err(would_replace(
+            SET,
+            format!(
+                "{bars} bars would drop {notes_dropped} note{} of `{}` (slot {} of Live column {}) starting past the new end: pass replace: true to drop them",
+                if notes_dropped == 1 { "" } else { "s" },
+                old.name(),
+                row + 1,
+                column + 1
+            ),
+        ));
+    }
     let out = json!({"column": column, "slot": row, "kind": slot.kind().id(), "name": slot.name(), "color": slot.color(), "mode": slot.mode().id(),
-        "length_beats": slot.length_beats(), "gain_db": slot.gain_db()});
+        "length_beats": slot.length_beats(), "gain_db": slot.gain_db(), "notes_dropped": notes_dropped});
     if slot != old {
         put(e, column, row, slot);
     }

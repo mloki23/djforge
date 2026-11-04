@@ -137,10 +137,10 @@ fn a_pattern_fills_a_slot_and_refuses_an_occupied_one() {
 fn slots_of_both_kinds_edit_clear_and_report_their_kind() {
     let mut e = engine();
     run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
-    let r = run(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "name": "Kicks", "gain_db": -6.0, "length_bars": 2}));
+    let r = run(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "name": "Kicks", "gain_db": -6.0, "length_bars": 2, "replace": true}));
     assert_eq!(
-        (r["kind"].as_str(), r["name"].as_str(), r["length_beats"].as_f64(), r["mode"].as_str()),
-        (Some("midi"), Some("Kicks"), Some(8.0), Some("loop"))
+        (r["kind"].as_str(), r["name"].as_str(), r["length_beats"].as_f64(), r["mode"].as_str(), r["notes_dropped"].as_u64()),
+        (Some("midi"), Some("Kicks"), Some(8.0), Some("loop"), Some(8))
     );
     assert!(err(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "mode": "one_shot"})).contains("only loops"));
     let s = e.session_mut();
@@ -212,6 +212,7 @@ fn setup_empties_the_audio_slots_of_a_lost_mixed_column() {
     s.live.columns[4].slots[3] = Some(soundcraft_engine::model::Slot::one_shot("Vox", [0; 3], soundcraft_engine::model::SourceId(77)).into());
     let r = run(&mut e, "live.setup", json!({}));
     assert_eq!(r["emptied"], json!([{"column": 4, "slot": 3, "name": "Vox"}]));
+    assert!(e.messages.iter().any(|m| m.contains("emptied `Vox` (Live 5 slot 4)")), "{:?}", e.messages);
     let s = e.session();
     assert_eq!(s.live.column_kind(4, &s.tracks), Some(SlotKind::Midi));
     assert!(s.live.slot(4, 3).is_none() && s.live.midi_slot(4, 0).is_some());
@@ -288,4 +289,67 @@ fn refusals_to_replace_are_typed() {
     let clip = midi_clip(&mut e, 4.0);
     let r = e.execute("live.slot_from_clip", &json!({"column": 4, "slot": 0, "clip": clip})).unwrap_err();
     assert!(matches!(r, soundcraft_engine::EngineError::WouldReplace { .. }), "{r:?}");
+}
+
+/// Shortening a MIDI slot so notes start past its new end needs `replace`; what it then holds is
+/// what a saved session reloads (only the notes it plays, those running past the end cut there).
+#[test]
+fn shrinking_a_midi_slot_drops_notes_only_when_asked_and_reloads_as_held() {
+    let mut e = engine();
+    run(&mut e, "prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}}));
+    // A note running from beat 6 over the 2-bar line.
+    let held = Note { pitch: 49, velocity: 90, release_velocity: 64, channel: 9, start: 6 * Q, length: 4 * Q };
+    e.session_mut().live.columns[4].slots[0] = {
+        let mut x = e.session().live.midi_slot(4, 0).unwrap().clone();
+        x.sequence.notes.push(held);
+        x.sequence.sort();
+        Some(x.into())
+    };
+    let before = e.session().live.clone();
+    let undo = e.undo_history().len();
+    let refused = e.execute("live.slot_set", &json!({"column": 4, "slot": 0, "length_bars": 2})).unwrap_err();
+    assert!(matches!(refused, soundcraft_engine::EngineError::WouldReplace { .. }), "{refused:?}");
+    assert_eq!(
+        refused.to_string(),
+        "bad parameters for `live.slot_set`: 2 bars would drop 8 notes of `Four Floor` (slot 1 of Live column 5) starting past the new end: pass replace: true to drop them"
+    );
+    assert_eq!((e.session().live == before, e.undo_history().len()), (true, undo), "a refusal changes nothing");
+    // Lengthening, and a shrink that drops nothing, need no `replace`.
+    assert_eq!(run(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "length_bars": 8}))["notes_dropped"], 0);
+    let r = run(&mut e, "live.slot_set", json!({"column": 4, "slot": 0, "length_bars": 2, "replace": true}));
+    assert_eq!((r["notes_dropped"].as_u64(), r["length_beats"].as_f64()), (Some(8), Some(8.0)));
+    let x = e.session().live.midi_slot(4, 0).unwrap().clone();
+    assert_eq!(x.sequence.notes.len(), 9, "8 kicks and the held note");
+    assert!(x.sequence.notes.iter().any(|n| n.pitch == 49 && n.start == 6 * Q && n.length == 2 * Q), "the held note ends on the loop end");
+    // Saved and reopened, it is the same.
+    let dir = std::env::temp_dir().join(format!("djforge-slot-shrink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("shrink.scraft");
+    soundcraft_engine::io::save_session(&mut e, file.to_str().unwrap()).unwrap();
+    let mut back = Engine::default();
+    let opened = soundcraft_engine::io::open_session(&mut back, file.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    opened.unwrap();
+    assert_eq!(back.session().live, e.session().live);
+}
+
+/// A lost instrument column's new track plays what its slots hold: the drum kit for drums, the
+/// bass otherwise.
+#[test]
+fn setup_picks_a_lost_instrument_columns_preset_from_its_notes() {
+    for (kind, style, key, plugin) in [("drums", "four_floor", None, "drum_synth"), ("bass", "rolling", Some("Am"), "subtractive_synth")] {
+        let mut e = engine();
+        let mut p = json!({"kind": kind, "style": style, "slot": {"column": 4, "slot": 0}});
+        if let Some(k) = key {
+            p["key"] = json!(k);
+        }
+        run(&mut e, "prod.pattern", p);
+        let lost = e.session().live.columns[4].track;
+        e.session_mut().tracks.retain(|t| t.id != lost);
+        run(&mut e, "live.setup", json!({}));
+        let s = e.session();
+        let ins = s.track(s.live.columns[4].track).and_then(|t| t.instrument.clone()).unwrap();
+        assert_eq!(ins.plugin, plugin, "{kind}");
+    }
 }

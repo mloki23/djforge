@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Starter Pattern",
             [],
             None,
-            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?, slot?: {column, slot} (0-based: an instrument column's slot instead of a clip)} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track unless `replace` (which clears what is under them). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. A sweep written onto an empty lane makes that param follow automation over the whole timeline: outside the bars it holds the part's setting at the time, and the knob no longer changes it (edit the lane instead). With the track's automation off, the sweep doesn't play. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids]}. With `slot`, it writes a looping MIDI slot of `bars` (default 4, at most 256) bars instead, in the key at the playhead (or `key`), named the same; `track`, `start` and `end` don't apply, an occupied slot is refused unless `replace`, and FX sweeps are left out (slots play no automation). Returns {column, slot, key, camelot, bars, length_beats, notes, automation_dropped: [params]}",
+            "{kind: drums|bass|synth|fx, style (drums: four_floor, trance_full, rolling_perc, fill; bass: rolling, offbeat, root_fifth; synth: stabs, arp; fx: riser, downlifter, impact), track? (default: the selected part), start?, end? (default: the timeline selection), bars? (without a selection: this many bars from the one holding the playhead), key? (bass and synth; default: the key the set plays at the start, as dj.key_at), replace?: bool (default false), seed?, slot?: {column, slot} (0-based: an instrument column's slot instead of a clip)} — a new MIDI clip of the style over the range snapped outward to whole 4/4 bars, named \"<Style> (<camelot>)\". Refuses when the bars overlap a clip on the track, or when the pattern's sweep would overwrite instrument:cutoff or instrument:level points inside them, unless `replace` (which clears the clips under them, and the cutoff and level points inside them that the new pattern doesn't sweep, so an old sweep doesn't keep playing under a drum pattern or an impact). FX sweeps automate the instrument's cutoff (exponentially over its range) and level (as gain under the part's own level) over the bars, leaving the lanes as they were outside them. A sweep written onto an empty lane makes that param follow automation over the whole timeline: outside the bars it holds the part's setting at the time, and the knob no longer changes it (edit the lane instead). With the track's automation off, the sweep doesn't play. One undo step. Returns {clip, track, key, camelot, bars, notes, start, end, automation: [lane ids written], automation_cleared: [lane ids cleared]}. With `slot`, it writes a looping MIDI slot of `bars` (default 4, at most 256) bars instead, in the key at the playhead (or `key`), named the same; `track`, `start` and `end` don't apply, an occupied slot is refused unless `replace`, and FX sweeps are left out (slots play no automation). Returns {column, slot, key, camelot, bars, length_beats, notes, automation_dropped: [params]}",
             always,
             pattern
         ),
@@ -318,12 +318,6 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
     let tr = s.track(t).ok_or_else(|| bad(CMD, "no such track"))?;
     let span = Range::new(range.start, range.end);
     let under: Vec<String> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).map(|c| format!("`{}`", c.name)).collect();
-    if !under.is_empty() && !replace {
-        return Err(would_replace(
-            CMD,
-            format!("the bars overlap {} on `{}`: pass replace: true to replace what is there", under.join(", "), tr.name),
-        ));
-    }
     // Stable by default: the same part and bars give the same pattern.
     let seed = seed.unwrap_or_else(|| t.0.wrapping_mul(1_000_003).wrapping_add(range.first.unsigned_abs()));
     let spec = PatternSpec { kind, style, bars: range.bars, beats_per_bar: 4, key, seed };
@@ -351,7 +345,38 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         lanes.push((param, points, base));
     }
+    // Sweep lanes with points inside the bars: the pattern's own sweeps would overwrite them, and
+    // `replace` clears the rest so an old sweep doesn't keep playing under the new pattern.
+    let drawn: Vec<&'static str> =
+        SWEEP_PARAMS.into_iter().filter(|param| tr.lane(&AutoParam::instrument(param)).is_some_and(|l| drawn_inside(l, span))).collect();
+    let writes = |param: &str| lanes.iter().any(|(q, ..)| *q == param);
+    let overwritten: Vec<String> = drawn.iter().filter(|p| writes(p)).map(|p| format!("instrument:{p}")).collect();
+    let cleared: Vec<&'static str> = drawn.iter().copied().filter(|p| !writes(p)).collect();
+    if !replace && (!under.is_empty() || !overwritten.is_empty()) {
+        let mut what = Vec::new();
+        if !under.is_empty() {
+            what.push(format!("the bars overlap {} on `{}`", under.join(", "), tr.name));
+        }
+        if !overwritten.is_empty() {
+            what.push(format!("the sweep would overwrite the {} points inside the bars on `{}`", overwritten.join(" and "), tr.name));
+        }
+        let also = if cleared.is_empty() {
+            String::new()
+        } else {
+            format!(" (it also clears the instrument:{} points there)", cleared.join(" and instrument:"))
+        };
+        return Err(would_replace(CMD, format!("{}: pass replace: true to replace what is there{also}", what.join("; "))));
+    }
+    let cleared = if replace { cleared } else { Vec::new() };
     let mut notices = Vec::new();
+    if !cleared.is_empty() {
+        notices.push(format!("{}: cleared the {} sweep inside the bars", tr.name, cleared.join("/")));
+    }
+    // What a cleared lane holds where it has no points (it always has some outside the bars).
+    let cleared: Vec<(&'static str, f32)> = cleared
+        .into_iter()
+        .map(|param| (param, stored(param).or_else(|| info.and_then(|i| i.param(param)).map(|pi| pi.default)).unwrap_or(0.0)))
+        .collect();
     if !pinned.is_empty() {
         notices.push(format!("{}'s {} now follow automation; edit the lane to change them", tr.name, pinned.join("/")));
     }
@@ -378,6 +403,10 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
             tr.lane_mut(&AutoParam::instrument(param)).write_curve(range.start, range.end, &points, base);
             automation.push(format!("instrument:{param}"));
         }
+        for &(param, base) in &cleared {
+            // Nothing written in place of the old points: the curve joins what is either side.
+            tr.lane_mut(&AutoParam::instrument(param)).write_curve(range.start, range.end, &[], base);
+        }
     }
     Ok(json!({
         "clip": cid,
@@ -389,7 +418,19 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
         "start": range.start,
         "end": range.end,
         "automation": automation,
+        "automation_cleared": cleared.iter().map(|(param, _)| format!("instrument:{param}")).collect::<Vec<_>>(),
     }))
+}
+
+/// The instrument params a pattern's sweeps drive (as [`sweep_target`] maps them).
+const SWEEP_PARAMS: [&str; 2] = ["cutoff", "level"];
+
+/// Whether `lane` has points strictly inside `span`, past the one-sample anchors a sweep on the
+/// neighbouring bars leaves just inside its bar lines (those hold the curve either side, and a
+/// sweep over `span` keeps them so).
+fn drawn_inside(lane: &soundcraft_model::AutomationLane, span: Range) -> bool {
+    let (from, to) = (span.start.saturating_add(1), span.end.saturating_sub(1));
+    lane.points.iter().any(|p| p.at > from && p.at < to)
 }
 
 /// Bars a slot pattern fills when `bars` isn't given.
@@ -1018,6 +1059,73 @@ mod tests {
         assert!((l.value_at(a - 1, 0.0) - was(a - 1)).abs() < 1e-3);
         assert!((l.value_at(b + 1, 0.0) - was(b + 1)).abs() < 1e-3);
         assert_eq!((c.value_at(a - 1, 0.0), c.value_at(b + 1, 0.0)), (cutoff, cutoff), "an empty lane holds the part's setting");
+    }
+
+    #[test]
+    fn a_sweep_refuses_to_overwrite_automation_drawn_inside_its_bars() {
+        let mut e = Engine::default();
+        let t = track_of(&part(&mut e, json!({"kind": "fx", "preset": "noise_riser"})));
+        let (a, b) = (bar(&e, 5), bar(&e, 9));
+        let mid = bar(&e, 7);
+        e.session_mut().track_mut(t).unwrap().lane_mut(&AutoParam::instrument("cutoff")).set_point(mid, 500.0);
+        select(&mut e, a, b);
+        let before = e.session().clone();
+        let err = e.execute("prod.pattern", &json!({"kind": "fx", "style": "riser"})).unwrap_err();
+        assert!(matches!(err, crate::EngineError::WouldReplace { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("instrument:cutoff") && msg.contains("replace: true") && !msg.contains("instrument:level"), "{msg}");
+        assert!(*e.session() == before, "the refusal changed nothing");
+        // A pattern with no sweep leaves the drawn points alone without asking.
+        let r = pattern(&mut e, json!({"kind": "fx", "style": "impact"}));
+        assert_eq!(r["automation_cleared"], json!([]));
+        assert_eq!(sweeps(&e, t).0.unwrap().value_at(mid, 0.0), 500.0);
+        // A sweep on the neighbouring bars isn't refused by the first one's anchors on the bar line.
+        let (c, d) = (bar(&e, 9), bar(&e, 11));
+        select(&mut e, c, d);
+        pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+        let (g, h) = (bar(&e, 11), bar(&e, 13));
+        select(&mut e, g, h);
+        pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+    }
+
+    #[test]
+    fn replace_clears_an_old_sweep_the_new_pattern_does_not_write_and_nothing_outside() {
+        for (kind, style) in [("fx", "impact"), ("drums", "fill")] {
+            let mut e = Engine::default();
+            let t = track_of(&part(&mut e, json!({"kind": "fx", "preset": "noise_riser"})));
+            let ins = e.session().track(t).unwrap().instrument.clone().unwrap();
+            let (level, cutoff) = (ins.params["level"], ins.params["cutoff"]);
+            // Hand-drawn level points either side of the bars stay as they were.
+            let (b1, b12) = (bar(&e, 1), bar(&e, 12));
+            {
+                let lane = e.session_mut().track_mut(t).unwrap().lane_mut(&AutoParam::instrument("level"));
+                lane.set_point(b1, level - 20.0);
+                lane.set_point(b12, level - 10.0);
+            }
+            let (a, b) = (bar(&e, 5), bar(&e, 9));
+            select(&mut e, a, b);
+            pattern(&mut e, json!({"kind": "fx", "style": "riser"}));
+            let err = e.execute("prod.pattern", &json!({"kind": kind, "style": style})).unwrap_err();
+            assert!(matches!(err, crate::EngineError::WouldReplace { .. }), "{err:?}");
+            assert!(err.to_string().contains("clears the instrument:cutoff and instrument:level points"), "{err}");
+            let r = pattern(&mut e, json!({"kind": kind, "style": style, "replace": true}));
+            assert_eq!(r["automation"], json!([]), "{style}");
+            assert_eq!(r["automation_cleared"], json!(["instrument:cutoff", "instrument:level"]), "{style}");
+            assert!(e.messages.iter().any(|m| m == "FX 1: cleared the cutoff/level sweep inside the bars"), "{:?}", e.messages);
+            let (c, l) = sweeps(&e, t);
+            let (c, l) = (c.unwrap(), l.unwrap());
+            for lane in [&c, &l] {
+                assert!(lane.points.iter().all(|p| p.at < a || p.at > b), "{style}: no points left inside the bars");
+            }
+            // The old riser no longer plays: cutoff holds the part's setting over the bars and the
+            // level runs along the hand-drawn line.
+            let was = |at: Samples| (level - 20.0) + 10.0 * ((at - b1) as f32 / (b12 - b1) as f32);
+            for at in [a, bar(&e, 7), b] {
+                assert_eq!(c.value_at(at, 0.0), cutoff, "{style}");
+                assert!((l.value_at(at, 0.0) - was(at)).abs() < 1e-3, "{style}: {} vs {}", l.value_at(at, 0.0), was(at));
+            }
+            assert_eq!((l.value_at(b1, 0.0), l.value_at(b12, 0.0)), (level - 20.0, level - 10.0), "{style}");
+        }
     }
 
     #[test]

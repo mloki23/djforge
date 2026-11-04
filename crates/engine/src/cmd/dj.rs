@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Key At Position",
             [],
             None,
-            "{at?: position (default: the playhead), track?} — the key playing at `at`: that of the beat-locked audio clip under it (on `track` only, when given; where a transition's two clips overlap, the outgoing one before its hit bar and the incoming one from it; otherwise the latest-started). Returns {key: name like `Am`, camelot: `8A`, source, clip}, or {key: null} when no keyed clip plays there. Changes nothing",
+            "{at?: position (default: the playhead), track?} — the key playing at `at`: that of the beat-locked audio clip under it (on `track` only, when given; where a transition's two clips overlap, the outgoing one before its hit bar and the incoming one from it; otherwise the latest-started). Returns {key: name like `Am`, camelot: `8A`, source, clip}; when the clip that owns `at` has no key, {key: null, camelot: null} with its source and clip (a keyed clip under it doesn't stand in); when no beat-locked clip plays there, all four null. Changes nothing",
             always,
             key::key_at
         ),
