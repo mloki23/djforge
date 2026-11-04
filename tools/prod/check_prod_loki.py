@@ -3,7 +3,8 @@
     python -I tools/prod/check_prod_loki.py "<produce folder>"
 
 Reads, from the folder: `loki produce.scraft`, `loki produce.wav` (the mix, bars 896..968) and
-`loki produce (parts only).wav` (the same window with Deck A/B muted). Needs numpy and scipy.
+`loki produce (parts only).wav` (the same window with Deck A/B muted; prod_loki.cmds' header
+gives the command that bounces it). Needs numpy and scipy.
 """
 
 import json
@@ -80,11 +81,10 @@ def main():
     _, parts = read_wav(folder / "loki produce (parts only).wav")
     sp, tp = db(float(np.max(np.abs(mix)))), db(true_peak(mix))
     print(f"mix: {len(mix) / rate:.2f} s, sample peak {sp:.2f} dBFS, true peak {tp:.2f} dBTP")
-    # Sample peak is the gate's proxy for the -1 dBTP ceiling; the true peak is reported as a
-    # warning (the engine's own bounce meter under-reads it).
-    ok &= sp <= -0.99
-    if tp > -1.0:
-        print(f"WARNING: mix true peak {tp:.2f} dBTP is above -1 dBTP")
+    # The master's Maximizer holds -1 dBTP; 0.05 dB allows for this 4x estimate's own error.
+    tp_ok = tp <= -1.0 + 0.05
+    print(f"mix true peak at or under -1 dBTP (+0.05): {tp_ok}")
+    ok &= sp <= -0.99 and tp_ok
     print(f"parts only: sample peak {db(float(np.max(np.abs(parts)))):.2f} dBFS, true peak {db(true_peak(parts)):.2f} dBTP")
     seg = segments("parts only", parts)
     segments("mix", mix)
