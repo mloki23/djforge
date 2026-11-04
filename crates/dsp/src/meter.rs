@@ -133,45 +133,63 @@ const SUB_BLOCKS: usize = 30; // 3 s of 100 ms sub-blocks
 const HIST_MIN: f32 = -70.0;
 const HIST_STEP: f32 = 0.05;
 const HIST_BINS: usize = 1800; // -70 .. +20 LUFS
-/// True peak: 4× oversampling with a 48-tap interpolation filter, 12 taps per phase.
-pub(crate) const TP_PHASES: usize = 4;
-pub(crate) const TP_TAPS: usize = 12;
+/// True peak (ITU-R BS.1770-4 Annex 2): 4× oversampling through a Kaiser-windowed sinc
+/// interpolation filter of `TP_TAPS * TP_PHASES` (96) taps.
+const TP_PHASES: usize = 4;
+const TP_TAPS: usize = 24;
+/// Kaiser window shape for the meter: passband flat (±0.05 dB) to about 20 kHz at 48 kHz.
+const TP_KAISER_BETA: f64 = 6.0;
 
-/// The true-peak interpolation filter (a windowed sinc at the original Nyquist, split into
-/// [`TP_PHASES`] phases, each normalised to unity gain). Phase `k` applied to the newest
-/// [`TP_TAPS`] samples (newest first) estimates the signal between samples, about
-/// `TP_TAPS / 2` samples back.
-pub(crate) fn true_peak_coefs() -> [[f32; TP_TAPS]; TP_PHASES] {
-    let mut tp_coefs = [[0.0f32; TP_TAPS]; TP_PHASES];
-    let total = TP_TAPS * TP_PHASES;
-    let center = (total as f64 - 1.0) / 2.0;
-    for i in 0..total {
-        let t = (i as f64 - center) / TP_PHASES as f64;
-        let sinc = if t.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) };
-        let x = i as f64 / (total as f64 - 1.0);
-        let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * x).cos() + 0.08 * (4.0 * std::f64::consts::PI * x).cos();
-        if let Some(slot) = tp_coefs.get_mut(i % TP_PHASES).and_then(|ph| ph.get_mut(i / TP_PHASES)) {
+/// Modified Bessel function of the first kind, order 0 (the Kaiser window's kernel).
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term) = (1.0f64, 1.0f64);
+    for k in 1..64 {
+        term *= (x / (2.0 * f64::from(k))).powi(2);
+        sum += term;
+        if term < 1e-15 * sum {
+            break;
+        }
+    }
+    sum
+}
+
+/// A polyphase interpolation filter: a Kaiser-windowed (`beta`) sinc with its cutoff at the
+/// original Nyquist, split into `P` branches of `T` taps. Applied to the newest `T` samples
+/// (newest first), branch `k` estimates the signal `k / P` of a sample after the one `T / 2`
+/// samples back: branch 0 is that sample itself, the others lie between it and the next. The branches are not renormalised: the prototype's own passband
+/// gain is what keeps high-frequency inter-sample peaks at their real height.
+pub(crate) fn interpolation_coefs<const P: usize, const T: usize>(beta: f64) -> [[f32; T]; P] {
+    let mut coefs = [[0.0f32; T]; P];
+    let half = (T / 2) as f64;
+    let i0_beta = bessel_i0(beta);
+    for (k, ph) in coefs.iter_mut().enumerate() {
+        for (j, slot) in ph.iter_mut().enumerate() {
+            // Distance (in input samples) from the estimated point to sample `j` back.
+            let d = j as f64 - half + k as f64 / P as f64;
+            let r = d / half;
+            let w = if r.abs() >= 1.0 { 0.0 } else { bessel_i0(beta * (1.0 - r * r).sqrt()) / i0_beta };
+            let pd = std::f64::consts::PI * d;
+            let sinc = if pd.abs() < 1e-12 { 1.0 } else { pd.sin() / pd };
             *slot = (sinc * w) as f32;
         }
     }
-    for ph in &mut tp_coefs {
-        let s: f32 = ph.iter().sum();
-        if s.abs() > 1e-6 {
-            ph.iter_mut().for_each(|c| *c /= s);
-        }
-    }
-    tp_coefs
+    coefs
 }
 
 /// The largest absolute value among `x` and the inter-sample estimates from the history `h`
 /// (newest first, `x` already pushed into it).
-pub(crate) fn true_peak_of(coefs: &[[f32; TP_TAPS]; TP_PHASES], h: &[f32; TP_TAPS], x: f32) -> f32 {
+pub(crate) fn interpolated_peak<const P: usize, const T: usize>(coefs: &[[f32; T]; P], h: &[f32; T], x: f32) -> f32 {
     let mut peak = x.abs();
     for ph in coefs {
         let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
         peak = peak.max(y.abs());
     }
     peak
+}
+
+/// The meter's true-peak filter (see [`interpolation_coefs`]), cutoff at the original Nyquist.
+fn true_peak_coefs() -> [[f32; TP_TAPS]; TP_PHASES] {
+    interpolation_coefs(TP_KAISER_BETA)
 }
 
 /// ITU-R BS.1770 / EBU R128 loudness meter.
@@ -308,7 +326,7 @@ impl LoudnessMeter {
         let Some(h) = self.tp_hist.get_mut(c) else { return };
         h.copy_within(0..TP_TAPS - 1, 1);
         h[0] = x;
-        let peak = true_peak_of(&self.tp_coefs, h, x);
+        let peak = interpolated_peak(&self.tp_coefs, h, x);
         if peak > self.true_peak {
             self.true_peak = peak;
         }

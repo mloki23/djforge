@@ -495,24 +495,31 @@ pub static MAX_INFO: PluginInfo = PluginInfo {
 
 const MAX_LOOKAHEAD_MS: f32 = 1.5;
 
+/// The true-peak detector: 8× oversampling (finer than the meter's 4×, so a peak between the
+/// meter's grid points is not missed) through a `TP_PHASES * TP_TAPS`-tap Kaiser-windowed sinc.
+const TP_PHASES: usize = 8;
+const TP_TAPS: usize = 32;
+const TP_KAISER_BETA: f64 = 6.0;
+
 /// How many samples late the true-peak detector sees an inter-sample peak (its interpolation
-/// filter's group delay, rounded up): the audio is delayed that much more in true-peak mode.
-const TP_DELAY: usize = crate::meter::TP_TAPS / 2;
+/// filter's group delay): the audio is delayed that much more in true-peak mode.
+const TP_DELAY: usize = TP_TAPS / 2;
 
 /// Lookahead brickwall limiter: the input is driven by `-threshold` dB and never exceeds the
 /// ceiling. Gain is a min-hold over the lookahead window followed by an equal-length moving
 /// average, which ramps the gain down before each peak reaches the output.
 ///
-/// With `true_peak` on, peaks are detected on a 4× oversampled signal (the loudness meter's
-/// true-peak filter), so inter-sample peaks stay under the ceiling too; the audio is delayed by
-/// the detector's [`TP_DELAY`] more samples, which [`Plugin::latency`] reports.
+/// With `true_peak` on, peaks are detected on an 8× oversampled signal (a finer grid than the
+/// BS.1770 meter's 4×, so the limiter never trusts an under-read), so inter-sample peaks stay
+/// under the ceiling too; the audio is delayed by the detector's [`TP_DELAY`] more samples,
+/// which [`Plugin::latency`] reports.
 pub struct Maximizer {
     p: Params,
     sr: f32,
     la: usize,
     delay: Vec<DelayLine>,
-    tp_coefs: [[f32; crate::meter::TP_TAPS]; crate::meter::TP_PHASES],
-    tp_hist: Vec<[f32; crate::meter::TP_TAPS]>,
+    tp_coefs: [[f32; TP_TAPS]; TP_PHASES],
+    tp_hist: Vec<[f32; TP_TAPS]>,
     req: Vec<f32>,
     smooth: Vec<f32>,
     idx: usize,
@@ -537,7 +544,7 @@ impl Maximizer {
             sr: 48_000.0,
             la: 1,
             delay: Vec::new(),
-            tp_coefs: crate::meter::true_peak_coefs(),
+            tp_coefs: crate::meter::interpolation_coefs(TP_KAISER_BETA),
             tp_hist: Vec::new(),
             req: vec![1.0],
             smooth: vec![1.0],
@@ -579,7 +586,7 @@ impl Plugin for Maximizer {
                 d
             })
             .collect();
-        self.tp_hist = vec![[0.0; crate::meter::TP_TAPS]; self.delay.len()];
+        self.tp_hist = vec![[0.0; TP_TAPS]; self.delay.len()];
         self.req = vec![1.0; self.la];
         self.smooth = vec![1.0; self.la];
         self.drive.set_time(20.0, self.sr);
@@ -590,7 +597,7 @@ impl Plugin for Maximizer {
 
     fn reset(&mut self) {
         self.delay.iter_mut().for_each(DelayLine::clear);
-        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; crate::meter::TP_TAPS]);
+        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; TP_TAPS]);
         self.req.iter_mut().for_each(|v| *v = 1.0);
         self.smooth.iter_mut().for_each(|v| *v = 1.0);
         self.sum = self.la as f64;
@@ -619,9 +626,9 @@ impl Plugin for Maximizer {
                 // The history is kept in both modes, so switching mode starts from real audio.
                 let p = match self.tp_hist.get_mut(c) {
                     Some(h) => {
-                        h.copy_within(0..crate::meter::TP_TAPS - 1, 1);
+                        h.copy_within(0..TP_TAPS - 1, 1);
                         h[0] = x;
-                        if true_peak { crate::meter::true_peak_of(&self.tp_coefs, h, x) } else { x.abs() }
+                        if true_peak { crate::meter::interpolated_peak(&self.tp_coefs, h, x) } else { x.abs() }
                     }
                     None => x.abs(),
                 };
