@@ -495,34 +495,47 @@ pub static MAX_INFO: PluginInfo = PluginInfo {
 
 const MAX_LOOKAHEAD_MS: f32 = 1.5;
 
-/// The true-peak detector: 8× oversampling (finer than the meter's 4×, so a peak between the
-/// meter's grid points is not missed) through a `TP_PHASES * TP_TAPS`-tap Kaiser-windowed sinc.
-const TP_PHASES: usize = 8;
-const TP_TAPS: usize = 32;
-const TP_KAISER_BETA: f64 = 6.0;
+/// The true-peak detector, built to err high (a limiter can afford to over-read a little, not to
+/// let a peak through): 16× oversampling through a `TP_PHASES * TP_TAPS`-tap
+/// Kaiser-windowed sinc whose passband reaches about 23 kHz at 48 kHz (a short or steep window
+/// rolls off from about 20 kHz, and content above that slipped through), with the largest
+/// estimate scaled by [`TP_GRID`]. The meter stays BS.1770's 4× and reads accurately instead.
+const TP_PHASES: usize = 16;
+const TP_TAPS: usize = 64;
+const TP_KAISER_BETA: f64 = 4.0;
+/// How far the largest of the 16× estimates can be under the true peak between them: for a
+/// signal band-limited to Nyquist (fs/2), the curve can fall at most `π² / (8 · P²)` of its peak
+/// within half a grid step of it (Bernstein's inequality bounds its curvature), so scaling the
+/// estimate by `1 / (1 - π² / (8 · P²))` (0.04 dB at 16×) bounds the peak from above.
+const TP_GRID: f32 = (1.0 / (1.0 - std::f64::consts::PI * std::f64::consts::PI / (8.0 * (TP_PHASES * TP_PHASES) as f64))) as f32;
 
 /// How many samples late the true-peak detector sees an inter-sample peak (its interpolation
-/// filter's group delay): the audio is delayed that much more in true-peak mode.
+/// filter's group delay). In true-peak mode the audio is delayed by twice that more: the gain a
+/// peak needs is held over every sample its estimate was made from.
 const TP_DELAY: usize = TP_TAPS / 2;
 
 /// Lookahead brickwall limiter: the input is driven by `-threshold` dB and never exceeds the
 /// ceiling. Gain is a min-hold over the lookahead window followed by an equal-length moving
 /// average, which ramps the gain down before each peak reaches the output.
 ///
-/// With `true_peak` on, peaks are detected on an 8× oversampled signal (a finer grid than the
-/// BS.1770 meter's 4×, so the limiter never trusts an under-read), so inter-sample peaks stay
-/// under the ceiling too; the audio is delayed by the detector's [`TP_DELAY`] more samples,
-/// which [`Plugin::latency`] reports.
+/// With `true_peak` on, peaks are detected on a 16× oversampled signal by a detector built to
+/// err high (see [`TP_GRID`]), and each request is held over the detector's whole span, so
+/// inter-sample peaks stay under the ceiling too; the audio is delayed by `2 * TP_DELAY` more
+/// samples, which [`Plugin::latency`] reports.
 pub struct Maximizer {
     p: Params,
     sr: f32,
     la: usize,
     delay: Vec<DelayLine>,
     tp_coefs: [[f32; TP_TAPS]; TP_PHASES],
+    /// The loudness meter's 4× filter, whose estimates count too (see [`Maximizer::process`]).
+    meter_coefs: [[f32; crate::meter::TP_TAPS]; crate::meter::TP_PHASES],
     tp_hist: Vec<crate::meter::History<{ 2 * TP_TAPS }>>,
     req: Vec<f32>,
     smooth: Vec<f32>,
     idx: usize,
+    /// Where the next request goes in `req` (a ring of [`Maximizer::hold_len`]).
+    hidx: usize,
     sum: f64,
     held: f32,
     rel: f32,
@@ -545,10 +558,12 @@ impl Maximizer {
             la: 1,
             delay: Vec::new(),
             tp_coefs: crate::meter::interpolation_coefs(TP_KAISER_BETA),
+            meter_coefs: crate::meter::true_peak_coefs(),
             tp_hist: Vec::new(),
             req: vec![1.0],
             smooth: vec![1.0],
             idx: 0,
+            hidx: 0,
             sum: 1.0,
             held: 1.0,
             rel: 0.0,
@@ -571,6 +586,13 @@ impl Maximizer {
     fn true_peak(&self) -> bool {
         self.p.on(3)
     }
+
+    /// Samples a gain request is held for: the lookahead, and in true-peak mode the detector's
+    /// whole span on top, so the gain is down over every sample an inter-sample estimate is made
+    /// from, not only the one it was found next to.
+    fn hold_len(&self) -> usize {
+        self.la.max(1) + if self.true_peak() { 2 * TP_DELAY } else { 0 }
+    }
 }
 
 impl Plugin for Maximizer {
@@ -582,12 +604,12 @@ impl Plugin for Maximizer {
         self.delay = (0..sane_channels(channels))
             .map(|_| {
                 let mut d = DelayLine::default();
-                d.allocate(self.la + TP_DELAY + 2);
+                d.allocate(self.la + 2 * TP_DELAY + 2);
                 d
             })
             .collect();
         self.tp_hist = vec![crate::meter::History::default(); self.delay.len()];
-        self.req = vec![1.0; self.la];
+        self.req = vec![1.0; self.la + 2 * TP_DELAY];
         self.smooth = vec![1.0; self.la];
         self.drive.set_time(20.0, self.sr);
         self.ceiling.set_time(20.0, self.sr);
@@ -603,6 +625,7 @@ impl Plugin for Maximizer {
         self.sum = self.la as f64;
         self.held = 1.0;
         self.idx = 0;
+        self.hidx = 0;
         self.drive.snap();
         self.ceiling.snap();
         self.gr_meter = 0.0;
@@ -613,7 +636,10 @@ impl Plugin for Maximizer {
         let frames = frames_in(io, frames, ch);
         let la = self.la.max(1);
         let true_peak = self.true_peak();
-        let out_tap = if true_peak { la + TP_DELAY } else { la };
+        // In true-peak mode the request made for the estimate `TP_DELAY` back holds over the
+        // `2 * TP_DELAY + 1` samples it is made from, so their output is delayed past them all.
+        let out_tap = if true_peak { la + 2 * TP_DELAY } else { la };
+        let hold_len = self.hold_len().min(self.req.len()).max(1);
         let mut min_gain = 1.0f32;
         for n in 0..frames {
             let drive = self.drive.next();
@@ -629,17 +655,29 @@ impl Plugin for Maximizer {
                         h.push(x);
                         // The sample `TP_DELAY` back and the estimates around it, all as late as
                         // the audio is delayed for them (the newest sample would be early).
-                        if true_peak { crate::meter::between_peak(&self.tp_coefs, h.window()).max(h.back(TP_DELAY).abs()) } else { x.abs() }
+                        if true_peak {
+                            // A 4× BS.1770 meter's short filter over-reads some transients
+                            // the 16× one reads truly; its estimates, over the same samples,
+                            // count too, so the master meters under its ceiling as well.
+                            let w = h.window();
+                            let at = TP_DELAY.saturating_sub(crate::meter::TP_TAPS / 2);
+                            let meter = w.get(at..).map_or(0.0, |m| crate::meter::interpolated_peak(&self.meter_coefs, m));
+                            (crate::meter::interpolated_peak(&self.tp_coefs, w).max(h.back(TP_DELAY).abs()) * TP_GRID).max(meter)
+                        } else {
+                            x.abs()
+                        }
                     }
                     None => x.abs(),
                 };
                 peak = peak.max(p);
             }
             let req = if peak > ceil { ceil / peak } else { 1.0 };
-            if let Some(r) = self.req.get_mut(self.idx) {
+            self.hidx %= hold_len;
+            if let Some(r) = self.req.get_mut(self.hidx) {
                 *r = req;
             }
-            let hold = self.req.iter().copied().fold(1.0f32, f32::min);
+            self.hidx += 1;
+            let hold = self.req.iter().take(hold_len).copied().fold(1.0f32, f32::min);
             self.held = if hold < self.held { hold } else { hold + (self.held - hold) * self.rel };
             if let Some(s) = self.smooth.get_mut(self.idx) {
                 self.sum += f64::from(self.held) - f64::from(*s);
@@ -663,7 +701,7 @@ impl Plugin for Maximizer {
     }
 
     fn latency(&self) -> usize {
-        self.la - 1 + if self.true_peak() { TP_DELAY } else { 0 }
+        self.la - 1 + if self.true_peak() { 2 * TP_DELAY } else { 0 }
     }
 
     fn gain_reduction_db(&self) -> f32 {

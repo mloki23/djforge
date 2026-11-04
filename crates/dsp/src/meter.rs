@@ -135,8 +135,8 @@ const HIST_STEP: f32 = 0.05;
 const HIST_BINS: usize = 1800; // -70 .. +20 LUFS
 /// True peak (ITU-R BS.1770-4 Annex 2): 4× oversampling through a Kaiser-windowed sinc
 /// interpolation filter of `TP_TAPS * TP_PHASES` (96) taps.
-const TP_PHASES: usize = 4;
-const TP_TAPS: usize = 24;
+pub(crate) const TP_PHASES: usize = 4;
+pub(crate) const TP_TAPS: usize = 24;
 /// Kaiser window shape for the meter: passband flat (±0.05 dB) to about 20 kHz at 48 kHz.
 const TP_KAISER_BETA: f64 = 6.0;
 
@@ -181,6 +181,12 @@ pub(crate) fn interpolation_coefs<const P: usize, const T: usize>(beta: f64) -> 
 /// sample `T / 2` back itself (its other taps sit on the sinc's zeros), which the caller has.
 pub(crate) fn between_peak<const P: usize, const T: usize>(coefs: &[[f32; T]; P], h: &[f32]) -> f32 {
     coefs.iter().skip(1).fold(0.0f32, |peak, ph| peak.max(dot(ph, h).abs()))
+}
+
+/// The largest absolute value among all the estimates of `coefs` (every branch) from the
+/// history `h` (the newest `T` samples, newest first).
+pub(crate) fn interpolated_peak<const P: usize, const T: usize>(coefs: &[[f32; T]; P], h: &[f32]) -> f32 {
+    coefs.iter().fold(0.0f32, |peak, ph| peak.max(dot(ph, h).abs()))
 }
 
 /// `a · b` over their common length, in eight running sums (so it vectorises).
@@ -234,7 +240,7 @@ impl<const N: usize> History<N> {
 }
 
 /// The meter's true-peak filter (see [`interpolation_coefs`]), cutoff at the original Nyquist.
-fn true_peak_coefs() -> [[f32; TP_TAPS]; TP_PHASES] {
+pub(crate) fn true_peak_coefs() -> [[f32; TP_TAPS]; TP_PHASES] {
     interpolation_coefs(TP_KAISER_BETA)
 }
 

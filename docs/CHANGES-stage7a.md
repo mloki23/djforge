@@ -2,27 +2,42 @@
 
 ## Master true peak: every imported DJ set is affected
 
-The Maximizer's True Peak mode now detects peaks on an 8x oversampled signal (BS.1770 Annex 2,
-on a finer grid than the meter's 4x) and holds them under its ceiling. Every set made by
-`dj.import_set` has this Maximizer on its master, so every imported DJ set changes:
+The Maximizer's True Peak mode now holds the master under its ceiling measured as true peak.
+Every set made by `dj.import_set` has this Maximizer on its master, so every imported DJ set
+changes.
 
-- **Latency.** In True Peak mode the limiter adds 10 more samples of latency than before: the
-  detector's filter delay is now 16 samples, up from 6. It reports this, so playback and
-  bounces stay aligned.
-- **Inter-sample peaks.** It now catches inter-sample peaks it used to miss, so masters come
-  out near -1 dBTP measured, not only under -1 dBFS sample peak. It isn't exact yet: on the
-  loki journey gate (bars 896..968), ffmpeg's ebur128 reads -0.95 dBTP, the engine's meter
-  -0.93 and the gate checker's 4x estimate -0.91. That's up to 0.1 dB over the ceiling, so the
-  checker's hard -0.95 dBTP check still fails.
-- **Bounces differ slightly.** Loud passages get a little more gain reduction, so a bounce of an
-  existing set does not match an older bounce sample for sample.
+How the detector works now:
+- It reads 16x oversampled through a 64-tap-per-phase filter whose passband reaches about
+  23 kHz. The old 8x, 32-tap filter rolled off from about 20 kHz, and content above that
+  slipped through.
+- It scales its largest estimate up by a bound on the error between grid points (0.04 dB), so
+  it errs high.
+- It also counts the loudness meter's own 4x estimate.
+- The gain a peak needs is held over every sample the estimate was made from, not just the one
+  next to it.
+
+What changes for a set:
+- **Latency.** In True Peak mode the limiter adds 64 more samples (1.3 ms at 48 kHz) on top of
+  its lookahead, up from 6 before stage 7a: the detector's span, twice its 32-sample delay. It
+  reports this, so playback and bounces stay aligned.
+- **Inter-sample peaks.** On the loki journey gate (bars 896..968), the master reads:
+  - ffmpeg ebur128 per-frame maximum: -1.0005 dBTP (it was -0.954);
+  - engine meter: -1.000 dBTP (was -0.935);
+  - gate checker's 4x estimate: -0.97 dBTP (was -0.91);
+  - a 32x long-sinc reference, at the loudest point: -1.04 dBTP.
+
+  ffmpeg's margin is only 0.0005 dB: its filter differs a little from the meter's, which the
+  limiter holds exactly at -1.000. Other material could read a hair over on ffmpeg.
+- **Loudness.** Loud passages get a little more gain reduction. The gate's integrated loudness
+  moved from -10.26 to -10.35 LUFS (engine meter; ffmpeg reads -10.3 → -10.4).
+- **Bounces differ.** A bounce of an existing set doesn't match an older one sample for sample.
 - **Prep gain steps may change.** Prep steps gain from true-peak readings, so its suggested
   gain steps for a set may come out different from before.
-
-A known limit: content up to Nyquist (unfiltered full-band noise, for example) can still read
-about 0.5 dB over the ceiling, because the detector's filter passes up to about 20 kHz. Real
-48 kHz masters stop around 20 kHz. The `true_peak` test
-`maximizer_true_peak_mode_on_unfiltered_white_noise` records this case and is marked ignored.
+- **CPU.** The Maximizer costs about 122 µs per 512-sample stereo block in True Peak mode, on
+  this machine in release: about 1.1% of the block's 10.7 ms. Before stage 7a it cost 102 µs.
+- **Full-band noise.** Unfiltered white noise, with content right up to Nyquist, now stays
+  under the ceiling too: -1.00 / -0.98 dBTP against a 16x long-sinc reference, where the old
+  detector let it reach -0.52.
 
 ## Things that now ask before they replace
 

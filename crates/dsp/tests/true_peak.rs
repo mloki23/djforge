@@ -231,13 +231,41 @@ fn assert_held_under_minus_one(what: &str, l: Vec<f32>, r: Vec<f32>, threshold: 
     }
 }
 
-/// Unfiltered white noise has content right up to Nyquist, past the band the detector's
-/// interpolation filter passes (a 48 kHz master's content stops around 20 kHz), and its true
-/// peak comes out about 0.5 dB over the ceiling: -0.52 dBTP on channel 0 (before and after the
-/// stage 7a detector clean-up alike). Kept failing, not loosened: run with `--ignored`.
+/// Unfiltered white noise has content right up to Nyquist, past where a short interpolation
+/// filter rolls off (a 48 kHz master's content stops around 20 kHz): the detector's passband
+/// reaches about 23 kHz and it errs high, so even this stays under the ceiling. (The 8× β=6
+/// detector before it let this through at -0.52 dBTP.)
 #[test]
-#[ignore = "known: full-band noise reads -0.52 dBTP through a -1 dBTP ceiling (the detector passes 20 kHz, not Nyquist)"]
 fn maximizer_true_peak_mode_on_unfiltered_white_noise() {
     let len = 12_000;
     assert_held_under_minus_one("white noise", white_noise(len, 21), white_noise(len, 22), -6.0);
+}
+
+/// The Maximizer's cost per 512-sample stereo block in True Peak mode, over 10 s of a hot
+/// master. A measurement, not a check: run in release with
+/// `cargo test --release -p soundcraft-dsp --test true_peak -- --ignored --nocapture maximizer_cost`.
+#[test]
+#[ignore = "a timing, run on demand in release"]
+fn maximizer_cost_per_block() {
+    let len = 480_000;
+    let (l, r) = (clipped_master(len, 3), clipped_master(len, 11));
+    let mut p = create("maximizer").unwrap();
+    p.prepare(SR, BLOCK, 2);
+    p.set_param("threshold", -3.0);
+    p.set_param("ceiling", -1.0);
+    p.set_param("true_peak", 1.0);
+    let blocks = len / BLOCK;
+    let mut buf = vec![vec![0.0f32; BLOCK]; 2];
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        p.reset();
+        let start = std::time::Instant::now();
+        for b in 0..blocks {
+            buf[0].copy_from_slice(&l[b * BLOCK..(b + 1) * BLOCK]);
+            buf[1].copy_from_slice(&r[b * BLOCK..(b + 1) * BLOCK]);
+            p.process(&mut buf, BLOCK);
+        }
+        best = best.min(start.elapsed().as_secs_f64() * 1e6 / blocks as f64);
+    }
+    eprintln!("maximizer, true peak on: {best:.1} us per 512-sample stereo block");
 }
