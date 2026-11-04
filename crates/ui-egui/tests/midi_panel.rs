@@ -201,3 +201,32 @@ fn only_pencil_inserts_notes_in_the_midi_roll() {
         assert!(*app.engine.session() == before, "{tool:?} click must not change the session");
     }
 }
+
+/// A Pencil note in the roll of a drum clip goes on MIDI channel 10 (where the starter patterns
+/// and `live.setup` keep drums); on any other clip it stays on channel 1.
+#[test]
+fn a_pencil_note_on_a_drum_part_goes_on_channel_ten() {
+    use soundcraft_model::{ClipContent, Tool};
+
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.ui.show_midi_editor = true;
+    let part = app.run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let ctx = egui::Context::default();
+    for (track, want) in [(part["track"].clone(), 9u8), (json!("Keys"), 0)] {
+        let created = app.run("midi.new_clip", json!({"track": track, "start": 0, "length": 96000})).unwrap();
+        let clip = created["clip"].as_u64().unwrap();
+        app.run("edit.select", json!({"clips": [clip]})).unwrap();
+        app.run("edit.tool", json!({"tool": Tool::Pencil.id()})).unwrap();
+        for _ in 0..6 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        let body = panel(&ctx);
+        let point = pos2(body.left() + 200.0, body.top() + 60.0);
+        frame(&ctx, &mut app, vec![Event::PointerMoved(point)]);
+        frame(&ctx, &mut app, vec![button(point, true)]);
+        frame(&ctx, &mut app, vec![button(point, false)]);
+        let (_, edited) = app.engine.session().find_clip(soundcraft_model::ClipId(clip)).unwrap();
+        let ClipContent::Midi { sequence } = &edited.content else { panic!("MIDI clip required") };
+        assert_eq!(sequence.notes.iter().map(|n| n.channel).collect::<Vec<_>>(), [want], "{track}");
+    }
+}

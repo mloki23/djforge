@@ -653,8 +653,8 @@ impl Plugin for Maximizer {
                 let p = match self.tp_hist.get_mut(c) {
                     Some(h) => {
                         h.push(x);
-                        // The sample `TP_DELAY` back and the estimates around it, all as late as
-                        // the audio is delayed for them (the newest sample would be early).
+                        // The estimates around the sample `TP_DELAY` back (branch 0 is that sample
+                        // itself), as late as the audio is delayed for them.
                         if true_peak {
                             // A 4× BS.1770 meter's short filter over-reads some transients
                             // the 16× one reads truly; its estimates, over the same samples,
@@ -662,7 +662,7 @@ impl Plugin for Maximizer {
                             let w = h.window();
                             let at = TP_DELAY.saturating_sub(crate::meter::TP_TAPS / 2);
                             let meter = w.get(at..).map_or(0.0, |m| crate::meter::interpolated_peak(&self.meter_coefs, m));
-                            (crate::meter::interpolated_peak(&self.tp_coefs, w).max(h.back(TP_DELAY).abs()) * TP_GRID).max(meter)
+                            (crate::meter::interpolated_peak(&self.tp_coefs, w) * TP_GRID).max(meter)
                         } else {
                             x.abs()
                         }

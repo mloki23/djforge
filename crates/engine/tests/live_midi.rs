@@ -353,3 +353,23 @@ fn setup_picks_a_lost_instrument_columns_preset_from_its_notes() {
         assert_eq!(ins.plugin, plugin, "{kind}");
     }
 }
+
+/// Drums count as drums when every note is a GM drum pitch and some are on channel 10 (a kit
+/// drawn partly on channel 1, then in the drum grid on 10); GM-range notes all on channel 1 are
+/// a bass line.
+#[test]
+fn setup_reads_drums_by_pitch_and_any_note_on_channel_ten() {
+    let on = |pitch: u8, channel: u8, start: i64| Note { pitch, velocity: 100, release_velocity: 64, channel, start, length: Q / 4 };
+    let mixed = vec![on(36, 0, 0), on(42, 9, Q), on(38, 0, 2 * Q)];
+    let bass = vec![on(45, 0, 0), on(45, 0, Q), on(52, 0, 2 * Q)];
+    for (notes, plugin) in [(mixed, "drum_synth"), (bass, "subtractive_synth")] {
+        let mut e = engine();
+        let slot = soundcraft_engine::model::MidiSlot::new("Hand", [0; 3], Sequence { notes, ctrls: Vec::new() }, 4.0, 0.0);
+        e.session_mut().live.columns[4].slots[0] = Some(slot.into());
+        let lost = e.session().live.columns[4].track;
+        e.session_mut().tracks.retain(|t| t.id != lost);
+        run(&mut e, "live.setup", json!({}));
+        let s = e.session();
+        assert_eq!(s.track(s.live.columns[4].track).and_then(|t| t.instrument.as_ref()).map(|i| i.plugin.as_str()), Some(plugin));
+    }
+}

@@ -383,10 +383,11 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             None if s.edit.tool == Tool::Pencil => {
                 let pitch = pitch_at(p.y).clamp(0, 127);
                 let start = (((p.x - roll.min.x) / px_per_tick) as i64 / grid_ticks) * grid_ticks;
-                let _ = app.run(
-                    "midi.note_add",
-                    json!({"clip": cid.0, "pitch": pitch, "start_ticks": start.max(0), "length_ticks": grid_ticks, "velocity": 100}),
-                );
+                let mut add = json!({"clip": cid.0, "pitch": pitch, "start_ticks": start.max(0), "length_ticks": grid_ticks, "velocity": 100});
+                if drums {
+                    add["channel"] = json!(drum_channel(sequence, u8::try_from(pitch).unwrap_or(0)));
+                }
+                let _ = app.run("midi.note_add", add);
                 app.midi.selected.clear();
             }
             None => app.midi.selected.clear(),
@@ -501,6 +502,16 @@ pub fn is_drum_clip(app: &SoundApp, track: TrackId, sequence: &Sequence) -> bool
     }
 }
 
+/// MIDI channel 10 (0-based): General MIDI's drum channel, which the starter patterns write
+/// drums on and `live.setup` reads a lost column's drums by.
+pub const DRUM_CHANNEL: u8 = 9;
+
+/// The channel a drum note added at `pitch` goes on: that of the row's notes already in the
+/// clip (so a kit on another channel stays on it), else [`DRUM_CHANNEL`].
+pub fn drum_channel(sequence: &Sequence, pitch: u8) -> u8 {
+    sequence.notes.iter().find(|n| n.pitch == pitch).map_or(DRUM_CHANNEL, |n| n.channel)
+}
+
 /// The drum grid's rows: the kit, then any other pitch the clip plays, low to high.
 pub fn grid_rows(sequence: &Sequence) -> Vec<u8> {
     let mut extra: Vec<u8> = sequence.notes.iter().map(|n| n.pitch).filter(|p| !KIT_ROWS.contains(p)).collect();
@@ -611,8 +622,11 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
     app.midi.selected.clear();
     if hits.is_empty() {
         let velocity = if shift { ACCENT } else { NORMAL };
-        let _ =
-            app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick.max(0), "length_ticks": STEP, "velocity": velocity}));
+        let channel = drum_channel(sequence, pitch);
+        let _ = app.run(
+            "midi.note_add",
+            json!({"clip": cid.0, "pitch": pitch, "start_ticks": tick.max(0), "length_ticks": STEP, "velocity": velocity, "channel": channel}),
+        );
     } else if !shift {
         let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": hits}));
     } else {

@@ -6,7 +6,9 @@
 #     --bounce "C:/Users/marty/Music/djforge-tests/produce/loki produce.wav" --start "bars_beats:896|1|000" --end "bars_beats:968|1|000"
 # Then the same window with the DJ decks muted, which tools/prod/check_prod_loki.py also reads
 # (it checks the parts are silent before their first clip and audible where they play):
-#   soundcraft-cli run --in "C:/Users/marty/Music/djforge-tests/produce/loki produce.scraft" #     --cmd 'mix.mute={"tracks": ["Deck A", "Deck B"], "value": true}' #     --bounce "C:/Users/marty/Music/djforge-tests/produce/loki produce (parts only).wav" --start "bars_beats:896|1|000" --end "bars_beats:968|1|000"
+#   soundcraft-cli run --in "C:/Users/marty/Music/djforge-tests/produce/loki produce.scraft" \
+#     --cmd 'mix.mute={"tracks": ["Deck A", "Deck B"], "value": true}' \
+#     --bounce "C:/Users/marty/Music/djforge-tests/produce/loki produce (parts only).wav" --start "bars_beats:896|1|000" --end "bars_beats:968|1|000"
 # and the checker (numpy and scipy):
 #   python -I tools/prod/check_prod_loki.py "C:/Users/marty/Music/djforge-tests/produce"
 # --start/--end take seconds or a time string (bare numbers are seconds, not samples). The bounce

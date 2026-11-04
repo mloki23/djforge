@@ -10,3 +10,5 @@ plan/
 /craft-fonts/
 plans/
 .DS_Store
+__pycache__/
+*.pyc

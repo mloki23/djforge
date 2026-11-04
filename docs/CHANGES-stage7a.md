@@ -57,5 +57,8 @@ These now ask before replacing anything (`replace: true`; the app shows a Replac
 - A playing MIDI slot keeps playing when you edit its notes or length (audio slots already
   did). Notes it was holding are released at the edit.
 - `live.setup` picks a lost instrument column's preset from what its slots hold. It uses
-  `trance_kit` when every note is a General MIDI drum on channel 10, and `rolling_bass`
-  otherwise. It also names any audio slots it had to empty in a message.
+  `trance_kit` when every note is a General MIDI drum pitch and at least one is on channel 10,
+  and `rolling_bass` otherwise. It also names any audio slots it had to empty in a message.
+- Drums drawn in the MIDI Editor go on channel 10, where the starter patterns put them. That
+  covers the drum grid, and Pencil notes on a drum clip. A note in a row that already has notes
+  takes their channel, so a kit on another channel stays on it.

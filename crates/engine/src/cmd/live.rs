@@ -30,7 +30,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Up Session View",
             [],
             None,
-            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track when it holds MIDI slots, its audio slots emptied: the trance_kit preset when every note is a General MIDI drum on channel 10, else rolling_bass). Returns {columns: [track ids], created, emptied: [{column, slot, name}]}",
+            "{columns?: 4 (1..=16)} — makes the Live columns: one stereo audio track each (\"Live 1\"…) with 8 empty clip slots. Idempotent: existing columns stay, a column whose track was deleted gets a new one (an instrument track when it holds MIDI slots, its audio slots emptied: the trance_kit preset when every note is a General MIDI drum pitch and some are on channel 10, else rolling_bass). Returns {columns: [track ids], created, emptied: [{column, slot, name}]}",
             always,
             setup
         ),
@@ -196,17 +196,25 @@ fn setup(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 /// The preset a lost instrument column's new track gets, from what its MIDI slots hold: the drum
-/// kit when every note is a General MIDI drum (35..=81 on channel 10), else the bass. The channel
-/// counts as well as the pitch: a bass line's notes are often all in the drum range too (a rolling
-/// bass in A is all 45, a GM tom), and the starter patterns put drums, and only drums, on 10.
+/// kit when every note is a General MIDI drum pitch (35..=81) and some are on channel 10, else
+/// the bass. The channel counts as well as the pitch: a bass line's notes are often all in the
+/// drum range too (a rolling bass in A is all 45, a GM tom), and the starter patterns and the
+/// MIDI Editor's drum grid put drums on 10.
 fn lost_column_preset(c: &LiveColumn) -> &'static str {
     /// MIDI channel 10, 0-based.
     const DRUM_CHANNEL: u8 = 9;
-    let mut notes = c.slots.iter().flatten().filter_map(|x| match x {
-        SlotContent::Midi(m) => Some(m.sequence.notes.iter()),
-        SlotContent::Audio(_) => None,
-    });
-    let drums = notes.all(|mut slot| slot.all(|n| n.channel == DRUM_CHANNEL && (35..=81).contains(&n.pitch)));
+    let notes = || {
+        c.slots
+            .iter()
+            .flatten()
+            .filter_map(|x| match x {
+                SlotContent::Midi(m) => Some(m.sequence.notes.iter()),
+                SlotContent::Audio(_) => None,
+            })
+            .flatten()
+    };
+    // No notes at all: the column's default, the kit.
+    let drums = notes().next().is_none() || (notes().all(|n| (35..=81).contains(&n.pitch)) && notes().any(|n| n.channel == DRUM_CHANNEL));
     if drums { DEFAULT_PRESET } else { "rolling_bass" }
 }
 

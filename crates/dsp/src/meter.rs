@@ -191,6 +191,8 @@ pub(crate) fn interpolated_peak<const P: usize, const T: usize>(coefs: &[[f32; T
 
 /// `a · b` over their common length, in eight running sums (so it vectorises).
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    // Over `a`'s length: `b` may be a longer window, and the chunks below must pair up.
+    let b = b.get(..a.len()).unwrap_or(b);
     let mut acc = [0.0f32; 8];
     let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
     let tail: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
@@ -231,11 +233,6 @@ impl<const N: usize> History<N> {
     /// The window, newest first.
     pub(crate) fn window(&self) -> &[f32] {
         self.buf.get(self.pos..self.pos + N / 2).unwrap_or(&[])
-    }
-
-    /// The sample `k` back (0: the newest).
-    pub(crate) fn back(&self, k: usize) -> f32 {
-        self.window().get(k).copied().unwrap_or(0.0)
     }
 }
 

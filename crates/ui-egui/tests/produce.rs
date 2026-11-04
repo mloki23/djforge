@@ -297,7 +297,7 @@ fn a_drum_grid_cell_toggles_a_16th_and_shift_click_accents_it() {
     h.get_by_label(cell).click();
     steps(&mut h, 2);
     let added: Vec<_> = notes(&h, clip).into_iter().filter(clap).collect();
-    assert_eq!(added.iter().map(|n| (n.velocity, n.length)).collect::<Vec<_>>(), [(96, 240)]);
+    assert_eq!(added.iter().map(|n| (n.velocity, n.length, n.channel)).collect::<Vec<_>>(), [(96, 240, 9)], "on channel 10");
     assert_eq!(undo_steps(&h), before + 1, "one undo step a click");
     h.get_by_label(cell).click_modifiers(Modifiers::SHIFT);
     steps(&mut h, 2);
@@ -541,4 +541,27 @@ fn shift_click_accents_every_note_on_a_step_even_identical_ones() {
     assert_eq!(undo_steps(&h), before + 3, "one undo step a click");
     h.state_mut().run("edit.undo", json!({})).unwrap();
     assert_eq!(snares(&h), [127, 127], "a single undo restores both");
+}
+
+/// A grid note goes on the channel its row's notes are on (a kit on channel 1 stays there), and
+/// on channel 10 in a row without notes.
+#[test]
+fn a_drum_grid_note_takes_its_rows_channel() {
+    let dir = Scratch::new("grid-channel");
+    let mut h = harness(&dir);
+    h.state_mut().run("prod.new_part", json!({"kind": "drums"})).unwrap();
+    let r = h.state_mut().run("prod.pattern", json!({"kind": "drums", "style": "four_floor", "bars": 1})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    if let ClipContent::Midi { sequence } = &mut h.state_mut().engine.session_mut().find_clip_mut(clip).unwrap().content {
+        sequence.notes.iter_mut().for_each(|n| n.channel = 0);
+    }
+    edit_clip(&mut h, clip);
+    h.get_by_label("Grid").click();
+    steps(&mut h, 3);
+    h.get_by_label("Bass Drum 1 bar 1 step 2").click();
+    steps(&mut h, 2);
+    h.get_by_label("Hand Clap bar 1 step 2").click();
+    steps(&mut h, 2);
+    let at = |pitch: u8| notes(&h, clip).into_iter().filter(|n| n.pitch == pitch && n.start == 240).map(|n| n.channel).collect::<Vec<_>>();
+    assert_eq!((at(36), at(39)), (vec![0], vec![9]));
 }
