@@ -57,7 +57,12 @@ fn search_chord(m: Modifiers, mac: bool) -> bool {
 pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd+= and Cmd+0 are Mix/Edit and Quantize to Grid, not egui's built-in interface zoom.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() || app.session_view.edit.is_some() {
+    if ctx.egui_wants_keyboard_input()
+        || app.dialogs.open.is_some()
+        || app.session_view.edit.is_some()
+        || app.produce.pattern.is_some()
+        || app.produce.replace.is_some()
+    {
         return;
     }
     // Each key with the physical key it came from (the Session window's digits go by the key

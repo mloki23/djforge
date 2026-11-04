@@ -22,6 +22,7 @@ pub mod ops_windows;
 pub mod palette;
 pub mod panels;
 pub mod prep;
+pub mod produce;
 mod recent;
 pub mod recovery;
 pub mod sampler_window;
@@ -350,6 +351,8 @@ pub struct SoundApp {
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     /// View › Session: the Live columns' clip slots.
     pub session_view: session_view::SessionView,
+    /// The Produce menu's Starter Pattern dialog and Replace question.
+    pub produce: produce::ProduceState,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -462,6 +465,7 @@ impl SoundApp {
             synthetic: Vec::new(),
             sample_drop_targets: Vec::new(),
             session_view: session_view::SessionView::default(),
+            produce: produce::ProduceState::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
@@ -1381,6 +1385,7 @@ impl SoundApp {
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);
         session_view::show(self, &ctx);
+        produce::show(self, &ctx);
         recovery::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);

@@ -370,8 +370,9 @@ fn the_edit_dialog_closes_when_its_slot_changes_and_keeps_refused_edits() {
     assert!(h.state().session_view.edit.is_none());
 }
 
-/// A column name's menu adds an instrument column; its slot menu writes a drum pattern or copies
-/// the selected MIDI clip, and a MIDI slot launches by click like an audio slot.
+/// A column name's menu adds an instrument column; its slot menu writes a drum pattern (through
+/// the Starter Pattern dialog) or copies the selected MIDI clip, and a MIDI slot launches by
+/// click like an audio slot.
 #[test]
 fn an_instrument_columns_midi_slots_fill_from_the_menus_and_launch() {
     let dir = Scratch::new("midi");
@@ -381,7 +382,11 @@ fn an_instrument_columns_midi_slots_fill_from_the_menus_and_launch() {
     let s = h.state().engine.session();
     assert_eq!(s.live.column_kind(4, &s.tracks), Some(soundcraft_model::SlotKind::Midi));
     steps(&mut h, 2);
-    menu(&mut h, "Live 5 slot 1", "Trance Drums Pattern Here");
+    menu(&mut h, "Live 5 slot 1", "New Starter Pattern Here...");
+    h.state_mut().produce.pattern.as_mut().unwrap().style = soundcraft_midi::patterns::PatternStyle::TranceFull;
+    steps(&mut h, 2);
+    h.get_by_label("Create").click();
+    steps(&mut h, 3);
     assert_eq!(h.state().engine.session().live.midi_slot(4, 0).map(|x| x.name.as_str()), Some("Trance Full"));
     {
         let s = h.state_mut().engine.session_mut();

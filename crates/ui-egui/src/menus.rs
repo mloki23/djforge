@@ -83,6 +83,7 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
     v.extend(MENU_WINDOWS.iter().copied());
     v.extend(DJ_MENU.iter().copied());
+    v.extend(PRODUCE_MENU.iter().copied());
     v
 }
 
@@ -101,19 +102,27 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
     ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
-    // Production parts over the set (PART_KINDS), each with its kind's default trance preset.
-    ("DJ > New Drums Part", "prod.new_part"),
-    ("DJ > New Bass Part", "prod.new_part"),
-    ("DJ > New Synth Part", "prod.new_part"),
-    ("DJ > New FX Part", "prod.new_part"),
-    // A stand-in until the pattern dialog: the full trance groove on the selected part over the
-    // selected bars.
-    ("DJ > Trance Drums over Selection", "prod.pattern"),
 ];
 
-/// The kind of part each DJ menu New Part item makes.
-const PART_KINDS: &[(&str, &str)] =
-    &[("DJ > New Drums Part", "drums"), ("DJ > New Bass Part", "bass"), ("DJ > New Synth Part", "synth"), ("DJ > New FX Part", "fx")];
+/// The Produce menu: parts over the set. The egui menu bar draws it itself ([`crate::produce::menu`]):
+/// each New Part item is a submenu of `prod.presets`, and Starter Pattern... opens its dialog.
+const PRODUCE_MENU: &[(&str, &str)] = &[
+    ("Produce > New Drums Part", "prod.new_part"),
+    ("Produce > New Bass Part", "prod.new_part"),
+    ("Produce > New Synth Part", "prod.new_part"),
+    ("Produce > New FX Part", "prod.new_part"),
+    ("Produce > Starter Pattern...", "prod.pattern"),
+    ("Produce > Add Instrument Column", "live.add_column"),
+];
+
+/// The kind of part each Produce menu New Part item makes (with its kind's default preset when
+/// reached by path rather than through its preset submenu).
+const PART_KINDS: &[(&str, &str)] = &[
+    ("Produce > New Drums Part", "drums"),
+    ("Produce > New Bass Part", "bass"),
+    ("Produce > New Synth Part", "synth"),
+    ("Produce > New FX Part", "fx"),
+];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
 fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
@@ -243,7 +252,7 @@ pub fn tree() -> Vec<MenuNode> {
     if let Some(clip) = roots.iter_mut().find(|n| n.label == "Clip") {
         clip.children.rotate_right(1);
     }
-    for (path, _) in MENU_WINDOWS.iter().chain(DJ_MENU) {
+    for (path, _) in MENU_WINDOWS.iter().chain(DJ_MENU).chain(PRODUCE_MENU) {
         insert_path(&mut roots, path);
     }
     roots
@@ -273,6 +282,10 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                 let extra = ui_aliases();
                 for root in tree() {
                     ui.menu_button(&root.label, |ui| {
+                        if root.label == "Produce" {
+                            crate::produce::menu(app, ui);
+                            return;
+                        }
                         for c in &root.children {
                             menu_node(app, ui, c, &extra);
                             if c.path == "File > Open" {
@@ -439,7 +452,6 @@ fn params_for(path: &str, id: &str) -> Value {
         "dj.move_transition" => json!({"bars": if leaf.contains("Earlier") { -4 } else { 4 }}),
         "dj.nudge" => json!({"ms": if leaf.contains("Earlier") { -5.0 } else { 5.0 }}),
         "prod.new_part" => json!({"kind": PART_KINDS.iter().find(|(p, _)| *p == path).map_or("", |(_, k)| *k)}),
-        "prod.pattern" => json!({"kind": "drums", "style": "trance_full"}),
         _ => json!({}),
     }
 }
@@ -494,6 +506,14 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         return;
     }
     if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {
+        return;
+    }
+    if id == "prod.pattern" {
+        crate::produce::open_pattern(app, None);
+        return;
+    }
+    if id == "live.add_column" {
+        crate::produce::add_instrument_column(app);
         return;
     }
     // These ids only exist to open a dialog from the menu. Programmatic `app.run` refuses them.
@@ -750,11 +770,14 @@ mod tests {
     }
 
     #[test]
-    fn the_dj_menus_new_part_items_make_a_part_of_their_kind() {
+    fn the_produce_menus_new_part_items_make_a_part_of_their_kind() {
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
-        for (path, name) in
-            [("DJ > New Drums Part", "Drums 1"), ("DJ > New Bass Part", "Bass 1"), ("DJ > New Synth Part", "Synth 1"), ("DJ > New FX Part", "FX 1")]
-        {
+        for (path, name) in [
+            ("Produce > New Drums Part", "Drums 1"),
+            ("Produce > New Bass Part", "Bass 1"),
+            ("Produce > New Synth Part", "Synth 1"),
+            ("Produce > New FX Part", "FX 1"),
+        ] {
             assert_eq!(command_for_path(path, &ui_aliases()).as_deref(), Some("prod.new_part"), "{path}");
             invoke_menu(&mut app, "prod.new_part", path);
             assert_eq!(app.engine.session().tracks.last().map(|t| t.name.as_str()), Some(name), "{path}");
@@ -762,15 +785,22 @@ mod tests {
     }
 
     #[test]
-    fn the_dj_menus_trance_drums_item_fills_the_selected_bars_of_the_selected_part() {
+    fn the_produce_menus_starter_pattern_opens_its_dialog_and_the_dj_menu_has_no_production_items() {
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
-        let path = "DJ > Trance Drums over Selection";
+        let path = "Produce > Starter Pattern...";
         assert_eq!(command_for_path(path, &ui_aliases()).as_deref(), Some("prod.pattern"));
-        invoke_menu(&mut app, "prod.new_part", "DJ > New Drums Part");
-        app.engine.session_mut().edit.selection = soundcraft_time::Range::new(0, 96_000);
         invoke_menu(&mut app, "prod.pattern", path);
-        let names: Vec<String> = app.engine.session().tracks.iter().flat_map(|t| t.clips()).map(|c| c.name.clone()).collect();
-        assert_eq!(names, ["Trance Full"]);
+        assert!(app.produce.pattern.is_some());
+        assert!(!app.engine.can_undo(), "opening the dialog writes nothing");
+        let tree = tree();
+        let dj = tree.iter().find(|n| n.label == "DJ").unwrap();
+        assert!(
+            dj.children.iter().all(|c| !c.label.contains("Part") && !c.label.contains("Trance")),
+            "{:?}",
+            dj.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        let produce = tree.iter().position(|n| n.label == "Produce").unwrap();
+        assert_eq!(tree.get(produce - 1).map(|n| n.label.as_str()), Some("DJ"), "Produce sits next to DJ");
     }
 
     #[test]
