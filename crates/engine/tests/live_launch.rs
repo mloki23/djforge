@@ -207,7 +207,8 @@ fn the_loop_position_counts_from_the_launch_beat_after_wraps_and_locates() {
     let path = dir.join("loop.wav");
     std::fs::write(&path, soundcraft_audio_io::encode(&buf, &soundcraft_audio_io::EncodeOptions::default()).unwrap()).unwrap();
     let mut e = engine(true);
-    e.execute("live.slot_from_file", &json!({"column": 0, "slot": 0, "path": path, "bpm": 120})).unwrap();
+    // Over the fixture's one-shot in that slot.
+    e.execute("live.slot_from_file", &json!({"column": 0, "slot": 0, "path": path, "bpm": 120, "replace": true})).unwrap();
     // Launched on beat 0, then a 7-beat transport loop wrapped twice: the start the host reports
     // moved back 14 beats, the phase did not.
     e.live_status[0] = LiveStatus { playing: Some((0, -336_000)), queued: None, origin: 0 };

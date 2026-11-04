@@ -412,3 +412,74 @@ fn an_instrument_columns_midi_slots_fill_from_the_menus_and_launch() {
     let s = until(&mut h, |s| playing(s, 4).is_none());
     assert_eq!(playing(&s, 4), None, "{s}");
 }
+
+/// Waits (in real time) until slot `row` of `column` holds `name`, or 5 s pass.
+fn until_slot_named(h: &mut Harness<'_, SoundApp>, column: usize, row: usize, name: &str) {
+    let start = std::time::Instant::now();
+    while h.state().engine.session().live.slot(column, row).map(|x| x.name().to_string()).as_deref() != Some(name)
+        && start.elapsed() < std::time::Duration::from_secs(5)
+    {
+        step(h);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A file dropped on a filled slot and Add Selection Here on one don't replace it: Replace?
+/// asks, and its Replace does (the file still loading off the UI thread).
+#[test]
+fn a_filled_slot_is_replaced_only_through_replace() {
+    let dir = Scratch::new("replace");
+    let (mut h, track) = harness(&dir.0);
+    open(&mut h);
+    h.state_mut().run("live.slot_from_file", json!({"column": 2, "slot": 5, "path": wav(&dir.0, "first.wav", 0.5)})).unwrap();
+    let target = h.state().session_view.drop_targets.iter().find(|(_, c, r)| (*c, *r) == (2, 5)).map(|(rect, _, _)| *rect).unwrap();
+    h.state_mut().synthetic.push(Event::PointerMoved(target.center()));
+    steps(&mut h, 3);
+    h.input_mut().dropped_files.push(Arc::new(Dropped(wav(&dir.0, "second.wav", 0.5))));
+    step(&mut h);
+    steps(&mut h, 3);
+    assert!(h.state().session_view.jobs.is_empty(), "nothing loads before Replace");
+    assert_eq!(h.state().produce.replace.as_ref().map(|a| a.id.as_str()), Some("live.slot_from_file"));
+    h.get_by_label("Replace").click();
+    steps(&mut h, 2);
+    until_slot_named(&mut h, 2, 5, "second");
+    assert_eq!(h.state().engine.session().live.audio_slot(2, 5).map(|x| x.name.as_str()), Some("second"));
+    assert!(h.state().produce.replace.is_none());
+
+    // Add Selection Here on the filled slot asks too.
+    {
+        let s = h.state_mut().engine.session_mut();
+        s.edit.selected_tracks = vec![track];
+        s.edit.selection = soundcraft_time::Range::new(0, 4 * 96_000);
+    }
+    steps(&mut h, 2);
+    menu(&mut h, "Live 3 slot 6", "Add Selection Here");
+    assert_eq!(h.state().engine.session().live.audio_slot(2, 5).map(|x| x.name.as_str()), Some("second"), "not replaced yet");
+    assert_eq!(h.state().produce.replace.as_ref().map(|a| a.id.as_str()), Some("live.slot_from_selection"));
+    h.get_by_label("Replace").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().engine.session().live.audio_slot(2, 5).map(|x| x.length_beats), Some(16.0));
+}
+
+/// Shortening a MIDI slot in Edit... so notes would go asks Replace? first.
+#[test]
+fn a_slot_edit_that_drops_notes_asks_first() {
+    let dir = Scratch::new("shrink");
+    let (mut h, _) = harness(&dir.0);
+    open(&mut h);
+    h.state_mut().run("live.add_column", json!({"kind": "instrument"})).unwrap();
+    h.state_mut().run("prod.pattern", json!({"kind": "drums", "style": "four_floor", "slot": {"column": 4, "slot": 0}})).unwrap();
+    steps(&mut h, 3);
+    menu(&mut h, "Live 5 slot 1", "Edit...");
+    h.state_mut().session_view.edit.as_mut().expect("the Edit Slot dialog is open").length_bars = Some(1);
+    steps(&mut h, 2);
+    h.get_by_label("OK").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().engine.session().live.midi_slot(4, 0).map(|x| x.length_beats), Some(16.0), "not shortened yet");
+    let ask = h.state().produce.replace.clone().expect("Replace? asks");
+    assert!(ask.why.contains("would drop 12 notes"), "{}", ask.why);
+    h.get_by_label("Replace").click();
+    steps(&mut h, 3);
+    let x = h.state().engine.session().live.midi_slot(4, 0).cloned().unwrap();
+    assert_eq!((x.length_beats, x.sequence.notes.len()), (4.0, 4));
+}

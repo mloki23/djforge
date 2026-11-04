@@ -9,13 +9,15 @@
 //! Replace, which reruns exactly the refused parameters with `replace: true`. The offer lapses
 //! when a field changes or the session does (an edit, a moved playhead), so nothing is replaced
 //! without a click that saw it. Other commands that refuse to replace (the slot menu's Copy
-//! Selected MIDI Clip Here, Copy to Arrangement at Playhead) ask the same in a small window.
+//! Selected MIDI Clip Here and Add Selection Here, a file dropped or loaded on a filled slot, a
+//! slot edit that would drop notes, Copy to Arrangement at Playhead) ask the same in a small
+//! window.
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
 use serde_json::{Value, json};
 use soundcraft_midi::Key;
-use soundcraft_midi::patterns::{PatternKind, PatternStyle};
+use soundcraft_midi::patterns::{PatternKind, PatternStyle, title_case};
 
 /// Bars a pattern fills without a selection (into a slot: [`SLOT_BARS`]).
 const TIMELINE_BARS: u32 = 8;
@@ -75,34 +77,15 @@ pub struct ReplaceAsk {
     pub error: Option<String>,
 }
 
-/// What a part of `kind` is called.
-pub fn kind_label(kind: PatternKind) -> &'static str {
-    match kind {
-        PatternKind::Drums => "Drums",
-        PatternKind::Bass => "Bass",
-        PatternKind::Synth => "Synth",
-        PatternKind::Fx => "FX",
-    }
-}
-
-/// "Trance Full" for `trance_full`.
-pub fn title(id: &str) -> String {
-    let word = |w: &str| {
-        let mut c = w.chars();
-        c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
-    };
-    id.split('_').map(word).collect::<Vec<_>>().join(" ")
-}
-
 /// The Produce menu's contents.
 pub fn menu(app: &mut SoundApp, ui: &mut egui::Ui) {
     for kind in PatternKind::ALL {
-        ui.menu_button(format!("New {} Part", kind_label(kind)), |ui| {
+        ui.menu_button(format!("New {} Part", kind.label()), |ui| {
             let presets = app.engine.execute("prod.presets", &json!({"kind": kind.name()})).unwrap_or_default();
             let ids: Vec<String> = presets.as_array().into_iter().flatten().filter_map(|p| p["id"].as_str().map(str::to_string)).collect();
             for (i, id) in ids.iter().enumerate() {
                 // `prod.presets` lists each kind's default preset first.
-                let label = if i == 0 { format!("{} (default)", title(id)) } else { title(id) };
+                let label = if i == 0 { format!("{} (default)", title_case(id)) } else { title_case(id) };
                 if ui.button(label).clicked() {
                     let _ = app.run("prod.new_part", json!({"kind": kind.name(), "preset": id}));
                     ui.close();
@@ -160,9 +143,15 @@ pub fn run_or_offer_replace(app: &mut SoundApp, id: &str, params: Value) {
     if let Err(e) = app.run_typed(id, params.clone())
         && e.would_replace()
     {
-        let revision = app.engine.revision;
-        app.produce.replace = Some(ReplaceAsk { id: id.to_string(), params, why: e.to_string(), revision, error: None });
+        offer_replace(app, id, params, &e);
     }
+}
+
+/// Asks whether to rerun `id` with `params` and `replace: true`, after it refused (`why`) because
+/// it would replace something.
+pub fn offer_replace(app: &mut SoundApp, id: &str, params: Value, why: &crate::RunError) {
+    let revision = app.engine.revision;
+    app.produce.replace = Some(ReplaceAsk { id: id.to_string(), params, why: why.to_string(), revision, error: None });
 }
 
 /// `params` with `replace: true` (`None` when they aren't an object).
@@ -275,9 +264,9 @@ fn pattern_dialog(app: &mut SoundApp, ctx: &egui::Context) {
         egui::Grid::new("starter_pattern_fields").num_columns(2).show(ui, |ui| {
             ui.label("Kind");
             let before = d.kind;
-            egui::ComboBox::from_id_salt("pattern_kind").selected_text(kind_label(d.kind)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("pattern_kind").selected_text(d.kind.label()).show_ui(ui, |ui| {
                 for k in PatternKind::ALL {
-                    ui.selectable_value(&mut d.kind, k, kind_label(k));
+                    ui.selectable_value(&mut d.kind, k, k.label());
                 }
             });
             if d.kind != before {
@@ -285,9 +274,9 @@ fn pattern_dialog(app: &mut SoundApp, ctx: &egui::Context) {
             }
             ui.end_row();
             ui.label("Style");
-            egui::ComboBox::from_id_salt("pattern_style").selected_text(title(d.style.name())).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("pattern_style").selected_text(d.style.title()).show_ui(ui, |ui| {
                 for s in PatternStyle::of_kind(d.kind) {
-                    ui.selectable_value(&mut d.style, s, title(s.name()));
+                    ui.selectable_value(&mut d.style, s, s.title());
                 }
             });
             ui.end_row();
@@ -402,7 +391,10 @@ fn replace_window(app: &mut SoundApp, ctx: &egui::Context) {
         });
     });
     if replace && let Some(p) = replacing(ask.params.clone()) {
-        match app.run_typed(&ask.id, p) {
+        // A file loads into its slot off the UI thread, as a drop does.
+        let r =
+            if ask.id == "live.slot_from_file" { crate::session_view::start_job(app, p).map(|()| Value::Null) } else { app.run_typed(&ask.id, p) };
+        match r {
             Ok(_) => keep = false,
             // Refused again: the window says why (Cancel closes it).
             Err(e) => ask.error = Some(e.to_string()),

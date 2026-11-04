@@ -157,21 +157,34 @@ pub fn key(app: &mut SoundApp, key: Key, m: Modifiers) -> bool {
 }
 
 /// Starts loading the audio file at `path` into a slot on another thread (`live.slot_from_file`,
-/// applied as one undo step once loaded). Refused while a prep, split or export runs.
+/// applied as one undo step once loaded). Refused while a prep, split or export runs. A filled
+/// slot is not replaced: Replace? asks first, and its Replace loads the file with `replace: true`.
 pub fn start_load(app: &mut SoundApp, column: usize, row: usize, path: &str) -> Result<(), String> {
+    start_job(app, json!({"column": column, "slot": row, "path": path})).map_err(|e| e.to_string())
+}
+
+/// [`start_load`] for `live.slot_from_file` parameters `params` (`column`, `slot`, `path`, and
+/// `replace` when the Replace? window reruns it). A refusal to replace a filled slot asks.
+pub(crate) fn start_job(app: &mut SoundApp, params: Value) -> Result<(), RunError> {
     if crate::prep::refuses_command(app, "live.slot_from_file") {
-        return Err(app.ui.status.clone());
+        return Err(RunError::App(app.ui.status.clone()));
     }
+    let path = params["path"].as_str().unwrap_or_default();
     let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
-    match slot_file_job(&app.engine, &json!({"column": column, "slot": row, "path": path})) {
+    match slot_file_job(&app.engine, &params) {
         Ok(job) => {
+            let (column, row) = job.target();
             app.ui.status = format!("Loading {name} into Live {} slot {}…", column + 1, row + 1);
             app.session_view.jobs.push((job, name));
             Ok(())
         }
         Err(e) => {
+            let e = RunError::Engine(e);
             app.ui.status = e.to_string();
-            Err(e.to_string())
+            if e.would_replace() {
+                crate::produce::offer_replace(app, "live.slot_from_file", params, &e);
+            }
+            Err(e)
         }
     }
 }
@@ -463,7 +476,7 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
             return;
         }
         if ui.button("Add Selection Here").clicked() {
-            let _ = app.run("live.slot_from_selection", json!({"column": column, "slot": row}));
+            crate::produce::run_or_offer_replace(app, "live.slot_from_selection", json!({"column": column, "slot": row}));
             ui.close();
         }
         let can_pick = app.services.pick_open.is_some();
@@ -589,12 +602,20 @@ fn edit_dialog(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
     });
-    if apply {
-        match changes(&e).map(|p| app.run("live.slot_set", p)) {
+    if apply && let Some(p) = changes(&e) {
+        match app.run_typed("live.slot_set", p.clone()) {
+            // A shorter MIDI loop would drop notes: Replace? asks (the dialog closes, its edits
+            // pinned in the question).
+            Err(why) if why.would_replace() => {
+                crate::produce::offer_replace(app, "live.slot_set", p, &why);
+                keep = false;
+            }
             // Refused: the dialog stays, with the edits and why.
-            Some(Err(why)) => e.error = Some(why),
-            _ => keep = false,
+            Err(why) => e.error = Some(why.to_string()),
+            Ok(_) => keep = false,
         }
+    } else if apply {
+        keep = false;
     }
     if keep {
         app.session_view.edit = Some(e);

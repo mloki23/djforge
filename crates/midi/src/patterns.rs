@@ -96,6 +96,16 @@ impl PatternKind {
         }
     }
 
+    /// What a part of this kind is called before its number ("Drums", "Bass", "Synth", "FX").
+    pub fn label(self) -> &'static str {
+        match self {
+            PatternKind::Drums => "Drums",
+            PatternKind::Bass => "Bass",
+            PatternKind::Synth => "Synth",
+            PatternKind::Fx => "FX",
+        }
+    }
+
     /// Parses a name produced by [`PatternKind::name`] (case-insensitive).
     pub fn parse(text: &str) -> Result<Self, PatternError> {
         let t = text.trim();
@@ -168,6 +178,11 @@ impl PatternStyle {
         }
     }
 
+    /// The style's name in title case ("Trance Full" for `trance_full`).
+    pub fn title(self) -> String {
+        title_case(self.name())
+    }
+
     /// Parses a name produced by [`PatternStyle::name`] (case-insensitive).
     pub fn parse(text: &str) -> Result<Self, PatternError> {
         let t = text.trim();
@@ -193,6 +208,15 @@ impl PatternStyle {
     pub fn of_kind(kind: PatternKind) -> impl Iterator<Item = PatternStyle> {
         Self::ALL.into_iter().filter(move |s| s.kind() == kind)
     }
+}
+
+/// An id in title case: each `_`-separated word capitalised ("Noise Riser" for `noise_riser`).
+pub fn title_case(id: &str) -> String {
+    let word = |w: &str| {
+        let mut c = w.chars();
+        c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
+    };
+    id.split('_').map(word).collect::<Vec<_>>().join(" ")
 }
 
 /// What to generate.

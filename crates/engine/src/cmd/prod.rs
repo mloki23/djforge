@@ -54,16 +54,6 @@ fn kind_param(cmd: &str, p: &Value) -> Result<Option<PatternKind>> {
     }
 }
 
-/// What a part of `kind` is called before its number.
-fn label(kind: PatternKind) -> &'static str {
-    match kind {
-        PatternKind::Drums => "Drums",
-        PatternKind::Bass => "Bass",
-        PatternKind::Synth => "Synth",
-        PatternKind::Fx => "FX",
-    }
-}
-
 /// "`base` n" with the first n from 1 no track is called.
 fn numbered_name(s: &Session, base: &str) -> String {
     let taken = |n: &str| s.tracks.iter().any(|t| t.name == n);
@@ -138,7 +128,7 @@ fn new_part(e: &mut Engine, p: &Value) -> Result<Value> {
     let ins = super::instrument::plugin_with(info, preset.params.iter().copied());
     // The track is whole before it joins the session: nothing below can fail.
     let s = e.session_mut();
-    let name = name.map_or_else(|| numbered_name(s, label(kind)), str::to_string);
+    let name = name.map_or_else(|| numbered_name(s, kind.label()), str::to_string);
     let mut track = s.make_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&name));
     track.instrument = Some(ins);
     let (t, name) = (track.id, track.name.clone());
@@ -221,15 +211,6 @@ fn pattern_bars(e: &Engine, cmd: &str, p: &Value, bars: Option<u32>) -> Result<B
         return Err(bad(cmd, "only 4/4 is supported over the range"));
     }
     Ok(Bars { first, bars: count, start_tick, start: s.tempo.tick_to_samples(start_tick, sr), end: s.tempo.tick_to_samples(end_tick, sr) })
-}
-
-/// "Trance Full" for `trance_full`.
-fn title(style: PatternStyle) -> String {
-    let word = |w: &str| {
-        let mut c = w.chars();
-        c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
-    };
-    style.name().split('_').map(word).collect::<Vec<_>>().join(" ")
 }
 
 /// A sweep's value (0..=1) as a value of the parameter it drives.
@@ -323,8 +304,8 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
     let spec = PatternSpec { kind, style, bars: range.bars, beats_per_bar: 4, key, seed };
     let g = patterns::generate(&spec).map_err(|err| bad(CMD, err.to_string()))?;
     let name = match key {
-        Some(k) => format!("{} ({})", title(style), k.camelot()),
-        None => title(style),
+        Some(k) => format!("{} ({})", style.title(), k.camelot()),
+        None => style.title(),
     };
     let notes = g.sequence.notes.len();
     // Each sweep point lands at its tick on the tempo map, so a ramp bends the curve with the bars.
@@ -381,11 +362,11 @@ fn pattern(e: &mut Engine, p: &Value) -> Result<Value> {
         notices.push(format!("{}'s {} now follow automation; edit the lane to change them", tr.name, pinned.join("/")));
     }
     if !lanes.is_empty() && !tr.mixer.automation_mode.reads() {
-        notices.push(format!("{}'s automation is off, so its {} sweep won't play until the track reads automation again", tr.name, title(style)));
+        notices.push(format!("{}'s automation is off, so its {} sweep won't play until the track reads automation again", tr.name, style.title()));
     }
     if !g.automation.is_empty() && lanes.is_empty() {
         let what = ins.map_or("the part has no instrument", |i| i.plugin.as_str());
-        e.message(format!("{}: {what} has no cutoff or level to sweep, so only the notes were written", title(style)));
+        e.message(format!("{}: {what} has no cutoff or level to sweep, so only the notes were written", style.title()));
     }
     for n in notices {
         e.message(n);
@@ -475,11 +456,11 @@ fn pattern_slot(e: &mut Engine, p: &Value, target: &Value, mut spec: PatternSpec
         })
         .collect();
     if !dropped.is_empty() {
-        e.message(format!("{}: slots play no automation, so its {} sweep was left out", title(spec.style), dropped.join("/")));
+        e.message(format!("{}: slots play no automation, so its {} sweep was left out", spec.style.title(), dropped.join("/")));
     }
     let name = match spec.key {
-        Some(k) => format!("{} ({})", title(spec.style), k.camelot()),
-        None => title(spec.style),
+        Some(k) => format!("{} ({})", spec.style.title(), k.camelot()),
+        None => spec.style.title(),
     };
     let color = e.session().live.column_track(column, &e.session().tracks).and_then(|t| e.session().track(t)).map_or([128, 128, 128], |t| t.color);
     let length_beats = f64::from(spec.bars) * 4.0;
