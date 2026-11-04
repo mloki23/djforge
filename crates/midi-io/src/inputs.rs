@@ -28,8 +28,14 @@ impl MidiInputs {
         Ok(Self { table: PortTable::default(), hub: Hub::new(clock)? })
     }
 
-    /// A fresh backend client and its ports, listed.
+    /// A fresh backend client and its ports, listed. midir's WinMM port enumeration contains an
+    /// `assert!`; enumeration never runs on the audio thread, so a panic there is caught and becomes
+    /// an error rather than taking the app down.
     fn enumerate() -> Result<(MidiInput, Vec<(PortInfo, MidiInputPort)>), String> {
+        std::panic::catch_unwind(Self::enumerate_inner).unwrap_or_else(|_| Err("the MIDI backend panicked while listing ports".to_string()))
+    }
+
+    fn enumerate_inner() -> Result<(MidiInput, Vec<(PortInfo, MidiInputPort)>), String> {
         let mut input = MidiInput::new(CLIENT).map_err(|e| e.to_string())?;
         input.ignore(Ignore::All);
         let ports = input.ports();
@@ -70,11 +76,7 @@ impl MidiSource for MidiInputs {
             name,
             |_| true,
             |id, info| {
-                let port = ports
-                    .iter()
-                    .find(|(i, _)| i.backend_id == info.backend_id)
-                    .map(|(_, p)| p)
-                    .ok_or_else(|| MidiIoError::NoSuchPort(name.to_string()))?;
+                let port = ports.iter().find(|(i, _)| i.same_port(info)).map(|(_, p)| p).ok_or_else(|| MidiIoError::NoSuchPort(name.to_string()))?;
                 let sink = hub.port_sink(id)?;
                 // On failure the sink is dropped and the router retires its queue.
                 input
@@ -113,6 +115,10 @@ impl MidiSource for MidiInputs {
 
     fn port_name(&self, id: PortId) -> Option<&str> {
         self.table.port_name(id)
+    }
+
+    fn raw_name(&self, id: PortId) -> Option<&str> {
+        self.table.raw_name(id)
     }
 
     fn backend_id(&self, id: PortId) -> Option<&str> {

@@ -58,8 +58,8 @@ impl FakeSource {
         let Some(info) = self.list().into_iter().find(|p| p.name == name) else {
             return false;
         };
-        self.devices.retain(|d| d.backend_id != info.backend_id);
-        for p in self.table.iter_mut().filter(|p| p.backend_id == info.backend_id) {
+        self.devices.retain(|d| !(d.backend_id == info.backend_id && d.name == info.raw_name));
+        for p in self.table.iter_mut().filter(|p| p.info.same_port(&info)) {
             p.conn.dead = true;
         }
         true
@@ -116,6 +116,10 @@ impl MidiSource for FakeSource {
 
     fn port_name(&self, id: PortId) -> Option<&str> {
         self.table.port_name(id)
+    }
+
+    fn raw_name(&self, id: PortId) -> Option<&str> {
+        self.table.raw_name(id)
     }
 
     fn backend_id(&self, id: PortId) -> Option<&str> {
@@ -223,12 +227,12 @@ mod tests {
     fn refresh_reports_appeared_and_disappeared_devices() {
         let mut s = source(&["Pads"]);
         let first = s.refresh();
-        assert_eq!(first, vec![PortChange::Appeared { name: "Pads".into(), backend_id: "fake:0".into() }]);
+        assert_eq!(first, vec![PortChange::Appeared { name: "Pads".into(), raw_name: "Pads".into(), backend_id: "fake:0".into() }]);
         assert!(s.refresh().is_empty());
         let keys = s.plug("Keys");
-        assert_eq!(s.refresh(), vec![PortChange::Appeared { name: "Keys".into(), backend_id: keys.clone() }]);
+        assert_eq!(s.refresh(), vec![PortChange::Appeared { name: "Keys".into(), raw_name: "Keys".into(), backend_id: keys.clone() }]);
         s.unplug("Keys");
-        assert_eq!(s.refresh(), vec![PortChange::Disappeared { name: "Keys".into(), backend_id: keys }]);
+        assert_eq!(s.refresh(), vec![PortChange::Disappeared { name: "Keys".into(), raw_name: "Keys".into(), backend_id: keys }]);
     }
 
     #[test]
@@ -284,6 +288,30 @@ mod tests {
         assert_eq!(recv(&mut sub, 1).first().map(|e| e.port), Some(second));
         assert!(eventually(|| s.hop_stats(false).count == 1));
         assert!(sub.pop().is_none(), "delivered exactly once");
+    }
+
+    #[test]
+    fn ports_of_one_device_keep_separate_identities() {
+        // A multi-port device (a Launchpad's MIDI and DAW ports) shares one backend id on WinMM.
+        let mut s = source(&[]);
+        s.plug_device("LPX MIDI", "usb:lpx");
+        s.plug_device("LPX DAW", "usb:lpx");
+        let mut sub = s.subscribe(64).unwrap();
+        let midi = s.open("LPX MIDI").unwrap();
+        let daw = s.open("LPX DAW").unwrap();
+        assert_ne!(midi, daw);
+        assert!(s.is_open("LPX MIDI") && s.is_open("LPX DAW"));
+        assert_eq!((s.raw_name(daw), s.backend_id(daw)), (Some("LPX DAW"), Some("usb:lpx")));
+        assert!(s.inject("LPX MIDI", on(1), 0));
+        assert!(s.inject("LPX DAW", on(2), 0));
+        let mut got: Vec<_> = recv(&mut sub, 2).iter().map(|e| (e.port, e.msg)).collect();
+        got.sort_by_key(|(p, _)| *p);
+        assert_eq!(got, vec![(midi, on(1)), (daw, on(2))]);
+        // Unplugging one port's listing leaves the other open.
+        s.unplug("LPX DAW");
+        let changes = s.refresh();
+        assert_eq!(changes.iter().filter(|c| matches!(c, PortChange::Closed { .. })).count(), 1, "{changes:?}");
+        assert!(s.is_open("LPX MIDI") && !s.is_open("LPX DAW"));
     }
 
     #[test]

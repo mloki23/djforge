@@ -12,9 +12,11 @@
 //!
 //! Devices come and go. Poll [`MidiSource::refresh`] (about once a second, off the UI and audio
 //! threads): it closes ports whose device vanished, reporting [`PortChange::Closed`] so held notes
-//! can be released, and reports new and renamed devices. A port is identified by its backend id
-//! (stable per device, distinct for identical devices) and keeps its [`PortId`] across replugs; see
-//! the `ports` module for how listed names relate to it.
+//! can be released, and reports new and renamed devices. A port is identified by its backend id and
+//! raw name together (the ports of one multi-port device share a backend id on WinMM). It keeps its
+//! [`PortId`] across replugs on Windows and macOS; on ALSA the backend id is `client:port`, which
+//! changes on replug, so a replugged device reads as `Closed` then `Appeared` with a new id. See the
+//! `ports` module for how listed names relate to all this.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable, clippy::indexing_slicing)]
 
 mod fake;
@@ -87,8 +89,9 @@ impl Default for MidiClock {
     }
 }
 
-/// A port's id within one source, keyed on the device's backend id: the same device always gets
-/// the same id, under whatever listed name and after replugs.
+/// A port's id within one source, keyed on (backend id, raw name): the same port always gets the
+/// same id under whatever listed name, and after replugs on Windows and macOS (not on ALSA, whose
+/// backend id changes on replug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortId(pub u32);
 
@@ -108,9 +111,13 @@ pub struct PortInfo {
     /// The name to open it by, unique within this listing only: a second device with the same name
     /// is "Name #2", and so on, and the suffix can change when devices come and go.
     pub name: String,
+    /// The name as the backend reports it, without the suffix.
+    pub raw_name: String,
     /// Its position in the current device list (changes when devices come and go).
     pub index: usize,
-    /// The backend's stable id for the device (on WinMM, the device-interface path). Opaque.
+    /// The backend's id for the port. Opaque. On WinMM it is the device-interface path, shared by all
+    /// ports of one device; on CoreMIDI the endpoint id; on ALSA `client:port` (changes on replug).
+    /// Identify a port by this together with `raw_name`.
     pub backend_id: String,
 }
 
@@ -119,8 +126,11 @@ pub trait MidiSource {
     /// The ports present now. On real hardware this creates a backend client and enumerates
     /// devices: poll it (or [`MidiSource::refresh`]) at about 1 Hz, off the UI and audio threads.
     fn list(&self) -> Vec<PortInfo>;
-    /// Opens a port by its listed name. If that device is already open (under any name) with a live
+    /// Opens a port by its listed name. If that port is already open (under any name) with a live
     /// connection, returns its id and connects nothing; a dead connection is replaced, keeping the id.
+    /// On real hardware a connection only counts as dead once a listing has seen its device
+    /// missing: a device unplugged and replugged between two listings keeps a silent connection, and
+    /// `open` returns it. Close then open to force a reconnect (Task 5 offers this as Reconnect).
     fn open(&mut self, name: &str) -> Result<PortId, MidiIoError>;
     /// Closes a port; false if it was not open.
     fn close(&mut self, name: &str) -> bool;
@@ -136,6 +146,8 @@ pub trait MidiSource {
     fn subscribe(&self, capacity: usize) -> Result<Subscriber, MidiIoError>;
     /// A port id's current listed name.
     fn port_name(&self, id: PortId) -> Option<&str>;
+    /// A port id's raw (unsuffixed) name.
+    fn raw_name(&self, id: PortId) -> Option<&str>;
     /// A port id's backend id.
     fn backend_id(&self, id: PortId) -> Option<&str>;
     /// The clock events are stamped with.
