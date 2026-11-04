@@ -1,0 +1,47 @@
+# Stage 7a gate: production over loki journey. Starter parts are written over transition 4
+# (Future Breeze "Why Don't You Dance with Me?", 5B/Eb, into Marc Dawn "Expander (Flutlicht Remix)",
+# 4A/Fm; a 16-bar blend, entry bar 910, hit bar 926, nudge reliable) and over the body of
+# Expander after it, plus two instrument columns in Session view.
+#   soundcraft-cli script tools/prod/prod_loki.cmds --save "C:/Users/marty/Music/djforge-tests/produce/loki produce.scraft" \
+#     --bounce "C:/Users/marty/Music/djforge-tests/produce/loki produce.wav" --start "bars_beats:896|1|000" --end "bars_beats:968|1|000"
+# --start/--end take seconds or a time string (bare numbers are seconds, not samples). The bounce
+# window is bars 896..968 (about 2 min 6 s): 14 bars of the plain mix, the drum build and the
+# riser into the hit on bar 926, and the bass section over bars 930..962.
+#
+# Bar positions on this set's tempo ramp, at 48 kHz (read from an import run):
+#   bar 896 = 77361445, bar 910 = 78555961, bar 925 = 79827044, bar 926 = 79911166,
+#   bar 927 = 79995212, bar 930 = 80246894, bar 962 = 82918801, bar 968 = 83419671.
+session.new {"name": "loki produce", "sample_rate": 48000}
+dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json"}
+
+# Drums: trance_full over transition 4's 16 build bars (entry bar 910 up to the hit on bar 926),
+# and a fill over bar 925, the last bar before the hit. The fill goes on its own part so it layers
+# on the groove's last bar instead of overlapping a clip on the same track.
+prod.new_part {"kind": "drums"}
+prod.pattern {"kind": "drums", "style": "trance_full", "track": "Drums 1", "start": 78555961, "end": 79911166}
+prod.new_part {"kind": "drums"}
+prod.pattern {"kind": "drums", "style": "fill", "track": "Drums 2", "start": 79827044, "end": 79911166}
+
+# Bass: 32 bars of rolling bass, bars 930..962, inside Expander's body (4 bars after the hit, well
+# before transition 5's entry on bar 1137). The key is the one dj.key_at reports there (4A, Fm),
+# which prod.pattern takes by default from the start of the range.
+dj.key_at {"at": 80246894}
+prod.new_part {"kind": "bass"}
+prod.pattern {"kind": "bass", "style": "rolling", "track": "Bass 1", "start": 80246894, "end": 82918801}
+
+# FX: a 16-bar noise riser ending exactly on the hit bar (910..926), and an impact on the hit bar
+# (926..927) on a second FX part.
+prod.new_part {"kind": "fx", "preset": "noise_riser"}
+prod.pattern {"kind": "fx", "style": "riser", "track": "FX 1", "start": 78555961, "end": 79911166}
+prod.new_part {"kind": "fx", "preset": "impact"}
+prod.pattern {"kind": "fx", "style": "impact", "track": "FX 2", "start": 79911166, "end": 79995212}
+
+# Session view: the four audio columns (0..3), then a drum column (4, trance_kit) and a bass
+# column (5, rolling_bass), each with a 4-bar starter slot. The bass slot is in Fm, the key of the
+# bass section above, so it can be jammed over Expander.
+live.setup {}
+live.add_column {"kind": "instrument"}
+live.add_column {"kind": "instrument", "preset": "rolling_bass"}
+prod.pattern {"kind": "drums", "style": "trance_full", "slot": {"column": 4, "slot": 0}, "bars": 4}
+prod.pattern {"kind": "bass", "style": "rolling", "slot": {"column": 5, "slot": 0}, "bars": 4, "key": "Fm"}
+live.state {}
