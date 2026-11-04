@@ -59,7 +59,7 @@ pub struct MeterSnapshot {
     pub main: StripMeter,
 }
 
-/// Plugin states read from the live instances: `(track, slot or INSTRUMENT_SLOT, state)`.
+/// Plugin states read from the live instances: `(track, slot or `soundcraft_mix::INSTRUMENT_INSTANCE`, state)`.
 pub type PluginStates = Vec<(TrackId, usize, Vec<u8>)>;
 
 /// A parameter edit made in a plugin's own editor: `(track, slot, param id, value)`.
@@ -2123,10 +2123,10 @@ mod tests {
         let mut side = Side::new(48_000.0, bin().1);
         let (a, b) = (TrackId(1), TrackId(2));
         side.states.insert((b, 0), Box::new(|| Some(b"b0".to_vec())));
-        side.states.insert((a, soundcraft_mix::INSTRUMENT_SLOT), Box::new(|| Some(b"synth".to_vec())));
+        side.states.insert((a, soundcraft_mix::INSTRUMENT_INSTANCE), Box::new(|| Some(b"synth".to_vec())));
         side.states.insert((a, 3), Box::new(|| Some(b"a3".to_vec())));
         side.states.insert((a, 4), Box::new(|| None));
-        let want = vec![(a, 3, b"a3".to_vec()), (a, soundcraft_mix::INSTRUMENT_SLOT, b"synth".to_vec()), (b, 0, b"b0".to_vec())];
+        let want = vec![(a, 3, b"a3".to_vec()), (a, soundcraft_mix::INSTRUMENT_INSTANCE, b"synth".to_vec()), (b, 0, b"b0".to_vec())];
         assert_eq!(side.capture_states(), want);
         side.forget((a, 3));
         assert_eq!(side.capture_states(), want[1..]);

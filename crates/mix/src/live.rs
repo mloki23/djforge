@@ -32,7 +32,8 @@
 //! a slot without its players is silent.
 //!
 //! **MIDI slots** (an instrument column's) play their sequence on the column track's instrument,
-//! scheduled before it renders the block ([`Column::schedule_midi`]). Pass `k` of a loop launched
+//! scheduled around the arrangement's notes as it renders the block ([`Column::midi_head`] before
+//! them, [`Column::midi_tail`] after). Pass `k` of a loop launched
 //! on session beat `b0` starts on the tick of beat `b0 + k · length_beats`, so it starts on the
 //! sample the tempo map puts that bar line at, as an audio loop's restart does; a note is cut at
 //! the end of its pass. The notes sounding are tracked per column ([`LiveMidi`], a fixed table)
@@ -868,6 +869,13 @@ impl LiveMidi {
     pub(crate) fn forget(&mut self, at: Samples) {
         self.held = [false; 128];
         self.since = at;
+    }
+
+    /// The playing slot's notes or length were edited: [`Column::midi_head`] releases what
+    /// sounds on the next block's first sample, as for a slot replaced, and plays on from the
+    /// new notes.
+    pub(crate) fn edited(&mut self) {
+        self.owner = None;
     }
 
     /// Note-offs at `offset` for every note sounding.

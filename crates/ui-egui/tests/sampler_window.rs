@@ -44,7 +44,7 @@ fn harness() -> (Harness<'static, SoundApp>, TrackId) {
     let engine = soundcraft_engine::demo::demo_engine();
     let keys = engine.session().tracks.iter().find(|t| t.name == "Keys").unwrap().id;
     let mut app = SoundApp::new(engine, None, Services::default());
-    app.ui.plugin_windows.push((keys, soundcraft_mix::INSTRUMENT_SLOT));
+    app.ui.plugin_windows.push((keys, soundcraft_mix::INSTRUMENT_INSTANCE));
     let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
         |ui, app: &mut SoundApp| {
             let ctx = ui.ctx().clone();
@@ -150,5 +150,5 @@ fn a_built_in_instruments_menu_opens_its_parameters() {
     assert!(h.state().ui.plugin_windows.is_empty());
     h.get_by_label("Edit Parameters…").click();
     h.step();
-    assert_eq!(h.state().ui.plugin_windows, vec![(keys, soundcraft_mix::INSTRUMENT_SLOT)]);
+    assert_eq!(h.state().ui.plugin_windows, vec![(keys, soundcraft_mix::INSTRUMENT_INSTANCE)]);
 }

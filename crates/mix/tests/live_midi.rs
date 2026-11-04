@@ -9,7 +9,7 @@
 
 use soundcraft_dsp::Plugin;
 use soundcraft_midi::{CtrlEvent, CtrlKind, Note, Sequence};
-use soundcraft_mix::{INSTRUMENT_SLOT, LiveCmd, MixEngine, PreparedInstance, render_range};
+use soundcraft_mix::{INSTRUMENT_INSTANCE, LiveCmd, MixEngine, PreparedInstance, render_range};
 use soundcraft_model::{ChannelFormat, Clip, Insert, LiveColumn, MidiSlot, Session, TrackId, TrackKind};
 use soundcraft_time::{Samples, TICKS_PER_QUARTER};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -150,7 +150,7 @@ fn rig_with(tempo: Tempo) -> Rig {
     let rec = Recorder { inner: soundcraft_dsp::create("gain").unwrap(), pos: Arc::clone(&pos), log: Arc::clone(&log), blocks: 0 };
     let mut eng = MixEngine::new(48_000.0, BLOCK);
     eng.set_external_instances(true);
-    eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }]);
+    eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }]);
     Rig { s, eng, pos, log, track: t }
 }
 
@@ -526,4 +526,45 @@ fn controllers_come_back_after_a_slot_is_cleared() {
     assert!(r.eng.live_state()[0].playing.is_none());
     assert_eq!(controllers(&r.log()), (true, 0), "the pedal is down again");
     assert!(r.events().contains(&Ev::Midi(mid, [0xB0, 64, 127])), "chased on the block's first sample");
+}
+
+/// A playing MIDI slot whose notes or length are edited plays on from its new notes, as an
+/// audio slot does; what it left sounding is released where the new snapshot starts.
+#[test]
+fn an_edited_midi_slot_plays_on_and_releases_what_it_held() {
+    // Notes only: the held note is removed.
+    let mut r = rig(false);
+    let mid = r.bar(2) + 6_144;
+    r.run(0, mid, &[(0, LiveCmd::Launch { column: 0, slot: 1, at: r.bar(2) })]);
+    assert_eq!(r.sounding(), [LONG]);
+    let old = r.s.clone();
+    let mut edited = old.clone();
+    if let Some(soundcraft_model::SlotContent::Midi(m)) = &mut edited.live.columns[0].slots[1] {
+        m.sequence.notes.retain(|n| n.pitch != LONG);
+    }
+    r.eng.live_snapshot(&old, &edited, mid);
+    r.s = edited;
+    assert!(r.eng.live_state()[0].playing.is_some(), "it plays on");
+    r.run(mid, r.bar(4), &[]);
+    let ev = r.events();
+    assert!(ev.contains(&Ev::Off(mid, LONG)), "the held note is released on the snapshot's first sample");
+    assert!(ev.contains(&Ev::On(r.beat(2, 3) + 12_000, CROSS)) && ev.contains(&Ev::On(r.beat(3, 3) + 12_000, CROSS)), "the new notes play");
+    assert!(!ev.iter().any(|e| matches!(e, Ev::On(t, p) if *p == LONG && *t >= mid)));
+
+    // Length only: two bars now, so the note past the old end plays from the next pass on.
+    let mut r = rig(false);
+    r.run(0, mid, &[(0, LiveCmd::Launch { column: 0, slot: 1, at: r.bar(2) })]);
+    let old = r.s.clone();
+    let mut longer = old.clone();
+    if let Some(soundcraft_model::SlotContent::Midi(m)) = &mut longer.live.columns[0].slots[1] {
+        m.length_beats = 8.0;
+    }
+    r.eng.live_snapshot(&old, &longer, mid);
+    r.s = longer;
+    r.run(mid, r.bar(6), &[(r.bar(5), LiveCmd::Stop { column: 0, at: r.bar(5) + 100 })]);
+    let ev = r.events();
+    assert!(r.eng.live_state()[0].playing.is_none());
+    assert!(ev.contains(&Ev::Off(mid, LONG)));
+    assert_eq!(r.ons(KICK), [r.beat(3, 1)], "the note at beat 5 of the two-bar loop");
+    assert_eq!(r.sounding(), Vec::<u8>::new());
 }

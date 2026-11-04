@@ -189,6 +189,12 @@ fn run(p: &mut dyn Plugin, input: &[Vec<f32>]) -> Vec<Vec<f32>> {
     out
 }
 
+/// Full-band white noise, unfiltered, peaking at 0.9.
+fn white_noise(len: usize, seed: u32) -> Vec<f32> {
+    let mut rng = Lcg(seed);
+    (0..len).map(|_| rng.next() * 0.9).collect()
+}
+
 /// A full-scale quarter-rate tone 45° off: samples at ±0.707, peaks at 1.0 between them.
 fn quarter_rate(len: usize, amp: f32) -> Vec<f32> {
     (0..len).map(|i| amp * (std::f32::consts::TAU * (i % 4) as f32 / 4.0 + std::f32::consts::FRAC_PI_4).sin()).collect()
@@ -204,16 +210,34 @@ fn maximizer_true_peak_mode_holds_the_real_true_peak_under_its_ceiling() {
         ("bright chord", bright_chord(len, 5), bright_chord(len, 6), -9.0),
         ("quarter-rate tone", quarter_rate(len, 1.0), quarter_rate(len, 0.5), -3.0),
     ] {
-        let (l, r) = (fade(l), fade(r));
-        let mut p = create("maximizer").unwrap();
-        p.prepare(SR, BLOCK, 2);
-        p.set_param("threshold", threshold);
-        p.set_param("ceiling", -1.0);
-        p.set_param("true_peak", 1.0);
-        let out = run(p.as_mut(), &[l, r]);
-        for (c, ch) in out.iter().enumerate() {
-            let tp = reference_true_peak_db(ch);
-            assert!(tp <= -0.9, "{what} ch{c}: {tp} dBTP through a -1 dBTP ceiling");
-        }
+        assert_held_under_minus_one(what, l, r, threshold);
     }
+}
+
+/// Drives `l`/`r` (faded) into the Maximizer at `threshold` with a -1 dB true-peak ceiling and
+/// checks the 16× reference reads at most -0.9 dBTP on each channel.
+fn assert_held_under_minus_one(what: &str, l: Vec<f32>, r: Vec<f32>, threshold: f32) {
+    let (l, r) = (fade(l), fade(r));
+    let mut p = create("maximizer").unwrap();
+    p.prepare(SR, BLOCK, 2);
+    p.set_param("threshold", threshold);
+    p.set_param("ceiling", -1.0);
+    p.set_param("true_peak", 1.0);
+    let out = run(p.as_mut(), &[l, r]);
+    for (c, ch) in out.iter().enumerate() {
+        let tp = reference_true_peak_db(ch);
+        eprintln!("{what} ch{c}: {tp:.3} dBTP");
+        assert!(tp <= -0.9, "{what} ch{c}: {tp} dBTP through a -1 dBTP ceiling");
+    }
+}
+
+/// Unfiltered white noise has content right up to Nyquist, past the band the detector's
+/// interpolation filter passes (a 48 kHz master's content stops around 20 kHz), and its true
+/// peak comes out about 0.5 dB over the ceiling: -0.52 dBTP on channel 0 (before and after the
+/// stage 7a detector clean-up alike). Kept failing, not loosened: run with `--ignored`.
+#[test]
+#[ignore = "known: full-band noise reads -0.52 dBTP through a -1 dBTP ceiling (the detector passes 20 kHz, not Nyquist)"]
+fn maximizer_true_peak_mode_on_unfiltered_white_noise() {
+    let len = 12_000;
+    assert_held_under_minus_one("white noise", white_noise(len, 21), white_noise(len, 22), -6.0);
 }

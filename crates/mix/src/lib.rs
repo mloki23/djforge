@@ -82,8 +82,9 @@ pub fn main_channels(s: &Session) -> usize {
 }
 
 /// Slot index used for a track's instrument plugin in [`InstanceSpec`] and [`PreparedInstance`]
-/// (insert slots use their index).
-pub const INSTRUMENT_SLOT: usize = usize::MAX;
+/// (insert slots use their index). Not the model's `INSTRUMENT_SLOT` (254), which addresses the
+/// instrument in automation lane ids.
+pub const INSTRUMENT_INSTANCE: usize = usize::MAX;
 
 /// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
 pub fn is_third_party(id: &str) -> bool {
@@ -97,7 +98,7 @@ pub fn is_third_party(id: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceSpec {
     pub track: TrackId,
-    /// Insert slot index, or [`INSTRUMENT_SLOT`].
+    /// Insert slot index, or [`INSTRUMENT_INSTANCE`].
     pub slot: usize,
     pub id: String,
     /// Channel count the instance is prepared for.
@@ -132,7 +133,7 @@ pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
         if let Some(ins) = &t.instrument
             && is_third_party(&ins.plugin)
         {
-            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: ins.state_bytes() });
+            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_INSTANCE, id: ins.plugin.clone(), ch: ch.max(2), state: ins.state_bytes() });
         }
     }
     out
@@ -175,7 +176,7 @@ pub struct StripMeter {
 pub struct PluginFailures {
     /// It only grows.
     pub count: u32,
-    /// The slot of the latest: an insert index or [`INSTRUMENT_SLOT`].
+    /// The slot of the latest: an insert index or [`INSTRUMENT_INSTANCE`].
     pub last: usize,
 }
 
@@ -586,8 +587,11 @@ impl MixEngine {
     /// The session snapshot changes from `old` to `new` with the next block at `at`: a playing
     /// slot that was cleared, refilled with other audio or lost its audio fades out from `at`
     /// (rendered from `old`) and its column stops; a column that was lost (its track deleted or
-    /// taken) stops and forgets what it had queued. Call before rendering `new`. Neither
-    /// allocates nor frees.
+    /// taken) stops and forgets what it had queued. A playing MIDI slot whose notes or length
+    /// were edited plays on, as an audio slot does, from its new notes: what it left sounding is
+    /// released at `at` (a note held past a shortened loop's end, or one removed, would never
+    /// get its note-off from the new notes). Call before rendering `new`. Neither allocates nor
+    /// frees.
     pub fn live_snapshot(&mut self, old: &Session, new: &Session, at: Samples) {
         for (c, play) in self.live.iter_mut().enumerate() {
             let (Some(p), was) = (play.playing, old.live.column_track(c, &old.tracks)) else {
@@ -597,18 +601,23 @@ impl MixEngine {
                 continue;
             };
             let now = new.live.column_track(c, &new.tracks);
-            // The same audio, all of it in the pool; or the same notes over the same length.
+            // The same audio, all of it in the pool; or MIDI still (its notes and length may change).
             let same = |n: &SlotContent, o: &SlotContent| match (n, o) {
                 (SlotContent::Audio(a), SlotContent::Audio(b)) => {
                     a.source == b.source
                         && a.stems.as_ref().map(|x| x.sources) == b.stems.as_ref().map(|x| x.sources)
                         && live::slot_sources(a).all(|(_, id)| new.pool.contains(id))
                 }
-                (SlotContent::Midi(a), SlotContent::Midi(b)) => a.sequence == b.sequence && a.length_beats == b.length_beats,
+                (SlotContent::Midi(_), SlotContent::Midi(_)) => true,
                 _ => false,
             };
-            let keeps = now.is_some() && now == was && new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot)).is_some_and(|(n, o)| same(n, o));
-            if keeps {
+            let slots = new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot));
+            if now.is_some() && now == was && slots.is_some_and(|(n, o)| same(n, o)) {
+                let edited = matches!(slots, Some((SlotContent::Midi(a), SlotContent::Midi(b)))
+                    if a.sequence != b.sequence || a.length_beats != b.length_beats);
+                if edited && let Some(st) = now.and_then(|id| self.strips.get_mut(&id)) {
+                    st.live_midi.edited();
+                }
                 continue;
             }
             if let Some(id) = was
@@ -932,11 +941,11 @@ impl MixEngine {
             let want = t.instrument.as_ref();
             let ich = ch.max(2);
             if strip.instrument.as_ref().map(|p| (p.id.as_str(), p.ch)) != want.map(|i| (i.plugin.as_str(), ich))
-                || (want.is_some() && cx.waiting(t.id, INSTRUMENT_SLOT))
+                || (want.is_some() && cx.waiting(t.id, INSTRUMENT_INSTANCE))
             {
                 let old = strip.instrument.take();
                 cx.retire(old);
-                strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
+                strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_INSTANCE, i, ich));
                 strip.sample = None;
             }
             sync_sample(strip, want, s);
@@ -1399,7 +1408,7 @@ fn process_strip(
                 // instance and the rendered audio matches the plugin's defaults — e.g. a saved
                 // `level = -12 dB` sounds the same as `level = -6 dB`.
                 if let Some(ins) = &t.instrument {
-                    apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
+                    apply_params(inst, ins, t, INSTRUMENT_INSTANCE, pos);
                 }
                 inst.plugin.set_transport(&transport);
                 // An instrument column's slot mutes the track's arrangement notes and controllers
@@ -1448,7 +1457,7 @@ fn process_strip(
                     }
                 }
                 if contain_failure(inst, &mut strip.buf, frames) {
-                    strip.failures.record(INSTRUMENT_SLOT);
+                    strip.failures.record(INSTRUMENT_INSTANCE);
                 }
             }
         }
@@ -2269,7 +2278,7 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
     // Automation lanes address insert slots by index and the instrument by its own lane slot, so
     // the instrument never picks up slot A's lanes.
-    let lane_slot = if i == INSTRUMENT_SLOT { Some(soundcraft_model::INSTRUMENT_SLOT) } else { u8::try_from(i).ok() };
+    let lane_slot = if i == INSTRUMENT_INSTANCE { Some(soundcraft_model::INSTRUMENT_SLOT) } else { u8::try_from(i).ok() };
     let Some(slot_u8) = lane_slot else {
         return apply_values(slot, ins, |_, v| v);
     };
@@ -3455,7 +3464,7 @@ mod tests {
         let ears = Ears { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears".into(), ch: 2, plugin: Box::new(ears) }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.ears".into(), ch: 2, plugin: Box::new(ears) }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (100, [0xB0, 64, 127])]);
         render_block(&mut eng, &s, 36_000);
@@ -3508,7 +3517,7 @@ mod tests {
         let keys = Keys { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(keys) }]);
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(keys) }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(*heard.lock().unwrap(), vec![(72, 80)]);
     }
@@ -3615,10 +3624,10 @@ mod tests {
         let b = add_dc_track(&mut s, 0.5, 48_000);
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
-        eng.adopt(nan(synth, INSTRUMENT_SLOT, 2));
+        eng.adopt(nan(synth, INSTRUMENT_INSTANCE, 2));
         let only_b = render_block(&mut eng, &s, 0);
         assert!(only_b > 0.3, "{only_b}");
-        assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
+        assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_INSTANCE });
         assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
         let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
         s.track_mut(m).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.nan"));
@@ -4088,10 +4097,15 @@ mod tests {
     #[test]
     fn instance_seeds_are_stable_and_differ_per_track_and_slot() {
         let (t, u) = (TrackId(3), TrackId(4));
-        assert_eq!(instance_seed(t, INSTRUMENT_SLOT), instance_seed(t, INSTRUMENT_SLOT));
-        let seeds: std::collections::HashSet<u64> =
-            [instance_seed(t, INSTRUMENT_SLOT), instance_seed(u, INSTRUMENT_SLOT), instance_seed(t, 0), instance_seed(t, 1), instance_seed(u, 0)]
-                .into();
+        assert_eq!(instance_seed(t, INSTRUMENT_INSTANCE), instance_seed(t, INSTRUMENT_INSTANCE));
+        let seeds: std::collections::HashSet<u64> = [
+            instance_seed(t, INSTRUMENT_INSTANCE),
+            instance_seed(u, INSTRUMENT_INSTANCE),
+            instance_seed(t, 0),
+            instance_seed(t, 1),
+            instance_seed(u, 0),
+        ]
+        .into();
         assert_eq!(seeds.len(), 5);
     }
 }

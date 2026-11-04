@@ -758,7 +758,7 @@ impl SoundApp {
     pub fn capture_plugin_states(&mut self) {
         let Some(p) = &self.player else { return };
         for (t, slot, data) in p.capture_states() {
-            let slot = if slot == soundcraft_mix::INSTRUMENT_SLOT { json!("instrument") } else { json!(slot) };
+            let slot = if slot == soundcraft_mix::INSTRUMENT_INSTANCE { json!("instrument") } else { json!(slot) };
             let state = soundcraft_model::b64::encode(&data);
             if let Err(e) = self.engine.execute("mix.insert_state", &json!({"track": t.0, "slot": slot, "state": state})) {
                 log::warn!("storing plugin state: {e}");
@@ -770,7 +770,7 @@ impl SoundApp {
     fn apply_editor_edits(&mut self) {
         let Some(p) = &self.player else { return };
         for (t, slot, param, value) in p.idle() {
-            if slot == soundcraft_mix::INSTRUMENT_SLOT {
+            if slot == soundcraft_mix::INSTRUMENT_INSTANCE {
                 continue;
             }
             let key = format!("param:{}:{slot}:{param}", t.0);
@@ -1480,10 +1480,10 @@ fn feed_meter(d: &mut MeterDisplay, peak: [f32; 2], gr: f32, dt: f32) {
 }
 
 /// The status line naming the plugin in `slot` (an insert index or
-/// [`soundcraft_mix::INSTRUMENT_SLOT`]), which the engine took out of the signal path.
+/// [`soundcraft_mix::INSTRUMENT_INSTANCE`]), which the engine took out of the signal path.
 fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usize) -> Option<String> {
     let t = s.track(track)?;
-    let ins = if slot == soundcraft_mix::INSTRUMENT_SLOT { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
+    let ins = if slot == soundcraft_mix::INSTRUMENT_INSTANCE { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
     let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
     Some(format!("{name} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", t.name))
 }
@@ -1529,7 +1529,7 @@ mod tests {
         let msg = super::failed_plugin_status(&s, t, 3).unwrap();
         assert!(msg.starts_with("Gain on Vox put out invalid audio"), "{msg}");
         assert_eq!(super::failed_plugin_status(&s, t, 0), None);
-        assert_eq!(super::failed_plugin_status(&s, t, soundcraft_mix::INSTRUMENT_SLOT), None);
+        assert_eq!(super::failed_plugin_status(&s, t, soundcraft_mix::INSTRUMENT_INSTANCE), None);
     }
 
     #[test]

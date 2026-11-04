@@ -123,7 +123,7 @@ impl SoundApp {
         }
         let s = self.engine.session();
         let mut open = self.ui.plugin_windows.iter().filter(|(t, slot)| {
-            *slot == soundcraft_mix::INSTRUMENT_SLOT && s.track(*t).and_then(|x| x.instrument.as_ref()).is_some_and(|i| i.plugin == SAMPLER)
+            *slot == soundcraft_mix::INSTRUMENT_INSTANCE && s.track(*t).and_then(|x| x.instrument.as_ref()).is_some_and(|i| i.plugin == SAMPLER)
         });
         match (open.next(), open.next()) {
             (Some((t, _)), None) => Some(*t),
@@ -147,8 +147,8 @@ impl SoundApp {
     fn sample_loaded(&mut self, track: TrackId, what: &str, r: Result<serde_json::Value, String>) {
         match r {
             Ok(v) => {
-                if !self.ui.plugin_windows.contains(&(track, soundcraft_mix::INSTRUMENT_SLOT)) {
-                    self.ui.plugin_windows.push((track, soundcraft_mix::INSTRUMENT_SLOT));
+                if !self.ui.plugin_windows.contains(&(track, soundcraft_mix::INSTRUMENT_INSTANCE)) {
+                    self.ui.plugin_windows.push((track, soundcraft_mix::INSTRUMENT_INSTANCE));
                 }
                 let name = v.get("name").and_then(|n| n.as_str()).unwrap_or(what);
                 self.ui.status = format!("{name} loaded into the sampler");

@@ -176,15 +176,61 @@ pub(crate) fn interpolation_coefs<const P: usize, const T: usize>(beta: f64) -> 
     coefs
 }
 
-/// The largest absolute value among `x` and the inter-sample estimates from the history `h`
-/// (newest first, `x` already pushed into it).
-pub(crate) fn interpolated_peak<const P: usize, const T: usize>(coefs: &[[f32; T]; P], h: &[f32; T], x: f32) -> f32 {
-    let mut peak = x.abs();
-    for ph in coefs {
-        let y: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
-        peak = peak.max(y.abs());
+/// The largest absolute value among the inter-sample estimates (branches 1.. of `coefs`) from
+/// the history `h` (the newest `T` samples, newest first). Branch 0 is left out: it is the
+/// sample `T / 2` back itself (its other taps sit on the sinc's zeros), which the caller has.
+pub(crate) fn between_peak<const P: usize, const T: usize>(coefs: &[[f32; T]; P], h: &[f32]) -> f32 {
+    coefs.iter().skip(1).fold(0.0f32, |peak, ph| peak.max(dot(ph, h).abs()))
+}
+
+/// `a · b` over their common length, in eight running sums (so it vectorises).
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    let tail: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.iter().zip(cb) {
+        for ((s, x), y) in acc.iter_mut().zip(x).zip(y) {
+            *s += x * y;
+        }
     }
-    peak
+    acc.iter().sum::<f32>() + tail
+}
+
+/// The newest `N / 2` samples of a signal, newest first, as one contiguous window: each sample
+/// is written twice, `N / 2` apart, so pushing one is two stores, not a shift of the window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct History<const N: usize> {
+    buf: [f32; N],
+    pos: usize,
+}
+
+impl<const N: usize> Default for History<N> {
+    fn default() -> Self {
+        History { buf: [0.0; N], pos: 0 }
+    }
+}
+
+impl<const N: usize> History<N> {
+    /// Pushes `x` as the newest sample.
+    pub(crate) fn push(&mut self, x: f32) {
+        let half = N / 2;
+        self.pos = if self.pos == 0 { half.saturating_sub(1) } else { self.pos - 1 };
+        for at in [self.pos, self.pos + half] {
+            if let Some(v) = self.buf.get_mut(at) {
+                *v = x;
+            }
+        }
+    }
+
+    /// The window, newest first.
+    pub(crate) fn window(&self) -> &[f32] {
+        self.buf.get(self.pos..self.pos + N / 2).unwrap_or(&[])
+    }
+
+    /// The sample `k` back (0: the newest).
+    pub(crate) fn back(&self, k: usize) -> f32 {
+        self.window().get(k).copied().unwrap_or(0.0)
+    }
 }
 
 /// The meter's true-peak filter (see [`interpolation_coefs`]), cutoff at the original Nyquist.
@@ -207,7 +253,7 @@ pub struct LoudnessMeter {
     hist_count: Vec<u64>,
     hist_energy: Vec<f64>,
     tp_coefs: [[f32; TP_TAPS]; TP_PHASES],
-    tp_hist: Vec<[f32; TP_TAPS]>,
+    tp_hist: Vec<History<{ 2 * TP_TAPS }>>,
     true_peak: f32,
     max_momentary: f32,
 }
@@ -266,7 +312,7 @@ impl LoudnessMeter {
             hist_count: vec![0; HIST_BINS],
             hist_energy: vec![0.0; HIST_BINS],
             tp_coefs,
-            tp_hist: vec![[0.0; TP_TAPS]; channels],
+            tp_hist: vec![History::default(); channels],
             true_peak: 0.0,
             max_momentary: MIN_DB,
         }
@@ -295,7 +341,7 @@ impl LoudnessMeter {
         self.sub_filled = 0;
         self.hist_count.iter_mut().for_each(|v| *v = 0);
         self.hist_energy.iter_mut().for_each(|v| *v = 0.0);
-        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; TP_TAPS]);
+        self.tp_hist.iter_mut().for_each(|h| *h = History::default());
         self.true_peak = 0.0;
         self.max_momentary = MIN_DB;
     }
@@ -324,9 +370,9 @@ impl LoudnessMeter {
 
     fn true_peak_sample(&mut self, c: usize, x: f32) {
         let Some(h) = self.tp_hist.get_mut(c) else { return };
-        h.copy_within(0..TP_TAPS - 1, 1);
-        h[0] = x;
-        let peak = interpolated_peak(&self.tp_coefs, h, x);
+        h.push(x);
+        // Each sample counts as it comes in; the estimates between samples, half the filter later.
+        let peak = between_peak(&self.tp_coefs, h.window()).max(x.abs());
         if peak > self.true_peak {
             self.true_peak = peak;
         }

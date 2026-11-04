@@ -519,7 +519,7 @@ pub struct Maximizer {
     la: usize,
     delay: Vec<DelayLine>,
     tp_coefs: [[f32; TP_TAPS]; TP_PHASES],
-    tp_hist: Vec<[f32; TP_TAPS]>,
+    tp_hist: Vec<crate::meter::History<{ 2 * TP_TAPS }>>,
     req: Vec<f32>,
     smooth: Vec<f32>,
     idx: usize,
@@ -586,7 +586,7 @@ impl Plugin for Maximizer {
                 d
             })
             .collect();
-        self.tp_hist = vec![[0.0; TP_TAPS]; self.delay.len()];
+        self.tp_hist = vec![crate::meter::History::default(); self.delay.len()];
         self.req = vec![1.0; self.la];
         self.smooth = vec![1.0; self.la];
         self.drive.set_time(20.0, self.sr);
@@ -597,7 +597,7 @@ impl Plugin for Maximizer {
 
     fn reset(&mut self) {
         self.delay.iter_mut().for_each(DelayLine::clear);
-        self.tp_hist.iter_mut().for_each(|h| *h = [0.0; TP_TAPS]);
+        self.tp_hist.iter_mut().for_each(|h| *h = crate::meter::History::default());
         self.req.iter_mut().for_each(|v| *v = 1.0);
         self.smooth.iter_mut().for_each(|v| *v = 1.0);
         self.sum = self.la as f64;
@@ -626,9 +626,10 @@ impl Plugin for Maximizer {
                 // The history is kept in both modes, so switching mode starts from real audio.
                 let p = match self.tp_hist.get_mut(c) {
                     Some(h) => {
-                        h.copy_within(0..TP_TAPS - 1, 1);
-                        h[0] = x;
-                        if true_peak { crate::meter::interpolated_peak(&self.tp_coefs, h, x) } else { x.abs() }
+                        h.push(x);
+                        // The sample `TP_DELAY` back and the estimates around it, all as late as
+                        // the audio is delayed for them (the newest sample would be early).
+                        if true_peak { crate::meter::between_peak(&self.tp_coefs, h.window()).max(h.back(TP_DELAY).abs()) } else { x.abs() }
                     }
                     None => x.abs(),
                 };

@@ -502,7 +502,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
 /// open from that menu. Dropping an audio file on it loads the sampler.
 pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
     let t = Tokens::current();
-    let (id, slot) = (track.id, soundcraft_mix::INSTRUMENT_SLOT);
+    let (id, slot) = (track.id, soundcraft_mix::INSTRUMENT_INSTANCE);
     let ins = track.instrument.as_ref();
     let info = ins.and_then(|i| plugin_info(&i.plugin));
     let resp = ui.interact(r, ui.id().with(("instrument", id.0)), Sense::click());
@@ -666,7 +666,7 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
 /// (until something is typed) its instrument's editor and the built-in, CLAP, VST3 and Audio Units
 /// instruments.
 pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
-    let slot = soundcraft_mix::INSTRUMENT_SLOT;
+    let slot = soundcraft_mix::INSTRUMENT_INSTANCE;
     let search = MenuSearch::show(ui, egui::Id::new(("instrument-search", id.0)), "Search instruments…");
     if search.typing() {
         if let Some(plugin) = plugin_search(ui, &search, true) {

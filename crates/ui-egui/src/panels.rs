@@ -443,7 +443,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
     let mut keep = Vec::new();
     for (tid, slot) in wins {
         // The instrument slot (an instrument track's instrument) or an insert slot.
-        let instrument = slot == soundcraft_mix::INSTRUMENT_SLOT;
+        let instrument = slot == soundcraft_mix::INSTRUMENT_INSTANCE;
         let Some((tname, ins)) = app.engine.session().track(tid).and_then(|t| {
             let ins = if instrument { t.instrument.clone() } else { t.mixer.inserts.get(slot).cloned().flatten() };
             ins.map(|i| (t.name.clone(), i))
