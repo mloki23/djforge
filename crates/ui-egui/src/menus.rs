@@ -67,6 +67,11 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.rtp", "MIDI Real-Time Properties", "", None),
     ("window.playback_engine", "Playback Engine", "", None),
     ("ui.audio_device", "Audio Device", "", None),
+    ("window.midi_inputs", "Live MIDI Inputs", "", None),
+    ("midi.inputs", "MIDI Inputs", "", None),
+    ("midi.input_enable", "Enable MIDI Input", "", None),
+    ("midi.target", "Live MIDI Target", "", None),
+    ("midi.panic", "Live MIDI Panic", "", None),
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
     ("view.mix_section", "Mix Window View", "", None),
@@ -464,6 +469,8 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > Playback Engine...", "window.playback_engine"),
     ("Setup > I/O...", "window.io_setup"),
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
+    ("Setup > MIDI > Live MIDI Inputs...", "window.midi_inputs"),
+    ("Setup > MIDI > Live MIDI Panic", "midi.panic"),
     ("Setup > Session", "setup.session"),
     ("Event > Beat Detective", "window.beat_detective"),
     ("Event > Tempo Operations > Tempo Operations Window", "window.tempo_ops"),
@@ -554,6 +561,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     if id == "ui.audio_device" {
         return Some(crate::windows::audio_device_command(app, p));
     }
+    if let Some(r) = crate::midi_input::command(app, id, p) {
+        return Some(r);
+    }
     let toggle = |v: &mut bool| {
         *v = p.get("value").and_then(Value::as_bool).unwrap_or(!*v);
         json!({"value": *v})
@@ -623,6 +633,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.metadata" => toggle(&mut app.ui.show_metadata),
         "window.event_list" => toggle(&mut app.ui.show_event_list),
         "window.midi_keyboard" => toggle(&mut app.ui.show_midi_keyboard),
+        "window.midi_inputs" => toggle(&mut app.ui.show_midi_inputs),
         "window.workspace" | "window.workspace_presets" | "window.workspace_sounds" | "window.workspace_front" => {
             app.ui.show_workspace = true;
             json!({"value": true})

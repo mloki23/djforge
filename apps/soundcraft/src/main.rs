@@ -290,6 +290,8 @@ fn main() -> eframe::Result {
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
+            // Live MIDI input: the devices enabled in the preferences open on the first frame.
+            app.midi_host = soundcraft_ui_egui::midi_input::system_host();
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);

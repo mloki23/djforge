@@ -17,6 +17,7 @@ pub mod icons;
 mod live_transport;
 pub mod menus;
 pub mod midi_editor;
+pub mod midi_input;
 pub mod mix_window;
 pub mod ops_windows;
 pub mod palette;
@@ -201,6 +202,13 @@ pub struct UiState {
     pub window_size: [f32; 2],
     pub window_maximized: bool,
     pub ui_scale: f32,
+    /// The MIDI inputs enabled for live play (`midi.input_enable`), kept with the preferences:
+    /// per machine.
+    pub midi_inputs: Vec<midi_input::MidiInputPref>,
+    /// The on-screen keyboard plays the live target instead of step-entering notes.
+    pub midi_keyboard_play: bool,
+    /// Setup › MIDI › Live MIDI Inputs.
+    pub show_midi_inputs: bool,
 }
 
 impl Default for UiState {
@@ -262,6 +270,9 @@ impl Default for UiState {
             window_size: [1600.0, 1000.0],
             window_maximized: false,
             ui_scale: 1.0,
+            midi_inputs: Vec::new(),
+            midi_keyboard_play: false,
+            show_midi_inputs: false,
         }
     }
 }
@@ -366,6 +377,10 @@ pub struct SoundApp {
     pub gesture: Option<Gesture>,
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
+    /// The MIDI input devices (`None`: none on this system, or not set up: tests, the web).
+    pub midi_host: Option<midi_input::MidiHost>,
+    /// The live MIDI target chosen with `midi.target` (see [`midi_input::resolve_target`]).
+    pub midi_target: Option<TrackId>,
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
@@ -483,6 +498,8 @@ impl SoundApp {
             gesture: None,
             edit_layout: edit_window::EditLayout::default(),
             midi: midi_editor::MidiEditorState::default(),
+            midi_host: None,
+            midi_target: None,
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
@@ -1224,7 +1241,11 @@ impl SoundApp {
                     self.play_from_selection();
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
-                TransportRequest::AllNotesOff => {}
+                TransportRequest::AllNotesOff => {
+                    if let Some(p) = &self.player {
+                        p.midi_panic();
+                    }
+                }
                 TransportRequest::Live(req) => self.live_request(req, &mut live_frame),
             }
         }
@@ -1307,6 +1328,7 @@ impl SoundApp {
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
+        midi_input::frame(self, now);
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);

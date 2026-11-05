@@ -20,6 +20,7 @@ soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
 soundcraft-engine.workspace = true
 soundcraft-playback.workspace = true
+soundcraft-midi-io.workspace = true
 soundcraft-video.workspace = true
 egui.workspace = true
 serde.workspace = true

@@ -4,7 +4,8 @@ use crate::SoundApp;
 use crate::theme::{Tokens, mono, rgb};
 use egui::{Color32, Sense, vec2};
 use serde_json::json;
-use soundcraft_model::{AutomationMode, ClipContent};
+use soundcraft_midi_io::MidiMessage;
+use soundcraft_model::{AutomationMode, ClipContent, TrackId};
 use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{AudioSystem, DeviceInfo};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     metadata(app, ctx);
     event_list(app, ctx);
     midi_keyboard(app, ctx);
+    midi_inputs(app, ctx);
     workspace(app, ctx);
     configurations(app, ctx);
     playback_engine(app, ctx);
@@ -266,38 +268,84 @@ fn event_list(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_event_list = open;
 }
 
+/// The key the on-screen keyboard's Play mode holds down (egui temp data).
+fn keyboard_held_id() -> egui::Id {
+    egui::Id::new("soundcraft-midi-keyboard-held")
+}
+
+/// Releases the key Play mode holds, if any.
+fn keyboard_release(app: &SoundApp, ctx: &egui::Context) {
+    if let Some(p) = ctx.data_mut(|d| d.remove_temp::<u8>(keyboard_held_id()))
+        && let Some(pl) = &app.player
+    {
+        pl.play_midi(MidiMessage::NoteOff { ch: 0, note: p, vel: 0 });
+    }
+}
+
 fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_midi_keyboard;
-    win(ctx, &mut open, "MIDI Keyboard", vec2(640.0, 110.0), |ui| {
-        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(400.0), 80.0), Sense::click());
+    win(ctx, &mut open, "MIDI Keyboard", vec2(640.0, 130.0), |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut app.ui.midi_keyboard_play, "Play")
+                .on_hover_text("Play the live MIDI target (the record-armed instrument track) instead of step-entering notes");
+        });
+        let play = app.ui.midi_keyboard_play;
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(400.0), 80.0), Sense::click_and_drag());
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("soundcraft-midi-keyboard"), r));
         let whites = 28;
         let w = r.width() / whites as f32;
-        let mut wi = 0;
         let base = 48u8;
-        let mut clicked: Option<u8> = None;
-        let pos = resp.interact_pointer_pos();
+        let black = |p: u8| matches!(p % 12, 1 | 3 | 6 | 8 | 10);
+        // Key rectangles: whites, then blacks (drawn over them, so hit first).
+        let mut keys: Vec<(u8, egui::Rect)> = Vec::with_capacity(48);
+        let mut wi = 0;
         for p in base..base + 48 {
-            if !matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
-                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w, r.min.y), vec2(w - 1.0, r.height()));
-                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(235, 235, 235));
-                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
-                    clicked = Some(p);
-                }
+            if !black(p) {
+                keys.push((p, egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w, r.min.y), vec2(w - 1.0, r.height()))));
                 wi += 1;
             }
         }
         wi = 0;
         for p in base..base + 48 {
-            if matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
-                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w - w * 0.3, r.min.y), vec2(w * 0.6, r.height() * 0.6));
-                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(20, 20, 20));
-                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
-                    clicked = Some(p);
-                }
+            if black(p) {
+                keys.push((p, egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w - w * 0.3, r.min.y), vec2(w * 0.6, r.height() * 0.6))));
             } else {
                 wi += 1;
             }
         }
+        let held: Option<u8> = ui.ctx().data(|d| d.get_temp(keyboard_held_id()));
+        for (p, kr) in &keys {
+            let fill = match (black(*p), held == Some(*p)) {
+                (_, true) => Color32::from_rgb(90, 160, 240),
+                (true, false) => Color32::from_rgb(20, 20, 20),
+                (false, false) => Color32::from_rgb(235, 235, 235),
+            };
+            ui.painter().rect_filled(*kr, 2.0, fill);
+        }
+        let pos = resp.interact_pointer_pos();
+        let under = pos.and_then(|q| keys.iter().rev().find(|(_, kr)| kr.contains(q)).map(|(p, _)| *p));
+        if play {
+            // Press is note-on, release note-off; dragging across keys plays each in turn.
+            let want = if resp.is_pointer_button_down_on() { under } else { None };
+            if want != held {
+                keyboard_release(app, ui.ctx());
+                if let Some(p) = want {
+                    if let Some(pl) = &app.player {
+                        pl.play_midi(MidiMessage::NoteOn { ch: 0, note: p, vel: 100 });
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(keyboard_held_id(), p));
+                }
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Plays the live MIDI target: the record-armed instrument track, or the one chosen in Setup › MIDI › Live MIDI Inputs.",
+                )
+                .small(),
+            );
+            return;
+        }
+        keyboard_release(app, ui.ctx());
+        let clicked = under.filter(|_| resp.clicked());
         if let Some(p) = clicked
             && let Some(cid) = crate::midi_editor::target_clip(app)
         {
@@ -313,7 +361,85 @@ fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
         }
         ui.label(egui::RichText::new("Click keys to step-enter notes into the selected MIDI clip at the insertion point.").small());
     });
+    if !open {
+        keyboard_release(app, ctx);
+    }
     app.ui.show_midi_keyboard = open;
+}
+
+/// Setup › MIDI › Live MIDI Inputs: which devices play live, the target, and a panic button.
+/// (Task 5 builds the full MIDI Devices window.)
+fn midi_inputs(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_midi_inputs;
+    if !open {
+        return;
+    }
+    let cache = egui::Id::new("soundcraft-midi-inputs");
+    win(ctx, &mut open, "Live MIDI Inputs", vec2(420.0, 260.0), |ui| {
+        // Listing creates a backend client: read on opening and on Refresh, not every frame.
+        let mut ports: Option<Vec<serde_json::Value>> = ui.ctx().data(|d| d.get_temp(cache));
+        if ports.is_none() || ui.button("Refresh").clicked() {
+            ports = app.run("midi.inputs", json!({})).ok().and_then(|v| v["ports"].as_array().cloned());
+        }
+        let ports = ports.unwrap_or_default();
+        let mut changed = false;
+        if ports.is_empty() {
+            ui.label("No MIDI input devices.");
+        }
+        for port in &ports {
+            let name = port["name"].as_str().unwrap_or_default().to_string();
+            let mut on = port["enabled"].as_bool().unwrap_or(false);
+            let open_now = port["open"].as_bool().unwrap_or(false);
+            if ui.checkbox(&mut on, format!("{name}{}", if open_now { "" } else { " (closed)" })).changed() {
+                if let Err(e) = app.run("midi.input_enable", json!({"name": name, "enabled": on})) {
+                    app.ui.status = e;
+                }
+                changed = true;
+            }
+        }
+        ui.separator();
+        let tracks: Vec<(TrackId, String)> = app
+            .engine
+            .session()
+            .tracks
+            .iter()
+            .filter(|t| matches!(t.kind, soundcraft_model::TrackKind::Instrument | soundcraft_model::TrackKind::Midi))
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        let current =
+            app.midi_target.and_then(|id| tracks.iter().find(|t| t.0 == id)).map_or("Automatic (record-armed track)".to_string(), |t| t.1.clone());
+        ui.horizontal(|ui| {
+            ui.label("Plays");
+            egui::ComboBox::from_id_salt("midi_target").selected_text(current).show_ui(ui, |ui| {
+                if ui.selectable_label(app.midi_target.is_none(), "Automatic (record-armed track)").clicked() {
+                    let _ = app.run("midi.target", json!({"track": null}));
+                }
+                for (id, name) in &tracks {
+                    if ui.selectable_label(app.midi_target == Some(*id), name).clicked() {
+                        let _ = app.run("midi.target", json!({"track": id.0}));
+                    }
+                }
+            });
+        });
+        if ui.button("Panic (all live notes off)").clicked() {
+            let _ = app.run("midi.panic", json!({}));
+        }
+        let next = if changed { None } else { Some(ports) };
+        ui.ctx().data_mut(|d| match next {
+            Some(p) => {
+                d.insert_temp(cache, p);
+            }
+            None => {
+                let _ = d.remove_temp::<Vec<serde_json::Value>>(cache);
+            }
+        });
+    });
+    if !open {
+        ctx.data_mut(|d| {
+            let _ = d.remove_temp::<Vec<serde_json::Value>>(cache);
+        });
+    }
+    app.ui.show_midi_inputs = open;
 }
 
 fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
