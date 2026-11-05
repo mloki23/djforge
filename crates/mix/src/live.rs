@@ -878,8 +878,13 @@ impl LiveMidi {
         self.owner = None;
     }
 
+    /// Whether a slot note holds `pitch`.
+    pub(crate) fn holds(&self, pitch: u8) -> bool {
+        self.held.get(usize::from(pitch)).copied().unwrap_or(false)
+    }
+
     /// Note-offs at `offset` for every note sounding.
-    fn release(&mut self, inst: &mut dyn Plugin, offset: usize) {
+    pub(crate) fn release(&mut self, inst: &mut dyn Plugin, offset: usize) {
         for (pitch, h) in self.held.iter_mut().enumerate() {
             if std::mem::take(h) {
                 inst.note_off(offset, u8::try_from(pitch).unwrap_or(0));

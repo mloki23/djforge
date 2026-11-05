@@ -63,10 +63,12 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 mod live;
+mod live_in;
 mod warp;
 pub use live::{
     ColumnPlay, LiveCmd, LivePlaying, LiveQueued, LiveStore, XFADE_S, column_of, pool_needs, pool_player_plays, slot_loops, slot_sources,
 };
+pub use live_in::{LIVE_INBOX, LiveEvent};
 use warp::WarpPlayers;
 pub use warp::{PlayerStem, PreparedWarp, SOURCE_PLAYER, WarpPlayer, WarpRoom, played_sources};
 
@@ -251,6 +253,10 @@ struct Strip {
     live_play: Option<(usize, ColumnPlay)>,
     /// An instrument column's MIDI slot notes sounding on the instrument.
     live_midi: live::LiveMidi,
+    /// Live MIDI input keys held on the instrument (see [`live_in`]).
+    live_keys: Box<live_in::LiveKeys>,
+    /// This strip is the live MIDI target, for the block being rendered.
+    live_target: bool,
     /// Total latency of the active inserts (samples).
     latency: usize,
     /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
@@ -338,6 +344,8 @@ impl Strip {
             live_store: None,
             live_play: None,
             live_midi: live::LiveMidi::default(),
+            live_keys: Box::default(),
+            live_target: false,
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -401,6 +409,12 @@ pub struct MixEngine {
     live: [ColumnPlay; MAX_LIVE_COLUMNS],
     /// The transport's loop range, while it loops.
     live_loop: Option<Range>,
+    /// Live MIDI input for the next block (see [`MixEngine::live_input`]). Never grows.
+    live_in: Vec<LiveEvent>,
+    /// The track live MIDI input plays (see [`MixEngine::set_live_target`]).
+    live_target: Option<TrackId>,
+    /// Live events refused because the inbox was full.
+    live_in_dropped: u64,
 }
 
 /// What `sync` needs to fill a slot.
@@ -496,6 +510,9 @@ impl MixEngine {
             work: Vec::new(),
             live: [ColumnPlay::default(); MAX_LIVE_COLUMNS],
             live_loop: None,
+            live_in: Vec::with_capacity(LIVE_INBOX),
+            live_target: None,
+            live_in_dropped: 0,
         }
     }
 
@@ -644,6 +661,83 @@ impl MixEngine {
                 l.clear_carry();
             }
         }
+    }
+
+    /// Queues a live MIDI event for the target's instrument in the next block (see [`live_in`]).
+    /// False (and counted, see [`MixEngine::live_dropped`]) when the inbox already holds
+    /// [`LIVE_INBOX`] events. Neither allocates nor frees: call it on the audio thread.
+    pub fn live_input(&mut self, ev: LiveEvent) -> bool {
+        if self.live_in.len() < LIVE_INBOX {
+            self.live_in.push(ev);
+            true
+        } else {
+            self.live_in_dropped = self.live_in_dropped.saturating_add(1);
+            false
+        }
+    }
+
+    /// Drops the live events queued and not yet played (nothing is listening).
+    pub fn live_discard(&mut self) {
+        self.live_in.clear();
+    }
+
+    /// Live events refused so far because the inbox was full.
+    pub fn live_dropped(&self) -> u64 {
+        self.live_in_dropped
+    }
+
+    /// The track live MIDI input plays from the next block (`None`: none). A change releases the
+    /// live keys held on the old target, and drops events queued for it.
+    pub fn set_live_target(&mut self, target: Option<TrackId>) {
+        if target == self.live_target {
+            return;
+        }
+        if let Some(old) = self.live_target {
+            self.live_in.clear();
+            let sr = self.sample_rate;
+            if let Some(st) = self.strips.get_mut(&old) {
+                release_live(st, None, sr, false);
+            }
+        }
+        self.live_target = target;
+    }
+
+    /// The live MIDI target.
+    pub fn live_target(&self) -> Option<TrackId> {
+        self.live_target
+    }
+
+    /// Releases the live keys `source` holds (a MIDI device went away), on every instrument.
+    pub fn live_release(&mut self, source: u32) {
+        let sr = self.sample_rate;
+        for st in self.strips.values_mut() {
+            release_live(st, Some(source), sr, false);
+        }
+    }
+
+    /// Releases every live key on every instrument (the transport stopped).
+    pub fn live_release_all(&mut self) {
+        let sr = self.sample_rate;
+        for st in self.strips.values_mut() {
+            release_live(st, None, sr, false);
+        }
+    }
+
+    /// MIDI panic: every live key released and the controllers reset (sustain off, then Reset All
+    /// Controllers) on the target's instrument and every instrument a live key held.
+    pub fn live_panic(&mut self) {
+        self.live_in.clear();
+        let (sr, target) = (self.sample_rate, self.live_target);
+        for (id, st) in self.strips.iter_mut() {
+            let reset = Some(*id) == target || st.live_keys.len() > 0;
+            release_live(st, None, sr, reset);
+        }
+    }
+
+    /// Something live to hear while the transport is stopped: a live MIDI target, or live notes
+    /// held or still ringing out on some instrument. The host keeps rendering while it is true.
+    pub fn live_awake(&self) -> bool {
+        self.live_target.is_some() || self.strips.values().any(|st| st.live_keys.awake())
     }
 
     /// Realtime mode: third-party plugins are created by the host and handed over with
@@ -875,8 +969,13 @@ impl MixEngine {
                 p.failed = false;
             }
             if let Some(i) = &mut s.instrument {
-                i.plugin.all_notes_off();
-                i.plugin.reset();
+                if s.live_keys.len() == 0 {
+                    i.plugin.all_notes_off();
+                    i.plugin.reset();
+                } else {
+                    // Live keys held (a play or locate while playing them) sound on.
+                    release_scheduled(i.plugin.as_mut(), &mut s.held, &mut s.live_midi, &s.live_keys);
+                }
                 i.failed = false;
             }
             s.held.clear();
@@ -947,6 +1046,8 @@ impl MixEngine {
                 cx.retire(old);
                 strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_INSTANCE, i, ich));
                 strip.sample = None;
+                // The live notes went with the old instrument.
+                strip.live_keys.forget();
             }
             sync_sample(strip, want, s);
             // A realtime host hands column storage over in a `WarpRoom`; elsewhere it is made here.
@@ -991,11 +1092,16 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
-        if pos != self.last_end {
-            // Seek: silence held notes and ringing plugins.
+        // While stopped the position stands still; nothing is scheduled there to silence.
+        if pos != self.last_end && !self.monitor_only {
+            // Seek: silence held notes and ringing plugins. Live keys sound on through it.
             for st in self.strips.values_mut() {
                 if let Some(i) = &mut st.instrument {
-                    i.plugin.all_notes_off();
+                    if st.live_keys.len() == 0 {
+                        i.plugin.all_notes_off();
+                    } else {
+                        release_scheduled(i.plugin.as_mut(), &mut st.held, &mut st.live_midi, &st.live_keys);
+                    }
                 }
                 st.held.clear();
                 st.live_midi.forget(pos);
@@ -1034,6 +1140,7 @@ impl MixEngine {
             }
             let column = if self.monitor_only { None } else { s.tracks.get(*i).and_then(|t| column_of(s, t.id)) };
             st.live_play = column.and_then(|c| Some((c, *self.live.get(c)?)));
+            st.live_target = self.live_target.is_some() && s.tracks.get(*i).map(|t| t.id) == self.live_target;
         }
         let busses = std::mem::take(&mut self.busses);
         let live_in = LiveInput {
@@ -1041,6 +1148,7 @@ impl MixEngine {
             monitor_only: self.monitor_only,
             recording: self.recording,
             wrap: self.live_loop.map(|r| (r.start, r.end)),
+            events: &self.live_in,
         };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
@@ -1150,6 +1258,7 @@ impl MixEngine {
                 monitor_only: self.monitor_only,
                 recording: self.recording,
                 wrap: self.live_loop.map(|r| (r.start, r.end)),
+                events: &[],
             };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
@@ -1218,6 +1327,8 @@ impl MixEngine {
             }
         }
         self.main_meter.measure(&self.main, frames, 0.0);
+        // Played (or, with no target strip rendered, dropped).
+        self.live_in.clear();
     }
 
     /// The delay-compensation latency written onto `bus`: the slowest track insert, plus the
@@ -1312,6 +1423,8 @@ struct LiveInput<'a> {
     recording: bool,
     /// The transport's loop range (start, end), for Live slots to restart across.
     wrap: Option<(Samples, Samples)>,
+    /// Live MIDI input for the target strip's instrument.
+    events: &'a [LiveEvent],
 }
 
 fn process_strip(
@@ -1349,7 +1462,22 @@ fn process_strip(
             }
         }
         TrackKind::Audio if live.monitor_only => {}
-        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
+        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {
+            // Stopped: only live MIDI input plays, on the target and on instruments ringing out.
+            if (strip.live_target || strip.live_keys.awake())
+                && let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed)
+            {
+                if let Some(ins) = &t.instrument {
+                    apply_params(inst, ins, t, INSTRUMENT_INSTANCE, pos);
+                }
+                inst.plugin.set_transport(&transport);
+                if strip.live_target {
+                    play_live(live.events, frames, inst.plugin.as_mut(), &mut strip.live_keys, &strip.held, &strip.live_midi, s);
+                }
+                run_instrument(inst, &mut strip.buf, &mut strip.scratch, frames, &mut strip.failures);
+            }
+            strip.live_keys.tick(frames);
+        }
         TrackKind::Audio => {
             let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
             for clip in t.clips() {
@@ -1421,44 +1549,36 @@ fn process_strip(
                 let mut split = end;
                 // A slot that stopped between blocks leaves the arrangement's controllers to chase.
                 let mut stopped = false;
+                // The arrangement and the slot never release a pitch a live key holds.
+                let sh = &mut live_in::Shield { inner: inst.plugin.as_mut(), live: &strip.live_keys };
                 if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
                     let column = live::Column { s, track: t, column: *c, wrap: None };
                     gate = column.midi_gate(play, pos, end);
-                    (split, stopped) = column.midi_head(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, end);
+                    (split, stopped) = column.midi_head(play, &mut strip.live_midi, sh, pos, end);
                 }
                 let reopen = gate.reopen().filter(|at| (pos..end).contains(at));
                 if (std::mem::take(&mut strip.chase) || stopped) && reopen != Some(pos) {
                     if gate.heard(pos) {
-                        chase_controllers(s, t, pos, 0, inst);
+                        chase_controllers(s, t, pos, 0, sh);
                     } else {
                         // Muted: the controllers wait for the slot to stop (chased there).
-                        reset_controllers(inst, 0);
+                        reset_controllers(sh, 0);
                     }
                 }
                 if let Some(at) = reopen {
-                    chase_controllers(s, t, at, usize::try_from(at - pos).unwrap_or(0), inst);
+                    chase_controllers(s, t, at, usize::try_from(at - pos).unwrap_or(0), sh);
                 }
-                schedule_notes(s, t, pos, frames, inst, &mut strip.held, gate);
+                schedule_notes(s, t, pos, frames, sh, &mut strip.held, gate);
                 if let Some((c, play)) = strip.live_play.as_mut().filter(|_| !live.monitor_only) {
-                    live::Column { s, track: t, column: *c, wrap: None }.midi_tail(play, &mut strip.live_midi, inst.plugin.as_mut(), pos, split, end);
+                    live::Column { s, track: t, column: *c, wrap: None }.midi_tail(play, &mut strip.live_midi, sh, pos, split, end);
                     midi_live = true;
                 }
-                if strip.buf.len() >= 2 {
-                    inst.plugin.process(&mut strip.buf, frames);
-                } else if let Some(c0) = strip.buf.first_mut() {
-                    // Mono MIDI track: render the instrument in stereo and fold.
-                    let mut st = [std::mem::take(c0), std::mem::take(&mut strip.scratch)];
-                    inst.plugin.process(&mut st, frames);
-                    let [a, b] = st;
-                    *c0 = a;
-                    strip.scratch = b;
-                    for (x, y) in c0.iter_mut().zip(strip.scratch.iter()).take(frames) {
-                        *x = 0.5 * (*x + *y);
-                    }
+                // Live input last: on a shared sample, the others' releases come first.
+                if strip.live_target {
+                    play_live(live.events, frames, inst.plugin.as_mut(), &mut strip.live_keys, &strip.held, &strip.live_midi, s);
                 }
-                if contain_failure(inst, &mut strip.buf, frames) {
-                    strip.failures.record(INSTRUMENT_INSTANCE);
-                }
+                strip.live_keys.tick(frames);
+                run_instrument(inst, &mut strip.buf, &mut strip.scratch, frames, &mut strip.failures);
             }
         }
         _ => {}
@@ -1546,6 +1666,76 @@ fn process_strip(
                 *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1));
             }
         }
+    }
+}
+
+/// Renders one block of an instrument into `buf` (a mono strip folds the stereo output) and
+/// contains a failure.
+fn run_instrument(inst: &mut PluginSlot, buf: &mut [Vec<f32>], scratch: &mut Vec<f32>, frames: usize, failures: &mut PluginFailures) {
+    if buf.len() >= 2 {
+        inst.plugin.process(buf, frames);
+    } else if let Some(c0) = buf.first_mut() {
+        // Mono MIDI track: render the instrument in stereo and fold.
+        let mut st = [std::mem::take(c0), std::mem::take(scratch)];
+        inst.plugin.process(&mut st, frames);
+        let [a, b] = st;
+        *c0 = a;
+        *scratch = b;
+        for (x, y) in c0.iter_mut().zip(scratch.iter()).take(frames) {
+            *x = 0.5 * (*x + *y);
+        }
+    }
+    if contain_failure(inst, buf, frames) {
+        failures.record(INSTRUMENT_INSTANCE);
+    }
+}
+
+/// Sends the block's live MIDI input to the target's instrument, after the arrangement and the
+/// slot (`held`, `midi`: the pitches they hold, whose live releases wait for theirs).
+fn play_live(
+    events: &[LiveEvent],
+    frames: usize,
+    inst: &mut dyn Plugin,
+    keys: &mut live_in::LiveKeys,
+    held: &[u8],
+    midi: &live::LiveMidi,
+    s: &Session,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let last = frames.saturating_sub(1);
+    for ev in events {
+        keys.play(LiveEvent { offset: ev.offset.min(last), ..*ev }, inst, |p| held.contains(&p) || midi.holds(p));
+    }
+    keys.wake(live_in::LiveKeys::ring_len(s.sample_rate.as_f64() as f32, inst));
+}
+
+/// The arrangement's and the slot's notes released on an instrument a live key plays (a seek or
+/// a play): the live keys' pitches sound on.
+fn release_scheduled(inst: &mut dyn Plugin, held: &mut Vec<u8>, midi: &mut live::LiveMidi, live: &live_in::LiveKeys) {
+    let sh = &mut live_in::Shield { inner: inst, live };
+    for p in held.drain(..) {
+        sh.note_off(0, p);
+    }
+    midi.release(sh, 0);
+}
+
+/// Releases `source`'s live keys (every source's with `None`) at the start of the strip's next
+/// block, and with `reset` resets its controllers. Its releases keep it rendering while stopped.
+fn release_live(st: &mut Strip, source: Option<u32>, sr: f32, reset: bool) {
+    let Some(inst) = st.instrument.as_mut() else {
+        st.live_keys.forget();
+        return;
+    };
+    let had = st.live_keys.len() > 0;
+    let (held, midi) = (&st.held, &st.live_midi);
+    st.live_keys.release(source, inst.plugin.as_mut(), 0, |p| held.contains(&p) || midi.holds(p));
+    if reset {
+        reset_controllers(inst.plugin.as_mut(), 0);
+    }
+    if had || reset {
+        st.live_keys.wake(live_in::LiveKeys::ring_len(sr, inst.plugin.as_ref()));
     }
 }
 
@@ -2077,7 +2267,7 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
 /// Send note on/offs and controllers for MIDI clips overlapping the block, where `gate` hears
 /// them: none start (and no controllers are sent) while a Live slot mutes them, and the notes
 /// sounding where it starts are released there.
-fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>, gate: live::ArrGate) {
+fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut dyn Plugin, held: &mut Vec<u8>, gate: live::ArrGate) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
     // the block looks that far back into the clips.
@@ -2089,7 +2279,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
     if let Some(x) = cut {
         let at = usize::try_from(x - pos).unwrap_or(0);
         for p in held.drain(..) {
-            inst.plugin.note_off(at, p);
+            inst.note_off(at, p);
         }
         // No pedal or bend of the arrangement's carries into the slot.
         reset_controllers(inst, at);
@@ -2127,7 +2317,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 continue;
             }
             if on >= pos && on < end && gate.heard(on) {
-                inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
+                inst.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
                 if !held.contains(&n.pitch) && held.len() < 128 {
                     held.push(n.pitch);
                 }
@@ -2138,7 +2328,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 _ => off,
             };
             if off >= pos && off < end && (gate.heard(off) || Some(off) == cut) {
-                inst.plugin.note_off(usize::try_from(off - pos).unwrap_or(0), n.pitch);
+                inst.note_off(usize::try_from(off - pos).unwrap_or(0), n.pitch);
                 held.retain(|p| *p != n.pitch);
             }
         }
@@ -2152,7 +2342,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             }
             let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
             if at >= pos && at < end && at < clip.end() && gate.heard(at) {
-                inst.plugin.midi(usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
+                inst.midi(usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
             }
         }
     }
@@ -2175,15 +2365,15 @@ fn ctrl_message(kind: CtrlKind, value: i32, transpose: i64) -> [u8; 3] {
 }
 
 /// Sustain off, then every controller reset, at `offset` in the block.
-fn reset_controllers(inst: &mut PluginSlot, offset: usize) {
-    inst.plugin.midi(offset, [0xB0, 64, 0]);
-    inst.plugin.midi(offset, [0xB0, 121, 0]);
+fn reset_controllers(inst: &mut dyn Plugin, offset: usize) {
+    inst.midi(offset, [0xB0, 64, 0]);
+    inst.midi(offset, [0xB0, 121, 0]);
 }
 
 /// Before an instrument plays from `pos` (at `offset` in the block): reset its controllers, then
 /// send each one the last value it had on this track before `pos`.
-fn chase_controllers(s: &Session, t: &Track, pos: Samples, offset: usize, inst: &mut PluginSlot) {
-    inst.plugin.midi(offset, [0xB0, 121, 0]);
+fn chase_controllers(s: &Session, t: &Track, pos: Samples, offset: usize, inst: &mut dyn Plugin) {
+    inst.midi(offset, [0xB0, 121, 0]);
     let pos = pos.saturating_sub(midi_offset(s, t));
     const BEND: usize = 128;
     const PRESSURE: usize = 129;
@@ -2222,7 +2412,7 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, offset: usize, inst: 
             n => CtrlKind::Cc(u8::try_from(n).unwrap_or(0)),
         };
         if at != i64::MIN {
-            inst.plugin.midi(offset, ctrl_message(kind, value, 0));
+            inst.midi(offset, ctrl_message(kind, value, 0));
         }
     }
 }

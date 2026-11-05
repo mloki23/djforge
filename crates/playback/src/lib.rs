@@ -24,14 +24,17 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod devices;
+pub mod midi_in;
 pub mod record;
 
 pub use devices::AudioConfig;
+pub use midi_in::{KEYBOARD_SOURCE, MIDI_SLACK_NS, PENDING as MIDI_PENDING};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
+use soundcraft_midi_io::{MidiClock, MidiMessage, PortId, Subscriber};
 use soundcraft_mix::{
-    ColumnPlay, LiveCmd, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold,
-    main_channels,
+    ColumnPlay, LiveCmd, LiveEvent, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom,
+    itu_stereo_fold, main_channels,
 };
 use soundcraft_model::{MAX_LIVE_COLUMNS, Session, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
@@ -85,6 +88,36 @@ enum Cmd {
     Locate(Samples),
     /// A Live slot launch or stop at its sample (see [`Player::live`]).
     Live(LiveCmd),
+    /// Live MIDI input: the queue to drain and the clock its events are stamped on. The one it
+    /// replaces goes back to be dropped off the audio thread.
+    MidiIn(Option<(Subscriber, MidiClock)>),
+    /// The track live MIDI plays (see [`Player::set_midi_target`]).
+    MidiTarget(Option<TrackId>),
+    /// A MIDI port's device went away: release its live keys.
+    MidiClosed(PortId),
+    /// All live notes off and the controllers reset.
+    MidiPanic,
+    /// A message from the on-screen keyboard, played at the next block's start.
+    MidiPlay(MidiMessage),
+}
+
+/// Live MIDI figures the audio thread publishes, and what the player last sent it.
+#[derive(Default)]
+struct MidiShared {
+    /// The live latency `L` (see [`midi_in`]).
+    latency_ns: AtomicU64,
+    /// Live events dropped (full pending buffer or engine inbox).
+    dropped: AtomicU64,
+    /// The target last sent (`u64::MAX`: none), so an unchanged target is not resent.
+    target: AtomicU64,
+    /// A MIDI input queue was handed to this player's audio thread.
+    has_input: AtomicBool,
+}
+
+impl MidiShared {
+    fn new() -> MidiShared {
+        MidiShared { target: AtomicU64::new(u64::MAX), ..MidiShared::default() }
+    }
 }
 
 struct Shared {
@@ -95,6 +128,7 @@ struct Shared {
     meters: Mutex<MeterSnapshot>,
     /// What each Live column plays and has queued, published by the audio thread.
     live: LiveShared,
+    midi: MidiShared,
 }
 
 /// What a Live column plays and has queued, as [`Player::live_state`] reads it.
@@ -291,6 +325,10 @@ struct AudioState {
     room_backlog: Option<WarpRoom>,
     /// The Live state last published to [`Shared::live`].
     live_seen: [ColumnPlay; MAX_LIVE_COLUMNS],
+    /// Live MIDI input.
+    midi: midi_in::MidiIn,
+    /// A replaced MIDI queue the full `subs` channel refused, sent again on the next callback.
+    sub_backlog: Option<Subscriber>,
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -302,6 +340,8 @@ struct Bin {
     /// Replaced warp tables and retired lists (with the players that no longer play). Bounded:
     /// see [`ROOMS`].
     rooms: SyncSender<WarpRoom>,
+    /// Replaced MIDI input queues (dropping one may free it). Bounded: sending never allocates.
+    subs: SyncSender<Subscriber>,
 }
 
 /// The UI-thread ends of a [`Bin`].
@@ -310,14 +350,19 @@ struct BinRx {
     warps: Receiver<Vec<WarpPlayer>>,
     batches: Receiver<Vec<PreparedWarp>>,
     rooms: Receiver<WarpRoom>,
+    subs: Receiver<Subscriber>,
 }
+
+/// Replaced MIDI queues in flight back to the UI thread.
+const SUBS: usize = 8;
 
 fn bin() -> (Bin, BinRx) {
     let (ptx, prx) = channel();
     let (wtx, wrx) = channel();
     let (btx, brx) = channel();
     let (rtx, rrx) = sync_channel(ROOMS);
-    (Bin { plugins: ptx, warps: wtx, batches: btx, rooms: rtx }, BinRx { plugins: prx, warps: wrx, batches: brx, rooms: rrx })
+    let (stx, srx) = sync_channel(SUBS);
+    (Bin { plugins: ptx, warps: wtx, batches: btx, rooms: rtx, subs: stx }, BinRx { plugins: prx, warps: wrx, batches: brx, rooms: rrx, subs: srx })
 }
 
 /// Most clips whose warp players are built per [`Player::update_session`] call (nearest the
@@ -388,6 +433,8 @@ impl AudioState {
             input: None,
             recording: false,
             live_seen: [ColumnPlay::default(); MAX_LIVE_COLUMNS],
+            midi: midi_in::MidiIn::new(),
+            sub_backlog: None,
         }
     }
 
@@ -455,7 +502,23 @@ impl AudioState {
                     self.read = 0.0;
                     self.mix.reset();
                 }
+                Cmd::MidiIn(sub) => {
+                    let old = self.midi.replace(sub);
+                    if let Some(old) = old {
+                        self.return_sub(old);
+                    }
+                }
+                Cmd::MidiTarget(t) => self.mix.set_live_target(t),
+                Cmd::MidiClosed(port) => self.mix.live_release(port.0),
+                Cmd::MidiPanic => self.mix.live_panic(),
+                Cmd::MidiPlay(msg) => {
+                    if self.mix.live_target().is_some() {
+                        self.mix.live_input(LiveEvent { source: midi_in::KEYBOARD_SOURCE, offset: 0, msg: midi_in::raw(msg) });
+                    }
+                }
                 Cmd::Stop => {
+                    // The transport stopped: live keys are released too.
+                    self.mix.live_release_all();
                     self.mix.live_clear();
                     self.playing = false;
                     self.end = None;
@@ -514,6 +577,29 @@ impl AudioState {
         }
     }
 
+    /// Sends a replaced MIDI queue back to be dropped on the UI thread, without allocating; one
+    /// the full channel refuses waits for the next callback (only when one already waits is a
+    /// queue dropped here, as a last resort).
+    fn return_sub(&mut self, sub: Subscriber) {
+        self.flush_subs();
+        match self.garbage.subs.try_send(sub) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(sub)) => {
+                if self.sub_backlog.is_none() {
+                    self.sub_backlog = Some(sub);
+                }
+            }
+        }
+    }
+
+    fn flush_subs(&mut self) {
+        if let Some(sub) = self.sub_backlog.take()
+            && let Err(TrySendError::Full(sub)) = self.garbage.subs.try_send(sub)
+        {
+            self.sub_backlog = Some(sub);
+        }
+    }
+
     /// Sends the room waiting from an earlier callback, if the channel has room now.
     fn flush_rooms(&mut self) {
         if let Some(room) = self.room_backlog.take()
@@ -533,6 +619,7 @@ impl AudioState {
 
     fn send_garbage(&mut self) {
         self.flush_rooms();
+        self.flush_subs();
         let g = self.mix.take_retired();
         if !g.is_empty() {
             let _ = self.garbage.plugins.send(g);
@@ -558,6 +645,7 @@ impl AudioState {
             if self.pos >= e {
                 self.playing = false;
                 self.end = None;
+                self.mix.live_release_all();
                 self.mix.live_clear();
                 self.shared.playing.store(false, Ordering::Relaxed);
                 n = 0;
@@ -581,7 +669,13 @@ impl AudioState {
         }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
+        if self.mix.live_target().is_some() {
+            self.midi.feed(&mut self.mix, n);
+        } else {
+            self.midi.discard();
+        }
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.shared.midi.dropped.store(self.midi.dropped.saturating_add(self.mix.live_dropped()), Ordering::Relaxed);
         self.send_garbage();
         self.pending_len = n;
         if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -603,11 +697,22 @@ impl AudioState {
 
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
+        let now = self.midi.now_ns();
+        self.fill_at(out, channels, now);
+    }
+
+    /// [`AudioState::fill`] for a callback starting at `now_ns` on the MIDI clock.
+    fn fill_at(&mut self, out: &mut [f32], channels: usize, now_ns: u64) {
         // The longest callback, in session samples, for the UI's launch margin.
         let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
-        let span = ((out.len() / channels.max(1)) as f64 * step - 1e-6).ceil() as i64;
+        let frames = out.len() / channels.max(1);
+        let span = (frames as f64 * step - 1e-6).ceil() as i64;
         self.shared.live.max_callback.fetch_max(span, Ordering::Relaxed);
+        // Live MIDI: this callback's time, length and rate (session samples a second).
+        let span_ns = (frames as f64 / self.device_rate.max(1.0) * 1e9) as u64;
+        self.midi.begin(now_ns, span_ns, self.device_rate * step);
+        self.shared.midi.latency_ns.store(self.midi.latency_ns, Ordering::Relaxed);
         self.fill_block(out, channels);
         // What the Live columns play, for the UI: published only when it changed.
         if self.mix.live_state() != self.live_seen.as_slice() {
@@ -621,8 +726,12 @@ impl AudioState {
     fn fill_block(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let monitoring =
+            (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)) || self.mix.live_awake();
         if !self.playing && !monitoring {
+            // Nothing plays live MIDI: what arrived is dropped rather than kept for later.
+            self.midi.discard();
+            self.mix.live_discard();
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 m.main = StripMeter::default();
@@ -754,6 +863,7 @@ impl Side {
         self.garbage.warps.try_iter().for_each(drop);
         self.garbage.batches.try_iter().for_each(drop);
         self.garbage.rooms.try_iter().for_each(drop);
+        self.garbage.subs.try_iter().for_each(drop);
         if let Some(rx) = &self.old_sessions {
             rx.try_iter().for_each(drop);
         }
@@ -845,6 +955,7 @@ impl Player {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
@@ -923,6 +1034,7 @@ impl Player {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let side_rate = session.sample_rate.as_f64() as f32;
         let (tx, rx) = channel();
@@ -1103,6 +1215,59 @@ impl Player {
     /// of its sample to be heard from its start.
     pub fn max_callback_samples(&self) -> Samples {
         self.shared.live.max_callback.load(Ordering::Relaxed)
+    }
+
+    /// Hands the audio thread the MIDI input queue to play live (events stamped on `clock`),
+    /// replacing any earlier one, which comes back to be dropped by [`Player::idle`]. `None`
+    /// takes it away.
+    pub fn set_midi_input(&self, input: Option<(Subscriber, MidiClock)>) {
+        self.shared.midi.has_input.store(input.is_some(), Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::MidiIn(input));
+    }
+
+    /// Whether this player has a MIDI input queue (a new player needs one).
+    pub fn has_midi_input(&self) -> bool {
+        self.shared.midi.has_input.load(Ordering::Relaxed)
+    }
+
+    /// The track live MIDI input plays (`None`: none). A change releases the live notes held on
+    /// the old target. Unchanged targets are not resent.
+    pub fn set_midi_target(&self, target: Option<TrackId>) {
+        let v = target.map_or(u64::MAX, |t| t.0);
+        if self.shared.midi.target.swap(v, Ordering::Relaxed) != v {
+            let _ = self.tx.send(Cmd::MidiTarget(target));
+        }
+    }
+
+    /// The live MIDI target last set.
+    pub fn midi_target(&self) -> Option<TrackId> {
+        let v = self.shared.midi.target.load(Ordering::Relaxed);
+        (v != u64::MAX).then_some(TrackId(v))
+    }
+
+    /// A MIDI port's device went away (`PortChange::Closed`): its live notes are released.
+    pub fn midi_port_closed(&self, port: PortId) {
+        let _ = self.tx.send(Cmd::MidiClosed(port));
+    }
+
+    /// MIDI panic: every live note off and the controllers reset.
+    pub fn midi_panic(&self) {
+        let _ = self.tx.send(Cmd::MidiPanic);
+    }
+
+    /// Plays one message from the on-screen keyboard on the target at the next block.
+    pub fn play_midi(&self, msg: MidiMessage) {
+        let _ = self.tx.send(Cmd::MidiPlay(msg));
+    }
+
+    /// The live MIDI latency `L`: the longest callback plus [`MIDI_SLACK_NS`] (see [`midi_in`]).
+    pub fn midi_latency_ns(&self) -> u64 {
+        self.shared.midi.latency_ns.load(Ordering::Relaxed)
+    }
+
+    /// Live MIDI events dropped so far (the pending buffer or the engine's inbox was full).
+    pub fn midi_dropped(&self) -> u64 {
+        self.shared.midi.dropped.load(Ordering::Relaxed)
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
@@ -1473,6 +1638,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1515,6 +1681,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -1534,6 +1701,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -1560,6 +1728,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, bin().0);
@@ -1594,6 +1763,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1646,6 +1816,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1692,6 +1863,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, bin().0);
@@ -1746,6 +1918,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1806,6 +1979,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -1979,6 +2153,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         (tx, AudioState::new(rx, shared, Arc::new(Session::default()), 48_000.0, gtx))
@@ -2094,6 +2269,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, bin().0);
@@ -2184,6 +2360,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
@@ -2214,6 +2391,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, bin().0);
@@ -2250,6 +2428,7 @@ mod tests {
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
                 live: LiveShared::default(),
+                midi: MidiShared::new(),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
@@ -2281,6 +2460,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, bin().0);
@@ -2344,6 +2524,7 @@ mod live_state_tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             live: LiveShared::default(),
+            midi: MidiShared::new(),
         });
         // A 44.1 kHz device under a 48 kHz session: 441 frames are 480 session samples.
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 44_100.0, bin().0);
@@ -2357,5 +2538,338 @@ mod live_state_tests {
         st.fill(&mut vec![0.0f32; 2 * 441], 2);
         assert_eq!(shared.live.read()[0].late, 1);
         assert_eq!(shared.live.read()[0].playing.map(|p| p.1), Some(10), "on the grid from its own sample");
+    }
+}
+
+/// Live MIDI input through the audio thread, from a [`soundcraft_midi_io::FakeSource`] (no real
+/// ports): timing against the callback and `L`, the pending buffer, per-port order, releases,
+/// bursts, and the queue's return off the audio thread.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod midi_tests {
+    use super::*;
+    use soundcraft_midi_io::{FakeSource, MidiEvent, MidiSource, PortChange};
+    use soundcraft_mix::INSTRUMENT_INSTANCE;
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Ev {
+        On(u8),
+        Off(u8),
+        AllOff,
+        Midi([u8; 3]),
+    }
+
+    /// Logs (block it was sent for, offset, event).
+    type Log = Arc<Mutex<Vec<(u64, usize, Ev)>>>;
+
+    struct Recorder {
+        inner: Box<dyn Plugin>,
+        log: Log,
+        blocks: u64,
+    }
+
+    impl Recorder {
+        fn push(&self, offset: usize, e: Ev) {
+            self.log.lock().unwrap().push((self.blocks, offset, e));
+        }
+    }
+
+    impl Plugin for Recorder {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {}
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {
+            self.blocks += 1;
+        }
+        fn note_on(&mut self, offset: usize, note: u8, _velocity: u8) {
+            self.push(offset, Ev::On(note));
+        }
+        fn note_off(&mut self, offset: usize, note: u8) {
+            self.push(offset, Ev::Off(note));
+        }
+        fn all_notes_off(&mut self) {
+            self.push(0, Ev::AllOff);
+        }
+        fn midi(&mut self, offset: usize, msg: [u8; 3]) {
+            self.push(offset, Ev::Midi(msg));
+        }
+    }
+
+    /// 256-frame callbacks at 48 kHz on a 48 kHz session: one 256-sample block each.
+    const CB: usize = 256;
+    const CB_NS: u64 = 5_333_333;
+
+    struct Rig {
+        tx: Sender<Cmd>,
+        st: AudioState,
+        shared: Arc<Shared>,
+        grx: BinRx,
+        log: Log,
+        track: TrackId,
+        src: FakeSource,
+        /// A second queue on the same source: once it has an event, so has the audio thread.
+        probe: Subscriber,
+        clock: MidiClock,
+        /// The next callback's time.
+        now: u64,
+    }
+
+    fn rig() -> Rig {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.rec"));
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
+            midi: MidiShared::new(),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let rec = Recorder { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log), blocks: 0 };
+        tx.send(session_cmd(
+            Arc::new(s),
+            vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }],
+            Vec::new(),
+        ))
+        .unwrap();
+        let clock = MidiClock::new();
+        let mut src = FakeSource::new(clock).unwrap();
+        src.plug("Keys");
+        src.plug("Pads");
+        src.open("Keys").unwrap();
+        src.open("Pads").unwrap();
+        tx.send(Cmd::MidiIn(Some((src.subscribe(4096).unwrap(), clock)))).unwrap();
+        tx.send(Cmd::MidiTarget(Some(t))).unwrap();
+        let probe = src.subscribe(4096).unwrap();
+        Rig { tx, st, shared, grx, log, track: t, src, probe, clock, now: 1_000_000_000 }
+    }
+
+    impl Rig {
+        /// One callback at `self.now`, then the clock moves on a callback.
+        fn callback(&mut self) {
+            let mut out = vec![0.0f32; CB * 2];
+            self.st.fill_at(&mut out, 2, self.now);
+            self.now += CB_NS;
+        }
+
+        /// Waits until the router has delivered `n` more events.
+        fn delivered(&mut self, n: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = 0;
+            while seen < n {
+                if self.probe.pop().is_some() {
+                    seen += 1;
+                } else {
+                    assert!(std::time::Instant::now() < deadline, "never delivered");
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        /// Sends `msg` from port `name` stamped `t`, and waits until the router delivered it.
+        fn send(&mut self, name: &str, msg: MidiMessage, t: u64) {
+            assert!(self.src.inject(name, msg, t));
+            self.delivered(1);
+        }
+
+        fn log(&self) -> Vec<(u64, usize, Ev)> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn notes(&self) -> Vec<(u64, usize, Ev)> {
+            self.log().into_iter().filter(|e| matches!(e.2, Ev::On(_) | Ev::Off(_))).collect()
+        }
+
+        /// Pitches still sounding.
+        fn sounding(&self) -> Vec<u8> {
+            let mut on = [false; 128];
+            let mut log = self.log();
+            log.sort_by_key(|e| (e.0, e.1));
+            for (_, _, e) in log {
+                match e {
+                    Ev::On(p) => on[usize::from(p)] = true,
+                    Ev::Off(p) => on[usize::from(p)] = false,
+                    Ev::AllOff => on = [false; 128],
+                    Ev::Midi(_) => {}
+                }
+            }
+            (0..128u8).filter(|p| on[usize::from(*p)]).collect()
+        }
+    }
+
+    fn note_on(note: u8) -> MidiMessage {
+        MidiMessage::NoteOn { ch: 0, note, vel: 100 }
+    }
+
+    fn note_off(note: u8) -> MidiMessage {
+        MidiMessage::NoteOff { ch: 0, note, vel: 0 }
+    }
+
+    /// The sample an event stamped `t` lands on, counted from the start of the callback at `now`.
+    fn expected(t: u64, now: u64) -> i64 {
+        let l = CB_NS + MIDI_SLACK_NS;
+        ((t + l) as i64 - now as i64) * 48 / 1_000_000
+    }
+
+    #[test]
+    fn a_note_on_lands_l_after_it_arrived_and_a_later_one_waits_for_its_block() {
+        let mut r = rig();
+        r.callback();
+        assert_eq!(r.shared.midi.latency_ns.load(Ordering::Relaxed), CB_NS + MIDI_SLACK_NS, "L: one callback plus 2 ms");
+        // Arrived 4 ms before this callback: due 3.33 ms into it.
+        let t = r.now - 4_000_000;
+        r.send("Keys", note_on(60), t);
+        let at = expected(t, r.now);
+        assert!((0..CB as i64).contains(&at));
+        r.callback();
+        let got = r.notes();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].2, Ev::On(60));
+        assert!((got[0].1 as i64 - at).abs() <= 1, "offset {} for {at}", got[0].1);
+        let block = got[0].0;
+        // Arrived 1 ms before the callback: due 6.33 ms in, past this 5.33 ms block.
+        let t = r.now - 1_000_000;
+        r.send("Keys", note_off(60), t);
+        r.callback();
+        assert_eq!(r.notes().len(), 1, "waits");
+        let next = expected(t, r.now);
+        r.callback();
+        let got = r.notes();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got[1].0, got[1].2), (block + 2, Ev::Off(60)));
+        assert!((got[1].1 as i64 - next).abs() <= 1, "offset {} for {next}", got[1].1);
+        // Late (arrived long ago): the block's start.
+        let t = r.now - 50_000_000;
+        r.send("Keys", note_on(62), t);
+        r.callback();
+        assert_eq!(r.notes().last().map(|e| (e.1, e.2)), Some((0, Ev::On(62))));
+    }
+
+    /// A port's events never overtake each other: one stamped earlier than the event waiting
+    /// before it waits behind it and plays after it; another port's goes on its own time.
+    #[test]
+    fn each_ports_events_keep_their_order() {
+        let mut r = rig();
+        r.callback();
+        let now = r.now;
+        r.send("Keys", note_on(60), now + 2_000_000);
+        r.send("Keys", note_on(61), now - 4_000_000);
+        r.send("Pads", note_on(70), now - 4_000_000);
+        r.callback();
+        assert_eq!(r.notes().iter().map(|e| e.2).collect::<Vec<_>>(), [Ev::On(70)], "the 61 of Keys waits behind its 60");
+        r.callback();
+        r.callback();
+        let got = r.notes();
+        assert_eq!(got.iter().map(|e| e.2).collect::<Vec<_>>(), [Ev::On(70), Ev::On(60), Ev::On(61)]);
+        assert_eq!(got[1].0, got[2].0, "in one block");
+        assert!(got[2].1 >= got[1].1, "never before the one ahead of it: {got:?}");
+    }
+
+    #[test]
+    fn no_note_is_left_sounding_after_a_target_change_a_stop_a_panic_or_an_unplug() {
+        let mut r = rig();
+        r.callback();
+        let held = |r: &mut Rig, n: u8| {
+            let t = r.now - 4_000_000;
+            r.send("Keys", note_on(n), t);
+            r.callback();
+            assert_eq!(r.sounding(), [n]);
+        };
+        held(&mut r, 60);
+        r.tx.send(Cmd::MidiTarget(None)).unwrap();
+        r.callback();
+        assert_eq!(r.sounding(), Vec::<u8>::new(), "target change");
+        r.tx.send(Cmd::MidiTarget(Some(r.track))).unwrap();
+        held(&mut r, 61);
+        r.tx.send(Cmd::Stop).unwrap();
+        r.callback();
+        assert_eq!(r.sounding(), Vec::<u8>::new(), "stop");
+        held(&mut r, 62);
+        r.tx.send(Cmd::MidiPanic).unwrap();
+        r.callback();
+        assert_eq!(r.sounding(), Vec::<u8>::new(), "panic");
+        assert!(r.log().iter().any(|e| e.2 == Ev::Midi([0xB0, 121, 0])), "controllers reset");
+        held(&mut r, 63);
+        assert!(r.src.unplug("Keys"));
+        let closed: Vec<PortId> =
+            r.src.refresh().into_iter().filter_map(|c| if let PortChange::Closed { port, .. } = c { Some(port) } else { None }).collect();
+        assert_eq!(closed.len(), 1);
+        r.tx.send(Cmd::MidiClosed(closed[0])).unwrap();
+        r.callback();
+        assert_eq!(r.sounding(), Vec::<u8>::new(), "unplugged");
+    }
+
+    /// A stopped transport with a target renders the target instrument; the on-screen
+    /// keyboard's notes play there too.
+    #[test]
+    fn the_keyboard_plays_the_target_while_stopped() {
+        let mut r = rig();
+        r.tx.send(Cmd::MidiPlay(note_on(64))).unwrap();
+        r.callback();
+        r.tx.send(Cmd::MidiPlay(note_off(64))).unwrap();
+        r.callback();
+        assert_eq!(r.notes().iter().map(|e| (e.1, e.2)).collect::<Vec<_>>(), [(0, Ev::On(64)), (0, Ev::Off(64))]);
+        // No target: nothing plays, and nothing piles up.
+        r.tx.send(Cmd::MidiTarget(None)).unwrap();
+        r.tx.send(Cmd::MidiPlay(note_on(65))).unwrap();
+        r.callback();
+        assert_eq!(r.notes().len(), 2);
+    }
+
+    /// A burst of 1000 events in one block plays without a panic; 1000 more for later fill the
+    /// pending buffer, which never grows: the rest are dropped and counted, a note-off excepted.
+    #[test]
+    fn a_burst_of_a_thousand_events_is_played_or_dropped_and_counted() {
+        let mut r = rig();
+        r.callback();
+        let now = r.now;
+        for i in 0..1000u32 {
+            let msg = MidiMessage::ControlChange { ch: 0, cc: 1, value: (i % 128) as u8 };
+            assert!(r.src.inject("Keys", msg, now - 4_000_000));
+        }
+        r.delivered(1000);
+        r.callback();
+        assert_eq!(r.log().iter().filter(|e| matches!(e.2, Ev::Midi([0xB0, 1, _]))).count(), 1000);
+        assert_eq!(r.shared.midi.dropped.load(Ordering::Relaxed), 0);
+        // A burst due a second from now, from Pads, ending with a note-off.
+        let later = r.now + 1_000_000_000;
+        for i in 0..1000u32 {
+            let msg = if i == 999 { note_off(60) } else { MidiMessage::ControlChange { ch: 0, cc: 2, value: 0 } };
+            assert!(r.src.inject("Pads", msg, later));
+        }
+        r.delivered(1000);
+        r.callback();
+        assert_eq!(r.st.midi.pending_len(), (MIDI_PENDING, MIDI_PENDING), "full, and never grown");
+        assert_eq!(r.shared.midi.dropped.load(Ordering::Relaxed), 1000 - MIDI_PENDING as u64);
+        assert!(r.st.midi.pending_any(|e: &MidiEvent| matches!(e.msg, MidiMessage::NoteOff { .. })), "the note-off kept its place");
+    }
+
+    #[test]
+    fn a_replaced_queue_comes_back_off_the_audio_thread() {
+        let mut r = rig();
+        r.callback();
+        assert!(r.grx.subs.try_recv().is_err());
+        r.tx.send(Cmd::MidiIn(Some((r.src.subscribe(16).unwrap(), r.clock)))).unwrap();
+        r.callback();
+        assert!(r.grx.subs.try_recv().is_ok(), "the old queue came back to be dropped here");
+        r.tx.send(Cmd::MidiIn(None)).unwrap();
+        r.callback();
+        assert!(r.grx.subs.try_recv().is_ok());
     }
 }

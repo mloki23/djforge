@@ -1,0 +1,270 @@
+//! Live MIDI input on the audio thread: placing timed events in the blocks rendered.
+//!
+//! **Timing.** Events are stamped on a [`MidiClock`] when they arrive. At the start of each
+//! audio callback the clock is read (`callback_ns`), and an event sounds `L` after it arrived:
+//! at session sample `(time_ns + L − callback_ns) · rate` from the first sample rendered in that
+//! callback (`rate`: session samples per second at the current speed). `L` is the longest device
+//! callback seen plus [`MIDI_SLACK_NS`]: an event arrives during the callback before the one that
+//! plays it, so with `L` one callback long it lands at a steady delay instead of on the next
+//! block boundary (jitter-free), and the slack absorbs callback-start jitter. `L` is reported by
+//! [`crate::Player::midi_latency_ns`]. Events whose sample is already past go at the block's
+//! start.
+//!
+//! **Pending.** An event due after the block being rendered waits in a fixed buffer of
+//! [`PENDING`] events for a later block. When the buffer is full the new event is dropped and
+//! counted, except a note-off, which takes the place of the newest pending event that is not a
+//! note-off (that one is dropped and counted instead), so a full buffer never strands a note.
+//!
+//! **Order.** Events of one port come in order, and never overtake each other: once an event of
+//! a port waits, the port's later events wait behind it, and offsets are clamped to be
+//! non-decreasing per port within a block. Different ports are independent.
+
+use soundcraft_midi_io::{MidiClock, MidiEvent, MidiMessage, PortId, Subscriber};
+use soundcraft_mix::{LiveEvent, MixEngine};
+
+/// Added to the longest callback to make the live MIDI latency `L` (2 ms).
+pub const MIDI_SLACK_NS: u64 = 2_000_000;
+
+/// Events that can wait for a later block.
+pub const PENDING: usize = 256;
+
+/// The live-event source id of the on-screen keyboard (no MIDI port uses it).
+pub const KEYBOARD_SOURCE: u32 = u32::MAX;
+
+/// Ports tracked per block for ordering; events of further ports are ordered conservatively.
+const PORTS: usize = 16;
+
+/// The MIDI input's state on the audio thread.
+pub(crate) struct MidiIn {
+    pub(crate) sub: Option<Subscriber>,
+    clock: MidiClock,
+    pending: Vec<MidiEvent>,
+    /// The current callback's start on the clock.
+    callback_ns: u64,
+    /// Session samples rendered since the callback started.
+    rendered: i64,
+    /// Session samples per nanosecond at the current speed.
+    per_ns: f64,
+    /// The live latency `L`.
+    pub(crate) latency_ns: u64,
+    /// Events dropped from the full pending buffer.
+    pub(crate) dropped: u64,
+}
+
+/// Per-port bookkeeping for one block: last offset emitted, and the ports whose events wait.
+struct Order {
+    last: [(PortId, usize); PORTS],
+    nlast: usize,
+    blocked: [PortId; PORTS],
+    nblocked: usize,
+    /// More ports blocked than fit: every port's events wait.
+    all_blocked: bool,
+}
+
+impl Order {
+    fn new() -> Order {
+        Order { last: [(PortId(0), 0); PORTS], nlast: 0, blocked: [PortId(0); PORTS], nblocked: 0, all_blocked: false }
+    }
+
+    fn is_blocked(&self, p: PortId) -> bool {
+        self.all_blocked || self.blocked.get(..self.nblocked).is_some_and(|b| b.contains(&p))
+    }
+
+    fn block(&mut self, p: PortId) {
+        if self.is_blocked(p) {
+            return;
+        }
+        match self.blocked.get_mut(self.nblocked) {
+            Some(slot) => {
+                *slot = p;
+                self.nblocked += 1;
+            }
+            None => self.all_blocked = true,
+        }
+    }
+
+    /// `offset` clamped to not precede the port's last event, recorded.
+    fn clamp(&mut self, p: PortId, offset: usize) -> usize {
+        let last = self.last.get(..self.nlast).and_then(|l| l.iter().position(|(q, _)| *q == p));
+        match last.and_then(|i| self.last.get_mut(i)) {
+            Some(e) => {
+                e.1 = e.1.max(offset);
+                e.1
+            }
+            None => {
+                if let Some(slot) = self.last.get_mut(self.nlast) {
+                    *slot = (p, offset);
+                    self.nlast += 1;
+                }
+                offset
+            }
+        }
+    }
+}
+
+/// A message as MIDI 1.0 bytes (no allocation, unlike [`MidiMessage::to_bytes`]).
+pub(crate) fn raw(msg: MidiMessage) -> [u8; 3] {
+    let st = |kind: u8, ch: u8| kind | (ch & 0x0F);
+    match msg {
+        MidiMessage::NoteOff { ch, note, vel } => [st(0x80, ch), note & 0x7F, vel & 0x7F],
+        MidiMessage::NoteOn { ch, note, vel } => [st(0x90, ch), note & 0x7F, vel & 0x7F],
+        MidiMessage::PolyPressure { ch, note, pressure } => [st(0xA0, ch), note & 0x7F, pressure & 0x7F],
+        MidiMessage::ControlChange { ch, cc, value } => [st(0xB0, ch), cc & 0x7F, value & 0x7F],
+        MidiMessage::ProgramChange { ch, program } => [st(0xC0, ch), program & 0x7F, 0],
+        MidiMessage::ChannelPressure { ch, pressure } => [st(0xD0, ch), pressure & 0x7F, 0],
+        MidiMessage::PitchBend { ch, value } => {
+            let v = (i32::from(value).clamp(-8192, 8191) + 8192) as u16;
+            [st(0xE0, ch), (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]
+        }
+    }
+}
+
+fn is_note_off(e: &MidiEvent) -> bool {
+    matches!(e.msg, MidiMessage::NoteOff { .. })
+}
+
+impl MidiIn {
+    pub(crate) fn new() -> MidiIn {
+        MidiIn {
+            sub: None,
+            clock: MidiClock::new(),
+            pending: Vec::with_capacity(PENDING),
+            callback_ns: 0,
+            rendered: 0,
+            per_ns: 48_000.0 / 1e9,
+            latency_ns: MIDI_SLACK_NS,
+            dropped: 0,
+        }
+    }
+
+    /// Takes a new subscriber (stamped on `clock`), returning the old one; what waited is dropped.
+    pub(crate) fn replace(&mut self, sub: Option<(Subscriber, MidiClock)>) -> Option<Subscriber> {
+        self.pending.clear();
+        let (sub, clock) = match sub {
+            Some((s, c)) => (Some(s), c),
+            None => (None, self.clock),
+        };
+        self.clock = clock;
+        std::mem::replace(&mut self.sub, sub)
+    }
+
+    /// Now on the events' clock.
+    pub(crate) fn now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
+
+    /// A callback starts at `now_ns`, `span_ns` long, rendering `per_s` session samples a second.
+    pub(crate) fn begin(&mut self, now_ns: u64, span_ns: u64, per_s: f64) {
+        self.callback_ns = now_ns;
+        self.rendered = 0;
+        if per_s.is_finite() && per_s > 0.0 {
+            self.per_ns = per_s / 1e9;
+        }
+        self.latency_ns = self.latency_ns.max(span_ns.saturating_add(MIDI_SLACK_NS));
+    }
+
+    /// Drops everything waiting and queued (nothing is listening).
+    pub(crate) fn discard(&mut self) {
+        self.pending.clear();
+        if let Some(sub) = &mut self.sub {
+            while sub.pop().is_some() {}
+        }
+    }
+
+    /// The event's sample offset from the start of the block being rendered (negative: past).
+    fn offset(&self, e: &MidiEvent) -> i64 {
+        let ns = e.time_ns as i128 + i128::from(self.latency_ns) - i128::from(self.callback_ns);
+        let at = (ns as f64 * self.per_ns).floor();
+        let at = if at.is_finite() { at.clamp(-1e15, 1e15) as i64 } else { 0 };
+        at.saturating_sub(self.rendered)
+    }
+
+    /// Hands the events due in the next block of `n` samples to `mix` (in port order), keeps the
+    /// later ones, and counts `n` as rendered.
+    pub(crate) fn feed(&mut self, mix: &mut MixEngine, n: usize) {
+        let mut order = Order::new();
+        let n_i = i64::try_from(n).unwrap_or(i64::MAX);
+        // What waited, oldest first, compacted in place.
+        let mut keep = 0;
+        for i in 0..self.pending.len() {
+            let Some(e) = self.pending.get(i).copied() else { break };
+            let at = self.offset(&e);
+            if order.is_blocked(e.port) || at >= n_i {
+                order.block(e.port);
+                if let Some(slot) = self.pending.get_mut(keep) {
+                    *slot = e;
+                }
+                keep += 1;
+            } else {
+                emit(mix, &mut order, e, at);
+            }
+        }
+        self.pending.truncate(keep);
+        // New arrivals.
+        while let Some(e) = self.sub.as_mut().and_then(Subscriber::pop) {
+            let at = self.offset(&e);
+            if order.is_blocked(e.port) || at >= n_i {
+                order.block(e.port);
+                self.wait(e);
+            } else {
+                emit(mix, &mut order, e, at);
+            }
+        }
+        self.rendered = self.rendered.saturating_add(n_i);
+    }
+
+    /// Keeps `e` for a later block (see the module docs for a full buffer).
+    fn wait(&mut self, e: MidiEvent) {
+        if self.pending.len() < PENDING {
+            self.pending.push(e);
+            return;
+        }
+        self.dropped = self.dropped.saturating_add(1);
+        if is_note_off(&e)
+            && let Some(i) = self.pending.iter().rposition(|p| !is_note_off(p))
+        {
+            self.pending.remove(i);
+            self.pending.push(e);
+        }
+    }
+}
+
+fn emit(mix: &mut MixEngine, order: &mut Order, e: MidiEvent, at: i64) {
+    let offset = order.clamp(e.port, usize::try_from(at.max(0)).unwrap_or(0));
+    mix.live_input(LiveEvent { source: e.port.0, offset, msg: raw(e.msg) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_bytes_match_the_wire_format() {
+        let msgs = [
+            MidiMessage::NoteOn { ch: 3, note: 60, vel: 100 },
+            MidiMessage::NoteOff { ch: 0, note: 61, vel: 5 },
+            MidiMessage::PolyPressure { ch: 1, note: 2, pressure: 3 },
+            MidiMessage::ControlChange { ch: 15, cc: 64, value: 127 },
+            MidiMessage::ProgramChange { ch: 2, program: 9 },
+            MidiMessage::ChannelPressure { ch: 2, pressure: 9 },
+            MidiMessage::PitchBend { ch: 0, value: -8192 },
+            MidiMessage::PitchBend { ch: 0, value: 8191 },
+        ];
+        for m in msgs {
+            let b = m.to_bytes();
+            let r = raw(m);
+            assert_eq!(&r[..b.len()], b.as_slice(), "{m:?}");
+        }
+    }
+
+    impl MidiIn {
+        /// (Events waiting, capacity).
+        pub(crate) fn pending_len(&self) -> (usize, usize) {
+            (self.pending.len(), self.pending.capacity())
+        }
+
+        pub(crate) fn pending_any(&self, f: impl Fn(&MidiEvent) -> bool) -> bool {
+            self.pending.iter().any(f)
+        }
+    }
+}
