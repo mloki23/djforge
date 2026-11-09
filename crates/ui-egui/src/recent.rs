@@ -66,7 +66,14 @@ impl SoundApp {
         }
     }
 
-    /// For the desktop host: whether the recent list changed since the last call (save it now).
+    /// The preferences changed (an enabled MIDI input): the host saves them on its next check
+    /// of [`SoundApp::take_recent_changed`].
+    pub(crate) fn mark_prefs_changed(&mut self) {
+        self.recent_changed = true;
+    }
+
+    /// For the desktop host: whether the recent list (or another preference) changed since the
+    /// last call (save it now).
     pub fn take_recent_changed(&mut self) -> bool {
         std::mem::take(&mut self.recent_changed)
     }

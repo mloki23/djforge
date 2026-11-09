@@ -336,12 +336,11 @@ fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
                     ui.ctx().data_mut(|d| d.insert_temp(keyboard_held_id(), p));
                 }
             }
-            ui.label(
-                egui::RichText::new(
-                    "Plays the live MIDI target: the record-armed instrument track, or the one chosen in Setup › MIDI › Live MIDI Inputs.",
-                )
-                .small(),
+            let what = crate::midi_input::target_name(app).map_or_else(
+                || "No target: record-arm an instrument track, or choose one in Setup › MIDI › Live MIDI Inputs.".to_string(),
+                |n| format!("Plays {n}."),
             );
+            ui.label(egui::RichText::new(what).small());
             return;
         }
         keyboard_release(app, ui.ctx());
@@ -379,7 +378,13 @@ fn midi_inputs(app: &mut SoundApp, ctx: &egui::Context) {
         // Listing creates a backend client: read on opening and on Refresh, not every frame.
         let mut ports: Option<Vec<serde_json::Value>> = ui.ctx().data(|d| d.get_temp(cache));
         if ports.is_none() || ui.button("Refresh").clicked() {
-            ports = app.run("midi.inputs", json!({})).ok().and_then(|v| v["ports"].as_array().cloned());
+            ports = match app.run("midi.inputs", json!({})) {
+                Ok(v) => v["ports"].as_array().cloned(),
+                Err(e) => {
+                    app.ui.status = e;
+                    Some(Vec::new())
+                }
+            };
         }
         let ports = ports.unwrap_or_default();
         let mut changed = false;
@@ -411,18 +416,24 @@ fn midi_inputs(app: &mut SoundApp, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.label("Plays");
             egui::ComboBox::from_id_salt("midi_target").selected_text(current).show_ui(ui, |ui| {
-                if ui.selectable_label(app.midi_target.is_none(), "Automatic (record-armed track)").clicked() {
-                    let _ = app.run("midi.target", json!({"track": null}));
+                if ui.selectable_label(app.midi_target.is_none(), "Automatic (record-armed track)").clicked()
+                    && let Err(e) = app.run("midi.target", json!({"track": null}))
+                {
+                    app.ui.status = e;
                 }
                 for (id, name) in &tracks {
-                    if ui.selectable_label(app.midi_target == Some(*id), name).clicked() {
-                        let _ = app.run("midi.target", json!({"track": id.0}));
+                    if ui.selectable_label(app.midi_target == Some(*id), name).clicked()
+                        && let Err(e) = app.run("midi.target", json!({"track": id.0}))
+                    {
+                        app.ui.status = e;
                     }
                 }
             });
         });
-        if ui.button("Panic (all live notes off)").clicked() {
-            let _ = app.run("midi.panic", json!({}));
+        if ui.button("Panic (all live notes off)").clicked()
+            && let Err(e) = app.run("midi.panic", json!({}))
+        {
+            app.ui.status = e;
         }
         let next = if changed { None } else { Some(ports) };
         ui.ctx().data_mut(|d| match next {

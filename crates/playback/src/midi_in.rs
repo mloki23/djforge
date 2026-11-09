@@ -3,12 +3,18 @@
 //! **Timing.** Events are stamped on a [`MidiClock`] when they arrive. At the start of each
 //! audio callback the clock is read (`callback_ns`), and an event sounds `L` after it arrived:
 //! at session sample `(time_ns + L − callback_ns) · rate` from the first sample rendered in that
-//! callback (`rate`: session samples per second at the current speed). `L` is the longest device
-//! callback seen plus [`MIDI_SLACK_NS`]: an event arrives during the callback before the one that
-//! plays it, so with `L` one callback long it lands at a steady delay instead of on the next
-//! block boundary (jitter-free), and the slack absorbs callback-start jitter. `L` is reported by
-//! [`crate::Player::midi_latency_ns`]. Events whose sample is already past go at the block's
-//! start.
+//! callback (`rate`: session samples per second at the current speed). Audio rendered ahead in
+//! an earlier callback and not yet played comes first, so the first sample rendered in this one
+//! sits that far into it. `L` is one callback plus [`MIDI_SLACK_NS`]: an event arrives during the
+//! callback before the one that plays it, so with `L` one callback long it lands at a steady
+//! delay instead of on the next block boundary (jitter-free), and the slack absorbs
+//! callback-start jitter.
+//!
+//! "One callback" is the longest of the last [`WINDOW`] callbacks, capped at twice their median
+//! and at [`MAX_SPAN_NS`]: a single long callback (a device hiccup) raises `L` only for a while,
+//! and the first [`SKIP`] callbacks (a device filling its buffers at start) don't count. `L` is
+//! reported by [`crate::Player::midi_latency_ns`]. Events whose sample is already past go at the
+//! block's start.
 //!
 //! **Pending.** An event due after the block being rendered waits in a fixed buffer of
 //! [`PENDING`] events for a later block. When the buffer is full the new event is dropped and
@@ -28,6 +34,15 @@ pub const MIDI_SLACK_NS: u64 = 2_000_000;
 /// Events that can wait for a later block.
 pub const PENDING: usize = 256;
 
+/// Callbacks whose lengths set `L` (about 0.7 s of 128-frame callbacks, 2.7 s of 512-frame ones).
+pub const WINDOW: usize = 256;
+
+/// Callbacks at the start that don't count towards `L`.
+pub const SKIP: u32 = 4;
+
+/// The longest callback `L` allows for (50 ms).
+pub const MAX_SPAN_NS: u64 = 50_000_000;
+
 /// The live-event source id of the on-screen keyboard (no MIDI port uses it).
 pub const KEYBOARD_SOURCE: u32 = u32::MAX;
 
@@ -41,8 +56,15 @@ pub(crate) struct MidiIn {
     pending: Vec<MidiEvent>,
     /// The current callback's start on the clock.
     callback_ns: u64,
-    /// Session samples rendered since the callback started.
+    /// Where the next block starts, in session samples from the callback's first output sample
+    /// (audio rendered ahead earlier plus what this callback rendered so far).
     rendered: i64,
+    /// The last [`WINDOW`] callback lengths (ns), a ring, and how many are in it.
+    spans: [u64; WINDOW],
+    nspans: usize,
+    next_span: usize,
+    /// Callbacks seen (saturating).
+    seen: u32,
     /// Session samples per nanosecond at the current speed.
     per_ns: f64,
     /// The live latency `L`.
@@ -131,6 +153,10 @@ impl MidiIn {
             pending: Vec::with_capacity(PENDING),
             callback_ns: 0,
             rendered: 0,
+            spans: [0; WINDOW],
+            nspans: 0,
+            next_span: 0,
+            seen: 0,
             per_ns: 48_000.0 / 1e9,
             latency_ns: MIDI_SLACK_NS,
             dropped: 0,
@@ -160,7 +186,43 @@ impl MidiIn {
         if per_s.is_finite() && per_s > 0.0 {
             self.per_ns = per_s / 1e9;
         }
-        self.latency_ns = self.latency_ns.max(span_ns.saturating_add(MIDI_SLACK_NS));
+        self.seen = self.seen.saturating_add(1);
+        if self.seen > SKIP {
+            if let Some(s) = self.spans.get_mut(self.next_span) {
+                *s = span_ns;
+            }
+            self.next_span = (self.next_span + 1) % WINDOW;
+            self.nspans = (self.nspans + 1).min(WINDOW);
+        }
+        let span = match self.spans.get(..self.nspans).filter(|w| !w.is_empty()) {
+            None => span_ns,
+            Some(w) => {
+                // No allocation: the window is sorted in a copy on the stack.
+                let mut sorted = [0u64; WINDOW];
+                let sorted = sorted.get_mut(..w.len()).unwrap_or_default();
+                sorted.copy_from_slice(w);
+                sorted.sort_unstable();
+                let median = sorted.get(sorted.len() / 2).copied().unwrap_or(span_ns);
+                let max = sorted.last().copied().unwrap_or(span_ns);
+                max.min(median.saturating_mul(2))
+            }
+        };
+        self.latency_ns = span.min(MAX_SPAN_NS).saturating_add(MIDI_SLACK_NS);
+    }
+
+    /// `ahead` session samples rendered in an earlier callback play first in this one.
+    pub(crate) fn ahead(&mut self, ahead: f64) {
+        self.rendered = if ahead.is_finite() && ahead > 0.0 { ahead.round().min(1e9) as i64 } else { 0 };
+    }
+
+    /// Drops the events waiting for a later block (a panic).
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Live input waits to be played: in the queue or for a later block.
+    pub(crate) fn waiting(&self) -> bool {
+        !self.pending.is_empty() || self.sub.as_ref().is_some_and(|s| !s.is_empty())
     }
 
     /// Drops everything waiting and queued (nothing is listening).

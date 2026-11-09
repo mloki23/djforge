@@ -510,7 +510,10 @@ impl AudioState {
                 }
                 Cmd::MidiTarget(t) => self.mix.set_live_target(t),
                 Cmd::MidiClosed(port) => self.mix.live_release(port.0),
-                Cmd::MidiPanic => self.mix.live_panic(),
+                Cmd::MidiPanic => {
+                    self.midi.clear_pending();
+                    self.mix.live_panic();
+                }
                 Cmd::MidiPlay(msg) => {
                     if self.mix.live_target().is_some() {
                         self.mix.live_input(LiveEvent { source: midi_in::KEYBOARD_SOURCE, offset: 0, msg: midi_in::raw(msg) });
@@ -643,10 +646,12 @@ impl AudioState {
             n = n.min(usize::try_from((l.end - self.pos).max(1)).unwrap_or(BLOCK));
         } else if let Some(e) = self.end {
             if self.pos >= e {
+                // The end of play stops the transport, as `Cmd::Stop` does.
                 self.playing = false;
                 self.end = None;
                 self.mix.live_release_all();
                 self.mix.live_clear();
+                self.mix.reset();
                 self.shared.playing.store(false, Ordering::Relaxed);
                 n = 0;
             } else {
@@ -726,19 +731,24 @@ impl AudioState {
     fn fill_block(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring =
-            (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)) || self.mix.live_awake();
+        // Live MIDI keeps the engine rendering while stopped only while there is something to
+        // play or ring out, not merely because a target exists.
+        let live = self.mix.live_awake() || (self.mix.live_target().is_some() && self.midi.waiting());
+        let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)) || live;
         if !self.playing && !monitoring {
             // Nothing plays live MIDI: what arrived is dropped rather than kept for later.
             self.midi.discard();
             self.mix.live_discard();
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
-                m.main = StripMeter::default();
-                m.tracks.clear();
+                // Zeroed in place: the map keeps its entries, so rendering again inserts nothing.
+                zero_meter(&mut m.main);
+                m.tracks.values_mut().for_each(zero_meter);
             }
             return;
         }
+        // Audio rendered ahead in the last callback plays first in this one.
+        self.midi.ahead(self.pending_len as f64 - self.read);
         let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let callback_frames = out.len() / channels;
@@ -790,6 +800,13 @@ impl AudioState {
             self.read += step;
         }
     }
+}
+
+/// A meter at rest, without freeing its storage.
+fn zero_meter(m: &mut StripMeter) {
+    m.peak = [0.0; 2];
+    m.peaks.iter_mut().for_each(|x| *x = 0.0);
+    m.gain_reduction_db = 0.0;
 }
 
 /// UI-thread bookkeeping of the third-party instances the audio thread holds.
@@ -2560,18 +2577,22 @@ mod midi_tests {
         Midi([u8; 3]),
     }
 
-    /// Logs (block it was sent for, offset, event).
-    type Log = Arc<Mutex<Vec<(u64, usize, Ev)>>>;
+    /// Logs (block it was sent for, offset, event, timeline sample).
+    type Log = Arc<Mutex<Vec<(u64, usize, Ev, i64)>>>;
 
     struct Recorder {
         inner: Box<dyn Plugin>,
         log: Log,
         blocks: u64,
+        /// Blocks processed, for the test to read.
+        processed: Arc<AtomicU64>,
+        /// The block's timeline position (from the transport).
+        pos: i64,
     }
 
     impl Recorder {
         fn push(&self, offset: usize, e: Ev) {
-            self.log.lock().unwrap().push((self.blocks, offset, e));
+            self.log.lock().unwrap().push((self.blocks, offset, e, self.pos + offset as i64));
         }
     }
 
@@ -2591,6 +2612,10 @@ mod midi_tests {
         }
         fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {
             self.blocks += 1;
+            self.processed.fetch_add(1, Ordering::Relaxed);
+        }
+        fn set_transport(&mut self, t: &soundcraft_dsp::Transport) {
+            self.pos = t.samples;
         }
         fn note_on(&mut self, offset: usize, note: u8, _velocity: u8) {
             self.push(offset, Ev::On(note));
@@ -2623,9 +2648,16 @@ mod midi_tests {
         clock: MidiClock,
         /// The next callback's time.
         now: u64,
+        /// Blocks the instrument processed.
+        processed: Arc<AtomicU64>,
     }
 
     fn rig() -> Rig {
+        rig_at(48_000.0)
+    }
+
+    /// The rig on a device running at `rate`.
+    fn rig_at(rate: f64) -> Rig {
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
         s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.rec"));
@@ -2639,9 +2671,11 @@ mod midi_tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = bin();
-        let st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+        let st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), rate, gtx);
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let rec = Recorder { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log), blocks: 0 };
+        let processed = Arc::new(AtomicU64::new(0));
+        let rec =
+            Recorder { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log), blocks: 0, processed: Arc::clone(&processed), pos: 0 };
         tx.send(session_cmd(
             Arc::new(s),
             vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }],
@@ -2657,7 +2691,7 @@ mod midi_tests {
         tx.send(Cmd::MidiIn(Some((src.subscribe(4096).unwrap(), clock)))).unwrap();
         tx.send(Cmd::MidiTarget(Some(t))).unwrap();
         let probe = src.subscribe(4096).unwrap();
-        Rig { tx, st, shared, grx, log, track: t, src, probe, clock, now: 1_000_000_000 }
+        Rig { tx, st, shared, grx, log, track: t, src, probe, clock, now: 1_000_000_000, processed }
     }
 
     impl Rig {
@@ -2688,11 +2722,11 @@ mod midi_tests {
             self.delivered(1);
         }
 
-        fn log(&self) -> Vec<(u64, usize, Ev)> {
+        fn log(&self) -> Vec<(u64, usize, Ev, i64)> {
             self.log.lock().unwrap().clone()
         }
 
-        fn notes(&self) -> Vec<(u64, usize, Ev)> {
+        fn notes(&self) -> Vec<(u64, usize, Ev, i64)> {
             self.log().into_iter().filter(|e| matches!(e.2, Ev::On(_) | Ev::Off(_))).collect()
         }
 
@@ -2701,7 +2735,7 @@ mod midi_tests {
             let mut on = [false; 128];
             let mut log = self.log();
             log.sort_by_key(|e| (e.0, e.1));
-            for (_, _, e) in log {
+            for (_, _, e, _) in log {
                 match e {
                     Ev::On(p) => on[usize::from(p)] = true,
                     Ev::Off(p) => on[usize::from(p)] = false,
@@ -2871,5 +2905,145 @@ mod midi_tests {
         r.tx.send(Cmd::MidiIn(None)).unwrap();
         r.callback();
         assert!(r.grx.subs.try_recv().is_ok());
+    }
+
+    impl Rig {
+        /// One callback of `frames` device frames at `rate`, then the clock moves on by it.
+        fn callback_of(&mut self, frames: usize, rate: f64) {
+            let mut out = vec![0.0f32; frames * 2];
+            self.st.fill_at(&mut out, 2, self.now);
+            self.now += (frames as f64 / rate * 1e9) as u64;
+        }
+
+        fn latency(&self) -> u64 {
+            self.shared.midi.latency_ns.load(Ordering::Relaxed)
+        }
+
+        /// The fixed storage the live path uses: (pending capacity, engine inbox capacity).
+        fn capacities(&self) -> (usize, usize) {
+            (self.st.midi.pending_len().1, self.st.mix.live_inbox_capacity())
+        }
+    }
+
+    /// One long callback raises `L` (capped at twice the usual callback), and it comes back
+    /// down once the long one has left the window.
+    #[test]
+    fn a_long_callback_raises_l_only_for_a_while() {
+        let mut r = rig();
+        for _ in 0..20 {
+            r.callback();
+        }
+        let usual = r.latency();
+        assert_eq!(usual, CB_NS + MIDI_SLACK_NS);
+        r.callback_of(4096, 48_000.0);
+        let raised = r.latency();
+        assert!(raised > usual, "{raised} > {usual}");
+        assert!(raised <= 2 * CB_NS + MIDI_SLACK_NS, "capped at twice the median: {raised}");
+        for _ in 0..midi_in::WINDOW + 1 {
+            r.callback();
+        }
+        assert_eq!(r.latency(), usual);
+    }
+
+    /// With a device rate other than the session's (callbacks of 300 frames at 44.1 kHz under a
+    /// 48 kHz session: 326.5 session samples each, so audio is rendered ahead by a varying
+    /// amount), events arriving once a callback land once every 326.5 samples on the timeline.
+    #[test]
+    fn offsets_stay_steady_when_device_and_session_rates_differ() {
+        let mut r = rig_at(44_100.0);
+        r.tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        for _ in 0..4 {
+            r.callback_of(300, 44_100.0);
+        }
+        for k in 0..40u8 {
+            let t = r.now - 3_000_000;
+            r.send("Keys", note_on(20 + k), t);
+            r.callback_of(300, 44_100.0);
+        }
+        r.callback_of(300, 44_100.0);
+        let at: Vec<i64> = r.notes().iter().filter(|e| matches!(e.2, Ev::On(_))).map(|e| e.3).collect();
+        assert_eq!(at.len(), 40);
+        for w in at.windows(2) {
+            let d = w[1] - w[0];
+            assert!((325..=328).contains(&d), "steady spacing, got {d}: {at:?}");
+        }
+    }
+
+    /// A target alone doesn't keep the engine rendering: an instrument with no input rests,
+    /// plays while it has notes, and rests again once they have rung out.
+    #[test]
+    fn a_target_with_nothing_to_play_renders_nothing() {
+        let mut r = rig();
+        for _ in 0..5 {
+            r.callback();
+        }
+        assert_eq!(r.processed.load(Ordering::Relaxed), 0);
+        r.tx.send(Cmd::MidiPlay(note_on(60))).unwrap();
+        r.callback();
+        r.tx.send(Cmd::MidiPlay(note_off(60))).unwrap();
+        r.callback();
+        assert_eq!(r.processed.load(Ordering::Relaxed), 2);
+        // About five seconds of ring-out, then rest.
+        for _ in 0..1000 {
+            r.callback();
+        }
+        let rested = r.processed.load(Ordering::Relaxed);
+        assert!(rested < 1000, "{rested}");
+        for _ in 0..10 {
+            r.callback();
+        }
+        assert_eq!(r.processed.load(Ordering::Relaxed), rested);
+    }
+
+    /// The live path's storage never grows on the audio thread: through a burst, a full pending
+    /// buffer, a target change, a panic and a queue swap, every buffer keeps its capacity. (A
+    /// counting global allocator would check more, but needs `unsafe`, which this workspace
+    /// forbids; capacities are the check the mix and playback tests use.)
+    #[test]
+    fn the_live_path_never_grows_its_storage() {
+        let mut r = rig();
+        r.callback();
+        let start = r.capacities();
+        assert_eq!(start, (MIDI_PENDING, soundcraft_mix::LIVE_INBOX));
+        let now = r.now;
+        for i in 0..1000u32 {
+            assert!(r.src.inject("Keys", MidiMessage::ControlChange { ch: 0, cc: 1, value: (i % 128) as u8 }, now - 4_000_000));
+        }
+        for _ in 0..1000u32 {
+            assert!(r.src.inject("Pads", note_on(60), now + 1_000_000_000));
+        }
+        r.delivered(2000);
+        r.callback();
+        assert_eq!(r.capacities(), start, "burst and full pending buffer");
+        r.tx.send(Cmd::MidiTarget(None)).unwrap();
+        r.tx.send(Cmd::MidiTarget(Some(r.track))).unwrap();
+        r.callback();
+        r.tx.send(Cmd::MidiPanic).unwrap();
+        r.callback();
+        r.tx.send(Cmd::MidiIn(Some((r.src.subscribe(16).unwrap(), r.clock)))).unwrap();
+        r.callback();
+        assert_eq!(r.capacities(), start, "target change, panic, queue swap");
+        assert!(r.grx.subs.try_recv().is_ok());
+    }
+
+    /// Play Selection runs to its end in the middle of an arrangement note on the target: the
+    /// note stops there, and stopped blocks after it leave nothing sounding.
+    #[test]
+    fn a_note_crossing_the_end_of_play_stops_there() {
+        let mut r = rig();
+        r.callback();
+        let mut s = (*r.st.session).clone();
+        let cid = s.new_clip_id();
+        let note = soundcraft_midi::Note { pitch: 70, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 4 * 960 };
+        let clip = soundcraft_model::Clip::midi(cid, "arr", 0, 96_000, soundcraft_midi::Sequence { notes: vec![note], ctrls: Vec::new() });
+        s.track_mut(r.track).unwrap().playlist_mut().unwrap().clips.push(clip);
+        r.tx.send(session_cmd(Arc::new(s), Vec::new(), Vec::new())).unwrap();
+        r.tx.send(Cmd::Play { from: 0, end: Some(10_000), looped: None }).unwrap();
+        for _ in 0..60 {
+            r.callback();
+        }
+        assert!(!r.shared.playing.load(Ordering::Relaxed));
+        assert!(r.log().iter().any(|e| e.2 == Ev::On(70)), "{:?}", r.log());
+        assert_eq!(r.sounding(), Vec::<u8>::new(), "{:?}", r.log());
     }
 }

@@ -369,6 +369,8 @@ pub struct MixEngine {
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
     last_end: Samples,
+    /// The last block rendered was monitor-only (transport stopped).
+    was_monitor: bool,
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
     order: Vec<usize>,
@@ -492,6 +494,7 @@ impl MixEngine {
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
             last_end: 0,
+            was_monitor: true,
             synced: (0, 0, 0),
             order: Vec::new(),
             latency: 0,
@@ -723,21 +726,36 @@ impl MixEngine {
         }
     }
 
-    /// MIDI panic: every live key released and the controllers reset (sustain off, then Reset All
-    /// Controllers) on the target's instrument and every instrument a live key held.
+    /// MIDI panic: silences every instrument. Live keys are released, every note sounding (the
+    /// arrangement's and the slots' too) is turned off, and the controllers are reset (sustain
+    /// off, then Reset All Controllers). Live events queued are dropped. Arrangement notes and
+    /// slots play on from their next note; arrangement controllers are chased again.
     pub fn live_panic(&mut self) {
         self.live_in.clear();
-        let (sr, target) = (self.sample_rate, self.live_target);
-        for (id, st) in self.strips.iter_mut() {
-            let reset = Some(*id) == target || st.live_keys.len() > 0;
-            release_live(st, None, sr, reset);
+        let sr = self.sample_rate;
+        for st in self.strips.values_mut() {
+            release_live(st, None, sr, false);
+            if let Some(i) = &mut st.instrument {
+                i.plugin.all_notes_off();
+                reset_controllers(i.plugin.as_mut(), 0);
+                st.live_keys.wake(live_in::LiveKeys::ring_len(sr, i.plugin.as_ref()));
+            }
+            st.held.clear();
+            st.live_midi.forget(Samples::MIN);
+            st.chase = true;
         }
     }
 
-    /// Something live to hear while the transport is stopped: a live MIDI target, or live notes
-    /// held or still ringing out on some instrument. The host keeps rendering while it is true.
+    /// Something live to hear while the transport is stopped: live events queued, or live notes
+    /// held or still ringing out on some instrument. The host keeps rendering while it is true
+    /// (and while live input waits for the target; see the playback crate).
     pub fn live_awake(&self) -> bool {
-        self.live_target.is_some() || self.strips.values().any(|st| st.live_keys.awake())
+        !self.live_in.is_empty() || self.strips.values().any(|st| st.live_keys.awake())
+    }
+
+    /// The inbox's capacity (it never grows; for allocation checks).
+    pub fn live_inbox_capacity(&self) -> usize {
+        self.live_in.capacity()
     }
 
     /// Realtime mode: third-party plugins are created by the host and handed over with
@@ -1092,8 +1110,11 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
-        // While stopped the position stands still; nothing is scheduled there to silence.
-        if pos != self.last_end && !self.monitor_only {
+        // While stopped the position stands still and nothing is scheduled: only the first
+        // stopped block (the transport just stopped or ran out) silences what was scheduled.
+        let seek = if self.monitor_only { !self.was_monitor } else { pos != self.last_end };
+        self.was_monitor = self.monitor_only;
+        if seek {
             // Seek: silence held notes and ringing plugins. Live keys sound on through it.
             for st in self.strips.values_mut() {
                 if let Some(i) = &mut st.instrument {
@@ -1464,7 +1485,7 @@ fn process_strip(
         TrackKind::Audio if live.monitor_only => {}
         TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {
             // Stopped: only live MIDI input plays, on the target and on instruments ringing out.
-            if (strip.live_target || strip.live_keys.awake())
+            if ((strip.live_target && !live.events.is_empty()) || strip.live_keys.awake())
                 && let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed)
             {
                 if let Some(ins) = &t.instrument {

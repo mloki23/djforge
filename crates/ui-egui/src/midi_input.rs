@@ -107,7 +107,9 @@ impl MidiHost {
             }
             return;
         };
-        if now - last < REFRESH_S && now >= last {
+        // Nothing enabled means nothing open (ports open only through the preferences): no
+        // device list to keep up with.
+        if prefs.is_empty() || (now - last < REFRESH_S && now >= last) {
             return;
         }
         self.last_refresh = Some(now);
@@ -164,9 +166,26 @@ impl MidiHost {
     }
 }
 
-/// A track that plays live MIDI: an instrument or MIDI track (its instrument plays the notes).
+/// A track that plays live MIDI: an active instrument or MIDI track (its instrument plays the
+/// notes; an inactive track doesn't render).
 fn plays_midi(t: &Track) -> bool {
-    matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
+    matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !t.inactive
+}
+
+/// The params of the `midi.*` UI commands, as `engine.commands` advertises them.
+pub fn params_doc(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "midi.inputs" | "midi.panic" => "{}",
+        "midi.input_enable" => "{name, enabled: bool}",
+        "midi.target" => "{track?: id | name | null}",
+        _ => return None,
+    })
+}
+
+/// The target live MIDI plays now, for display: its name, or `None`.
+pub fn target_name(app: &SoundApp) -> Option<String> {
+    let s = app.engine.session();
+    resolve_target(s, app.midi_target).and_then(|t| s.track(t)).map(|t| t.name.clone())
 }
 
 /// The track live MIDI input plays: the explicit override (`midi.target`) while it names an
@@ -211,7 +230,10 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
             let on = p.get("enabled").and_then(Value::as_bool).ok_or("`enabled` (true or false) required")?;
             let host = app.midi_host.as_mut().ok_or("no MIDI input on this system")?;
-            host.set_enabled(name, on, &mut app.ui.midi_inputs)
+            let r = host.set_enabled(name, on, &mut app.ui.midi_inputs);
+            // Saved straight away, like the recent sessions.
+            app.mark_prefs_changed();
+            r
         })(),
         "midi.target" => (|| {
             let s = app.engine.session();
@@ -224,7 +246,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
                 }
             };
             if let Some(t) = track.filter(|t| !plays_midi(t)) {
-                return Err(format!("\"{}\" is not an instrument track", t.name));
+                return Err(format!("\"{}\" is not an active instrument track", t.name));
             }
             app.midi_target = track.map(|t| t.id);
             let target = resolve_target(app.engine.session(), app.midi_target);
@@ -263,5 +285,7 @@ mod tests {
         assert_eq!(resolve_target(&s, None), Some(a), "armed comes first");
         assert_eq!(resolve_target(&s, Some(b)), Some(b), "the override comes first");
         assert_eq!(resolve_target(&s, Some(audio)), Some(a), "an audio track is no target");
+        s.track_mut(a).unwrap().inactive = true;
+        assert_eq!(resolve_target(&s, None), Some(b), "an inactive track is no target");
     }
 }

@@ -85,6 +85,7 @@ fn an_enabled_input_persists_in_the_preferences_and_opens() {
     let r = app.run("midi.input_enable", json!({"name": "Keys", "enabled": true})).unwrap();
     assert_eq!((r["enabled"].as_bool(), r["open"].as_bool()), (Some(true), Some(true)));
     assert!(app.run("midi.input_enable", json!({"name": "Nope", "enabled": true})).is_err());
+    assert!(app.take_recent_changed(), "the preferences are saved straight away");
     // Saved and read back like the app's preferences file, in a scratch folder.
     let dir = std::env::temp_dir().join(format!("djforge-midi-prefs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

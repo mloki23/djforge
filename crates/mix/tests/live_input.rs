@@ -292,7 +292,9 @@ fn nothing_live_is_left_sounding_after_a_target_change_a_closed_device_a_panic_o
     r.eng.live_panic();
     r.block(2048, &[]);
     assert_eq!(r.sounding(), Vec::<u8>::new());
-    assert!(r.events().ends_with(&[Ev::Off(1536, 64), Ev::Midi(1536, [0xB0, 64, 0]), Ev::Midi(1536, [0xB0, 121, 0])]), "{:?}", r.events());
+    let ev = r.events();
+    let at = ev.iter().position(|e| *e == Ev::Off(1536, 64)).unwrap();
+    assert!(ev[at..].starts_with(&[Ev::Off(1536, 64), Ev::AllOff(1536), Ev::Midi(1536, [0xB0, 64, 0]), Ev::Midi(1536, [0xB0, 121, 0])]), "{ev:?}");
     // A stop.
     r.block(2560, &[on(1, 65, 0)]);
     r.eng.live_release_all();
@@ -368,4 +370,54 @@ fn a_burst_past_the_inbox_is_refused_and_counted() {
     assert_eq!((refused, r.eng.live_dropped()), (100, 100));
     r.block(0, &[]);
     assert_eq!(r.events().iter().filter(|e| matches!(e, Ev::Midi(_, [0xB0, 1, _]))).count(), LIVE_INBOX);
+}
+
+/// Playback runs out (or stops) in the middle of an arrangement note while the target keeps
+/// rendering stopped: the first stopped block releases it.
+#[test]
+fn a_note_crossing_the_end_of_play_is_released_when_stopped() {
+    let mut r = rig(vec![note(70, 0, 4 * Q)]);
+    r.block(0, &[]);
+    r.block(512, &[]);
+    assert_eq!(r.sounding(), [70]);
+    r.eng.monitor_only = true;
+    for _ in 0..4 {
+        r.block(1024, &[]);
+    }
+    assert_eq!(r.sounding(), Vec::<u8>::new(), "{:?}", r.events());
+    // Only once: the standing position is not a seek every block.
+    let offs = r.events().iter().filter(|e| matches!(e, Ev::Off(_, 70) | Ev::AllOff(_))).count();
+    assert_eq!(offs, 1);
+}
+
+/// Panic silences everything on the instrument: live keys, the arrangement's notes and the
+/// slots', and resets the controllers.
+#[test]
+fn panic_silences_the_arrangement_too() {
+    let mut r = rig(vec![note(70, 0, 4 * Q)]);
+    r.block(0, &[on(1, 60, 0)]);
+    assert_eq!(r.sounding(), [60, 70]);
+    r.eng.live_panic();
+    r.block(512, &[]);
+    assert_eq!(r.sounding(), Vec::<u8>::new(), "{:?}", r.events());
+    assert!(r.events().contains(&Ev::Midi(0, [0xB0, 121, 0])));
+}
+
+/// A loop wrap chases the arrangement's controllers: not over the live sustain pedal while it is
+/// down, and not under live keys.
+#[test]
+fn a_loop_wrap_leaves_the_live_pedal_down() {
+    let mut r = rig(vec![note(70, 0, Q)]);
+    r.block(0, &[LiveEvent { source: 1, offset: 0, msg: [0xB0, 64, 127] }, on(1, 60, 0)]);
+    r.block(512, &[off(1, 60, 0)]);
+    let before = r.events().len();
+    // Wrap back to 0 (a seek): the chase sends no reset while the pedal is down.
+    r.block(0, &[]);
+    let after: Vec<Ev> = r.events()[before..].to_vec();
+    assert!(!after.iter().any(|e| matches!(e, Ev::Midi(_, [0xB0, 121, _]) | Ev::Midi(_, [0xB0, 64, 0..=63]))), "{after:?}");
+    // Pedal up: the next chase resets again.
+    r.block(512, &[LiveEvent { source: 1, offset: 0, msg: [0xB0, 64, 0] }]);
+    let before = r.events().len();
+    r.block(0, &[]);
+    assert!(r.events()[before..].contains(&Ev::Midi(0, [0xB0, 121, 0])), "{:?}", r.events());
 }

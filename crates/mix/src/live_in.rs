@@ -83,6 +83,11 @@ impl LiveKeys {
         self.len
     }
 
+    /// Live keys held or the live sustain pedal down: the arrangement's controller resets wait.
+    pub(crate) fn busy(&self) -> bool {
+        self.len > 0 || self.sustain.is_some()
+    }
+
     /// Something to hear while the transport is stopped: keys held or releases ringing.
     pub(crate) fn awake(&self) -> bool {
         self.len > 0 || self.ring > 0
@@ -191,7 +196,8 @@ impl LiveKeys {
 }
 
 /// An instrument seen by the arrangement and Session view slot schedulers: their note-offs for
-/// a pitch a live key holds are not sent (the live key's release sends it later).
+/// a pitch a live key holds are not sent (the live key's release sends it later), and their
+/// controller resets don't lift the live sustain pedal or reset controllers under live keys.
 pub(crate) struct Shield<'a> {
     pub(crate) inner: &'a mut dyn Plugin,
     pub(crate) live: &'a LiveKeys,
@@ -225,7 +231,13 @@ impl Plugin for Shield<'_> {
         }
     }
     fn midi(&mut self, offset: usize, msg: [u8; 3]) {
-        self.inner.midi(offset, msg);
+        // The arrangement's chases and the slot cuts reset the controllers: not the live
+        // player's pedal while it is down, nor anything while live keys are held.
+        let [status, cc, value] = msg;
+        let cut = status & 0xF0 == 0xB0 && ((cc == 64 && value < 64 && self.live.sustain.is_some()) || (cc == 121 && self.live.busy()));
+        if !cut {
+            self.inner.midi(offset, msg);
+        }
     }
     fn all_notes_off(&mut self) {
         self.inner.all_notes_off();

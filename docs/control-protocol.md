@@ -57,6 +57,15 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `ui.screenshot` | `{path?}` | PNG of the window (base64 in `png_base64` when no path). |
 | `app.quit` | `{}` | Quit. |
 
+### Live MIDI input (UI commands, through `engine.execute`)
+
+| Command | Params | What it does |
+|---|---|---|
+| `midi.inputs` | `{}` | The MIDI input ports: `name`, `raw_name`, `backend_id`, `open`, `enabled`; plus `available` (a MIDI system), `latency_ms` (the live latency L: the longest recent audio callback plus 2 ms) and `dropped` (live events dropped). |
+| `midi.input_enable` | `{name, enabled: bool}` | Enables or disables a port for live play, in the app preferences (per machine), and opens or closes it. Enabled ports open when they appear. |
+| `midi.target` | `{track?: id \| name \| null}` | The track live MIDI plays: this override, else the first record-armed instrument track, else the selected instrument track with input monitoring on. `null` or nothing clears the override. Returns `override` and `target`. |
+| `midi.panic` | `{}` | Silences every instrument: live notes, arrangement and slot notes off, controllers reset. `event.all_notes_off` does the same. |
+
 ## Positions and references
 
 - Tracks: id (number) or name (`"Kick"`).
