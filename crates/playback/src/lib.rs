@@ -736,9 +736,17 @@ impl AudioState {
         let live = self.mix.live_awake() || (self.mix.live_target().is_some() && self.midi.waiting());
         let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)) || live;
         if !self.playing && !monitoring {
-            // Nothing plays live MIDI: what arrived is dropped rather than kept for later.
-            self.midi.discard();
-            self.mix.live_discard();
+            // With no target nothing plays live MIDI: what arrived is dropped rather than kept for
+            // later. With one, an event that arrived since the check above is the first note
+            // after idle: it waits for the next callback.
+            if self.mix.live_target().is_none() {
+                self.midi.discard();
+                self.mix.live_discard();
+            }
+            // Nothing rendered ahead survives the rest: waking renders afresh, so old audio from
+            // before a stop never plays and the first note lands at its own offset.
+            self.pending_len = 0;
+            self.read = 0.0;
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 // Zeroed in place: the map keeps its entries, so rendering again inserts nothing.
@@ -2588,6 +2596,8 @@ mod midi_tests {
         processed: Arc<AtomicU64>,
         /// The block's timeline position (from the transport).
         pos: i64,
+        /// The transport plays: the instrument then outputs a steady 0.5 (stale audio shows).
+        playing: bool,
     }
 
     impl Recorder {
@@ -2610,12 +2620,17 @@ mod midi_tests {
         fn param(&self, id: &str) -> Option<f32> {
             self.inner.param(id)
         }
-        fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
             self.blocks += 1;
             self.processed.fetch_add(1, Ordering::Relaxed);
+            let v = if self.playing { 0.5 } else { 0.0 };
+            for c in io.iter_mut() {
+                c.iter_mut().take(frames).for_each(|x| *x = v);
+            }
         }
         fn set_transport(&mut self, t: &soundcraft_dsp::Transport) {
             self.pos = t.samples;
+            self.playing = t.playing;
         }
         fn note_on(&mut self, offset: usize, note: u8, _velocity: u8) {
             self.push(offset, Ev::On(note));
@@ -2674,8 +2689,14 @@ mod midi_tests {
         let st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), rate, gtx);
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let processed = Arc::new(AtomicU64::new(0));
-        let rec =
-            Recorder { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log), blocks: 0, processed: Arc::clone(&processed), pos: 0 };
+        let rec = Recorder {
+            inner: soundcraft_dsp::create("gain").unwrap(),
+            log: Arc::clone(&log),
+            blocks: 0,
+            processed: Arc::clone(&processed),
+            pos: 0,
+            playing: false,
+        };
         tx.send(session_cmd(
             Arc::new(s),
             vec![PreparedInstance { track: t, slot: INSTRUMENT_INSTANCE, id: "clap:test.rec".into(), ch: 2, plugin: Box::new(rec) }],
@@ -2967,6 +2988,36 @@ mod midi_tests {
             let d = w[1] - w[0];
             assert!((325..=328).contains(&d), "steady spacing, got {d}: {at:?}");
         }
+    }
+
+    /// Stopped and idle, then a key: the note lands at its `L` offset in the first callback after
+    /// idle (not a block late, not thrown away), and none of the audio rendered ahead before the
+    /// stop plays.
+    #[test]
+    fn the_first_note_after_idle_plays_on_time_and_alone() {
+        let mut r = rig();
+        r.tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        // 1000-frame callbacks render 512-sample blocks: a callback ends inside one.
+        for _ in 0..3 {
+            r.callback_of(1000, 48_000.0);
+        }
+        assert!(r.st.pending_len as f64 > r.st.read, "rendered ahead when stopping");
+        r.tx.send(Cmd::Stop).unwrap();
+        for _ in 0..3 {
+            r.callback();
+        }
+        let before = r.notes().len();
+        let t = r.now - 4_000_000;
+        r.send("Keys", note_on(60), t);
+        let now = r.now;
+        let mut out = vec![0.0f32; CB * 2];
+        r.st.fill_at(&mut out, 2, now);
+        let l = r.latency();
+        let got = r.notes();
+        assert_eq!(got.len(), before + 1, "played in the first callback after idle: {got:?}");
+        let at = ((t + l) as i64 - now as i64) * 48 / 1_000_000;
+        assert!((got[before].1 as i64 - at).abs() <= 1, "offset {} for {at}", got[before].1);
+        assert!(out.iter().all(|x| x.abs() < 1e-6), "no audio from before the stop");
     }
 
     /// A target alone doesn't keep the engine rendering: an instrument with no input rests,
