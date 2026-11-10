@@ -24,7 +24,7 @@ pub(crate) struct LiveFrame {
 impl SoundApp {
     /// The largest audio callback in session samples: as the player measured it, else (before
     /// its first callback) the device's buffer at the session rate.
-    fn callback_samples(&self) -> Samples {
+    pub(crate) fn callback_samples(&self) -> Samples {
         let Some(p) = &self.player else { return 0 };
         let measured = p.max_callback_samples();
         if measured > 0 {
@@ -45,6 +45,8 @@ impl SoundApp {
     ///   is sent before Play, which keeps it, so the first block can't miss it. A stop does
     ///   nothing: nothing plays. A launch refused (no boundary in the loop, a meter not in 4/4)
     ///   leaves the transport stopped.
+    ///
+    /// A slot recording (`live.record_slot`) is armed for that boundary the same way.
     ///
     /// Every request of one frame (`frame`) counts from the same point, so they land together.
     pub(crate) fn live_request(&mut self, req: LiveRequest, frame: &mut Option<LiveFrame>) {
@@ -78,7 +80,12 @@ impl SoundApp {
                 return;
             }
         };
-        if let Some(p) = &self.player {
+        if let LiveRequest::RecordSlot { column, slot, bars, replace } = req {
+            // Recording starts on the boundary; the launch follows once the slot is written.
+            if !crate::midi_record::arm_slot(self, column, slot, bars, replace, at, f.looped) {
+                return;
+            }
+        } else if let Some(p) = &self.player {
             live_cmds(s, &req, at).into_iter().for_each(|c| p.live(c));
         }
         if f.start {

@@ -185,7 +185,7 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
 /// The target live MIDI plays now, for display: its name, or `None`.
 pub fn target_name(app: &SoundApp) -> Option<String> {
     let s = app.engine.session();
-    resolve_target(s, app.midi_target).and_then(|t| s.track(t)).map(|t| t.name.clone())
+    resolve_target(s, crate::midi_record::target_override(app).or(app.midi_target)).and_then(|t| s.track(t)).map(|t| t.name.clone())
 }
 
 /// The track live MIDI input plays: the explicit override (`midi.target`) while it names an
@@ -207,7 +207,9 @@ pub fn frame(app: &mut SoundApp, now: f64) {
         h.tick(now, &app.ui.midi_inputs, app.player.as_ref());
     }
     if let Some(p) = &app.player {
-        p.set_midi_target(resolve_target(app.engine.session(), app.midi_target));
+        // A slot recording plays its column's instrument while armed.
+        let over = crate::midi_record::target_override(app).or(app.midi_target);
+        p.set_midi_target(resolve_target(app.engine.session(), over));
     }
 }
 
@@ -249,7 +251,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
                 return Err(format!("\"{}\" is not an active instrument track", t.name));
             }
             app.midi_target = track.map(|t| t.id);
-            let target = resolve_target(app.engine.session(), app.midi_target);
+            let target = resolve_target(app.engine.session(), crate::midi_record::target_override(app).or(app.midi_target));
             if let Some(pl) = &app.player {
                 pl.set_midi_target(target);
             }

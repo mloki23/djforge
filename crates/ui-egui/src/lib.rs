@@ -18,6 +18,7 @@ mod live_transport;
 pub mod menus;
 pub mod midi_editor;
 pub mod midi_input;
+pub mod midi_record;
 pub mod mix_window;
 pub mod ops_windows;
 pub mod palette;
@@ -381,6 +382,12 @@ pub struct SoundApp {
     pub midi_host: Option<midi_input::MidiHost>,
     /// The live MIDI target chosen with `midi.target` (see [`midi_input::resolve_target`]).
     pub midi_target: Option<TrackId>,
+    /// The live MIDI the target plays, captured for recording (see [`midi_record`]).
+    pub midi_capture: Option<soundcraft_playback::MidiCapture>,
+    /// The arrangement MIDI take being recorded.
+    pub midi_take: Option<midi_record::MidiTake>,
+    /// The Session view slot recording armed or running.
+    pub slot_recording: Option<midi_record::SlotRecording>,
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
@@ -500,6 +507,9 @@ impl SoundApp {
             midi: midi_editor::MidiEditorState::default(),
             midi_host: None,
             midi_target: None,
+            midi_capture: None,
+            midi_take: None,
+            slot_recording: None,
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
@@ -648,6 +658,7 @@ impl SoundApp {
     }
 
     fn stop_play(&mut self) {
+        midi_record::cancel_slot(self, "Slot recording cancelled");
         if let Some(p) = &self.player {
             // Half-speed is a separate command. Stop must not leave that rate for the next Play.
             p.set_speed(1.0);
@@ -691,6 +702,15 @@ impl SoundApp {
 
     fn start_recording(&mut self) {
         let armed = self.engine.session().tracks.iter().any(|t| t.mixer.record_arm);
+        // Only an instrument track armed: a MIDI take, which needs no audio input.
+        let audio = self.engine.session().tracks.iter().any(|t| t.mixer.record_arm && !t.kind.is_midi());
+        let midi = midi_record::armed_target(self).is_some();
+        if armed && !audio && !midi {
+            let why = "The record-armed instrument track is not playing live MIDI: it must be active, or chosen with midi.target";
+            self.ui.status = why.into();
+            self.record_hint = Some((self.last_frame.unwrap_or_default(), why));
+            return;
+        }
         if !armed {
             let why = if self.engine.session().tracks.is_empty() {
                 "Nothing to record on yet: add a track with Track › New…, then click its R button."
@@ -701,13 +721,17 @@ impl SoundApp {
             self.record_hint = Some((self.last_frame.unwrap_or_default(), why));
             return;
         }
-        self.ensure_input();
-        let takes = match self.arm_recorder() {
-            Ok(takes) => takes,
-            Err(err) => {
-                self.ui.status = format!("Cannot record: {err}");
-                return;
+        let takes = if audio {
+            self.ensure_input();
+            match self.arm_recorder() {
+                Ok(takes) => takes,
+                Err(err) => {
+                    self.ui.status = format!("Cannot record: {err}");
+                    return;
+                }
             }
+        } else {
+            Vec::new()
         };
         self.lost_shown = 0;
         if let Some(p) = &self.player {
@@ -720,6 +744,7 @@ impl SoundApp {
             self.record_start = self.position();
             self.punch = None;
             self.plan_recording(takes, None);
+            midi_record::start_take(self, self.record_start);
             return;
         }
         let e = self.engine.session().edit.clone();
@@ -740,6 +765,7 @@ impl SoundApp {
             self.start_play(from, end, None);
             self.plan_recording(takes, None);
         }
+        midi_record::start_take(self, self.record_start);
     }
 
     /// Remember where the armed `takes` go (split into passes of `pass` when loop recording) and
@@ -1057,7 +1083,17 @@ impl SoundApp {
         if let Some(p) = &self.player {
             p.set_recording(false);
         }
+        // Where the player rendered to: everything played up to there is captured.
+        let end = self.player.as_ref().map_or(self.engine.transport.position, |p| p.position().max(self.engine.transport.position));
+        let midi = midi_record::finish_take(self, end, self.punch);
+        if let Some(m) = &midi {
+            self.ui.status = m.clone();
+        }
         let plan = self.take_plan.take();
+        if plan.as_ref().is_some_and(|p| p.takes.is_empty()) && midi.is_some() {
+            self.punch = None;
+            return;
+        }
         let Some(r) = &mut self.recorder else { return };
         let (takes, problem) = r.finish();
         let tracks = takes.len().max(1);
@@ -1076,6 +1112,9 @@ impl SoundApp {
         if let Some(p) = problem {
             log::warn!("recording: {p}");
             self.ui.status = format!("{} ({p})", self.ui.status);
+        }
+        if let Some(m) = midi {
+            self.ui.status = format!("{}; {m}", self.ui.status);
         }
     }
 
@@ -1175,6 +1214,8 @@ impl SoundApp {
                 TransportRequest::ResetSession => {
                     // The Session window's slots, jobs and dialog belonged to the old session.
                     self.session_view = session_view::SessionView { open: self.session_view.open, ..Default::default() };
+                    midi_record::cancel_slot(self, "Slot recording cancelled: another session");
+                    self.midi_take = None;
                     if let Some(p) = &self.player {
                         p.stop();
                         p.set_recording(false);
@@ -1347,6 +1388,8 @@ impl SoundApp {
         self.watch_input();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
+        // After the transport: a slot recording armed this frame starts collecting.
+        midi_record::frame(self, ctx);
         // After the transport, which notes a replaced session.
         stems::step(self, ctx);
         session_view::step(self, ctx);

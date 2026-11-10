@@ -11,6 +11,10 @@
 //! its notes, with Copy to Arrangement at Playhead: the slot's notes become a MIDI clip on the
 //! column's track at the playhead's bar, to edit in the MIDI Editor and copy back with Copy
 //! Selected MIDI Clip Here. A column name's right-click menu adds an audio or instrument column.
+//! An empty instrument slot has a small record button (●): it arms a slot recording of the
+//! chosen bars (`live.record_slot`, set in the slot's menu), shown blinking until its boundary,
+//! then with a progress bar; the slot launches and loops where it ends. Click the slot, Stop or
+//! Esc to cancel.
 //!
 //! While the window has focus (it was clicked last), 1–8 launch the selected column's slots, 0
 //! stops it, Shift+0 stops everything, ←/→ select the column and Shift+1–8 launch a scene. The
@@ -50,6 +54,22 @@ pub struct SessionView {
     pub jobs: Vec<(SlotFileJob, String)>,
     /// The MIDI slot whose notes are shown.
     pub notes: Option<SlotNotes>,
+    /// Bars a slot recording records (0: [`DEFAULT_RECORD_BARS`]).
+    pub record_bars: u32,
+}
+
+/// Bars a slot recording records until another length is chosen.
+pub const DEFAULT_RECORD_BARS: u32 = 4;
+
+/// The bars the record buttons record.
+pub fn record_bars(app: &SoundApp) -> u32 {
+    if app.session_view.record_bars == 0 { DEFAULT_RECORD_BARS } else { app.session_view.record_bars }
+}
+
+/// Arms a slot recording into `row` of `column` (offering Replace for a filled slot).
+fn record_here(app: &mut SoundApp, column: usize, row: usize) {
+    let bars = record_bars(app);
+    crate::produce::run_or_offer_replace(app, "live.record_slot", json!({"column": column, "slot": row, "bars": bars}));
 }
 
 /// The Edit Slot dialog's fields.
@@ -443,19 +463,54 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
         }
         (None, None) => {}
     }
-    let text = if loading { Some("loading…".to_string()) } else { filled.as_ref().map(|(name, _)| name.clone()) };
+    // A slot recording here: armed (blinking until its boundary), then recording (a progress bar).
+    let pos = app.player.as_ref().map_or(0, |p| p.position());
+    let recording = app.slot_recording.as_ref().filter(|r| (r.column, r.slot) == (column, row)).map(|r| (pos >= r.start, r.progress(pos)));
+    if let Some((started, fraction)) = recording {
+        let on = started || (now * 4.0).floor() as i64 % 2 == 0;
+        p.rect_stroke(rect, 3.0, Stroke::new(2.0, if on { t.rec } else { t.border }), StrokeKind::Inside);
+        if started {
+            let bar = Rect::from_min_size(egui::pos2(rect.min.x + 2.0, rect.max.y - 5.0), vec2((rect.width() - 4.0) * fraction, 3.0));
+            p.rect_filled(bar, 1.0, t.rec);
+        }
+        p.circle_filled(icon, 4.5, if on { t.rec } else { t.rec.gamma_multiply(0.4) });
+    }
+    let text = if loading {
+        Some("loading…".to_string())
+    } else if let Some((started, _)) = recording {
+        Some(if started { "recording…" } else { "armed" }.to_string())
+    } else {
+        filled.as_ref().map(|(name, _)| name.clone())
+    };
     if let Some(text) = text {
         p.text(egui::pos2(rect.min.x + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, text, regular(11.0), t.text);
     }
     if loading {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
+    // The record button of an empty instrument slot.
+    if instrument && filled.is_none() && !loading && recording.is_none() {
+        let dot = Rect::from_center_size(egui::pos2(rect.max.x - 12.0, rect.center().y), vec2(16.0, 16.0));
+        let b = ui.interact(dot, resp.id.with("record"), Sense::click());
+        let bars = record_bars(app);
+        let what = format!("Record {bars} bar(s) into Live {} slot {}", column + 1, row + 1);
+        b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &what));
+        let c = if b.hovered() { t.rec } else { t.rec.gamma_multiply(0.55) };
+        p.circle_filled(dot.center(), 4.5, c);
+        if b.on_hover_text(what).clicked() {
+            app.session_view.column = column;
+            record_here(app, column, row);
+            return;
+        }
+    }
     if resp.double_clicked() && instrument && filled.is_some() {
         // The first click launched it; the second shows its notes rather than launching again.
         app.session_view.notes = Some(SlotNotes::new(column, row));
     } else if resp.clicked() {
         app.session_view.column = column;
-        if filled.is_some() {
+        if recording.is_some() {
+            crate::midi_record::cancel_slot(app, "Slot recording cancelled");
+        } else if filled.is_some() {
             let _ = app.run("live.launch", json!({"column": column, "slot": row}));
         }
     }
@@ -470,6 +525,18 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
                 crate::produce::run_or_offer_replace(app, "live.slot_from_clip", json!({"column": column, "slot": row}));
                 ui.close();
             }
+            ui.menu_button("Record Here", |ui| {
+                let mut bars = record_bars(app);
+                for n in [1, 2, 4, 8, 16] {
+                    ui.radio_value(&mut bars, n, format!("{n} bar{}", if n == 1 { "" } else { "s" }));
+                }
+                app.session_view.record_bars = bars;
+                ui.separator();
+                if ui.button(format!("Record {bars} Bar(s)")).clicked() {
+                    record_here(app, column, row);
+                    ui.close();
+                }
+            });
             slot_edit_items(app, ui, column, row, filled.is_some());
             ui.separator();
             column_menu(app, ui);
