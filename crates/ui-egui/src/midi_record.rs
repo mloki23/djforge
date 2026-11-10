@@ -12,9 +12,10 @@
 //!   undo step), within the punch range if there is one. Recording stop never refuses: a pass
 //!   over another clip goes on a new playlist made active (`on_overlap: new_playlist`), the
 //!   clips under it intact on the one before, as audio loop passes do; with MIDI Merge on it is
-//!   merged into the clip. The last take is kept: `midi.recover_take` (Event › Recover Last MIDI
-//!   Take) places it again, on a new playlist. Recording needs no audio input when only an
-//!   instrument track is armed.
+//!   merged into the clip. The last take is kept (with a copy in the autosave folder, so it
+//!   survives a crash): `midi.recover_take` (Event › Recover Last MIDI Take (place again))
+//!   places it again, on a new playlist. Recording needs no audio input when only an instrument
+//!   track is armed.
 //! - **Slot recordings** (`live.record_slot`). Armed on an empty slot of an instrument column,
 //!   the column's track is the live target ([`target_override`]: the old target comes back
 //!   afterwards). Capture starts at the next launch boundary `start` and runs for the slot's
@@ -223,8 +224,24 @@ fn lates(app: &SoundApp) -> u64 {
 fn dropped_note(app: &SoundApp, since: u64) -> String {
     match drops(app).saturating_sub(since) {
         0 => String::new(),
-        n => format!(" ({n} live events were dropped: the capture queue was full)"),
+        n => {
+            format!(" ({n} live events were dropped: the capture queue was full, so the take may be missing notes and its timing may be approximate)")
+        }
     }
+}
+
+/// The last take's copy in the autosave folder, so it survives a crash.
+pub const LAST_TAKE_FILE: &str = "last_midi_take.json";
+
+/// Keeps `params` (`midi.record_take`'s) as the last take, and a copy in the autosave folder.
+fn keep_take(app: &mut SoundApp, params: Value) {
+    if let Some(dir) = &app.autosave_dir
+        && let Ok(bytes) = serde_json::to_vec(&params)
+        && let Err(e) = soundcraft_engine::io::write_file(&dir.join(LAST_TAKE_FILE).to_string_lossy(), &bytes)
+    {
+        log::warn!("keeping the last MIDI take: {e}");
+    }
+    app.last_take = Some(params);
 }
 
 /// Every UI frame, after the transport requests (see the module docs).
@@ -269,7 +286,9 @@ pub fn slot_step(app: &mut SoundApp, pos: Samples, margin: Samples) {
     let written = match r.step(pos, margin) {
         SlotStep::Wait => return,
         SlotStep::Write => {
-            app.engine.begin_undo_group(SLOT_GROUP);
+            if !app.engine.in_undo_group() {
+                app.engine.begin_undo_group(SLOT_GROUP);
+            }
             match write_slot(app, &r, r.replace) {
                 Ok((slot, n)) => {
                     let launched = n > 0 && launch(app, &r, slot);
@@ -285,7 +304,9 @@ pub fn slot_step(app: &mut SoundApp, pos: Samples, margin: Samples) {
         // Played since the first write (or nothing written yet: a frame came after the end).
         // A first write that put notes in the slot is ours: the whole take replaces it.
         SlotStep::Finish => {
-            app.engine.begin_undo_group(SLOT_GROUP);
+            if !app.engine.in_undo_group() {
+                app.engine.begin_undo_group(SLOT_GROUP);
+            }
             write_slot(app, &r, r.replace || r.ours)
         }
     };
@@ -360,7 +381,7 @@ fn finish_slot(app: &mut SoundApp, r: &SlotRecording, recorded: Option<(usize, u
 /// The slot couldn't be written (`why`): the take waits for Recover Last MIDI Take.
 fn keep_for_recovery(app: &mut SoundApp, r: &SlotRecording, why: &str) {
     if r.events.iter().any(|c| c.msg().is_some()) {
-        app.last_take = Some(r.as_take());
+        keep_take(app, r.as_take());
         cancel_slot(app, &format!("Slot take not written: {why}. Event › Recover Last MIDI Take puts it on the track"));
     } else {
         cancel_slot(app, &format!("Slot recording stopped: {why}"));
@@ -377,7 +398,7 @@ pub fn cancel_slot(app: &mut SoundApp, why: &str) {
     }
     let unwritten = r.written.is_none_or(|n| n < r.events.len()) && r.events.iter().any(|c| c.msg().is_some());
     if unwritten && app.last_take.as_ref() != Some(&r.as_take()) {
-        app.last_take = Some(r.as_take());
+        keep_take(app, r.as_take());
         app.ui.status = format!("{why} (what was played is kept: Event › Recover Last MIDI Take)");
     } else {
         app.ui.status = why.to_string();
@@ -440,7 +461,7 @@ pub fn finish_take(app: &mut SoundApp, end: Samples, punch: Option<Range>) -> Op
         return Some(format!("Nothing recorded: the MIDI take was empty{dropped}"));
     }
     let params = json!({"track": take.track.0, "passes": passes_json(&passes), "on_overlap": "new_playlist"});
-    app.last_take = Some(params.clone());
+    keep_take(app, params.clone());
     Some(match app.run_typed("midi.record_take", params) {
         Ok(v) => format!("{}{dropped}", v.get("message").and_then(Value::as_str).unwrap_or("Recorded the MIDI take")),
         Err(e) => format!("MIDI take not placed: {e}. Event › Recover Last MIDI Take tries again{dropped}"),
@@ -450,7 +471,15 @@ pub fn finish_take(app: &mut SoundApp, end: Samples, punch: Option<Range>) -> Op
 /// `midi.recover_take {}`: places the last MIDI take (an arrangement take, or a slot take that
 /// could not be written) again, on a new playlist of its track. One undo step.
 pub fn recover(app: &mut SoundApp) -> Result<Value, String> {
-    let mut p = app.last_take.clone().ok_or("no MIDI take to recover: nothing was recorded since SoundCraft started")?;
+    if app.last_take.is_none() {
+        // After a crash: the copy kept in the autosave folder.
+        app.last_take = app
+            .autosave_dir
+            .as_ref()
+            .and_then(|d| soundcraft_engine::io::read_file(d.join(LAST_TAKE_FILE)).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok());
+    }
+    let mut p = app.last_take.clone().ok_or("no MIDI take to recover: nothing was recorded")?;
     if let Some(o) = p.as_object_mut() {
         o.insert("new_playlist".into(), json!(true));
     }

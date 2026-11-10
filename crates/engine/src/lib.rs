@@ -186,6 +186,8 @@ pub struct Engine {
     merge_hold: Option<String>,
     /// An open undo group: its label and the document before it (see `begin_undo_group`).
     undo_group: Option<(String, Arc<Session>)>,
+    /// How many `begin_undo_group`s the open group has had (nested ones join it).
+    undo_depth: u32,
     /// Messages for the UI status line / agents.
     pub messages: Vec<String>,
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
@@ -235,6 +237,7 @@ impl Engine {
             merge_key: None,
             merge_hold: None,
             undo_group: None,
+            undo_depth: 0,
             messages: Vec::new(),
             last_selection: None,
             stems: None,
@@ -324,6 +327,7 @@ impl Engine {
         self.undo.clear();
         self.redo.clear();
         self.undo_group = None;
+        self.undo_depth = 0;
         self.last_selection = None;
         // Copied clips name the old session's sources and clips.
         self.clipboard = Clipboard::default();
@@ -368,16 +372,32 @@ impl Engine {
 
     /// Opens an undo group labelled `label`: until [`Engine::commit_undo_group`], the commands
     /// run push no undo steps of their own (merged gestures and held merges included), and the
-    /// commit pushes one step for everything they changed. Does nothing while one is open.
+    /// commit pushes one step for everything they changed. It ends any merged gesture, so
+    /// nothing before it merges in. A group opened inside an open one joins it (its label is
+    /// the outer one's); the outermost commit closes it.
     pub fn begin_undo_group(&mut self, label: &str) {
+        self.merge_key = None;
         if self.undo_group.is_none() {
             self.undo_group = Some((label.to_string(), Arc::clone(&self.doc)));
+            self.undo_depth = 0;
+        }
+        self.undo_depth = self.undo_depth.saturating_add(1);
+    }
+
+    /// Closes the open undo group (the outermost of nested ones): one step for what changed
+    /// since it opened (none if nothing did). It ends any merged gesture, so what comes after
+    /// never merges into the group's step. Undo and redo close it first.
+    pub fn commit_undo_group(&mut self) {
+        self.undo_depth = self.undo_depth.saturating_sub(1);
+        if self.undo_depth == 0 {
+            self.close_undo_group();
         }
     }
 
-    /// Closes the open undo group: one step for what changed since it opened (none if nothing
-    /// did). Undo and redo close it first.
-    pub fn commit_undo_group(&mut self) {
+    /// Closes the open undo group whatever its nesting.
+    fn close_undo_group(&mut self) {
+        self.undo_depth = 0;
+        self.merge_key = None;
         if let Some((label, before)) = self.undo_group.take() {
             self.push_undo(&label, before);
         }
@@ -389,7 +409,7 @@ impl Engine {
     }
 
     pub fn undo(&mut self) -> bool {
-        self.commit_undo_group();
+        self.close_undo_group();
         let Some(h) = self.undo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
@@ -400,7 +420,7 @@ impl Engine {
     }
 
     pub fn redo(&mut self) -> bool {
-        self.commit_undo_group();
+        self.close_undo_group();
         let Some(h) = self.redo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);

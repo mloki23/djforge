@@ -164,7 +164,8 @@ fn a_take_over_a_clip_is_refused_goes_on_a_new_playlist_replaces_or_overdubs() {
     let s = e.session();
     assert_eq!(r["playlist"], "Lead.02");
     assert!(r["message"].as_str().unwrap().contains("new playlist `Lead.02`"), "{r}");
-    assert_eq!(playlists(&e, t), (vec![("Lead".into(), vec![at_beat(s, 4.0)]), ("Lead.02".into(), vec![at_beat(s, 6.0)])], 1));
+    // The new playlist is the old one with the take placed on it: the first clip plays on up to it.
+    assert_eq!(playlists(&e, t), (vec![("Lead".into(), vec![at_beat(s, 4.0)]), ("Lead.02".into(), vec![at_beat(s, 4.0), at_beat(s, 6.0)])], 1));
     e.undo();
     assert_eq!(playlists(&e, t).0.len(), 1, "undo takes the playlist too");
     // MIDI Merge: the take goes into the clip, which grows to cover it.
@@ -329,9 +330,27 @@ fn an_undo_group_makes_one_step_whatever_merges_are_held() {
     assert_eq!(e.undo_history().len(), steps, "nothing pushed while the group is open");
     e.commit_undo_group();
     assert_eq!((e.undo_history().len(), e.undo_label()), (steps + 1, Some("Record Slot Take")));
+    // A merged gesture after the commit (the automation pass still held) is a step of its own.
+    let s = e.session();
+    let p = take(&e, t, 8.0, 9.0, note(s, 64, 8.0, 8.5).to_vec());
+    e.execute_merged("midi.record_take", &p, "c").unwrap();
+    assert_eq!(e.undo_history().len(), steps + 2, "the group's step is not merged into");
     e.hold_merge(None);
     assert!(e.undo());
+    assert_eq!(clip_count(&e, t), 2, "only the later write undone");
+    assert!(e.undo());
     assert_eq!(clip_count(&e, t), 0, "both writes undone together");
+    // A group opened inside an open one joins it; the outermost commit closes it.
+    let steps = e.undo_history().len();
+    e.begin_undo_group("Outer");
+    e.begin_undo_group("Inner");
+    let s = e.session();
+    let p = take(&e, t, 4.0, 5.0, note(s, 60, 4.0, 4.5).to_vec());
+    e.execute("midi.record_take", &p).unwrap();
+    e.commit_undo_group();
+    assert!(e.in_undo_group(), "the inner commit leaves the outer group open");
+    e.commit_undo_group();
+    assert_eq!((e.undo_history().len(), e.undo_label(), e.in_undo_group()), (steps + 1, Some("Outer"), false));
     // A group in which nothing changed pushes nothing.
     let steps = e.undo_history().len();
     e.begin_undo_group("Nothing");
@@ -410,4 +429,52 @@ fn record_slot_arms_through_the_host_and_quantize_wraps_onto_the_downbeat() {
     let r = run(&mut e, "live.slot_from_take", p);
     assert_eq!(r["notes"], 0);
     assert!(e.session().live.slot(4, 1).is_none());
+}
+
+/// A punch-in over one clip of a long track, with the clips under it kept on a new playlist: the
+/// new active playlist is the old one with the take placed on it (only its own time cleared), so
+/// the rest of the track plays on; the old playlist is intact.
+#[test]
+fn a_take_on_a_new_playlist_keeps_the_rest_of_the_track_playing() {
+    let (mut e, t) = engine();
+    for (from, to, pitch) in [(0.0, 2.0, 50), (8.0, 12.0, 52), (20.0, 22.0, 54)] {
+        let s = e.session();
+        let p = take(&e, t, from, to, note(s, pitch, from, from + 0.5).to_vec());
+        run(&mut e, "midi.record_take", p);
+    }
+    // The middle clip's played timing was kept (it was quantized).
+    let middle = e.session().track(t).unwrap().clips()[1].id;
+    e.session_mut().midi_originals.insert(middle.0, soundcraft_midi::Sequence::default());
+    let before = e.session().track(t).unwrap().playlists[0].clone();
+    let s = e.session();
+    let p = json!({"track": t.0, "start": at_beat(s, 9.0), "end": at_beat(s, 10.0), "events": note(s, 60, 9.0, 9.5).to_vec(),
+        "on_overlap": "new_playlist"});
+    let r = run(&mut e, "midi.record_take", p);
+    assert_eq!(r["new_playlist"], true);
+    let s = e.session();
+    let tr = s.track(t).unwrap();
+    assert_eq!((tr.playlists.len(), tr.active_playlist), (2, 1));
+    assert_eq!(tr.playlists[0], before, "the playlist before is intact");
+    let spans: Vec<(Samples, Samples)> = tr.clips().iter().map(|c| (c.start, c.end())).collect();
+    let b = |x: f64| at_beat(s, x);
+    assert_eq!(spans, [(b(0.0), b(2.0)), (b(8.0), b(9.0)), (b(9.0), b(10.0)), (b(10.0), b(12.0)), (b(20.0), b(22.0))]);
+    let old: Vec<u64> = before.clips.iter().map(|c| c.id.0).collect();
+    assert!(tr.clips().iter().all(|c| !old.contains(&c.id.0)), "the copies have their own ids");
+    let copy = tr.clips().iter().find(|c| c.start == b(8.0)).unwrap().id;
+    assert!(s.midi_originals.contains_key(&copy.0), "a copy keeps its played timing");
+    // Forced (recovering a take), even over nothing: the track still plays on.
+    let p = json!({"track": t.0, "start": at_beat(s, 30.0), "end": at_beat(s, 31.0), "events": note(s, 62, 30.0, 30.5).to_vec(),
+        "new_playlist": true});
+    run(&mut e, "midi.record_take", p);
+    let tr = e.session().track(t).unwrap();
+    assert_eq!((tr.playlists.len(), tr.active_playlist, tr.clips().len()), (3, 2, 6));
+}
+
+#[test]
+fn a_take_of_too_many_events_over_its_passes_is_refused() {
+    let (mut e, t) = engine();
+    let ev: Vec<Value> = (0..600_000).map(|i| json!({"at": i, "status": 0xB0, "data1": 1, "data2": 0})).collect();
+    let pass = json!({"start": 0, "end": 1_000_000, "events": ev});
+    let err = e.execute("midi.record_take", &json!({"track": t.0, "passes": [pass.clone(), pass]})).unwrap_err().to_string();
+    assert!(err.contains("1200000 events") && err.contains("at most 1000000"), "{err}");
 }

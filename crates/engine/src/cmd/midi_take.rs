@@ -16,9 +16,10 @@
 //! overdub switch. With it on, a pass over one MIDI clip is merged into it (the clip grows to
 //! cover it). With it off, a pass goes on the track as a new clip where nothing is; over another
 //! clip, `on_overlap` decides: refused ([`would_replace`]), recorded over (`replace`, clearing
-//! only what lies under its own time), or put on a new playlist made active with the clips
-//! under it intact on the one before (`new_playlist`, what the app does when recording stops,
-//! as audio loop passes do). So a take never silently replaces Marty's clips, and is never lost.
+//! only what lies under its own time), or put on a new playlist made active (`new_playlist`,
+//! what the app does when recording stops, as audio loop passes do): a copy of the active
+//! playlist, so the rest of the track plays on, with the take placed on it, the playlist before
+//! intact. So a take never silently replaces Marty's clips, and is never lost.
 
 use super::live::{column_param, four_four, refuse_occupied, replace_param, slot_param};
 use super::*;
@@ -46,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Record MIDI",
             [],
             None,
-            "{track, start, end (positions: where recording started and stopped), events: [{at (timeline sample it played on), status, data1?, data2?}] (MIDI 1.0 channel messages in the order played), passes?: [{start, end, events}] (instead of start/end/events, for a take with transport jumps: one per stretch played without a loop wrap or locate), quantize?: bool (default: Input Quantize's setting), on_overlap?: refuse|replace|new_playlist (default refuse; replace: true means replace), new_playlist?: bool (always on a new playlist)} — each pass of the live MIDI recorded on an instrument or MIDI track becomes a MIDI clip over the time it was played (a note quantized past its end stretches it): note-ons paired with their note-offs within the pass (a repeated note-on ends the held note there), notes still held at its end cut there, events outside it left out; control changes, pitch bend, pressure and program changes kept as controllers. Input Quantize (event.input_quantize) moves the notes onto the session's grid when on; the played timing stays restorable (event.restore_performance). With MIDI Merge on (options.midi_merge) a pass over one MIDI clip is merged into it, the clip growing to cover it. Otherwise a pass over another clip is refused, records over what lies under its own time (replace), or goes on a new playlist made active, the clips under it staying intact on the playlist before (new_playlist), as audio loop passes do. A take with neither notes nor controllers creates nothing. One undo step. Returns {clip (the last; null when nothing was recorded), takes: [{clip, playlist, new_playlist, notes, controllers, start, end, merged, held_cut}], notes, controllers, start, end, merged, quantized, held_cut, playlist, new_playlist, message}",
+            "{track, start, end (positions: where recording started and stopped), events: [{at (timeline sample it played on), status, data1?, data2?}] (MIDI 1.0 channel messages in the order played), passes?: [{start, end, events}] (instead of start/end/events, for a take with transport jumps: one per stretch played without a loop wrap or locate), quantize?: bool (default: Input Quantize's setting), on_overlap?: refuse|replace|new_playlist (default refuse; replace: true means replace), new_playlist?: bool (always on a new playlist)}; at most 1000000 events in all — each pass of the live MIDI recorded on an instrument or MIDI track becomes a MIDI clip over the time it was played (a note quantized past its end stretches it): note-ons paired with their note-offs within the pass (a repeated note-on ends the held note there), notes still held at its end cut there, events outside it left out; control changes, pitch bend, pressure and program changes kept as controllers. Input Quantize (event.input_quantize) moves the notes onto the session's grid when on; the played timing stays restorable (event.restore_performance). With MIDI Merge on (options.midi_merge) a pass over one MIDI clip is merged into it, the clip growing to cover it. Otherwise a pass over another clip is refused, records over what lies under its own time (replace), or goes on a new playlist made active: a copy of the active one (so the rest of the track plays on) with the take placed on it, clearing only what lies under its own time, the playlist before staying intact (new_playlist), as audio loop passes do. A take with neither notes nor controllers creates nothing. One undo step. Returns {clip (the last; null when nothing was recorded), takes: [{clip, playlist, new_playlist, notes, controllers, start, end, merged, held_cut}], notes, controllers, start, end, merged, quantized, held_cut, playlist, new_playlist, message}",
             always,
             record_take
         ),
@@ -260,6 +261,10 @@ fn record_take(e: &mut Engine, p: &Value) -> Result<Value> {
     let name = tr.name.clone();
     let quantize = quantize_param(id, s, p)?;
     let opts = super::event_more::quantize_opts(s);
+    let total: usize = passes.iter().map(|x| x.events.len()).sum();
+    if total > MAX_EVENTS {
+        return Err(bad(id, format!("the take holds {total} events over its passes: at most {MAX_EVENTS} go in one command (split it)")));
+    }
     let mut takes: Vec<Value> = Vec::new();
     let (mut notes, mut controllers, mut held) = (0usize, 0usize, 0usize);
     for (i, pass) in passes.iter().enumerate() {
@@ -319,9 +324,8 @@ fn record_take(e: &mut Engine, p: &Value) -> Result<Value> {
             }
             Place::Clip | Place::NewPlaylist => {
                 let fresh = matches!(place, Place::NewPlaylist);
-                if fresh && let Some(t) = s.track_mut(track) {
-                    t.playlists.push(soundcraft_model::Playlist::new(format!("{}.{:02}", t.name, t.playlists.len() + 1)));
-                    t.active_playlist = t.playlists.len() - 1;
+                if fresh {
+                    copy_playlist(s, track);
                 }
                 let cid = s.new_clip_id();
                 // Placing it clears (and trims) only what lies under its own extent: refused
@@ -358,6 +362,42 @@ fn record_take(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"clip": top["clip"], "takes": takes, "notes": notes, "controllers": controllers, "start": bottom["start"], "end": top["end"],
         "merged": takes.iter().any(|t| t["merged"] == true), "quantized": quantize, "held_cut": held, "playlist": playlist,
         "new_playlist": on_new, "message": msg}))
+}
+
+/// Makes a copy of `track`'s active playlist and makes it active: its clips under new ids,
+/// with their played MIDI timing and clip effects, so the track plays on as before and the
+/// take placed on it next clears only what lies under its own time. The playlist copied stays
+/// as it was.
+fn copy_playlist(s: &mut Session, track: TrackId) {
+    let Some(clips) = s.track(track).map(|t| t.clips().to_vec()) else { return };
+    let mut copied = Vec::with_capacity(clips.len());
+    for mut c in clips {
+        let (old, new) = (c.id, s.new_clip_id());
+        c.id = new;
+        if let Some(seq) = s.midi_originals.get(&old.0).cloned() {
+            s.midi_originals.insert(new.0, seq);
+        }
+        let edit = &mut s.edit;
+        let (from, bypass) = (format!("clip_fx.{}.", old.0), format!("clip_fx.bypass.{}", old.0));
+        let values: Vec<(String, f64)> = edit
+            .values
+            .range(from.clone()..)
+            .take_while(|(k, _)| k.starts_with(&from))
+            .map(|(k, v)| (k.replacen(&from, &format!("clip_fx.{}.", new.0), 1), *v))
+            .collect();
+        edit.values.extend(values);
+        if edit.flag(&bypass) {
+            edit.set_flag(&format!("clip_fx.bypass.{}", new.0), true);
+        }
+        copied.push(c);
+    }
+    if let Some(t) = s.track_mut(track) {
+        let mut pl = soundcraft_model::Playlist::new(format!("{}.{:02}", t.name, t.playlists.len() + 1));
+        pl.clips = copied;
+        pl.sort();
+        t.playlists.push(pl);
+        t.active_playlist = t.playlists.len() - 1;
+    }
 }
 
 /// Merges a take (`seq`, in ticks from `base`; `performance`: its notes as played, when

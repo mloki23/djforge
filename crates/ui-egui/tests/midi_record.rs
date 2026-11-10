@@ -164,11 +164,13 @@ fn a_take_over_a_clip_goes_on_a_new_playlist_and_the_last_take_recovers() {
     let tr = app.engine.session().track(t).unwrap().clone();
     assert_eq!((tr.playlists.len(), tr.active_playlist), (2, 1), "{}", app.ui.status);
     assert_eq!(tr.playlists[0].clips.len(), 1, "the clip under it is intact on the playlist before");
+    assert_eq!(tr.playlists[1].clips.len(), 2, "the take, and the rest of the clip after it");
     assert!(app.ui.status.contains("new playlist `Lead.02`"), "{}", app.ui.status);
     // Recover Last MIDI Take places it again, on a new playlist.
     app.run("midi.recover_take", json!({})).unwrap();
     let tr = app.engine.session().track(t).unwrap();
-    assert_eq!((tr.playlists.len(), tr.active_playlist, tr.clips().len()), (3, 2, 1));
+    assert_eq!((tr.playlists.len(), tr.active_playlist), (3, 2));
+    assert_eq!(tr.clips().len(), 2, "the take, and the rest of the clip under it, still playing");
     assert!(app.ui.status.contains("Lead.03"), "{}", app.ui.status);
     assert_eq!(app.engine.undo_label(), Some("Record MIDI"));
 }
