@@ -184,6 +184,8 @@ pub struct Engine {
     merge_key: Option<String>,
     /// The key every merged gesture takes while held (see `hold_merge`).
     merge_hold: Option<String>,
+    /// An open undo group: its label and the document before it (see `begin_undo_group`).
+    undo_group: Option<(String, Arc<Session>)>,
     /// Messages for the UI status line / agents.
     pub messages: Vec<String>,
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
@@ -232,6 +234,7 @@ impl Engine {
             dirty_at: Cell::new((0, false)),
             merge_key: None,
             merge_hold: None,
+            undo_group: None,
             messages: Vec::new(),
             last_selection: None,
             stems: None,
@@ -320,6 +323,7 @@ impl Engine {
         self.saved = Arc::clone(&self.doc);
         self.undo.clear();
         self.redo.clear();
+        self.undo_group = None;
         self.last_selection = None;
         // Copied clips name the old session's sources and clips.
         self.clipboard = Clipboard::default();
@@ -362,7 +366,30 @@ impl Engine {
         self.undo.iter().map(|h| h.label.clone()).collect()
     }
 
+    /// Opens an undo group labelled `label`: until [`Engine::commit_undo_group`], the commands
+    /// run push no undo steps of their own (merged gestures and held merges included), and the
+    /// commit pushes one step for everything they changed. Does nothing while one is open.
+    pub fn begin_undo_group(&mut self, label: &str) {
+        if self.undo_group.is_none() {
+            self.undo_group = Some((label.to_string(), Arc::clone(&self.doc)));
+        }
+    }
+
+    /// Closes the open undo group: one step for what changed since it opened (none if nothing
+    /// did). Undo and redo close it first.
+    pub fn commit_undo_group(&mut self) {
+        if let Some((label, before)) = self.undo_group.take() {
+            self.push_undo(&label, before);
+        }
+    }
+
+    /// Whether an undo group is open.
+    pub fn in_undo_group(&self) -> bool {
+        self.undo_group.is_some()
+    }
+
     pub fn undo(&mut self) -> bool {
+        self.commit_undo_group();
         let Some(h) = self.undo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
@@ -373,6 +400,7 @@ impl Engine {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.commit_undo_group();
         let Some(h) = self.redo.pop() else { return false };
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
@@ -470,7 +498,7 @@ impl Engine {
                 // tempo change.
                 cmd::dj::settle_clipboard(&mut self.clipboard, &self.doc);
                 cmd::remember_selection(self, &before);
-                if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
+                if spec.undoable && !Arc::ptr_eq(&before, &self.doc) && self.undo_group.is_none() {
                     self.push_undo(spec.label, before);
                 }
                 if spec.journal {

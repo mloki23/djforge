@@ -25,10 +25,13 @@
 
 pub mod capture;
 pub mod devices;
+#[cfg(feature = "harness")]
+#[doc(hidden)]
+pub mod harness;
 pub mod midi_in;
 pub mod record;
 
-pub use capture::{CAPTURE_CAPACITY, Captured, MidiCapture};
+pub use capture::{CAPTURE_CAPACITY, CaptureEvent, Captured, MidiCapture, TakePass, passes as take_passes};
 pub use devices::AudioConfig;
 pub use midi_in::{KEYBOARD_SOURCE, MIDI_SLACK_NS, PENDING as MIDI_PENDING};
 
@@ -346,6 +349,8 @@ struct AudioState {
     capture_playing: bool,
     /// Captured events dropped (full queue).
     capture_dropped: u64,
+    /// Which pass of the timeline capture is in: a transport jump starts the next.
+    capture_pass: u32,
     /// A replaced capture queue the full `captures` channel refused, sent again later.
     capture_backlog: Option<rtrb::Producer<Captured>>,
 }
@@ -464,6 +469,7 @@ impl AudioState {
             capture: None,
             capture_playing: false,
             capture_dropped: 0,
+            capture_pass: 0,
             capture_backlog: None,
         }
     }
@@ -520,6 +526,7 @@ impl AudioState {
                     self.mix.set_live_loop(looped.filter(|r| r.len() > 64));
                     if self.playing {
                         self.mix.live_locate(self.pos, from, false);
+                        self.capture_jump(from);
                     } else {
                         // Launches sent just before the play command (for `from` on) stay queued.
                         self.mix.live_start(from);
@@ -566,6 +573,9 @@ impl AudioState {
                 }
                 Cmd::Locate(at) => {
                     self.mix.live_locate(self.pos, at, false);
+                    if self.playing {
+                        self.capture_jump(at);
+                    }
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
@@ -656,21 +666,40 @@ impl AudioState {
     /// into the capture queue, at the timeline sample each plays on (see [`capture`]). No
     /// allocation: a full queue drops the event and counts it.
     fn capture_live(&mut self, n: usize) {
-        let Some(target) = self.mix.live_target() else { return };
-        let Some(q) = self.capture.as_mut() else { return };
-        let armed = self.recording && self.session.track(target).is_some_and(|t| t.mixer.record_arm);
-        if !self.playing || !(armed || self.capture_playing) {
+        if !self.capturing() {
             return;
         }
+        let Some(q) = self.capture.as_mut() else { return };
         let last = n.saturating_sub(1);
+        let pass = self.capture_pass;
         for ev in self.mix.live_events() {
             let Some(msg) = midi_in::from_raw(ev.msg) else { continue };
             let at = self.pos.saturating_add(i64::try_from(ev.offset.min(last)).unwrap_or(0));
-            if q.push(Captured { at, msg }).is_err() {
+            if q.push(Captured { at, pass, event: CaptureEvent::Midi(msg) }).is_err() {
                 self.capture_dropped = self.capture_dropped.saturating_add(1);
             }
         }
         self.shared.midi.capture_dropped.store(self.capture_dropped, Ordering::Relaxed);
+    }
+
+    /// Whether what the target plays is being captured now (see [`capture`]).
+    fn capturing(&self) -> bool {
+        let Some(target) = self.mix.live_target() else { return false };
+        let armed = self.recording && self.session.track(target).is_some_and(|t| t.mixer.record_arm);
+        self.capture.is_some() && self.playing && (armed || self.capture_playing)
+    }
+
+    /// The transport jumps from `self.pos` to `to` while playing (a loop wrap, a locate): the
+    /// capture's pass ends here and the next starts at `to`, marked in the queue.
+    fn capture_jump(&mut self, to: Samples) {
+        if self.capturing()
+            && let Some(q) = self.capture.as_mut()
+            && q.push(Captured { at: self.pos, pass: self.capture_pass, event: CaptureEvent::Jump { to } }).is_err()
+        {
+            self.capture_dropped = self.capture_dropped.saturating_add(1);
+            self.shared.midi.capture_dropped.store(self.capture_dropped, Ordering::Relaxed);
+        }
+        self.capture_pass = self.capture_pass.wrapping_add(1);
     }
 
     fn flush_subs(&mut self) {
@@ -719,6 +748,7 @@ impl AudioState {
             && self.pos >= l.end
         {
             self.mix.live_locate(self.pos, l.start, true);
+            self.capture_jump(l.start);
             self.pos = l.start;
         }
         if let Some(l) = self.looped {
@@ -3229,13 +3259,6 @@ mod midi_tests {
             self.edit(|s| s.track_mut(t).unwrap().mixer.record_arm = on);
         }
 
-        /// Callbacks until the transport has rendered up to `at` (the next block starts there or later).
-        fn render_to(&mut self, at: i64) {
-            while self.st.pos < at {
-                self.callback();
-            }
-        }
-
         /// Sends `msg` from "Keys", due in the next callback.
         fn play_now(&mut self, msg: MidiMessage) {
             let t = self.now - 4_000_000;
@@ -3246,6 +3269,11 @@ mod midi_tests {
         fn played(&self, e: Ev) -> Vec<i64> {
             self.log().into_iter().filter(|x| x.2 == e).map(|x| x.3).collect()
         }
+    }
+
+    /// A live event captured in the first pass.
+    fn mid(at: i64, msg: MidiMessage) -> Captured {
+        Captured { at, pass: 0, event: CaptureEvent::Midi(msg) }
     }
 
     fn drained(c: &mut MidiCapture) -> Vec<Captured> {
@@ -3283,11 +3311,8 @@ mod midi_tests {
         r.tx.send(Cmd::MidiPlay(note_on(64))).unwrap();
         r.callback();
         let got = drained(&mut cap);
-        let want = vec![
-            Captured { at: r.played(Ev::On(60))[0], msg: note_on(60) },
-            Captured { at: r.played(Ev::Off(60))[0], msg: note_off(60) },
-            Captured { at: r.played(Ev::On(64))[0], msg: note_on(64) },
-        ];
+        let want =
+            vec![mid(r.played(Ev::On(60))[0], note_on(60)), mid(r.played(Ev::Off(60))[0], note_off(60)), mid(r.played(Ev::On(64))[0], note_on(64))];
         assert_eq!(got, want);
         assert!(want[0].at > 0 && want[0].at < want[1].at, "{want:?}");
         // Session view slot recordings capture while playing, recording or not.
@@ -3297,7 +3322,7 @@ mod midi_tests {
         r.play_now(note_on(65));
         r.callback();
         r.callback();
-        assert_eq!(drained(&mut cap), [Captured { at: r.played(Ev::On(65))[0], msg: note_on(65) }]);
+        assert_eq!(drained(&mut cap), [mid(r.played(Ev::On(65))[0], note_on(65))]);
         // Stopped: nothing plays on the timeline, nothing is captured.
         r.tx.send(Cmd::Stop).unwrap();
         r.callback();
@@ -3329,8 +3354,8 @@ mod midi_tests {
         assert_eq!(r.capacities(), start);
         let kept: Vec<u8> = drained(&mut cap)
             .iter()
-            .map(|c| match c.msg {
-                MidiMessage::ControlChange { value, .. } => value,
+            .map(|c| match c.msg() {
+                Some(MidiMessage::ControlChange { value, .. }) => value,
                 _ => 255,
             })
             .collect();
@@ -3338,143 +3363,5 @@ mod midi_tests {
         let _new = r.capture(8);
         r.callback();
         assert!(r.grx.captures.try_recv().is_ok(), "the old queue came back to be dropped");
-    }
-
-    /// The JSON events of a capture, as the UI hands them to the engine.
-    fn events_json(c: &[Captured]) -> serde_json::Value {
-        serde_json::Value::Array(
-            c.iter()
-                .map(|c| {
-                    let [status, data1, data2] = midi_in::raw(c.msg);
-                    serde_json::json!({"at": c.at, "status": status, "data1": data1, "data2": data2})
-                })
-                .collect(),
-        )
-    }
-
-    /// A take played on a fake MIDI source under a tempo ramp, captured on the audio thread and
-    /// written by `midi.record_take`: a clip on bar lines whose note ticks are where the
-    /// instrument played them.
-    #[test]
-    fn a_take_played_under_a_tempo_ramp_becomes_a_clip_of_the_ticks_heard() {
-        use soundcraft_time::TICKS_PER_QUARTER as Q;
-        let mut r = rig();
-        r.edit(|s| {
-            for b in 0..16 {
-                s.tempo.set_tempo(b * Q, 128.0 + 2.0 * b as f64).unwrap();
-            }
-        });
-        r.arm(true);
-        let mut cap = r.capture(1024);
-        r.tx.send(Cmd::Recording(true)).unwrap();
-        let start = 30_000;
-        r.tx.send(Cmd::Play { from: start, end: None, looped: None }).unwrap();
-        r.callback();
-        let mut pitches = Vec::new();
-        for (i, pitch) in [60u8, 62, 64, 65, 67].into_iter().enumerate() {
-            for _ in 0..(37 + 11 * i) {
-                r.callback();
-            }
-            r.play_now(note_on(pitch));
-            for _ in 0..(20 + 3 * i) {
-                r.callback();
-            }
-            r.play_now(note_off(pitch));
-            pitches.push(pitch);
-        }
-        // The last note is still held at the stop.
-        r.callback();
-        r.play_now(note_on(72));
-        for _ in 0..30 {
-            r.callback();
-        }
-        let end = r.st.pos;
-        let got = drained(&mut cap);
-        assert_eq!(got.len(), 11);
-        let mut e = soundcraft_engine::Engine::new((*r.st.session).clone());
-        let p = serde_json::json!({"track": r.track.0, "start": start, "end": end, "events": events_json(&got)});
-        let res = e.execute("midi.record_take", &p).unwrap();
-        let s = e.session();
-        let tick = |at: i64| s.tempo.samples_to_ticks_f(at, s.sample_rate).round() as i64;
-        let bar0 = s.tempo.bar_start_tick(s.tempo.bar_beat_at_tick(tick(start)).bar);
-        let clip = s.find_clip(soundcraft_model::ClipId(res["clip"].as_u64().unwrap())).unwrap().1;
-        assert_eq!(clip.start, s.tempo.tick_to_samples(bar0, s.sample_rate), "starts on the bar line");
-        let end_bb = s.tempo.bar_beat_at_tick(s.tempo.samples_to_ticks(clip.end(), s.sample_rate));
-        assert_eq!((end_bb.beat, end_bb.tick), (1, 0), "ends on a bar line");
-        assert!(clip.end() >= end);
-        let soundcraft_model::ClipContent::Midi { sequence } = &clip.content else { panic!() };
-        let mut want: Vec<(u8, i64, i64)> = pitches
-            .iter()
-            .map(|p| {
-                let (on, off) = (r.played(Ev::On(*p))[0], r.played(Ev::Off(*p))[0]);
-                (*p, tick(on) - bar0, tick(off) - tick(on))
-            })
-            .collect();
-        let held = r.played(Ev::On(72))[0];
-        want.push((72, tick(held) - bar0, tick(end) - tick(held)));
-        let notes: Vec<(u8, i64, i64)> = sequence.notes.iter().map(|n| (n.pitch, n.start, n.length)).collect();
-        assert_eq!(notes, want);
-        assert_eq!(res["held_cut"], 1);
-    }
-
-    /// A Session view slot recording, as the UI runs it: capture from the boundary, write the
-    /// slot a launch margin before the end and launch it there, then write in the notes played
-    /// after the first write (one undo step). The slot's first note sounds exactly where the
-    /// recording ended, and the late write cuts nothing sounding.
-    #[test]
-    fn a_slot_recording_launches_where_it_ends_and_loops_on_seamlessly() {
-        let mut r = rig();
-        let t = r.track;
-        r.edit(|s| s.live.columns = vec![soundcraft_model::LiveColumn::new(t)]);
-        let mut cap = r.capture(1024);
-        r.tx.send(Cmd::MidiCaptureWhilePlaying(true)).unwrap();
-        r.tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
-        r.callback();
-        // 120 bpm: bar 2 at 96 000, a one-bar recording ends at bar 3 (192 000).
-        let (b, end) = (96_000, 192_000);
-        r.render_to(b);
-        r.tx.send(Cmd::MidiPlay(note_on(60))).unwrap();
-        r.render_to(b + 12_000);
-        r.tx.send(Cmd::MidiPlay(note_off(60))).unwrap();
-        r.render_to(b + 48_000);
-        r.play_now(note_on(62));
-        r.render_to(b + 60_000);
-        r.play_now(note_off(62));
-        let mut e = soundcraft_engine::Engine::new((*r.st.session).clone());
-        let margin = soundcraft_engine::cmd::live_launch_margin(e.session(), 256);
-        r.render_to(end - 2 * margin);
-        let mut events = drained(&mut cap);
-        let write = |e: &mut soundcraft_engine::Engine, ev: &[Captured], replace: bool| {
-            let p = serde_json::json!({"column": 0, "slot": 0, "start": b, "bars": 1, "events": events_json(ev), "replace": replace});
-            e.execute_merged("live.slot_from_take", &p, "slot_take").unwrap()
-        };
-        let first = write(&mut e, &events, false);
-        assert_eq!(first["notes"], 2);
-        r.tx.send(session_cmd(e.session_arc(), Vec::new(), Vec::new())).unwrap();
-        r.tx.send(Cmd::Live(LiveCmd::Launch { column: 0, slot: 0, at: end })).unwrap();
-        // A note played in the last moments, after the first write.
-        r.render_to(end - margin / 2);
-        r.tx.send(Cmd::MidiPlay(note_on(64))).unwrap();
-        r.render_to(end - margin / 4);
-        r.tx.send(Cmd::MidiPlay(note_off(64))).unwrap();
-        r.render_to(end + 512);
-        events.extend(drained(&mut cap).into_iter().filter(|c| c.at < end));
-        let second = write(&mut e, &events, true);
-        assert_eq!(second["notes"], 3);
-        assert_eq!(e.undo_history().len(), 1, "one undo step");
-        r.tx.send(session_cmd(e.session_arc(), Vec::new(), Vec::new())).unwrap();
-        r.render_to(end + 96_000 + 1_000);
-        let on60 = r.played(Ev::On(60));
-        assert_eq!(on60, [b, end, end + 96_000], "live on the boundary, then the slot from where the recording ended");
-        // Released where it was played to (to the tick: 25 samples at 120 bpm), not cut early.
-        let held = r.played(Ev::Off(60))[0] - b;
-        let off60: Vec<i64> = r.played(Ev::Off(60)).into_iter().filter(|x| *x > end).collect();
-        assert_eq!(off60.len(), 1, "{off60:?}");
-        assert!((off60[0] - end - held).abs() <= 25, "not cut by the late write: {off60:?}, held {held}");
-        let on64 = r.played(Ev::On(64));
-        assert_eq!(on64.len(), 2, "{on64:?}");
-        assert!((on64[1] - on64[0] - 96_000).abs() <= 25, "the late note loops on too: {on64:?}");
-        assert_eq!(r.st.mix.live_late(), 0, "the launch arrived in time");
-        assert_eq!(r.st.mix.live_state()[0].playing.map(|p| (p.slot, p.start)), Some((0, end)));
     }
 }

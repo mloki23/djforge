@@ -3887,6 +3887,7 @@ dependencies = [
  "soundcraft-midi-io",
  "soundcraft-mix",
  "soundcraft-model",
+ "soundcraft-playback",
  "soundcraft-time",
 ]
 

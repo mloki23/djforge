@@ -25,6 +25,8 @@ cpal.workspace = true
 cpal = { workspace = true, features = ["wasm-bindgen"] }
 
 [features]
+# The hand-driven audio thread end-to-end tests use (`harness`); not for the app.
+harness = []
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
 # (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p soundcraft --features asio`.
 asio = ["cpal/asio"]
@@ -32,6 +34,7 @@ asio = ["cpal/asio"]
 [dev-dependencies]
 serde_json.workspace = true
 soundcraft-engine.workspace = true
+soundcraft-playback = { path = ".", features = ["harness"] }
 soundcraft-midi.workspace = true
 
 [lints]

@@ -8,13 +8,17 @@
 //! the end is cut there. Control changes, pitch bend, pressure and program changes are kept as
 //! the clip's controllers (a slot keeps none: slots play only notes).
 //!
+//! A take is played in passes: a loop wrap or a locate while recording starts a new one, and
+//! notes pair only within a pass. Each pass becomes a clip over the time it was played.
+//!
 //! **Record modes.** Audio takes follow `edit.record_mode`, which is about audio files
 //! (destructive, TrackPunch); MIDI follows MIDI Merge (`options.midi_merge`), Pro Tools' MIDI
-//! overdub switch. With it on, a take over one MIDI clip is merged into it (the clip grows to
-//! the take's bars). With it off, a take goes on the track as a new clip only where nothing is:
-//! over another clip it is refused ([`would_replace`]) unless `replace: true`, which clears what
-//! is under it, so a take never silently replaces Marty's clips. (An audio take clears what is
-//! under it, as Pro Tools' normal record does; MIDI is refused instead so the host can ask.)
+//! overdub switch. With it on, a pass over one MIDI clip is merged into it (the clip grows to
+//! cover it). With it off, a pass goes on the track as a new clip where nothing is; over another
+//! clip, `on_overlap` decides: refused ([`would_replace`]), recorded over (`replace`, clearing
+//! only what lies under its own time), or put on a new playlist made active with the clips
+//! under it intact on the one before (`new_playlist`, what the app does when recording stops,
+//! as audio loop passes do). So a take never silently replaces Marty's clips, and is never lost.
 
 use super::live::{column_param, four_four, refuse_occupied, replace_param, slot_param};
 use super::*;
@@ -42,7 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Record MIDI",
             [],
             None,
-            "{track, start, end (positions: where recording started and stopped), events: [{at (timeline sample it played on), status, data1?, data2?}] (MIDI 1.0 channel messages in the order played), quantize?: bool (default: Input Quantize's setting), replace?: bool (default false)} — the live MIDI recorded on an instrument or MIDI track becomes a MIDI clip from the bar line at or before `start` to the one at or after `end`: note-ons paired with their note-offs (a repeated note-on ends the held note there), notes still held at `end` cut there, events outside start..end left out; control changes, pitch bend, pressure and program changes kept as controllers. Input Quantize (event.input_quantize) moves the notes when on; the played timing stays restorable (event.restore_performance). With MIDI Merge on (options.midi_merge) a take over one MIDI clip is merged into it, the clip growing to the take's bars; otherwise a take over another clip is refused unless `replace` (which clears what is under it). A take without notes creates nothing. One undo step. Returns {clip (null when nothing was recorded), notes, controllers, start, end, merged, quantized, held_cut}",
+            "{track, start, end (positions: where recording started and stopped), events: [{at (timeline sample it played on), status, data1?, data2?}] (MIDI 1.0 channel messages in the order played), passes?: [{start, end, events}] (instead of start/end/events, for a take with transport jumps: one per stretch played without a loop wrap or locate), quantize?: bool (default: Input Quantize's setting), on_overlap?: refuse|replace|new_playlist (default refuse; replace: true means replace), new_playlist?: bool (always on a new playlist)} — each pass of the live MIDI recorded on an instrument or MIDI track becomes a MIDI clip over the time it was played (a note quantized past its end stretches it): note-ons paired with their note-offs within the pass (a repeated note-on ends the held note there), notes still held at its end cut there, events outside it left out; control changes, pitch bend, pressure and program changes kept as controllers. Input Quantize (event.input_quantize) moves the notes onto the session's grid when on; the played timing stays restorable (event.restore_performance). With MIDI Merge on (options.midi_merge) a pass over one MIDI clip is merged into it, the clip growing to cover it. Otherwise a pass over another clip is refused, records over what lies under its own time (replace), or goes on a new playlist made active, the clips under it staying intact on the playlist before (new_playlist), as audio loop passes do. A take with neither notes nor controllers creates nothing. One undo step. Returns {clip (the last; null when nothing was recorded), takes: [{clip, playlist, new_playlist, notes, controllers, start, end, merged, held_cut}], notes, controllers, start, end, merged, quantized, held_cut, playlist, new_playlist, message}",
             always,
             record_take
         ),
@@ -173,14 +177,6 @@ fn tick_of(tempo: &TempoMap, sr: soundcraft_time::SampleRate, at: Samples) -> i6
     if t.is_finite() { t.clamp(-1e15, 1e15) as i64 } else { 0 }
 }
 
-/// The bar line at or before `tick`, and the one at or after it.
-fn bars_around(tempo: &TempoMap, tick: i64) -> (i64, i64) {
-    let bar = tempo.bar_beat_at_tick(tick).bar;
-    let at = tempo.bar_start_tick(bar);
-    let after = if at < tick { tempo.bar_start_tick(bar.saturating_add(1)) } else { at };
-    (at, after)
-}
-
 /// `p`'s `quantize` (default: whether Input Quantize is on).
 fn quantize_param(cmd: &str, s: &Session, p: &Value) -> Result<bool> {
     match p.get("quantize") {
@@ -189,118 +185,179 @@ fn quantize_param(cmd: &str, s: &Session, p: &Value) -> Result<bool> {
     }
 }
 
+/// What `midi.record_take` does with a take over another clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnOverlap {
+    Refuse,
+    Replace,
+    NewPlaylist,
+}
+
+/// `p`'s `on_overlap` (`replace: true` is `replace`; default `refuse`).
+fn on_overlap_param(cmd: &str, p: &Value) -> Result<OnOverlap> {
+    let replace = replace_param(cmd, p)?;
+    match p.get("on_overlap").filter(|v| !v.is_null()) {
+        None => Ok(if replace { OnOverlap::Replace } else { OnOverlap::Refuse }),
+        Some(v) => match v.as_str() {
+            Some("refuse") => Ok(OnOverlap::Refuse),
+            Some("replace") => Ok(OnOverlap::Replace),
+            Some("new_playlist") => Ok(OnOverlap::NewPlaylist),
+            _ => Err(bad(cmd, "`on_overlap` must be refuse, replace or new_playlist")),
+        },
+    }
+}
+
+/// One pass of a take: timeline played without a jump, from `start` to `end`.
+struct Pass {
+    start: Samples,
+    end: Samples,
+    events: Vec<TakeEvent>,
+}
+
+/// `p`'s passes: its `passes` list, else one pass of its `start`, `end` and `events`.
+fn passes_param(e: &Engine, cmd: &str, p: &Value) -> Result<Vec<Pass>> {
+    let one = |v: &Value, i: Option<usize>| -> Result<Pass> {
+        let (Some(start), Some(end)) = (position_param(e, cmd, v, "start")?, position_param(e, cmd, v, "end")?) else {
+            return Err(bad(
+                cmd,
+                match i {
+                    Some(i) => format!("pass {i}: `start` and `end` required"),
+                    None => "`start` and `end` (where recording started and stopped) required".into(),
+                },
+            ));
+        };
+        if end <= start {
+            return Err(bad(cmd, "`end` must come after `start`"));
+        }
+        Ok(Pass { start, end, events: events_param(cmd, v)? })
+    };
+    match p.get("passes") {
+        None | Some(Value::Null) => Ok(vec![one(p, None)?]),
+        Some(Value::Array(list)) if !list.is_empty() && list.len() <= 1_000 => list.iter().enumerate().map(|(i, v)| one(v, Some(i))).collect(),
+        Some(_) => Err(bad(cmd, "`passes` must be a list of 1..=1000 {start, end, events}")),
+    }
+}
+
+/// Where a pass goes: merged into a clip (grown to the range), a new clip on the active
+/// playlist, or a new clip on a new playlist.
+enum Place {
+    Merge(ClipId, Range),
+    Clip,
+    NewPlaylist,
+}
+
 fn record_take(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = RECORD_TAKE;
     let track = track_param(e, id, p, "track")?.ok_or_else(|| bad(id, "`track` required"))?;
-    let (Some(start), Some(end)) = (position_param(e, id, p, "start")?, position_param(e, id, p, "end")?) else {
-        return Err(bad(id, "`start` and `end` (where recording started and stopped) required"));
-    };
-    if end <= start {
-        return Err(bad(id, "`end` must come after `start`"));
-    }
-    let replace = replace_param(id, p)?;
-    let events = events_param(id, p)?;
+    let on_overlap = on_overlap_param(id, p)?;
+    let force_playlist = p.get("new_playlist").and_then(Value::as_bool).unwrap_or(false);
+    let passes = passes_param(e, id, p)?;
     let s = e.session();
     let tr = s.track(track).ok_or_else(|| bad(id, "no such track"))?;
     if !tr.kind.is_midi() {
         return Err(bad(id, format!("`{}` is not an instrument or MIDI track", tr.name)));
     }
-    let quantize = quantize_param(id, s, p)?;
-    let (sr, tempo) = (s.sample_rate, &s.tempo);
-    let (t0, t1) = (tick_of(tempo, sr, start), tick_of(tempo, sr, end));
-    let (bar0, _) = bars_around(tempo, t0);
-    let (_, mut bar1) = bars_around(tempo, t1);
-    let clip_start = tempo.tick_to_samples(bar0, sr);
-    let base = tempo.samples_to_ticks(clip_start, sr);
-    let (mut seq, held_cut) = take_sequence(&events, |at| tick_of(tempo, sr, at) - base, t0 - base, t1 - base);
-    let controllers = seq.ctrls.len();
-    if seq.notes.is_empty() {
-        let msg = if controllers > 0 {
-            format!("Nothing recorded on `{}`: the take has no notes ({controllers} controller events left out)", tr.name)
-        } else {
-            format!("Nothing recorded on `{}`: no notes were played", tr.name)
-        };
-        e.message(msg.clone());
-        return Ok(json!({"clip": null, "notes": 0, "controllers": controllers, "start": start, "end": end, "merged": false,
-            "quantized": false, "held_cut": 0, "message": msg}));
-    }
-    let performance = seq.clone();
-    if quantize {
-        soundcraft_midi::ops::quantize(&mut seq.notes, &super::event_more::quantize_opts(s));
-        seq.notes.iter_mut().for_each(|n| n.start = n.start.max(0));
-        seq.sort();
-    }
-    // A note quantized onto the last bar line still starts inside the clip.
-    let last_start = seq.notes.iter().map(|n| n.start).max().unwrap_or(0);
-    for _ in 0..4 {
-        if base.saturating_add(last_start) < bar1 {
-            break;
-        }
-        bar1 = bars_around(tempo, bar1.saturating_add(1)).1;
-    }
-    let clip_end = tempo.tick_to_samples(bar1, sr).max(clip_start.saturating_add(1));
-    let span = Range::new(clip_start, clip_end);
-    let under: Vec<&Clip> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).collect();
     let name = tr.name.clone();
-    let bar_label = |t: i64| tempo.bar_beat_at_tick(t).bar;
-    let what = || under.iter().map(|c| format!("`{}`", c.name)).collect::<Vec<_>>().join(", ");
-    let merge_into = if under.is_empty() {
-        None
-    } else if s.edit.midi_merge {
-        let one = match under.as_slice() {
-            [c] if matches!(c.content, ClipContent::Midi { .. }) => Some(*c),
+    let quantize = quantize_param(id, s, p)?;
+    let opts = super::event_more::quantize_opts(s);
+    let mut takes: Vec<Value> = Vec::new();
+    let (mut notes, mut controllers, mut held) = (0usize, 0usize, 0usize);
+    for (i, pass) in passes.iter().enumerate() {
+        let s = e.session();
+        let (sr, tempo) = (s.sample_rate, &s.tempo);
+        // Ticks from the take's own first sample, as the clip will play them.
+        let base = tempo.samples_to_ticks(pass.start, sr);
+        let t1 = tick_of(tempo, sr, pass.end) - base;
+        let (mut seq, held_cut) = take_sequence(&pass.events, |at| tick_of(tempo, sr, at) - base, 0, t1.max(1));
+        if seq.notes.is_empty() && seq.ctrls.is_empty() {
+            continue;
+        }
+        let performance = seq.clone();
+        if quantize && !seq.notes.is_empty() {
+            // On the session's grid: in absolute ticks, back to the take's after.
+            seq.notes.iter_mut().for_each(|n| n.start += base);
+            soundcraft_midi::ops::quantize(&mut seq.notes, &opts);
+            seq.notes.iter_mut().for_each(|n| n.start = (n.start - base).max(0));
+            seq.sort();
+        }
+        // Its real extent: where it was played, and any note quantized past the end.
+        let last = seq.notes.iter().map(|n| n.start.saturating_add(1)).max().unwrap_or(0);
+        let end = pass.end.max(tempo.tick_to_samples(base.saturating_add(last), sr));
+        let span = Range::new(pass.start, end);
+        let tr = s.track(track).ok_or_else(|| bad(id, "no such track"))?;
+        let under: Vec<&Clip> = tr.clips().iter().filter(|c| c.range().overlaps(&span)).collect();
+        let merge_into = match under.as_slice() {
+            [c] if s.edit.midi_merge && matches!(c.content, ClipContent::Midi { .. }) => {
+                let grown = Range::new(c.start.min(span.start), c.end().max(span.end));
+                let blocked = tr.clips().iter().any(|o| o.id != c.id && o.range().overlaps(&grown));
+                (!blocked).then_some((c.id, grown))
+            }
             _ => None,
         };
-        let grown = one.map(|c| Range::new(c.start.min(span.start), c.end().max(span.end)));
-        let blocked = |r: &Range| tr.clips().iter().any(|o| one.is_some_and(|c| c.id != o.id) && o.range().overlaps(r));
-        match one.zip(grown) {
-            Some((c, r)) if !blocked(&r) => Some((c.id, r)),
-            _ if replace => None,
-            _ => {
-                return Err(would_replace(
-                    id,
-                    format!(
-                        "bars {}–{} on `{name}` hold {}: MIDI Merge overdubs into one MIDI clip with room to grow; pass replace: true to record over them",
-                        bar_label(bar0),
-                        bar_label(bar1) - 1,
-                        what()
-                    ),
-                ));
+        let place = match (force_playlist, merge_into, under.is_empty(), on_overlap) {
+            (true, _, _, _) => Place::NewPlaylist,
+            (false, Some((cid, grown)), _, _) => Place::Merge(cid, grown),
+            (false, None, true, _) | (false, None, false, OnOverlap::Replace) => Place::Clip,
+            (false, None, false, OnOverlap::NewPlaylist) => Place::NewPlaylist,
+            (false, None, false, OnOverlap::Refuse) => {
+                let what = under.iter().map(|c| format!("`{}`", c.name)).collect::<Vec<_>>().join(", ");
+                let which = if passes.len() > 1 { format!(" (pass {})", i + 1) } else { String::new() };
+                let how = if s.edit.midi_merge {
+                    "MIDI Merge overdubs into one MIDI clip with room to grow; pass on_overlap: new_playlist to keep both, or replace to record over them"
+                } else {
+                    "pass on_overlap: new_playlist to keep both, or replace to record over them, or turn on MIDI Merge (options.midi_merge) to overdub"
+                };
+                return Err(would_replace(id, format!("the take{which} on `{name}` overlaps {what}: {how}")));
             }
-        }
-    } else if replace {
-        None
-    } else {
-        return Err(would_replace(
-            id,
-            format!(
-                "bars {}–{} on `{name}` hold {}: pass replace: true to record over them, or turn on MIDI Merge (options.midi_merge) to overdub",
-                bar_label(bar0),
-                bar_label(bar1) - 1,
-                what()
-            ),
-        ));
-    };
-    let notes = seq.notes.len();
-    let s = e.session_mut();
-    let (clip, merged, span) = match merge_into {
-        Some((cid, grown)) => {
-            merge(s, cid, grown, base, seq, quantize.then_some(performance));
-            (cid, true, grown)
-        }
-        None => {
-            let cid = s.new_clip_id();
-            // Placing it clears (and trims) what was under it: refused above unless `replace`.
-            crate::edit::place_clip(s, track, Clip::midi(cid, name.clone(), span.start, span.len(), seq));
-            if quantize {
-                s.midi_originals.insert(cid.0, performance);
+        };
+        let (n, c) = (seq.notes.len(), seq.ctrls.len());
+        let s = e.session_mut();
+        let (clip, merged, span, new_playlist) = match place {
+            Place::Merge(cid, grown) => {
+                merge(s, cid, grown, base, seq, quantize.then_some(performance));
+                (cid, true, grown, false)
             }
-            (cid, false, span)
-        }
+            Place::Clip | Place::NewPlaylist => {
+                let fresh = matches!(place, Place::NewPlaylist);
+                if fresh && let Some(t) = s.track_mut(track) {
+                    t.playlists.push(soundcraft_model::Playlist::new(format!("{}.{:02}", t.name, t.playlists.len() + 1)));
+                    t.active_playlist = t.playlists.len() - 1;
+                }
+                let cid = s.new_clip_id();
+                // Placing it clears (and trims) only what lies under its own extent: refused
+                // above unless `replace`.
+                crate::edit::place_clip(s, track, Clip::midi(cid, name.clone(), span.start, span.len().max(1), seq));
+                if quantize {
+                    s.midi_originals.insert(cid.0, performance);
+                }
+                (cid, false, span, fresh)
+            }
+        };
+        let playlist = e.session().track(track).and_then(|t| t.playlist()).map(|pl| pl.name.clone());
+        (notes, controllers, held) = (notes + n, controllers + c, held + held_cut);
+        takes.push(json!({"clip": clip, "playlist": playlist, "new_playlist": new_playlist, "notes": n, "controllers": c,
+            "start": span.start, "end": span.end, "merged": merged, "held_cut": held_cut}));
+    }
+    let first = passes.first().map_or(0, |x| x.start);
+    let last = passes.last().map_or(0, |x| x.end);
+    let (Some(top), Some(bottom)) = (takes.last().cloned(), takes.first().cloned()) else {
+        let msg = format!("Nothing recorded on `{name}`: nothing was played");
+        e.message(msg.clone());
+        return Ok(json!({"clip": null, "takes": [], "notes": 0, "controllers": 0, "start": first, "end": last, "merged": false,
+            "quantized": false, "held_cut": 0, "playlist": null, "new_playlist": false, "message": msg}));
     };
-    e.message(format!("Recorded {notes} MIDI note(s) on `{name}`"));
-    Ok(json!({"clip": clip, "notes": notes, "controllers": controllers, "start": span.start, "end": span.end, "merged": merged,
-        "quantized": quantize, "held_cut": held_cut}))
+    let playlist = e.session().track(track).and_then(|t| t.playlist()).map(|pl| pl.name.clone());
+    let on_new = takes.iter().any(|t| t["new_playlist"] == true);
+    let msg = match &playlist {
+        Some(pl) if on_new => {
+            format!("Recorded {notes} MIDI note(s) on `{name}`, on the new playlist `{pl}` (the clips under it stay on the playlist before)")
+        }
+        _ => format!("Recorded {notes} MIDI note(s) on `{name}`"),
+    };
+    e.message(msg.clone());
+    Ok(json!({"clip": top["clip"], "takes": takes, "notes": notes, "controllers": controllers, "start": bottom["start"], "end": top["end"],
+        "merged": takes.iter().any(|t| t["merged"] == true), "quantized": quantize, "held_cut": held, "playlist": playlist,
+        "new_playlist": on_new, "message": msg}))
 }
 
 /// Merges a take (`seq`, in ticks from `base`; `performance`: its notes as played, when
