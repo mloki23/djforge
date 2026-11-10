@@ -489,6 +489,11 @@ pub struct LearnState {
     pub wake_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Said once that mapped ports went beyond what the player filters.
     overflow_logged: bool,
+    /// The waker couldn't start: try again from this UI time (the next device refresh).
+    waker_retry_at: Option<f64>,
+    /// The detected encoder's direction is a guess (all its ticks went one way): the overlay
+    /// says to check it.
+    pub check_direction: bool,
     runtime: HashMap<String, Runtime>,
     /// The merged gesture (its key) and the time of its last event.
     gesture: Option<(String, f64)>,
@@ -566,6 +571,11 @@ fn learned(app: &mut SoundApp, m: Mapping, replace: bool, first: Option<u8>) {
 fn finish_detect(app: &mut SoundApp) {
     let Some(d) = app.midi_learn.detect.take() else { return };
     let mode = classify(&d.values);
+    app.midi_learn.check_direction = match mode {
+        Mode::RelOffset => d.values.iter().all(|v| *v > 64),
+        Mode::RelTwos => d.values.iter().all(|v| (1..=63).contains(v)),
+        _ => false,
+    };
     if let Some(m) = app.ui.midi_mappings.iter_mut().find(|m| m.key() == d.key)
         && m.mode != mode
     {
@@ -626,11 +636,17 @@ pub fn frame(app: &mut SoundApp, now: f64) {
 /// Wakes the UI for MIDI (the host's waker) and for what MIDI learn waits on: a gesture to end,
 /// encoder detection, a Touch/Latch touch to release.
 pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
+    // Started once MIDI is first wanted; a failed start is tried again at the device refresh rate.
+    let s = &mut app.midi_learn;
+    let due = s.waker_retry_at.is_none_or(|at| s.now >= at);
     if let Some(h) = &mut app.midi_host
         && !h.has_waker()
+        && due
+        && s.wake_wanted.load(std::sync::atomic::Ordering::Relaxed)
     {
         let c = ctx.clone();
-        h.set_waker(std::sync::Arc::clone(&app.midi_learn.wake_wanted), Box::new(move || c.request_repaint()));
+        let started = h.set_waker(std::sync::Arc::clone(&s.wake_wanted), Box::new(move || c.request_repaint()));
+        s.waker_retry_at = (!started).then_some(s.now + crate::midi_input::REFRESH_S);
     }
     let s = &app.midi_learn;
     if s.gesture.is_some() || !s.touch.is_empty() || s.detect.is_some() {
@@ -1188,6 +1204,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             let key = app.midi_learn.overlay_mapping.clone();
             let found = key.as_ref().and_then(|k| app.ui.midi_mappings.iter().position(|m| &m.key() == k));
             let detecting = app.midi_learn.detect.is_some();
+            let check = app.midi_learn.check_direction && mode_is_relative(app, found);
             let mut mode = found.and_then(|i| app.ui.midi_mappings.get(i)).map(|m| m.mode);
             let mut held = false;
             overlay(ctx, &mut |ui| {
@@ -1197,6 +1214,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         if detecting {
                             ui.label(egui::RichText::new("detecting…").color(t.text_dim));
                         } else {
+                            if check {
+                                ui.label(egui::RichText::new("(check direction)").color(t.text_dim))
+                                    .on_hover_text("Every tick went one way: turn it the other way to check the mode");
+                            }
                             egui::ComboBox::new("midi_learn_overlay_mode", "Mode").selected_text(mode.label()).show_ui(ui, |ui| {
                                 for x in Mode::ALL.into_iter().filter(|x| !matches!(x, Mode::Momentary | Mode::Toggle)) {
                                     ui.selectable_value(mode, x, x.label());
@@ -1226,6 +1247,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         }
     }
     mappings_window(app, ctx);
+}
+
+fn mode_is_relative(app: &SoundApp, i: Option<usize>) -> bool {
+    i.and_then(|i| app.ui.midi_mappings.get(i)).is_some_and(|m| m.mode.relative())
 }
 
 /// Setup › MIDI › MIDI Mappings: every mapping, its mode, sensitivity and pickup, and activity.
@@ -1622,6 +1647,27 @@ mod tests {
         frame(&mut app, 1.0 + DETECT_S + 0.05);
         assert!(app.midi_learn.detect.is_none());
         assert_eq!(app.ui.midi_mappings[1].mode, Mode::Absolute);
+        assert!(!app.midi_learn.check_direction);
+        // Ticks only one way: its mode is a guess, and the overlay says so.
+        app.run("midi.learn", json!({"target": {"kind": "track_volume", "track": "Verb"}})).unwrap();
+        for _ in 0..DETECT_MSGS {
+            handle(&mut app, &cc(ddj, 9, 1), 2.0);
+        }
+        assert_eq!(app.ui.midi_mappings[2].mode, Mode::RelTwos);
+        assert!(app.midi_learn.check_direction);
+    }
+
+    #[test]
+    fn the_waker_starts_only_once_midi_is_wanted() {
+        let (mut app, _, _) = app();
+        let ctx = egui::Context::default();
+        frame(&mut app, 0.0);
+        wake_on_midi(&mut app, &ctx);
+        assert!(!app.midi_host.as_ref().unwrap().has_waker(), "no mappings, no learn: no waker");
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "stop_all"}), json!({}));
+        frame(&mut app, 0.1);
+        wake_on_midi(&mut app, &ctx);
+        assert!(app.midi_host.as_ref().unwrap().has_waker());
     }
 
     #[test]

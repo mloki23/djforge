@@ -25,14 +25,16 @@ pub const QUEUE_CAPACITY: usize = 4096;
 /// Seconds between device-list refreshes.
 pub const REFRESH_S: f64 = 1.0;
 
-/// How often the waker thread looks at its queue: the longest a mapped control waits for the UI
-/// to wake while nothing else repaints it.
+/// How often the waker thread looks at its queue while wanted: the longest a mapped control
+/// waits for the UI to wake while nothing else repaints it.
 pub const WAKE_POLL: std::time::Duration = std::time::Duration::from_millis(4);
+/// How often it looks while not wanted (it only empties its queue then).
+pub const WAKE_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A thread with its own queue of the source's events that wakes the UI (`wake`) when events
 /// arrive and `wanted` is set: egui sleeps between frames while the transport is stopped, and
-/// MIDI input is no egui event. It sleeps between looks ([`WAKE_POLL`]); the router does nothing
-/// extra for it.
+/// MIDI input is no egui event. It sleeps between looks ([`WAKE_POLL`] while wanted, else
+/// [`WAKE_IDLE`]); the router does nothing extra for it.
 struct Waker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -150,7 +152,7 @@ impl MidiHost {
         let stopped = std::sync::Arc::clone(&stop);
         let thread = std::thread::Builder::new().name("midi-ui-waker".into()).spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
-                std::thread::park_timeout(WAKE_POLL);
+                std::thread::park_timeout(if wanted.load(Ordering::Relaxed) { WAKE_POLL } else { WAKE_IDLE });
                 let mut any = false;
                 while sub.pop().is_some() {
                     any = true;
@@ -406,10 +408,10 @@ mod tests {
             std::thread::yield_now();
         }
         wanted.store(false, Ordering::Relaxed);
-        std::thread::sleep(WAKE_POLL * 3);
+        std::thread::sleep(WAKE_IDLE + WAKE_POLL * 3);
         let before = woken.load(Ordering::Relaxed);
         assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
-        std::thread::sleep(WAKE_POLL * 10);
+        std::thread::sleep(WAKE_IDLE * 2);
         assert_eq!(woken.load(Ordering::Relaxed), before, "not wanted: no wake");
         drop(h);
     }
