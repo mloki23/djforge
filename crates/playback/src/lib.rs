@@ -33,7 +33,7 @@ pub mod record;
 
 pub use capture::{CAPTURE_CAPACITY, CaptureEvent, Captured, MidiCapture, TakePass, passes as take_passes};
 pub use devices::AudioConfig;
-pub use midi_in::{KEYBOARD_SOURCE, MIDI_SLACK_NS, PENDING as MIDI_PENDING};
+pub use midi_in::{CONTROL_PORTS, Control as MidiControl, KEYBOARD_SOURCE, MIDI_SLACK_NS, MidiControls, PENDING as MIDI_PENDING};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_midi_io::{MidiClock, MidiMessage, PortId, Subscriber};
@@ -126,6 +126,8 @@ struct MidiShared {
     capture_dropped: AtomicU64,
     /// A capture queue was handed to this player's audio thread.
     has_capture: AtomicBool,
+    /// The notes and controllers mapped to controls, which don't play the target.
+    controls: midi_in::MidiControls,
 }
 
 impl MidiShared {
@@ -784,7 +786,7 @@ impl AudioState {
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         if self.mix.live_target().is_some() {
-            self.midi.feed(&mut self.mix, n);
+            self.midi.feed(&mut self.mix, n, &self.shared.midi.controls);
         } else {
             self.midi.discard();
         }
@@ -1389,6 +1391,12 @@ impl Player {
     /// MIDI panic: every live note off and the controllers reset.
     pub fn midi_panic(&self) {
         let _ = self.tx.send(Cmd::MidiPanic);
+    }
+
+    /// The notes and controllers (per port) mapped to controls: they no longer play the live
+    /// target (note-offs still pass). Replaces the set given before.
+    pub fn set_midi_controls(&self, controls: &[(PortId, midi_in::Control)]) {
+        self.shared.midi.controls.set(controls);
     }
 
     /// Plays one message from the on-screen keyboard on the target at the next block.
@@ -3004,6 +3012,38 @@ mod midi_tests {
         r.tx.send(Cmd::MidiClosed(closed[0])).unwrap();
         r.callback();
         assert_eq!(r.sounding(), Vec::<u8>::new(), "unplugged");
+    }
+
+    /// A note and a controller mapped to controls on one port don't play the target from that
+    /// port; from another port, and once unmapped, they do. Note-offs always pass.
+    #[test]
+    fn mapped_notes_and_controllers_do_not_play_the_target() {
+        let mut r = rig();
+        let keys = r.src.open("Keys").unwrap();
+        let cc = |cc: u8| MidiMessage::ControlChange { ch: 0, cc, value: 99 };
+        r.callback();
+        // Held before its key is mapped: the mapping doesn't strand it.
+        r.send("Keys", note_on(64), r.now - 4_000_000);
+        r.callback();
+        let map = [
+            (keys, midi_in::Control::Note { ch: 0, note: 60 }),
+            (keys, midi_in::Control::Cc { ch: 0, cc: 7 }),
+            (keys, midi_in::Control::Note { ch: 0, note: 64 }),
+        ];
+        r.shared.midi.controls.set(&map);
+        let t = r.now - 4_000_000;
+        r.send("Keys", note_on(60), t);
+        r.send("Keys", cc(7), t);
+        r.send("Keys", note_on(62), t);
+        r.send("Pads", note_on(60), t);
+        r.send("Keys", note_off(64), t);
+        r.callback();
+        let got: Vec<Ev> = r.log().into_iter().map(|e| e.2).filter(|e| !matches!(e, Ev::Midi([0xB0, 121 | 123, _]))).collect();
+        assert_eq!(got, [Ev::On(64), Ev::On(62), Ev::On(60), Ev::Off(64)], "Keys' 60 and CC 7 are controls; Pads' 60 plays");
+        r.shared.midi.controls.set(&[]);
+        r.send("Keys", note_on(60), r.now - 4_000_000);
+        r.callback();
+        assert_eq!(r.notes().last().map(|e| e.2), Some(Ev::On(60)), "unmapped: it plays");
     }
 
     /// A stopped transport with a target renders the target instrument; the on-screen

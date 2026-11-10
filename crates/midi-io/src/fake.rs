@@ -87,6 +87,10 @@ impl Drop for FakeSource {
 }
 
 impl MidiSource for FakeSource {
+    fn as_fake_mut(&mut self) -> Option<&mut FakeSource> {
+        Some(self)
+    }
+
     fn list(&self) -> Vec<PortInfo> {
         listing(self.devices.iter().map(|d| (d.name.clone(), d.backend_id.clone())))
     }

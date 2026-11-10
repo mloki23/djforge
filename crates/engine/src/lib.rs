@@ -571,6 +571,11 @@ impl Engine {
         }
     }
 
+    /// The key of the gesture `execute_merged` is merging into now (`None`: none).
+    pub fn merge_key(&self) -> Option<&str> {
+        self.merge_key.as_deref()
+    }
+
     /// End a gesture started with `execute_merged`.
     pub fn end_merge(&mut self) {
         self.merge_key = None;

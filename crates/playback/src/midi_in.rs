@@ -24,9 +24,15 @@
 //! **Order.** Events of one port come in order, and never overtake each other: once an event of
 //! a port waits, the port's later events wait behind it, and offsets are clamped to be
 //! non-decreasing per port within a block. Different ports are independent.
+//!
+//! **Controls.** Notes and controllers mapped to controls (MIDI learn) don't play the target:
+//! the [`MidiControls`] filter, shared with the UI thread through atomics, drops their note-ons,
+//! poly pressure and control changes as they arrive. Note-offs always pass, so a note that was
+//! sounding when its key got mapped is still released.
 
 use soundcraft_midi_io::{MidiClock, MidiEvent, MidiMessage, PortId, Subscriber};
 use soundcraft_mix::{LiveEvent, MixEngine};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Added to the longest callback to make the live MIDI latency `L` (2 ms).
 pub const MIDI_SLACK_NS: u64 = 2_000_000;
@@ -48,6 +54,93 @@ pub const KEYBOARD_SOURCE: u32 = u32::MAX;
 
 /// Ports tracked per block for ordering; events of further ports are ordered conservatively.
 const PORTS: usize = 16;
+
+/// Ports [`MidiControls`] can filter; mappings on further ports also play the target.
+pub const CONTROL_PORTS: usize = 16;
+
+/// One bit per channel and note (the first 2048), then per channel and controller.
+const CONTROL_WORDS: usize = 2 * 16 * 128 / 64;
+
+/// What a mapped message is, for [`MidiControls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Control {
+    Note { ch: u8, note: u8 },
+    Cc { ch: u8, cc: u8 },
+}
+
+impl Control {
+    fn bit(self) -> usize {
+        match self {
+            Control::Note { ch, note } => usize::from(ch & 0x0F) * 128 + usize::from(note & 0x7F),
+            Control::Cc { ch, cc } => 2048 + usize::from(ch & 0x0F) * 128 + usize::from(cc & 0x7F),
+        }
+    }
+
+    /// The control `msg` belongs to (`None`: note-offs, which always pass, and the rest).
+    fn of(msg: &MidiMessage) -> Option<Control> {
+        match *msg {
+            MidiMessage::NoteOn { ch, note, .. } | MidiMessage::PolyPressure { ch, note, .. } => Some(Control::Note { ch, note }),
+            MidiMessage::ControlChange { ch, cc, .. } => Some(Control::Cc { ch, cc }),
+            _ => None,
+        }
+    }
+}
+
+/// The notes and controllers, per port, that are mapped to controls and so don't play the live
+/// target. The UI thread writes it ([`MidiControls::set`]); the audio thread reads it as events
+/// arrive, wait-free. A change is not atomic as a whole: an event arriving during one may be
+/// judged by the old or the new set.
+pub struct MidiControls {
+    /// The port each row filters (`u32::MAX`: none).
+    ports: [AtomicU32; CONTROL_PORTS],
+    bits: [[AtomicU64; CONTROL_WORDS]; CONTROL_PORTS],
+}
+
+impl Default for MidiControls {
+    fn default() -> Self {
+        MidiControls {
+            ports: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            bits: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+        }
+    }
+}
+
+impl MidiControls {
+    /// Replaces the set with `controls`. Ports beyond [`CONTROL_PORTS`] are left out.
+    pub fn set(&self, controls: &[(PortId, Control)]) {
+        let mut rows: Vec<PortId> = controls.iter().map(|(p, _)| *p).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for (i, (port, bits)) in self.ports.iter().zip(&self.bits).enumerate() {
+            let id = rows.get(i).copied();
+            let mut words = [0u64; CONTROL_WORDS];
+            for (_, c) in controls.iter().filter(|(p, _)| Some(*p) == id) {
+                let b = c.bit();
+                if let Some(w) = words.get_mut(b / 64) {
+                    *w |= 1 << (b % 64);
+                }
+            }
+            // Cleared first, so a row never pairs a new port with its old bits.
+            port.store(u32::MAX, Ordering::Release);
+            for (a, w) in bits.iter().zip(words) {
+                a.store(w, Ordering::Relaxed);
+            }
+            port.store(id.map_or(u32::MAX, |p| p.0), Ordering::Release);
+        }
+    }
+
+    /// Whether `msg` from `port` is mapped to a control. No allocation, no lock.
+    pub fn consumes(&self, port: PortId, msg: &MidiMessage) -> bool {
+        let Some(c) = Control::of(msg) else { return false };
+        let b = c.bit();
+        self.ports
+            .iter()
+            .zip(&self.bits)
+            .find(|(p, _)| p.load(Ordering::Acquire) == port.0)
+            .and_then(|(_, bits)| bits.get(b / 64))
+            .is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (b % 64)) != 0)
+    }
+}
 
 /// The MIDI input's state on the audio thread.
 pub(crate) struct MidiIn {
@@ -260,8 +353,8 @@ impl MidiIn {
     }
 
     /// Hands the events due in the next block of `n` samples to `mix` (in port order), keeps the
-    /// later ones, and counts `n` as rendered.
-    pub(crate) fn feed(&mut self, mix: &mut MixEngine, n: usize) {
+    /// later ones, and counts `n` as rendered. New arrivals that `controls` consumes are dropped.
+    pub(crate) fn feed(&mut self, mix: &mut MixEngine, n: usize, controls: &MidiControls) {
         let mut order = Order::new();
         let n_i = i64::try_from(n).unwrap_or(i64::MAX);
         // What waited, oldest first, compacted in place.
@@ -282,6 +375,9 @@ impl MidiIn {
         self.pending.truncate(keep);
         // New arrivals.
         while let Some(e) = self.sub.as_mut().and_then(Subscriber::pop) {
+            if controls.consumes(e.port, &e.msg) {
+                continue;
+            }
             let at = self.offset(&e);
             if order.is_blocked(e.port) || at >= n_i {
                 order.block(e.port);

@@ -160,6 +160,12 @@ pub trait MidiSource {
     /// False once the router thread has stopped: subscribers will receive nothing more.
     fn healthy(&self) -> bool;
 
+    /// The simulated source behind this one, for tests that inject events into a source an app
+    /// owns (`None` for real hardware).
+    fn as_fake_mut(&mut self) -> Option<&mut FakeSource> {
+        None
+    }
+
     /// Opens every listed port that is not open yet; one result per attempted port.
     fn open_all(&mut self) -> Vec<Result<PortId, MidiIoError>> {
         let closed: Vec<PortInfo> = self.list().into_iter().filter(|p| !self.is_open(&p.name)).collect();
