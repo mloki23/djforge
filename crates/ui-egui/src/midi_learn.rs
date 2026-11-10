@@ -27,9 +27,17 @@
 //!   sensitivity (travel per tick). A note (or a controller in Momentary or Toggle mode) is a
 //!   button: Momentary sets "on" while held and "off" on release; Toggle flips between them on
 //!   each press ("on": 0 dB for volume and stems, the top for pan and parameters; "off": −inf, the
-//!   bottom). Moves go through `Engine::execute_merged` keyed by the mapping, and the gesture
-//!   ends [`GESTURE_S`] after the last event: one knob turn is one undo step.
+//!   bottom). Moves go through `Engine::execute_merged` under one key for every MIDI control
+//!   ([`MIDI_GESTURE`]), and the gesture ends [`GESTURE_S`] after the last event: one knob turn,
+//!   or several knobs turned together, is one undo step. A message that changes nothing (a
+//!   jittery pot) edits nothing and doesn't hold the gesture open. While a track is in
+//!   Touch/Latch automation and playing, a MIDI move of its volume, pan or a stem fader counts as
+//!   touching that fader for [`GESTURE_S`], so the pass writes its lane as a mouse drag would.
 //! - The same message from another device does nothing.
+//!
+//! **Waking.** egui sleeps between frames while nothing changes, and MIDI is no egui event: the
+//! host's waker thread (`MidiHost::set_waker`, its own queue) repaints the UI as soon as MIDI
+//! arrives while there are mappings or a learn is under way.
 //!
 //! **Coexistence with live play.** A mapped note or controller is a control, not music: while
 //! it is mapped it doesn't play the live MIDI target. The player's audio thread drops it
@@ -39,7 +47,11 @@
 //!
 //! **Learn.** Right-click a control and choose Learn MIDI (or `midi.learn`): the next note-on or
 //! controller from any enabled input binds it, and a small overlay says "Move a control…", then
-//! "Mapped to <device> CC 7". Esc cancels. Learning a target again replaces its mapping; binding a
+//! "Mapped to <device> CC 7". Esc cancels. A controller learned for a continuous target is
+//! watched for [`DETECT_S`] (or [`DETECT_MSGS`] messages) to tell an encoder from a knob
+//! ([`classify`]); those messages move nothing, and the overlay then offers the detected mode
+//! as a selector, so a wrong guess is one click. Mapping a switch controller (CC 64..69, the
+//! sustain pedal and its kin) sends it 0 on the live target, so a pedal held then can't stick. Learning a target again replaces its mapping; binding a
 //! message another target already uses asks whether to replace that mapping or keep both.
 //!
 //! **Commands** (UI commands, see [`command`]): `midi.mappings`, `midi.map`, `midi.unmap`,
@@ -63,6 +75,19 @@ const PICKUP_WINDOW: f32 = 1.5 / 127.0;
 const OVERLAY_S: f64 = 2.5;
 /// Seconds a mapping's activity light stays lit.
 const ACTIVITY_S: f64 = 0.3;
+/// The merge key every continuous MIDI move takes: moves of several controls within one
+/// gesture are one undo step.
+pub const MIDI_GESTURE: &str = "midi";
+/// A newly learned controller is watched this long (or for [`DETECT_MSGS`] messages) to tell a
+/// relative encoder from an absolute knob ([`classify`]).
+pub const DETECT_S: f64 = 0.3;
+pub const DETECT_MSGS: usize = 4;
+/// The range of a relative controller's sensitivity (travel per tick).
+pub const MIN_SENSITIVITY: f32 = 0.001;
+pub const MAX_SENSITIVITY: f32 = 0.25;
+/// Controllers whose value 0 releases something held (sustain, portamento, sostenuto, soft
+/// pedal, legato, hold 2): reset on the live target when mapped, so a held pedal can't stick.
+const SWITCH_CCS: std::ops::RangeInclusive<u8> = 64..=69;
 
 /// A MIDI input device as a mapping names it: its identity (backend id and raw name, see
 /// `soundcraft_midi_io::PortInfo`) and the name it was listed under.
@@ -131,6 +156,13 @@ impl Matcher {
 
     fn is_note(self) -> bool {
         matches!(self, Matcher::Note { .. })
+    }
+
+    /// Channel 0..=15 and note or controller 0..=127.
+    pub fn valid(&self) -> bool {
+        match *self {
+            Matcher::Note { ch, note: n } | Matcher::Cc { ch, cc: n } => ch <= 15 && n <= 127,
+        }
     }
 }
 
@@ -326,6 +358,19 @@ impl Mapping {
         !self.target.is_trigger() && !self.matcher.is_note() && self.mode == Mode::Absolute
     }
 
+    /// Itself with its sensitivity in range and a mode its message can use (`None`: the message is
+    /// out of range).
+    pub fn normalised(mut self) -> Option<Mapping> {
+        if !self.matcher.valid() {
+            return None;
+        }
+        self.sensitivity = clamp_sensitivity(self.sensitivity);
+        if !self.mode.fits(&self.matcher) {
+            self.mode = default_mode(&self.matcher, &self.target);
+        }
+        Some(self)
+    }
+
     fn json(&self) -> Value {
         json!({
             "device": self.device,
@@ -337,6 +382,35 @@ impl Mapping {
             "sensitivity": self.sensitivity,
             "pickup": self.pickup,
         })
+    }
+}
+
+/// `s` within [`MIN_SENSITIVITY`]..=[`MAX_SENSITIVITY`] (the default when not a number).
+pub fn clamp_sensitivity(s: f32) -> f32 {
+    if s.is_finite() { s.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY) } else { DEFAULT_SENSITIVITY }
+}
+
+/// The mode a controller's first messages after learning suggest (see [`DETECT_S`]): repeated
+/// small steps around 0 (1..8 up, 120..127 down) are a two's-complement encoder, repeated values
+/// around 64 (57..71) an offset encoder, repeated 1..8 and 65..72 a sign-bit encoder, and only
+/// tiny values (1..3) an encoder ticking up; anything else (distinct values moving one way, say)
+/// is an absolute knob or fader.
+pub fn classify(values: &[u8]) -> Mode {
+    let mut distinct = values.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let repeats = distinct.len() < values.len();
+    let all = |f: &dyn Fn(u8) -> bool| !values.is_empty() && values.iter().all(|v| f(*v));
+    if repeats && all(&|v| (1..=8).contains(&v) || (120..=127).contains(&v)) {
+        Mode::RelTwos
+    } else if repeats && all(&|v| (57..=71).contains(&v)) {
+        Mode::RelOffset
+    } else if repeats && all(&|v| (1..=8).contains(&v) || (65..=72).contains(&v)) {
+        Mode::RelSignMag
+    } else if all(&|v| (1..=3).contains(&v)) {
+        Mode::RelTwos
+    } else {
+        Mode::Absolute
     }
 }
 
@@ -353,7 +427,9 @@ pub fn default_mode(matcher: &Matcher, target: &Target) -> Mode {
 /// Reads the preferences' mappings, skipping (rather than failing on) any it can't read.
 pub fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Mapping>, D::Error> {
     let v = Value::deserialize(d)?;
-    Ok(v.as_array().map(|a| a.iter().filter_map(|m| serde_json::from_value(m.clone()).ok()).collect()).unwrap_or_default())
+    Ok(v.as_array()
+        .map(|a| a.iter().filter_map(|m| serde_json::from_value::<Mapping>(m.clone()).ok().and_then(Mapping::normalised)).collect())
+        .unwrap_or_default())
 }
 
 /// A learned message another target already uses: replace that mapping, or keep both.
@@ -362,6 +438,20 @@ pub struct Conflict {
     pub mapping: Mapping,
     /// The target already mapped to it.
     pub other: String,
+    /// The learned controller's value (for encoder detection), `None` for a note or a trigger.
+    pub first: Option<u8>,
+}
+
+/// A newly learned controller being watched to tell its kind ([`classify`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Detect {
+    /// The mapping's key.
+    pub key: String,
+    pub device: DeviceKey,
+    pub matcher: Matcher,
+    pub values: Vec<u8>,
+    /// When it was learned (UI time).
+    pub started: f64,
 }
 
 /// A mapping's state while running: pickup, the button's last state, activity.
@@ -373,6 +463,8 @@ struct Runtime {
     /// The controller's last position, while not picked up.
     last_in: Option<f32>,
     pressed: bool,
+    /// The mode this state is for: a change of mode starts afresh.
+    mode: Option<Mode>,
     /// When it last received something (UI time), and what.
     activity: Option<(f64, String)>,
 }
@@ -386,6 +478,17 @@ pub struct LearnState {
     pub conflict: Option<Conflict>,
     /// A message the overlay shows until a UI time.
     pub overlay: Option<(String, f64)>,
+    /// The mapping (its key) whose mode the overlay offers, after learning a controller.
+    pub overlay_mapping: Option<String>,
+    /// A controller just learned, watched to detect an encoder.
+    pub detect: Option<Detect>,
+    /// The faders (volume, pan, stems) MIDI moved, and when (UI time): Touch/Latch automation
+    /// counts them as touched for [`GESTURE_S`].
+    pub(crate) touch: HashMap<(TrackId, soundcraft_model::AutoParam), f64>,
+    /// Set while MIDI should wake the UI (mappings or learning), read by the host's waker.
+    pub wake_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Said once that mapped ports went beyond what the player filters.
+    overflow_logged: bool,
     runtime: HashMap<String, Runtime>,
     /// The merged gesture (its key) and the time of its last event.
     gesture: Option<(String, f64)>,
@@ -420,6 +523,14 @@ pub fn mapped(app: &SoundApp, target: &Target) -> usize {
 pub fn commit(app: &mut SoundApp, m: Mapping, replace: bool) -> usize {
     app.ui.midi_mappings.retain(|o| o.target != m.target && !(replace && o.device.same(&m.device) && o.matcher == m.matcher));
     let line = format!("Mapped to {} {}", m.device.name, m.matcher.label());
+    if let Matcher::Cc { ch, cc } = m.matcher
+        && SWITCH_CCS.contains(&cc)
+        && let Some(p) = &app.player
+    {
+        // Its messages stop reaching the live target now: release what it may be holding.
+        p.play_midi(MidiMessage::ControlChange { ch, cc, value: 0 });
+    }
+    app.midi_learn.overlay_mapping = (!m.matcher.is_note() && !m.target.is_trigger()).then(|| m.key());
     app.ui.midi_mappings.push(m);
     app.midi_learn.overlay = Some((line.clone(), app.midi_learn.now + OVERLAY_S));
     app.ui.status = line;
@@ -428,21 +539,50 @@ pub fn commit(app: &mut SoundApp, m: Mapping, replace: bool) -> usize {
 }
 
 /// Binds the learned target to `matcher` of `device`, or asks first when another target uses it.
-fn bind(app: &mut SoundApp, device: DeviceKey, matcher: Matcher, target: Target) {
+fn bind(app: &mut SoundApp, device: DeviceKey, matcher: Matcher, input: Input, target: Target) {
     let mode = default_mode(&matcher, &target);
     let m = Mapping { device, matcher, target, mode, ..Mapping::default() };
     let other = app.ui.midi_mappings.iter().find(|o| o.device.same(&m.device) && o.matcher == m.matcher && o.target != m.target);
+    let first = match input {
+        Input::Cc(v) if !m.target.is_trigger() => Some(v),
+        _ => None,
+    };
     if let Some(o) = other {
-        app.midi_learn.conflict = Some(Conflict { other: o.target.label(), mapping: m });
+        app.midi_learn.conflict = Some(Conflict { other: o.target.label(), mapping: m, first });
         return;
     }
-    commit(app, m, false);
+    learned(app, m, false, first);
+}
+
+/// Commits a learned mapping and, for a controller on a continuous target, starts telling an
+/// encoder from a knob with its first value.
+fn learned(app: &mut SoundApp, m: Mapping, replace: bool, first: Option<u8>) {
+    let detect = first.map(|v| Detect { key: m.key(), device: m.device.clone(), matcher: m.matcher, values: vec![v], started: app.midi_learn.now });
+    commit(app, m, replace);
+    app.midi_learn.detect = detect;
+}
+
+/// Ends encoder detection: the mapping takes the mode its values suggest.
+fn finish_detect(app: &mut SoundApp) {
+    let Some(d) = app.midi_learn.detect.take() else { return };
+    let mode = classify(&d.values);
+    if let Some(m) = app.ui.midi_mappings.iter_mut().find(|m| m.key() == d.key)
+        && m.mode != mode
+    {
+        m.mode = mode;
+        app.mark_prefs_changed();
+    }
+    if let Some(m) = app.ui.midi_mappings.iter().find(|m| m.key() == d.key) {
+        let line = format!("Mapped to {} {}", m.device.name, m.matcher.label());
+        app.midi_learn.overlay = Some((line, app.midi_learn.now + OVERLAY_S));
+        app.midi_learn.overlay_mapping = Some(d.key);
+    }
 }
 
 /// Answers the pending question: `replace` the other mapping, or keep both.
 pub fn resolve_conflict(app: &mut SoundApp, replace: bool) {
     if let Some(c) = app.midi_learn.conflict.take() {
-        commit(app, c.mapping, replace);
+        learned(app, c.mapping, replace, c.first);
     }
 }
 
@@ -462,6 +602,9 @@ pub fn frame(app: &mut SoundApp, now: f64) {
     for e in events {
         handle(app, &e, now);
     }
+    if app.midi_learn.detect.as_ref().is_some_and(|d| now - d.started > DETECT_S) {
+        finish_detect(app);
+    }
     if let Some((key, at)) = &app.midi_learn.gesture
         && now - at > GESTURE_S
     {
@@ -470,7 +613,34 @@ pub fn frame(app: &mut SoundApp, now: f64) {
         }
         app.midi_learn.gesture = None;
     }
+    app.midi_learn.touch.retain(|_, at| now - *at <= GESTURE_S);
+    if !app.midi_learn.runtime.is_empty() {
+        let keys: std::collections::HashSet<String> = app.ui.midi_mappings.iter().map(Mapping::key).collect();
+        app.midi_learn.runtime.retain(|k, _| keys.contains(k));
+    }
+    let wanted = !app.ui.midi_mappings.is_empty() || app.midi_learn.learning.is_some() || app.midi_learn.detect.is_some();
+    app.midi_learn.wake_wanted.store(wanted, std::sync::atomic::Ordering::Relaxed);
     sync_controls(app);
+}
+
+/// Wakes the UI for MIDI (the host's waker) and for what MIDI learn waits on: a gesture to end,
+/// encoder detection, a Touch/Latch touch to release.
+pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
+    if let Some(h) = &mut app.midi_host
+        && !h.has_waker()
+    {
+        let c = ctx.clone();
+        h.set_waker(std::sync::Arc::clone(&app.midi_learn.wake_wanted), Box::new(move || c.request_repaint()));
+    }
+    let s = &app.midi_learn;
+    if s.gesture.is_some() || !s.touch.is_empty() || s.detect.is_some() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Whether MIDI moved `param` of `track` within the last [`GESTURE_S`] (Touch/Latch writing).
+pub(crate) fn touched(app: &SoundApp, track: TrackId, param: &soundcraft_model::AutoParam) -> bool {
+    app.midi_learn.touch.get(&(track, param.clone())).is_some_and(|at| app.midi_learn.now - at <= GESTURE_S)
 }
 
 /// Whether a MIDI control's gesture is merging now: the frame's end-of-gesture must leave it.
@@ -496,7 +666,13 @@ fn sync_controls(app: &mut SoundApp) {
     let Some(p) = &app.player else { return };
     let now = controls(app);
     if app.midi_learn.controls_sent.as_ref() != Some(&now) {
-        p.set_midi_controls(&now);
+        if !p.set_midi_controls(&now) && !app.midi_learn.overflow_logged {
+            log::warn!(
+                "MIDI mappings on more than {} ports: mapped notes of the others also play the live target",
+                soundcraft_playback::CONTROL_PORTS
+            );
+            app.midi_learn.overflow_logged = true;
+        }
         app.midi_learn.controls_sent = Some(now);
     }
 }
@@ -519,14 +695,25 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
         if input != Input::Note(false)
             && let Some(target) = app.midi_learn.learning.take()
         {
-            bind(app, device, matcher, target);
+            bind(app, device, matcher, input, target);
         }
         return;
     }
-    let hits: Vec<usize> =
-        app.ui.midi_mappings.iter().enumerate().filter(|(_, m)| m.device.same(&device) && m.matcher == matcher).map(|(i, _)| i).collect();
-    for i in hits {
-        if let Some(m) = app.ui.midi_mappings.get(i).cloned() {
+    if let (Some(d), Input::Cc(v)) = (&mut app.midi_learn.detect, input)
+        && d.device.same(&device)
+        && d.matcher == matcher
+    {
+        // Still telling an encoder from a knob: these messages only teach.
+        d.values.push(v);
+        if d.values.len() >= DETECT_MSGS {
+            finish_detect(app);
+        }
+        return;
+    }
+    let hits: Vec<String> = app.ui.midi_mappings.iter().filter(|m| m.device.same(&device) && m.matcher == matcher).map(Mapping::key).collect();
+    for key in hits {
+        // Found again by key: a command run by an earlier hit may have changed the list.
+        if let Some(m) = app.ui.midi_mappings.iter().find(|m| m.key() == key).cloned() {
             apply(app, &m, input, now);
         }
     }
@@ -557,6 +744,10 @@ fn edge(m: &Mapping, rt: &mut Runtime, input: Input) -> Option<bool> {
 fn apply(app: &mut SoundApp, m: &Mapping, input: Input, now: f64) {
     let key = m.key();
     let mut rt = app.midi_learn.runtime.remove(&key).unwrap_or_default();
+    if rt.mode != Some(m.mode) {
+        // A new mode reads the control afresh (pickup, button state).
+        rt = Runtime { activity: rt.activity, mode: Some(m.mode), ..Runtime::default() };
+    }
     rt.activity = Some((
         now,
         match input {
@@ -570,7 +761,7 @@ fn apply(app: &mut SoundApp, m: &Mapping, input: Input, now: f64) {
             trigger(app, m);
         }
     } else {
-        continuous(app, m, &mut rt, input, &key, now);
+        continuous(app, m, &mut rt, input, now);
     }
     app.midi_learn.runtime.insert(key, rt);
 }
@@ -615,7 +806,7 @@ fn on_off(target: &Target) -> (f32, f32) {
     }
 }
 
-fn continuous(app: &mut SoundApp, m: &Mapping, rt: &mut Runtime, input: Input, key: &str, now: f64) {
+fn continuous(app: &mut SoundApp, m: &Mapping, rt: &mut Runtime, input: Input, now: f64) {
     let cur = match travel(app, &m.target) {
         Ok(v) => v,
         Err(e) => return skipped(app, m, &e),
@@ -654,19 +845,40 @@ fn continuous(app: &mut SoundApp, m: &Mapping, rt: &mut Runtime, input: Input, k
         Input::Note(_) => None,
     };
     let Some(to) = to else { return };
+    if (to - cur).abs() < 1e-4 {
+        // Nothing to change (a jittery pot): no edit, and the gesture isn't held open.
+        rt.picked = true;
+        rt.sent = Some(cur);
+        return;
+    }
     let merged = !button;
-    let gesture = format!("midi:{key}");
     if !merged {
         app.engine.end_merge();
     }
-    if let Err(e) = set_travel(app, &m.target, to, merged.then_some(gesture.as_str())) {
+    if let Err(e) = set_travel(app, &m.target, to, merged.then_some(MIDI_GESTURE)) {
         return skipped(app, m, &e);
     }
     rt.picked = true;
     rt.sent = travel(app, &m.target).ok();
     if merged {
-        app.midi_learn.gesture = Some((gesture, now));
+        app.midi_learn.gesture = Some((MIDI_GESTURE.to_string(), now));
     }
+    if let Some(key) = automation_param(app, &m.target) {
+        app.midi_learn.touch.insert(key, now);
+    }
+}
+
+/// The automation lane a MIDI move of `target` writes in Touch/Latch: volume, pan, stems.
+fn automation_param(app: &SoundApp, target: &Target) -> Option<(TrackId, soundcraft_model::AutoParam)> {
+    use soundcraft_model::AutoParam;
+    let s = app.engine.session();
+    let (track, param) = match target {
+        Target::TrackVolume { track } => (track, AutoParam::Volume),
+        Target::TrackPan { track } => (track, AutoParam::Pan(0)),
+        Target::StemFader { track, stem } => (track, AutoParam::Stem(u8::try_from(stem_index(stem).ok()?).ok()?)),
+        _ => return None,
+    };
+    Some((resolve(s, track)?, param))
 }
 
 fn track_of<'a>(s: &'a Session, r: &TrackRef) -> Result<&'a Track, String> {
@@ -840,6 +1052,9 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             let device = parse_device(app, p.get("device").unwrap_or(&Value::Null))?;
             let matcher: Matcher = serde_json::from_value(p.get("matcher").cloned().unwrap_or_default())
                 .map_err(|e| format!("bad `matcher` ({{type: note|cc, ch, note|cc}}): {e}"))?;
+            if !matcher.valid() {
+                return Err("`matcher`: channels are 0..=15, notes and controllers 0..=127".into());
+            }
             let target = parse_target(app.engine.session(), p.get("target").unwrap_or(&Value::Null))?;
             let mode = match p.get("mode") {
                 None | Some(Value::Null) => default_mode(&matcher, &target),
@@ -848,14 +1063,12 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             if !mode.fits(&matcher) {
                 return Err(format!("a note is momentary or toggle, not {}", mode.id()));
             }
-            let sensitivity = p.get("sensitivity").and_then(Value::as_f64).map_or(DEFAULT_SENSITIVITY, |s| s as f32);
-            if !(sensitivity.is_finite() && sensitivity > 0.0 && sensitivity <= 1.0) {
-                return Err("`sensitivity` is travel per tick, 0..1".into());
-            }
+            let sensitivity = clamp_sensitivity(p.get("sensitivity").and_then(Value::as_f64).map_or(DEFAULT_SENSITIVITY, |s| s as f32));
             let pickup = p.get("pickup").and_then(Value::as_bool).unwrap_or(true);
             let replace = p.get("replace").and_then(Value::as_bool).unwrap_or(false);
             let m = Mapping { device, matcher, target, mode, sensitivity, pickup };
             let i = commit(app, m, replace);
+            app.midi_learn.overlay_mapping = None;
             Ok(json!({"index": i, "mapping": app.ui.midi_mappings.get(i).map(Mapping::json)}))
         })(),
         "midi.unmap" => (|| {
@@ -892,7 +1105,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
         })(),
         "midi.learn_command" => {
             app.ui.show_search = true;
-            app.palette.learn = true;
+            app.palette = crate::palette::PaletteState { learn: true, ..crate::palette::PaletteState::default() };
             Ok(json!({"value": true}))
         }
         "window.midi_mappings" => {
@@ -971,12 +1184,45 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         }
     } else if let Some((line, until)) = app.midi_learn.overlay.clone() {
         if app.midi_learn.now < until {
+            // A learned controller's mode, detected or not yet, one click away.
+            let key = app.midi_learn.overlay_mapping.clone();
+            let found = key.as_ref().and_then(|k| app.ui.midi_mappings.iter().position(|m| &m.key() == k));
+            let detecting = app.midi_learn.detect.is_some();
+            let mut mode = found.and_then(|i| app.ui.midi_mappings.get(i)).map(|m| m.mode);
+            let mut held = false;
             overlay(ctx, &mut |ui| {
-                ui.label(egui::RichText::new(&line).strong());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&line).strong());
+                    if let Some(mode) = &mut mode {
+                        if detecting {
+                            ui.label(egui::RichText::new("detecting…").color(t.text_dim));
+                        } else {
+                            egui::ComboBox::new("midi_learn_overlay_mode", "Mode").selected_text(mode.label()).show_ui(ui, |ui| {
+                                for x in Mode::ALL.into_iter().filter(|x| !matches!(x, Mode::Momentary | Mode::Toggle)) {
+                                    ui.selectable_value(mode, x, x.label());
+                                }
+                            });
+                        }
+                    }
+                });
+                held = ui.ui_contains_pointer() || egui::Popup::is_any_open(ui.ctx());
             });
+            if let (Some(i), Some(mode)) = (found, mode)
+                && let Some(m) = app.ui.midi_mappings.get_mut(i)
+                && m.mode != mode
+            {
+                m.mode = mode;
+                app.ui.status = format!("{} {}: {}", m.device.name, m.matcher.label(), mode.label());
+                app.mark_prefs_changed();
+            }
+            if held || detecting {
+                // Stays while it is being used.
+                app.midi_learn.overlay = Some((line, app.midi_learn.now + 1.0_f64.max(until - app.midi_learn.now)));
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         } else {
             app.midi_learn.overlay = None;
+            app.midi_learn.overlay_mapping = None;
         }
     }
     mappings_window(app, ctx);
@@ -1026,7 +1272,7 @@ fn mappings_window(app: &mut SoundApp, ctx: &egui::Context) {
                     let mut pickup = m.pickup;
                     ui.horizontal(|ui| {
                         if mode.relative() {
-                            ui.add(egui::DragValue::new(&mut sens).range(0.001..=0.25).speed(0.0005).prefix("step "));
+                            ui.add(egui::DragValue::new(&mut sens).range(MIN_SENSITIVITY..=MAX_SENSITIVITY).speed(0.0005).prefix("step "));
                         }
                         if !m.target.is_trigger() && !m.matcher.is_note() && mode == Mode::Absolute {
                             ui.checkbox(&mut pickup, "Pickup");
@@ -1274,6 +1520,148 @@ mod tests {
         assert!(!holds_merge(&app), "the gesture ends after a pause");
         handle(&mut app, &cc(ddj, 16, 1), now + 1.0);
         assert_eq!(app.engine.undo_history().len(), steps + 2, "the next turn is its own step");
+    }
+
+    #[test]
+    fn two_controls_moved_together_are_one_undo_step() {
+        let (mut app, ddj, _) = app();
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 16}), json!({"kind": "track_pan", "track": "Kick"}), json!({"mode": "rel_twos"}));
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 17}), json!({"kind": "track_volume", "track": "Bass"}), json!({"mode": "rel_twos"}));
+        let steps = app.engine.undo_history().len();
+        let mut now = 1.0;
+        for i in 0..20 {
+            frame(&mut app, now);
+            handle(&mut app, &cc(ddj, if i % 2 == 0 { 16 } else { 17 }, 1), now);
+            now += 0.02;
+        }
+        assert_eq!(app.engine.undo_history().len(), steps + 1, "interleaved, still one step");
+    }
+
+    #[test]
+    fn an_unchanged_value_neither_edits_nor_holds_the_gesture() {
+        let (mut app, ddj, _) = app();
+        app.run("mix.pan", json!({"tracks": ["Kick"], "pan": 1.0})).unwrap();
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 16}), json!({"kind": "track_pan", "track": "Kick"}), json!({"mode": "rel_twos"}));
+        let rev = app.engine.revision;
+        handle(&mut app, &cc(ddj, 16, 1), 0.0);
+        assert_eq!(app.engine.revision, rev, "already at the top: nothing to do");
+        assert!(!holds_merge(&app) && app.midi_learn.gesture.is_none());
+    }
+
+    #[test]
+    fn a_new_mode_reads_the_control_afresh_and_removed_mappings_leave_no_state() {
+        let (mut app, ddj, _) = app();
+        app.run("mix.volume", json!({"tracks": ["Kick"], "db": 0.0})).unwrap();
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "track_volume", "track": "Kick"}), json!({}));
+        handle(&mut app, &cc(ddj, 7, 95), 0.0);
+        let m = app.ui.midi_mappings[0].clone();
+        assert!(!waiting_for_pickup(&app, &m), "picked up");
+        app.ui.midi_mappings[0].mode = Mode::RelTwos;
+        handle(&mut app, &cc(ddj, 7, 1), 0.0);
+        app.ui.midi_mappings[0].mode = Mode::Absolute;
+        let before = db(&app, "Kick");
+        handle(&mut app, &cc(ddj, 7, 10), 0.0);
+        assert_eq!(db(&app, "Kick"), before, "back to absolute: picked up again first");
+        app.run("midi.unmap", json!({"all": true})).unwrap();
+        frame(&mut app, 0.0);
+        assert!(app.midi_learn.runtime.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_messages_are_refused_and_dropped_from_the_preferences() {
+        let (mut app, _, _) = app();
+        let bad = |m: Value| json!({"device": "DDJ", "matcher": m, "target": {"kind": "stop_all"}});
+        assert!(app.run("midi.map", bad(json!({"type": "cc", "ch": 16, "cc": 1}))).is_err());
+        assert!(app.run("midi.map", bad(json!({"type": "note", "ch": 0, "note": 128}))).is_err());
+        let r = app
+            .run(
+                "midi.map",
+                json!({"device": "DDJ", "matcher": {"type": "cc", "ch": 0, "cc": 1}, "target": {"kind": "stop_all"}, "sensitivity": 9.0}),
+            )
+            .unwrap();
+        assert_eq!(r["mapping"]["sensitivity"].as_f64(), Some(f64::from(MAX_SENSITIVITY)), "clamped");
+        let ui: crate::UiState = serde_json::from_value(json!({"midi_mappings": [
+            {"device": {"backend_id": "b", "raw_name": "P", "name": "P"}, "matcher": {"type": "note", "ch": 0, "note": 200}, "target": {"kind": "stop_all"}},
+            {"device": {"backend_id": "b", "raw_name": "P", "name": "P"}, "matcher": {"type": "note", "ch": 0, "note": 36}, "target": {"kind": "stop_all"}, "mode": "rel_twos", "sensitivity": -1.0}
+        ]}))
+        .unwrap();
+        assert_eq!(ui.midi_mappings.len(), 1, "note 200 dropped");
+        assert_eq!((ui.midi_mappings[0].mode, ui.midi_mappings[0].sensitivity), (Mode::Momentary, MIN_SENSITIVITY), "normalised");
+    }
+
+    #[test]
+    fn encoders_and_knobs_are_told_apart_by_their_first_messages() {
+        assert_eq!(classify(&[1, 1, 1, 1]), Mode::RelTwos, "repeated small steps up");
+        assert_eq!(classify(&[127, 127, 126, 127]), Mode::RelTwos, "and down");
+        assert_eq!(classify(&[65, 65, 66, 65]), Mode::RelOffset, "repeated around 64");
+        assert_eq!(classify(&[63, 63, 62]), Mode::RelOffset);
+        assert_eq!(classify(&[1, 65, 65, 1]), Mode::RelSignMag, "sign bit set and clear");
+        assert_eq!(classify(&[20, 24, 29, 33]), Mode::Absolute, "distinct, moving one way");
+        assert_eq!(classify(&[90, 80, 70]), Mode::Absolute);
+        assert_eq!(classify(&[1, 2]), Mode::RelTwos, "only upward ticks");
+        assert_eq!(classify(&[40]), Mode::Absolute);
+    }
+
+    #[test]
+    fn a_learned_encoder_gets_its_mode_and_its_first_ticks_move_nothing() {
+        let (mut app, ddj, _) = app();
+        app.run("mix.volume", json!({"tracks": ["Kick"], "db": 0.0})).unwrap();
+        frame(&mut app, 1.0);
+        app.run("midi.learn", json!({"target": {"kind": "track_volume", "track": "Kick"}})).unwrap();
+        for _ in 0..DETECT_MSGS {
+            handle(&mut app, &cc(ddj, 7, 127), 1.0);
+        }
+        assert!(app.midi_learn.detect.is_none(), "decided after {DETECT_MSGS} messages");
+        assert_eq!(app.ui.midi_mappings[0].mode, Mode::RelTwos);
+        assert_eq!(db(&app, "Kick"), 0.0, "the learning messages moved nothing");
+        assert_eq!(app.midi_learn.overlay_mapping.as_deref(), Some(app.ui.midi_mappings[0].key().as_str()), "the overlay offers the mode");
+        // A knob: a couple of distinct values, then the time runs out.
+        app.run("midi.learn", json!({"target": {"kind": "track_volume", "track": "Bass"}})).unwrap();
+        handle(&mut app, &cc(ddj, 8, 30), 1.0);
+        handle(&mut app, &cc(ddj, 8, 33), 1.1);
+        frame(&mut app, 1.0 + DETECT_S + 0.05);
+        assert!(app.midi_learn.detect.is_none());
+        assert_eq!(app.ui.midi_mappings[1].mode, Mode::Absolute);
+    }
+
+    #[test]
+    fn touch_automation_records_midi_moves_of_volume_pan_and_stems() {
+        use soundcraft_model::AutoParam;
+        let (mut app, ddj, _) = app();
+        {
+            let s = app.engine.session_mut();
+            let t = s.track_by_name("Kick").unwrap().id;
+            let clip = s.track(t).unwrap().clips().first().unwrap().id;
+            let src = s.find_clip(clip).unwrap().1.source().unwrap();
+            s.find_clip_mut(clip).unwrap().stems = Some(soundcraft_model::StemSet { key: "fake".into(), sources: [src; 4], scale_log2: 0 });
+        }
+        app.run("mix.automation_mode", json!({"tracks": ["Kick"], "mode": "touch"})).unwrap();
+        for (cc_, target) in [
+            (16, json!({"kind": "track_volume", "track": "Kick"})),
+            (17, json!({"kind": "track_pan", "track": "Kick"})),
+            (18, json!({"kind": "stem_fader", "track": "Kick", "stem": "drums"})),
+        ] {
+            map(&mut app, json!({"type": "cc", "ch": 0, "cc": cc_}), target, json!({"mode": "rel_twos", "sensitivity": 0.02}));
+        }
+        app.run("transport.play", json!({})).unwrap();
+        let ctx = egui::Context::default();
+        let mut now = 1.0;
+        for i in 0..30u8 {
+            app.handle_transport(1.0 / 30.0);
+            frame(&mut app, now);
+            handle(&mut app, &cc(ddj, 16 + i % 3, 127), now);
+            app.write_automation(&ctx);
+            now += 1.0 / 30.0;
+        }
+        app.run("transport.stop", json!({})).unwrap();
+        app.handle_transport(0.0);
+        app.write_automation(&ctx);
+        let t = app.engine.session().track_by_name("Kick").unwrap();
+        for p in [AutoParam::Volume, AutoParam::Pan(0), AutoParam::Stem(1)] {
+            let n = t.lane(&p).map_or(0, |l| l.points.len());
+            assert!(n >= 2, "{p:?}: {n} points");
+        }
+        assert!(t.lane(&AutoParam::Stem(0)).is_none_or(|l| l.points.is_empty()), "an untouched stem writes nothing");
     }
 
     #[test]

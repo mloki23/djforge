@@ -1395,8 +1395,9 @@ impl Player {
 
     /// The notes and controllers (per port) mapped to controls: they no longer play the live
     /// target (note-offs still pass). Replaces the set given before.
-    pub fn set_midi_controls(&self, controls: &[(PortId, midi_in::Control)]) {
-        self.shared.midi.controls.set(controls);
+    /// False when the ports went beyond [`CONTROL_PORTS`]: those ports' mapped messages still play.
+    pub fn set_midi_controls(&self, controls: &[(PortId, midi_in::Control)]) -> bool {
+        self.shared.midi.controls.set(controls)
     }
 
     /// Plays one message from the on-screen keyboard on the target at the next block.
@@ -3030,7 +3031,7 @@ mod midi_tests {
             (keys, midi_in::Control::Cc { ch: 0, cc: 7 }),
             (keys, midi_in::Control::Note { ch: 0, note: 64 }),
         ];
-        r.shared.midi.controls.set(&map);
+        assert!(r.shared.midi.controls.set(&map));
         let t = r.now - 4_000_000;
         r.send("Keys", note_on(60), t);
         r.send("Keys", cc(7), t);
@@ -3040,7 +3041,7 @@ mod midi_tests {
         r.callback();
         let got: Vec<Ev> = r.log().into_iter().map(|e| e.2).filter(|e| !matches!(e, Ev::Midi([0xB0, 121 | 123, _]))).collect();
         assert_eq!(got, [Ev::On(64), Ev::On(62), Ev::On(60), Ev::Off(64)], "Keys' 60 and CC 7 are controls; Pads' 60 plays");
-        r.shared.midi.controls.set(&[]);
+        assert!(r.shared.midi.controls.set(&[]));
         r.send("Keys", note_on(60), r.now - 4_000_000);
         r.callback();
         assert_eq!(r.notes().last().map(|e| e.2), Some(Ev::On(60)), "unmapped: it plays");

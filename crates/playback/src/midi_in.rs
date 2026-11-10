@@ -32,7 +32,7 @@
 
 use soundcraft_midi_io::{MidiClock, MidiEvent, MidiMessage, PortId, Subscriber};
 use soundcraft_mix::{LiveEvent, MixEngine};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Added to the longest callback to make the live MIDI latency `L` (2 ms).
 pub const MIDI_SLACK_NS: u64 = 2_000_000;
@@ -87,56 +87,96 @@ impl Control {
 }
 
 /// The notes and controllers, per port, that are mapped to controls and so don't play the live
-/// target. The UI thread writes it ([`MidiControls::set`]); the audio thread reads it as events
-/// arrive, wait-free. A change is not atomic as a whole: an event arriving during one may be
-/// judged by the old or the new set.
+/// target. The UI thread writes it ([`MidiControls::set`], one writer); the audio thread reads it
+/// as events arrive, wait-free. A port keeps its row while it stays in the set, so changing its
+/// bits never hides it; a change is not atomic as a whole: an event arriving during one may be
+/// judged by the old or the new bits.
 pub struct MidiControls {
-    /// The port each row filters (`u32::MAX`: none).
-    ports: [AtomicU32; CONTROL_PORTS],
+    /// The port each row filters, as `port + 1` (0: a free row), so no port id can match a free
+    /// row (not even [`KEYBOARD_SOURCE`]'s).
+    ports: [AtomicU64; CONTROL_PORTS],
     bits: [[AtomicU64; CONTROL_WORDS]; CONTROL_PORTS],
 }
 
 impl Default for MidiControls {
     fn default() -> Self {
         MidiControls {
-            ports: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            ports: std::array::from_fn(|_| AtomicU64::new(FREE)),
             bits: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 }
 
+/// A free row of [`MidiControls`].
+const FREE: u64 = 0;
+
+fn row_tag(p: PortId) -> u64 {
+    u64::from(p.0) + 1
+}
+
 impl MidiControls {
-    /// Replaces the set with `controls`. Ports beyond [`CONTROL_PORTS`] are left out.
-    pub fn set(&self, controls: &[(PortId, Control)]) {
-        let mut rows: Vec<PortId> = controls.iter().map(|(p, _)| *p).collect();
-        rows.sort_unstable();
-        rows.dedup();
-        for (i, (port, bits)) in self.ports.iter().zip(&self.bits).enumerate() {
-            let id = rows.get(i).copied();
+    /// Replaces the set with `controls`. A port already in the set keeps its row; a new one takes
+    /// a free row. Returns false when ports beyond [`CONTROL_PORTS`] were left out (their mapped
+    /// messages still play the target).
+    pub fn set(&self, controls: &[(PortId, Control)]) -> bool {
+        let mut wanted: Vec<PortId> = controls.iter().map(|(p, _)| *p).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        // Rows whose port left the set are freed first.
+        for port in &self.ports {
+            let tag = port.load(Ordering::Acquire);
+            if tag != FREE && !wanted.iter().any(|p| row_tag(*p) == tag) {
+                port.store(FREE, Ordering::Release);
+            }
+        }
+        let mut fits = true;
+        for p in wanted {
+            let tag = row_tag(p);
+            let row = self.ports.iter().position(|r| r.load(Ordering::Acquire) == tag);
+            let (row, new) = match row {
+                Some(r) => (r, false),
+                None => match self.ports.iter().position(|r| r.load(Ordering::Acquire) == FREE) {
+                    Some(r) => (r, true),
+                    None => {
+                        fits = false;
+                        continue;
+                    }
+                },
+            };
             let mut words = [0u64; CONTROL_WORDS];
-            for (_, c) in controls.iter().filter(|(p, _)| Some(*p) == id) {
+            for (_, c) in controls.iter().filter(|(q, _)| *q == p) {
                 let b = c.bit();
                 if let Some(w) = words.get_mut(b / 64) {
                     *w |= 1 << (b % 64);
                 }
             }
-            // Cleared first, so a row never pairs a new port with its old bits.
-            port.store(u32::MAX, Ordering::Release);
-            for (a, w) in bits.iter().zip(words) {
-                a.store(w, Ordering::Relaxed);
+            if let Some(bits) = self.bits.get(row) {
+                for (a, w) in bits.iter().zip(words) {
+                    a.store(w, Ordering::Relaxed);
+                }
             }
-            port.store(id.map_or(u32::MAX, |p| p.0), Ordering::Release);
+            // A new row is claimed once its bits are in place.
+            if new && let Some(r) = self.ports.get(row) {
+                r.store(tag, Ordering::Release);
+            }
         }
+        fits
+    }
+
+    /// The row `port` has, if any (for tests of the row's stability).
+    pub fn row_of(&self, port: PortId) -> Option<usize> {
+        self.ports.iter().position(|r| r.load(Ordering::Acquire) == row_tag(port))
     }
 
     /// Whether `msg` from `port` is mapped to a control. No allocation, no lock.
     pub fn consumes(&self, port: PortId, msg: &MidiMessage) -> bool {
         let Some(c) = Control::of(msg) else { return false };
         let b = c.bit();
+        let tag = row_tag(port);
         self.ports
             .iter()
             .zip(&self.bits)
-            .find(|(p, _)| p.load(Ordering::Acquire) == port.0)
+            .find(|(p, _)| p.load(Ordering::Acquire) == tag)
             .and_then(|(_, bits)| bits.get(b / 64))
             .is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (b % 64)) != 0)
     }
@@ -413,6 +453,24 @@ fn emit(mix: &mut MixEngine, order: &mut Order, e: MidiEvent, at: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_keeps_its_control_row_and_extra_ports_are_reported() {
+        let c = MidiControls::default();
+        let note = |n: u8| Control::Note { ch: 0, note: n };
+        let on = |n: u8| MidiMessage::NoteOn { ch: 0, note: n, vel: 1 };
+        assert!(c.set(&[(PortId(5), note(1)), (PortId(2), note(2))]));
+        let row = c.row_of(PortId(5));
+        assert!(c.set(&[(PortId(5), note(3)), (PortId(1), note(4))]), "2 leaves, 1 joins");
+        assert_eq!(c.row_of(PortId(5)), row, "5 kept its row");
+        assert!(c.consumes(PortId(5), &on(3)) && !c.consumes(PortId(5), &on(1)) && c.consumes(PortId(1), &on(4)));
+        assert!(!c.consumes(PortId(2), &on(2)), "2 left");
+        assert!(!c.consumes(PortId(KEYBOARD_SOURCE), &on(3)), "a free row matches no port");
+        let many: Vec<(PortId, Control)> = (0..CONTROL_PORTS as u32 + 1).map(|p| (PortId(p), note(9))).collect();
+        assert!(!c.set(&many), "one port too many");
+        assert!(c.set(&[]));
+        assert!(!c.consumes(PortId(5), &on(3)));
+    }
 
     #[test]
     fn raw_bytes_match_the_wire_format() {

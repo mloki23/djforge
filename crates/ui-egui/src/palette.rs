@@ -62,6 +62,10 @@ fn score(hay: &str, needle: &str) -> Option<i32> {
 
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     if !app.ui.show_search {
+        // Closed by any means (window.search, Close Window…): the next opening searches afresh.
+        if app.palette.learn || !app.palette.query.is_empty() {
+            app.palette = PaletteState::default();
+        }
         return;
     }
     let t = Tokens::current();

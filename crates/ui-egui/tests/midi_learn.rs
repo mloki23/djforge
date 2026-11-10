@@ -11,7 +11,7 @@ use serde_json::json;
 use soundcraft_midi_io::{FakeSource, MidiClock, MidiMessage};
 use soundcraft_model::{ChannelFormat, Insert, TrackKind};
 use soundcraft_ui_egui::midi_input::MidiHost;
-use soundcraft_ui_egui::midi_learn::{Matcher, Target};
+use soundcraft_ui_egui::midi_learn::{Matcher, Mode, Target};
 use soundcraft_ui_egui::{Services, SoundApp};
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,19 @@ fn learn_from_a_mixer_fader_binds_the_next_controller_which_rides_the_fader() {
     assert_eq!(m.matcher, Matcher::Cc { ch: 0, cc: 7 });
     assert!(matches!(&m.target, Target::TrackVolume { track } if track.name == "Kick"), "{:?}", m.target);
     let _ = h.get_by_label("Mapped to DDJ CC 7");
+    // Its first messages tell a knob from an encoder, and move nothing.
+    send(&mut h, cc(7, 24));
+    send(&mut h, cc(7, 29));
+    until(&mut h, "detected", |a| a.midi_learn.detect.is_none());
+    assert_eq!(h.state().ui.midi_mappings[0].mode, Mode::Absolute, "distinct values: a knob");
+    assert_eq!(db(h.state(), "Kick"), 0.0);
+    // The overlay offers the mode: one click makes it an encoder, another puts it back.
+    h.get_by_label("Mode").click();
+    steps(&mut h, 2);
+    h.get_by_label("Relative (two's complement)").click();
+    steps(&mut h, 2);
+    assert_eq!(h.state().ui.midi_mappings[0].mode, Mode::RelTwos);
+    h.state_mut().ui.midi_mappings[0].mode = Mode::Absolute;
     // Below 0 dB (CC 95): picked up only once it crosses.
     send(&mut h, cc(7, 40));
     steps(&mut h, 5);
@@ -239,4 +252,38 @@ fn a_mapped_note_does_not_play_the_instrument_until_it_is_unmapped() {
         frame(&ctx, &mut app);
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn learn_midi_for_command_picks_the_command_in_search_and_never_leaks_into_it() {
+    let mut h = harness(soundcraft_engine::demo::demo_engine());
+    h.state_mut().run("window.search", json!({"value": true})).unwrap();
+    h.state_mut().palette.query = "Learn MIDI for".into();
+    steps(&mut h, 3);
+    h.get_by_label("Learn MIDI for Command...").click();
+    steps(&mut h, 3);
+    let p = &h.state().palette;
+    assert!(h.state().ui.show_search && p.learn && p.query.is_empty(), "Search stays open, picking the command to learn");
+    h.state_mut().palette.query = "Big Counter".into();
+    steps(&mut h, 3);
+    h.get_by_label("Big Counter").click();
+    steps(&mut h, 3);
+    assert!(!h.state().ui.show_search && !h.state().ui.show_big_counter, "learned, not run");
+    assert!(matches!(&h.state().midi_learn.learning, Some(Target::Command { id, .. }) if id == "window.big_counter"));
+    send(&mut h, MidiMessage::NoteOn { ch: 0, note: 40, vel: 100 });
+    until(&mut h, "learned", |a| !a.ui.midi_mappings.is_empty());
+    send(&mut h, MidiMessage::NoteOff { ch: 0, note: 40, vel: 0 });
+    send(&mut h, MidiMessage::NoteOn { ch: 0, note: 40, vel: 100 });
+    until(&mut h, "the pad runs it", |a| a.ui.show_big_counter);
+    // Closing Search another way ends learn mode: the next Search runs commands again.
+    h.state_mut().run("midi.learn_command", json!({})).unwrap();
+    h.state_mut().palette.query = "left over".into();
+    h.state_mut().run("midi.learn_command", json!({})).unwrap();
+    assert!(h.state().palette.query.is_empty() && h.state().palette.learn, "learn_command starts afresh");
+    steps(&mut h, 2);
+    h.state_mut().run("window.search", json!({"value": false})).unwrap();
+    steps(&mut h, 2);
+    h.state_mut().run("window.search", json!({"value": true})).unwrap();
+    steps(&mut h, 2);
+    assert!(!h.state().palette.learn, "learn mode leaked into the next Search");
 }

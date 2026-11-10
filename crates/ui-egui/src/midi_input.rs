@@ -25,6 +25,31 @@ pub const QUEUE_CAPACITY: usize = 4096;
 /// Seconds between device-list refreshes.
 pub const REFRESH_S: f64 = 1.0;
 
+/// How often the waker thread looks at its queue: the longest a mapped control waits for the UI
+/// to wake while nothing else repaints it.
+pub const WAKE_POLL: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// A thread with its own queue of the source's events that wakes the UI (`wake`) when events
+/// arrive and `wanted` is set: egui sleeps between frames while the transport is stopped, and
+/// MIDI input is no egui event. It sleeps between looks ([`WAKE_POLL`]); the router does nothing
+/// extra for it.
+struct Waker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Waker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            if t.join().is_err() {
+                log::warn!("MIDI waker thread ended abnormally");
+            }
+        }
+    }
+}
+
 /// An enabled MIDI input, as stored in the preferences: the port's identity (backend id and raw
 /// name, see `soundcraft_midi_io::PortInfo`) and the name it was listed under when enabled.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -75,11 +100,12 @@ pub struct MidiHost {
     control: Option<Subscriber>,
     /// The ports opened so far (their ids outlive a close), for the mapped-control filter.
     opened: Vec<PortId>,
+    waker: Option<Waker>,
 }
 
 impl MidiHost {
     pub fn new(source: Box<dyn MidiSource>) -> MidiHost {
-        MidiHost { source, last_refresh: None, control: None, opened: Vec::new() }
+        MidiHost { source, last_refresh: None, control: None, opened: Vec::new(), waker: None }
     }
 
     /// The events that arrived since the last call, oldest first (subscribing on the first call:
@@ -101,6 +127,49 @@ impl MidiHost {
     /// The ports opened so far.
     pub fn opened(&self) -> &[PortId] {
         &self.opened
+    }
+
+    /// Whether [`MidiHost::set_waker`] has started a waker.
+    pub fn has_waker(&self) -> bool {
+        self.waker.is_some()
+    }
+
+    /// Calls `wake` (from another thread) soon after MIDI events arrive while `wanted` is set,
+    /// replacing any earlier waker. False when its thread couldn't start.
+    pub fn set_waker(&mut self, wanted: std::sync::Arc<std::sync::atomic::AtomicBool>, wake: Box<dyn Fn() + Send>) -> bool {
+        use std::sync::atomic::Ordering;
+        self.waker = None;
+        let mut sub = match self.source.subscribe(256) {
+            Ok(q) => q,
+            Err(e) => {
+                log::warn!("MIDI waker: {e}");
+                return false;
+            }
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new().name("midi-ui-waker".into()).spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                std::thread::park_timeout(WAKE_POLL);
+                let mut any = false;
+                while sub.pop().is_some() {
+                    any = true;
+                }
+                if any && wanted.load(Ordering::Relaxed) {
+                    wake();
+                }
+            }
+        });
+        match thread {
+            Ok(t) => {
+                self.waker = Some(Waker { stop, thread: Some(t) });
+                true
+            }
+            Err(e) => {
+                log::warn!("MIDI waker: {e}");
+                false
+            }
+        }
     }
 
     /// The source, for reading.
@@ -310,6 +379,40 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
 mod tests {
     use super::*;
     use soundcraft_model::ChannelFormat;
+
+    /// The waker calls back soon after an event arrives, and only while wanted.
+    #[test]
+    fn the_waker_wakes_the_ui_for_midi_while_wanted() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut src = soundcraft_midi_io::FakeSource::new(soundcraft_midi_io::MidiClock::new()).unwrap();
+        src.plug("DDJ");
+        let mut h = MidiHost::new(Box::new(src));
+        h.source_mut().open("DDJ").unwrap();
+        let wanted = Arc::new(AtomicBool::new(true));
+        let woken = Arc::new(AtomicUsize::new(0));
+        let w = Arc::clone(&woken);
+        assert!(h.set_waker(
+            Arc::clone(&wanted),
+            Box::new(move || {
+                w.fetch_add(1, Ordering::Relaxed);
+            })
+        ));
+        let cc = soundcraft_midi_io::MidiMessage::ControlChange { ch: 0, cc: 7, value: 1 };
+        assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
+        let start = std::time::Instant::now();
+        while woken.load(Ordering::Relaxed) == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "never woken");
+            std::thread::yield_now();
+        }
+        wanted.store(false, Ordering::Relaxed);
+        std::thread::sleep(WAKE_POLL * 3);
+        let before = woken.load(Ordering::Relaxed);
+        assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
+        std::thread::sleep(WAKE_POLL * 10);
+        assert_eq!(woken.load(Ordering::Relaxed), before, "not wanted: no wake");
+        drop(h);
+    }
 
     #[test]
     fn the_override_then_the_armed_then_the_selected_monitored_track_is_the_target() {

@@ -1149,9 +1149,11 @@ impl SoundApp {
     }
 
     /// While playing, record automation from fader positions: the volume fader, and on tracks
-    /// with split clips the four stem faders (`stem:*` lanes). Tracks in Write mode write the
-    /// volume throughout and a stem fader while it is moved; in Touch/Latch, the fader being
-    /// (or, for Latch, once) moved. Each point replaces the
+    /// with split clips the four stem faders (`stem:*` lanes); the pan too while a MIDI control
+    /// moves it. Tracks in Write mode write the volume throughout and a stem fader or the pan
+    /// while it is moved; in Touch/Latch, the fader being (or, for Latch, once) moved, with the
+    /// mouse or by a mapped MIDI control (touched for [`midi_learn::GESTURE_S`] after its last
+    /// move). Each point replaces the
     /// automation since the previous one, and Stop writes a last point. A pass and whatever is
     /// dragged during it, its fader included, are one undo step.
     fn write_automation(&mut self, ctx: &egui::Context) {
@@ -1186,13 +1188,21 @@ impl SoundApp {
             if stems::has_split(t) {
                 faders.extend(t.mixer.stem_gain_db.iter().zip(0u8..).map(|(db, i)| (AutoParam::Stem(i), *db)));
             }
+            if let Some(pan) = t.mixer.pan.first() {
+                faders.push((AutoParam::Pan(0), *pan));
+            }
             for (param, value) in faders {
                 let key = (t.id, param);
-                let touched_now = dragging && fader.as_ref() == Some(&key);
+                let midi = midi_learn::touched(self, key.0, &key.1);
+                let touched_now = (dragging && fader.as_ref() == Some(&key)) || midi;
+                if matches!(key.1, AutoParam::Pan(_)) && !midi && !self.touched.contains(&key) {
+                    // The pan is written only once a MIDI control has moved it.
+                    continue;
+                }
                 let write = match mode {
-                    // Write rides the volume throughout; a stem lane only while its fader is
-                    // moved, so hand-drawn stem lanes survive a Write pass.
-                    M::Write => !matches!(key.1, AutoParam::Stem(_)) || touched_now,
+                    // Write rides the volume throughout; a stem lane or the pan only while it is
+                    // moved, so hand-drawn lanes survive a Write pass.
+                    M::Write => !matches!(key.1, AutoParam::Stem(_) | AutoParam::Pan(_)) || touched_now,
                     M::Touch => touched_now,
                     _ => touched_now || self.touched.contains(&key),
                 };
@@ -1401,6 +1411,7 @@ impl SoundApp {
         control::drain(self, ctx);
         midi_input::frame(self, now);
         midi_learn::frame(self, now);
+        midi_learn::wake_on_midi(self, ctx);
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
