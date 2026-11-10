@@ -854,7 +854,10 @@ pub(crate) struct LiveMidi {
     /// Pitches an edit of the playing slot left without a note: released on the next block's
     /// first sample.
     stale: [bool; 128],
-    /// Notes starting before this sample were never sent (a late launch, a seek).
+    /// Pitches an edit left sounding from before `since`: their new note's note-off is sent
+    /// although it started before `since`.
+    carry: [bool; 128],
+    /// Notes starting before this sample were never sent (a late launch, a seek, an edit).
     since: Samples,
     /// The launch (row and origin) the held notes belong to.
     owner: Option<(usize, Samples)>,
@@ -862,7 +865,7 @@ pub(crate) struct LiveMidi {
 
 impl Default for LiveMidi {
     fn default() -> Self {
-        LiveMidi { held: [false; 128], stale: [false; 128], since: Samples::MIN, owner: None }
+        LiveMidi { held: [false; 128], stale: [false; 128], carry: [false; 128], since: Samples::MIN, owner: None }
     }
 }
 
@@ -871,6 +874,7 @@ impl LiveMidi {
     /// sounds, and notes before `at` were not sent.
     pub(crate) fn forget(&mut self, at: Samples) {
         self.held = [false; 128];
+        self.carry = [false; 128];
         self.since = at;
     }
 
@@ -888,8 +892,12 @@ impl LiveMidi {
         let k = p.pass(s, length, at.max(p.start)).max(0);
         let base = ((p.beat0 + k as f64 * length) * tpq).round() as i64;
         let seam = s.tempo.tick_to_samples(base.saturating_add(len_ticks), sr);
+        // Only notes starting up to a loop before `at` can sound there (none outlasts the loop).
+        let tick = s.tempo.samples_to_ticks(at, sr).saturating_sub(base);
+        let notes = slot.sequence.notes.as_slice();
+        let (from, upto) = (notes.partition_point(|n| n.start < tick.saturating_sub(len_ticks + 1)), notes.partition_point(|n| n.start <= tick));
         let mut covered = [false; 128];
-        for n in slot.sequence.notes.iter().filter(|n| (0..len_ticks).contains(&n.start)) {
+        for n in notes.get(from..upto).unwrap_or(&[]).iter().filter(|n| (0..len_ticks).contains(&n.start)) {
             let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
             let off = s.tempo.tick_to_samples(base.saturating_add(n.end().min(len_ticks)), sr).min(seam).max(on.saturating_add(1));
             if on < at
@@ -900,9 +908,14 @@ impl LiveMidi {
                 *c = true;
             }
         }
-        for ((st, held), c) in self.stale.iter_mut().zip(self.held.iter()).zip(covered) {
+        for (((st, carry), held), c) in self.stale.iter_mut().zip(self.carry.iter_mut()).zip(self.held.iter()).zip(covered) {
             *st = *held && !c;
+            // Sounding and still covered: its new note's note-off ends it.
+            *carry = *held && c;
         }
+        // Nothing of the new notes before `at` was sent: notes inserted behind the playhead
+        // (which never started) send no note-off.
+        self.since = self.since.max(at);
     }
 
     /// Releases at `offset` the pitches an edit left without a note (see [`LiveMidi::edited`]).
@@ -921,6 +934,7 @@ impl LiveMidi {
 
     /// Note-offs at `offset` for every note sounding.
     pub(crate) fn release(&mut self, inst: &mut dyn Plugin, offset: usize) {
+        self.carry = [false; 128];
         for (pitch, h) in self.held.iter_mut().enumerate() {
             if std::mem::take(h) {
                 inst.note_off(offset, u8::try_from(pitch).unwrap_or(0));
@@ -1042,16 +1056,23 @@ impl Column<'_> {
             };
             for n in notes.get(from_off..upto).unwrap_or(&[]).iter().filter(playable).filter(|n| near.contains(&n.end().min(len_ticks))) {
                 let (on, off) = span(n);
-                if on >= midi.since && off >= a && off < b {
+                let carried = midi.carry.get(usize::from(n.pitch)).copied().unwrap_or(false);
+                if (on >= midi.since || carried) && off >= a && off < b {
                     inst.note_off(at(off), n.pitch);
                     if let Some(h) = midi.held.get_mut(usize::from(n.pitch)) {
                         *h = false;
+                    }
+                    if let Some(c) = midi.carry.get_mut(usize::from(n.pitch)) {
+                        *c = false;
                     }
                 }
             }
             for n in notes.get(from_on..upto).unwrap_or(&[]).iter().filter(playable) {
                 let (on, off) = span(n);
                 if on >= midi.since && on >= a && on < b {
+                    if let Some(c) = midi.carry.get_mut(usize::from(n.pitch)) {
+                        *c = false;
+                    }
                     let Some(h) = midi.held.get_mut(usize::from(n.pitch)) else { continue };
                     if *h {
                         inst.note_off(at(on), n.pitch);

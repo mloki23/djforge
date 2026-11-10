@@ -571,3 +571,47 @@ fn an_edited_midi_slot_plays_on_and_releases_what_it_held() {
     assert_eq!(r.ons(KICK), [r.beat(3, 1)], "the note at beat 5 of the two-bar loop");
     assert_eq!(r.sounding(), Vec::<u8>::new());
 }
+
+/// A note written into a playing slot behind its playhead never started: it sends no note-off
+/// (none to cut a live key holding that pitch, none after the key lets go), and plays from the
+/// next pass.
+#[test]
+fn a_note_written_behind_the_playhead_sends_no_note_off_of_its_own() {
+    const KEY: u8 = 72;
+    let live = |r: &mut Rig, vel: u8| {
+        r.eng.live_input(soundcraft_mix::LiveEvent { source: 1, offset: 0, msg: [0x90, KEY, vel] });
+    };
+    for release_early in [true, false] {
+        let mut r = rig(false);
+        let t = r.track;
+        r.eng.set_live_target(Some(t));
+        let mid = r.beat(2, 1) + 6_000;
+        r.run(0, mid, &[(0, LiveCmd::Launch { column: 0, slot: 0, at: r.bar(2) })]);
+        live(&mut r, 100);
+        r.run(mid, mid + BLOCK as i64, &[]);
+        let old = r.s.clone();
+        let mut edited = old.clone();
+        if let Some(soundcraft_model::SlotContent::Midi(m)) = &mut edited.live.columns[0].slots[0] {
+            m.sequence.notes.push(note(KEY, 0, 3 * Q));
+            m.sequence.sort();
+        }
+        let at = mid + BLOCK as i64;
+        r.eng.live_snapshot(&old, &edited, at);
+        r.s = edited;
+        let release_at = if release_early { r.beat(2, 2) } else { r.beat(2, 3) + 6_000 };
+        r.run(at, release_at, &[]);
+        assert!(r.sounding().contains(&KEY), "the live key sounds on");
+        live(&mut r, 0);
+        r.run(release_at, r.bar(3) + 6_000, &[]);
+        let offs: Vec<Samples> = r
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Off(t, p) if *p == KEY => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offs, [release_at], "only the live key's release (early: {release_early})");
+        assert_eq!(r.ons(KEY).last(), Some(&r.bar(3)), "the new note plays from the next pass");
+    }
+}
