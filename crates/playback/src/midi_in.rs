@@ -125,7 +125,7 @@ impl Order {
 }
 
 /// A message as MIDI 1.0 bytes (no allocation, unlike [`MidiMessage::to_bytes`]).
-pub(crate) fn raw(msg: MidiMessage) -> [u8; 3] {
+pub fn raw(msg: MidiMessage) -> [u8; 3] {
     let st = |kind: u8, ch: u8| kind | (ch & 0x0F);
     match msg {
         MidiMessage::NoteOff { ch, note, vel } => [st(0x80, ch), note & 0x7F, vel & 0x7F],
@@ -139,6 +139,24 @@ pub(crate) fn raw(msg: MidiMessage) -> [u8; 3] {
             [st(0xE0, ch), (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]
         }
     }
+}
+
+/// The message MIDI 1.0 bytes from [`raw`] hold (`None` for a status that is no channel message).
+/// A note-on with velocity 0 is a note-off. No allocation.
+pub fn from_raw(bytes: [u8; 3]) -> Option<MidiMessage> {
+    let [status, d1, d2] = bytes;
+    let (ch, d1, d2) = (status & 0x0F, d1 & 0x7F, d2 & 0x7F);
+    Some(match status & 0xF0 {
+        0x80 => MidiMessage::NoteOff { ch, note: d1, vel: d2 },
+        0x90 if d2 == 0 => MidiMessage::NoteOff { ch, note: d1, vel: 0 },
+        0x90 => MidiMessage::NoteOn { ch, note: d1, vel: d2 },
+        0xA0 => MidiMessage::PolyPressure { ch, note: d1, pressure: d2 },
+        0xB0 => MidiMessage::ControlChange { ch, cc: d1, value: d2 },
+        0xC0 => MidiMessage::ProgramChange { ch, program: d1 },
+        0xD0 => MidiMessage::ChannelPressure { ch, pressure: d1 },
+        0xE0 => MidiMessage::PitchBend { ch, value: ((i16::from(d2) << 7) | i16::from(d1)) - 8192 },
+        _ => return None,
+    })
 }
 
 fn is_note_off(e: &MidiEvent) -> bool {
@@ -316,7 +334,10 @@ mod tests {
             let b = m.to_bytes();
             let r = raw(m);
             assert_eq!(&r[..b.len()], b.as_slice(), "{m:?}");
+            assert_eq!(from_raw(r), Some(m), "round trip");
         }
+        assert_eq!(from_raw([0x93, 60, 0]), Some(MidiMessage::NoteOff { ch: 3, note: 60, vel: 0 }));
+        assert_eq!(from_raw([0xF8, 0, 0]), None);
     }
 
     impl MidiIn {

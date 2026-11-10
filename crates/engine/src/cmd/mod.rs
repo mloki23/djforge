@@ -23,6 +23,7 @@ mod health;
 mod instrument;
 mod live;
 mod midi;
+mod midi_take;
 mod mix;
 mod more_util;
 mod options;
@@ -161,6 +162,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(export::specs());
         v.extend(stems::specs());
         v.extend(live::specs());
+        v.extend(midi_take::specs());
         v.extend(prod::specs());
         v
     })

@@ -851,6 +851,9 @@ impl ArrGate {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LiveMidi {
     held: [bool; 128],
+    /// Pitches an edit of the playing slot left without a note: released on the next block's
+    /// first sample.
+    stale: [bool; 128],
     /// Notes starting before this sample were never sent (a late launch, a seek).
     since: Samples,
     /// The launch (row and origin) the held notes belong to.
@@ -859,7 +862,7 @@ pub(crate) struct LiveMidi {
 
 impl Default for LiveMidi {
     fn default() -> Self {
-        LiveMidi { held: [false; 128], since: Samples::MIN, owner: None }
+        LiveMidi { held: [false; 128], stale: [false; 128], since: Samples::MIN, owner: None }
     }
 }
 
@@ -871,11 +874,44 @@ impl LiveMidi {
         self.since = at;
     }
 
-    /// The playing slot's notes or length were edited: [`Column::midi_head`] releases what
-    /// sounds on the next block's first sample, as for a slot replaced, and plays on from the
-    /// new notes.
-    pub(crate) fn edited(&mut self) {
-        self.owner = None;
+    /// The playing slot `p` was edited to `slot` (in `s`), with the next block at `at`: it plays
+    /// on from the new notes. A pitch sounding that a note of the new notes also sounds at `at`
+    /// (started before it in the same pass, ending after it) sounds on, its note-off coming from
+    /// the new note; every other pitch sounding is released on the next block's first sample
+    /// (it would never get a note-off). So an edit that leaves what sounds alone, such as a
+    /// recorded slot's last notes written in after it launched, cuts nothing.
+    pub(crate) fn edited(&mut self, s: &Session, slot: &MidiSlot, p: &LivePlaying, at: Samples) {
+        let sr = s.sample_rate;
+        let tpq = TICKS_PER_QUARTER as f64;
+        let length = slot.length_beats.max(1.0);
+        let len_ticks = (length * tpq).round() as i64;
+        let k = p.pass(s, length, at.max(p.start)).max(0);
+        let base = ((p.beat0 + k as f64 * length) * tpq).round() as i64;
+        let seam = s.tempo.tick_to_samples(base.saturating_add(len_ticks), sr);
+        let mut covered = [false; 128];
+        for n in slot.sequence.notes.iter().filter(|n| (0..len_ticks).contains(&n.start)) {
+            let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
+            let off = s.tempo.tick_to_samples(base.saturating_add(n.end().min(len_ticks)), sr).min(seam).max(on.saturating_add(1));
+            if on < at
+                && on >= self.since
+                && off > at
+                && let Some(c) = covered.get_mut(usize::from(n.pitch))
+            {
+                *c = true;
+            }
+        }
+        for ((st, held), c) in self.stale.iter_mut().zip(self.held.iter()).zip(covered) {
+            *st = *held && !c;
+        }
+    }
+
+    /// Releases at `offset` the pitches an edit left without a note (see [`LiveMidi::edited`]).
+    fn release_stale(&mut self, inst: &mut dyn Plugin, offset: usize) {
+        for (pitch, (st, h)) in self.stale.iter_mut().zip(self.held.iter_mut()).enumerate() {
+            if std::mem::take(st) && std::mem::take(h) {
+                inst.note_off(offset, u8::try_from(pitch).unwrap_or(0));
+            }
+        }
     }
 
     /// Whether a slot note holds `pitch`.
@@ -925,6 +961,7 @@ impl Column<'_> {
     pub(crate) fn midi_head(&self, play: &mut ColumnPlay, midi: &mut LiveMidi, inst: &mut dyn Plugin, pos: Samples, end: Samples) -> (Samples, bool) {
         let owner = play.playing.map(|p| (p.slot, p.origin));
         let stopped = midi.owner.is_some() && owner.is_none();
+        midi.release_stale(inst, 0);
         if midi.owner != owner {
             // Stopped or replaced between blocks (a snapshot change, a transport stop): what it
             // left sounding stops now, and nothing of what plays now was sent before this block.

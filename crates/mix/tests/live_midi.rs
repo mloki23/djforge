@@ -529,7 +529,8 @@ fn controllers_come_back_after_a_slot_is_cleared() {
 }
 
 /// A playing MIDI slot whose notes or length are edited plays on from its new notes, as an
-/// audio slot does; what it left sounding is released where the new snapshot starts.
+/// audio slot does; what it left sounding that no new note sounds there is released where the
+/// new snapshot starts, and what a new note still sounds plays on to that note's end.
 #[test]
 fn an_edited_midi_slot_plays_on_and_releases_what_it_held() {
     // Notes only: the held note is removed.
@@ -564,7 +565,9 @@ fn an_edited_midi_slot_plays_on_and_releases_what_it_held() {
     r.run(mid, r.bar(6), &[(r.bar(5), LiveCmd::Stop { column: 0, at: r.bar(5) + 100 })]);
     let ev = r.events();
     assert!(r.eng.live_state()[0].playing.is_none());
-    assert!(ev.contains(&Ev::Off(mid, LONG)));
+    assert!(!ev.contains(&Ev::Off(mid, LONG)), "the longer loop still sounds it: not cut");
+    assert!(ev.contains(&Ev::Off(r.beat(2, 3), LONG)), "it ends where its note does");
+    assert_eq!(r.ons(LONG).into_iter().find(|t| *t > mid), Some(r.bar(4)), "and plays again on the next pass, not twice");
     assert_eq!(r.ons(KICK), [r.beat(3, 1)], "the note at beat 5 of the two-bar loop");
     assert_eq!(r.sounding(), Vec::<u8>::new());
 }

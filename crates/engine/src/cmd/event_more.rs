@@ -370,7 +370,7 @@ fn input_quantize(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(input_quantize_state(s))
 }
 
-fn quantize_opts(s: &Session) -> QuantizeOptions {
+pub(super) fn quantize_opts(s: &Session) -> QuantizeOptions {
     QuantizeOptions {
         grid_ticks: (s.edit.value("midi.input_quantize.grid_ticks", (TICKS_PER_QUARTER / 4) as f64) as i64).clamp(1, TICKS_PER_QUARTER * 16),
         strength: (s.edit.value("midi.input_quantize.strength", 100.0) / 100.0).clamp(0.0, 1.0) as f32,

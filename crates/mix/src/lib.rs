@@ -608,9 +608,10 @@ impl MixEngine {
     /// slot that was cleared, refilled with other audio or lost its audio fades out from `at`
     /// (rendered from `old`) and its column stops; a column that was lost (its track deleted or
     /// taken) stops and forgets what it had queued. A playing MIDI slot whose notes or length
-    /// were edited plays on, as an audio slot does, from its new notes: what it left sounding is
-    /// released at `at` (a note held past a shortened loop's end, or one removed, would never
-    /// get its note-off from the new notes). Call before rendering `new`. Neither allocates nor
+    /// were edited plays on, as an audio slot does, from its new notes: what it left sounding
+    /// that no new note sounds at `at` is released there (a note held past a shortened loop's
+    /// end, or one removed, would never get its note-off from the new notes); a pitch a new note
+    /// sounds at `at` sounds on, so an edit away from the playhead cuts nothing. Call before rendering `new`. Neither allocates nor
     /// frees.
     pub fn live_snapshot(&mut self, old: &Session, new: &Session, at: Samples) {
         for (c, play) in self.live.iter_mut().enumerate() {
@@ -633,10 +634,11 @@ impl MixEngine {
             };
             let slots = new.live.slot(c, p.slot).zip(old.live.slot(c, p.slot));
             if now.is_some() && now == was && slots.is_some_and(|(n, o)| same(n, o)) {
-                let edited = matches!(slots, Some((SlotContent::Midi(a), SlotContent::Midi(b)))
-                    if a.sequence != b.sequence || a.length_beats != b.length_beats);
-                if edited && let Some(st) = now.and_then(|id| self.strips.get_mut(&id)) {
-                    st.live_midi.edited();
+                if let Some((SlotContent::Midi(a), SlotContent::Midi(b))) = slots
+                    && (a.sequence != b.sequence || a.length_beats != b.length_beats)
+                    && let Some(st) = now.and_then(|id| self.strips.get_mut(&id))
+                {
+                    st.live_midi.edited(new, a, &p, at);
                 }
                 continue;
             }
@@ -677,6 +679,12 @@ impl MixEngine {
             self.live_in_dropped = self.live_in_dropped.saturating_add(1);
             false
         }
+    }
+
+    /// The live events queued for the next block, in the order the target plays them (for
+    /// capturing a take; their offsets are clamped into the block when played).
+    pub fn live_events(&self) -> &[LiveEvent] {
+        &self.live_in
     }
 
     /// Drops the live events queued and not yet played (nothing is listening).

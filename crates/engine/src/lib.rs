@@ -81,10 +81,26 @@ pub enum TransportRequest {
 /// commands at the boundary [`cmd::live_next_boundary`] gives, with [`cmd::live_cmds`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum LiveRequest {
-    Launch { column: usize, slot: usize },
-    Stop { column: usize },
+    Launch {
+        column: usize,
+        slot: usize,
+    },
+    Stop {
+        column: usize,
+    },
     StopAll,
-    Scene { row: usize },
+    Scene {
+        row: usize,
+    },
+    /// Record the live MIDI played through column `column`'s instrument into slot `slot` for
+    /// `bars` bars from the next boundary (see `live.record_slot`); the host writes it with
+    /// `live.slot_from_take` and launches it where the recording ends.
+    RecordSlot {
+        column: usize,
+        slot: usize,
+        bars: u32,
+        replace: bool,
+    },
 }
 
 /// What a Live column plays and has queued, as the host's audio engine last reported it.

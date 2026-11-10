@@ -958,11 +958,13 @@ pub fn live_cmds(s: &Session, req: &crate::LiveRequest, at: Samples) -> Vec<soun
             .filter(|&c| s.live.slot(c, row).is_some() && s.live.column_track(c, &s.tracks).is_some())
             .map(|column| C::Launch { column, slot: row, at })
             .collect(),
+        // The host arms it; the launch follows once it is written.
+        R::RecordSlot { .. } => Vec::new(),
     }
 }
 
 /// Refuses a launch or stop the host can't carry out: no audio engine, or bars that aren't bars.
-fn can_launch(e: &Engine, cmd: &str) -> Result<()> {
+pub(super) fn can_launch(e: &Engine, cmd: &str) -> Result<()> {
     if !e.live_audio {
         return Err(bad(
             cmd,
