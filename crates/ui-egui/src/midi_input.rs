@@ -178,6 +178,9 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         "midi.inputs" | "midi.panic" => "{}",
         "midi.input_enable" => "{name, enabled: bool}",
         "midi.target" => "{track?: id | name | null}",
+        "midi.recover_take" => {
+            "{} — places the last MIDI take again (an arrangement take, or a slot take that could not be written) on a new playlist of its track"
+        }
         _ => return None,
     })
 }
@@ -257,6 +260,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             }
             Ok(json!({"override": app.midi_target.map(|t| t.0), "target": target.map(|t| t.0)}))
         })(),
+        "midi.recover_take" => crate::midi_record::recover(app),
         "midi.panic" => {
             if let Some(pl) = &app.player {
                 pl.midi_panic();

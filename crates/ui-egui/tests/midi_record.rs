@@ -138,3 +138,101 @@ fn esc_or_stop_cancels_a_slot_recording() {
     let filled: Value = app.engine.execute("live.state", &json!({})).unwrap()["columns"][4]["slots"][0].clone();
     assert_eq!(filled, Value::Null);
 }
+
+/// Plays `pitch` for 6 000 samples.
+fn tap(ctx: &egui::Context, app: &mut SoundApp, pitch: u8) {
+    play(app, MidiMessage::NoteOn { ch: 0, note: pitch, vel: 100 });
+    let on = pos(app);
+    until(ctx, app, "the note sounds a while", |a| pos(a) > on + 6_000);
+    play(app, MidiMessage::NoteOff { ch: 0, note: pitch, vel: 0 });
+}
+
+#[test]
+fn a_take_over_a_clip_goes_on_a_new_playlist_and_the_last_take_recovers() {
+    let (mut app, t) = app();
+    let ctx = egui::Context::default();
+    // A clip already where the take will go.
+    app.run("midi.new_clip", json!({"track": t.0, "start": 0, "end": 200_000})).unwrap();
+    frame(&ctx, &mut app, vec![]);
+    app.run("transport.record", json!({})).unwrap();
+    until(&ctx, &mut app, "recording", |a| a.engine.transport.recording && pos(a) > 10_000);
+    tap(&ctx, &mut app, 60);
+    let off = pos(&app);
+    until(&ctx, &mut app, "the note-off is in", |a| pos(a) > off + 2_000);
+    app.run("transport.stop", json!({})).unwrap();
+    frame(&ctx, &mut app, vec![]);
+    let tr = app.engine.session().track(t).unwrap().clone();
+    assert_eq!((tr.playlists.len(), tr.active_playlist), (2, 1), "{}", app.ui.status);
+    assert_eq!(tr.playlists[0].clips.len(), 1, "the clip under it is intact on the playlist before");
+    assert!(app.ui.status.contains("new playlist `Lead.02`"), "{}", app.ui.status);
+    // Recover Last MIDI Take places it again, on a new playlist.
+    app.run("midi.recover_take", json!({})).unwrap();
+    let tr = app.engine.session().track(t).unwrap();
+    assert_eq!((tr.playlists.len(), tr.active_playlist, tr.clips().len()), (3, 2, 1));
+    assert!(app.ui.status.contains("Lead.03"), "{}", app.ui.status);
+    assert_eq!(app.engine.undo_label(), Some("Record MIDI"));
+}
+
+#[test]
+fn a_slot_filled_during_its_recording_sends_the_take_to_the_next_empty_slot() {
+    let (mut app, _) = app();
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut app, vec![]);
+    app.run("live.record_slot", json!({"column": 4, "slot": 1, "bars": 1})).unwrap();
+    frame(&ctx, &mut app, vec![]);
+    until(&ctx, &mut app, "recording", |a| pos(a) > 4_000);
+    tap(&ctx, &mut app, 36);
+    // Something else fills slot 2 meanwhile (a pattern, a copy).
+    let p = json!({"column": 4, "slot": 1, "start": 0, "bars": 1, "events": [{"at": 10, "status": 0x90, "data1": 40, "data2": 90}]});
+    app.engine.execute("live.slot_from_take", &p).unwrap();
+    until(&ctx, &mut app, "the recording ends", |a| a.slot_recording.is_none());
+    assert!(app.ui.status.contains("into slot 1 of Live 5 (slot 2 was filled meanwhile)"), "{}", app.ui.status);
+    let s = app.engine.session();
+    assert_eq!(s.live.slot(4, 0).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(36), "the take");
+    assert_eq!(s.live.slot(4, 1).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(40), "what filled it stays");
+}
+
+#[test]
+fn a_slot_take_with_no_empty_slot_left_is_kept_for_recovery() {
+    let (mut app, t) = app();
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut app, vec![]);
+    app.run("live.record_slot", json!({"column": 4, "slot": 7, "bars": 1})).unwrap();
+    frame(&ctx, &mut app, vec![]);
+    until(&ctx, &mut app, "recording", |a| pos(a) > 4_000);
+    tap(&ctx, &mut app, 36);
+    for slot in 0..8 {
+        let p = json!({"column": 4, "slot": slot, "start": 0, "bars": 1, "events": [{"at": 10, "status": 0x90, "data1": 40, "data2": 90}]});
+        app.engine.execute("live.slot_from_take", &p).unwrap();
+    }
+    until(&ctx, &mut app, "the recording ends", |a| a.slot_recording.is_none());
+    assert!(app.ui.status.contains("Recover Last MIDI Take"), "{}", app.ui.status);
+    let column_track = app.engine.session().live.column_track(4, &app.engine.session().tracks).unwrap();
+    assert_ne!(column_track, t);
+    let r = app.run("midi.recover_take", json!({})).unwrap();
+    assert_eq!(r["notes"], 1);
+    let tr = app.engine.session().track(column_track).unwrap();
+    assert_eq!(tr.clips().len(), 1, "on the column's track");
+}
+
+/// A first write that put nothing in the slot (nothing played yet) doesn't make the slot the
+/// recording's: filled by something else before the notes played last come in, it is not
+/// replaced, and the take goes to the next empty slot.
+#[test]
+fn an_empty_first_write_does_not_claim_the_slot() {
+    let (mut app, _) = app();
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut app, vec![]);
+    app.run("live.record_slot", json!({"column": 4, "slot": 2, "bars": 1})).unwrap();
+    frame(&ctx, &mut app, vec![]);
+    until(&ctx, &mut app, "the first write", |a| a.slot_recording.as_ref().is_some_and(|r| r.written.is_some()));
+    assert!(!app.slot_recording.as_ref().unwrap().ours);
+    assert!(app.engine.session().live.slot(4, 2).is_none(), "nothing to write yet");
+    play(&app, MidiMessage::NoteOn { ch: 0, note: 38, vel: 100 });
+    let p = json!({"column": 4, "slot": 2, "start": 0, "bars": 1, "events": [{"at": 10, "status": 0x90, "data1": 40, "data2": 90}]});
+    app.engine.execute("live.slot_from_take", &p).unwrap();
+    until(&ctx, &mut app, "the recording ends", |a| a.slot_recording.is_none());
+    let s = app.engine.session();
+    assert_eq!(s.live.slot(4, 2).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(40), "not replaced");
+    assert_eq!(s.live.slot(4, 0).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(38), "{}", app.ui.status);
+}

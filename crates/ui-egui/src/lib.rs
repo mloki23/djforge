@@ -388,6 +388,8 @@ pub struct SoundApp {
     pub midi_take: Option<midi_record::MidiTake>,
     /// The Session view slot recording armed or running.
     pub slot_recording: Option<midi_record::SlotRecording>,
+    /// The last MIDI take (`midi.record_take` parameters), for Recover Last MIDI Take.
+    pub last_take: Option<Value>,
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
@@ -510,6 +512,7 @@ impl SoundApp {
             midi_capture: None,
             midi_take: None,
             slot_recording: None,
+            last_take: None,
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
@@ -705,6 +708,7 @@ impl SoundApp {
         // Only an instrument track armed: a MIDI take, which needs no audio input.
         let audio = self.engine.session().tracks.iter().any(|t| t.mixer.record_arm && !t.kind.is_midi());
         let midi = midi_record::armed_target(self).is_some();
+        let unheard = midi_record::armed_not_target(self);
         if armed && !audio && !midi {
             let why = "The record-armed instrument track is not playing live MIDI: it must be active, or chosen with midi.target";
             self.ui.status = why.into();
@@ -745,6 +749,7 @@ impl SoundApp {
             self.punch = None;
             self.plan_recording(takes, None);
             midi_record::start_take(self, self.record_start);
+            self.warn_unheard(&unheard);
             return;
         }
         let e = self.engine.session().edit.clone();
@@ -766,6 +771,19 @@ impl SoundApp {
             self.plan_recording(takes, None);
         }
         midi_record::start_take(self, self.record_start);
+        self.warn_unheard(&unheard);
+    }
+
+    /// Says which record-armed instrument tracks live MIDI doesn't reach (it plays only the
+    /// target): nothing is recorded on them.
+    fn warn_unheard(&mut self, unheard: &[String]) {
+        if !unheard.is_empty() {
+            self.ui.status = format!(
+                "Recording; live MIDI plays only {}, not the armed {}: choose the target with midi.target",
+                midi_input::target_name(self).unwrap_or_else(|| "no track".into()),
+                unheard.join(", ")
+            );
+        }
     }
 
     /// Remember where the armed `takes` go (split into passes of `pass` when loop recording) and
