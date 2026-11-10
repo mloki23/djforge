@@ -543,7 +543,16 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                     pl.editor_set_param(tid, slot, p.id, x);
                                 }
                             }
-                            let _ = resp;
+                            if let Some(t) = app.engine.session().track(tid) {
+                                let track = crate::midi_learn::TrackRef::of(t);
+                                let param = p.id.to_string();
+                                let target = if instrument {
+                                    crate::midi_learn::Target::InstrumentParam { track, param }
+                                } else {
+                                    crate::midi_learn::Target::InsertParam { track, slot, param }
+                                };
+                                resp.context_menu(|ui| crate::midi_learn::menu_items(app, ui, target));
+                            }
                             let shown = if instrument { crate::sampler_window::format_param(&ins.plugin, p, x) } else { p.format(x) };
                             ui.label(egui::RichText::new(shown).font(mono(11.0)));
                             ui.end_row();

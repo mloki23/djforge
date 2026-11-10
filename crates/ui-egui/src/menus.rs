@@ -73,6 +73,12 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("midi.target", "Live MIDI Target", "", None),
     ("midi.panic", "Live MIDI Panic", "", None),
     ("midi.recover_take", "Recover Last MIDI Take (place again)", "", None),
+    ("window.midi_mappings", "MIDI Mappings", "", None),
+    ("midi.mappings", "List MIDI Mappings", "", None),
+    ("midi.map", "Map MIDI Control", "", None),
+    ("midi.unmap", "Remove MIDI Mapping", "", None),
+    ("midi.learn", "Learn MIDI", "", None),
+    ("midi.learn_command", "Learn MIDI for Command...", "", None),
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
     ("view.mix_section", "Mix Window View", "", None),
@@ -440,7 +446,7 @@ fn mix_section_id(label: &str) -> &'static str {
 }
 
 /// Parameters implied by the menu item a command was reached through.
-fn params_for(path: &str, id: &str) -> Value {
+pub(crate) fn params_for(path: &str, id: &str) -> Value {
     let leaf = path.rsplit(" > ").next().unwrap_or("");
     match id {
         "view.ruler" => json!({"ruler": ruler_id(leaf)}),
@@ -472,6 +478,7 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
     ("Setup > MIDI > Live MIDI Inputs...", "window.midi_inputs"),
     ("Setup > MIDI > Live MIDI Panic", "midi.panic"),
+    ("Setup > MIDI > MIDI Mappings...", "window.midi_mappings"),
     ("Event > Recover Last MIDI Take (place again)", "midi.recover_take"),
     ("Setup > Session", "setup.session"),
     ("Event > Beat Detective", "window.beat_detective"),
@@ -564,6 +571,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         return Some(crate::windows::audio_device_command(app, p));
     }
     if let Some(r) = crate::midi_input::command(app, id, p) {
+        return Some(r);
+    }
+    if let Some(r) = crate::midi_learn::command(app, id, p) {
         return Some(r);
     }
     let toggle = |v: &mut bool| {

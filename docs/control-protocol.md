@@ -66,6 +66,21 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `midi.target` | `{track?: id \| name \| null}` | The track live MIDI plays: this override, else the first record-armed instrument track, else the selected instrument track with input monitoring on. `null` or nothing clears the override. Returns `override` and `target`. |
 | `midi.panic` | `{}` | Silences every instrument: live notes, arrangement and slot notes off, controllers reset. `event.all_notes_off` does the same. |
 
+### MIDI learn (UI commands, through `engine.execute`)
+
+A mapping binds a device and a message (a note or a controller on a channel) to a control, with a mode. Mappings are app preferences (per machine), not part of the session; Setup › MIDI › MIDI Mappings lists them. While mapped, a note or controller doesn't play the live MIDI target (note-offs still pass). Tracks are kept as `{id, name}`: the id while that track has the name, else the track with the name, so a mapping made in one session finds its track in another. A mapping whose target is missing does nothing and says so on the status line.
+
+| Command | Params | What it does |
+|---|---|---|
+| `midi.mappings` | `{}` | Every mapping: `index`, `device` (`backend_id`, `raw_name`, `name`), `matcher`, `message` (`"CC 7"`, `"Note 36 ch 10"`), `target`, `label`, `mode`, `sensitivity`, `pickup`, `resolved` (the target exists now) and `activity_s` (seconds since its last message, or `null`); plus `learning` (the target being learned, or `null`). |
+| `midi.map` | `{device, matcher, target, mode?, sensitivity?, pickup?, replace?}` | Adds a mapping, replacing the target's own. `device`: a listed input name or `{backend_id, raw_name, name}`. `matcher`: `{type: "note", ch, note}` or `{type: "cc", ch, cc}` (channels 0–15). `target` (`kind`, then its fields, 0-based): `slot_launch {column, slot}`, `scene {row}`, `stop_column {column}`, `stop_all`, `track_volume {track}`, `track_pan {track}`, `stem_fader {track, stem}`, `instrument_param {track, param}`, `insert_param {track, slot, param}`, `command {id, params}`; `track` is an id, a name or `{id, name}`. `mode`: `momentary`, `toggle` (notes are one of these), `absolute`, `rel_twos` (1–63 up, 65–127 down), `rel_offset` (64 is centre), `rel_sign_mag` (bit 6 is down); default momentary on triggers, toggle for a note on a fader, absolute for a controller on one. `sensitivity`: travel (0–1) per relative tick, default 0.01. `pickup` (default true): an absolute controller is ignored until it reaches the current value. `replace: true` also removes another target's mapping of the same message (else both are kept). Returns `{index, mapping}`. |
+| `midi.unmap` | `{index}` \| `{target}` \| `{device, matcher}` \| `{all: true}` | Removes mappings; returns `{removed}`. |
+| `midi.learn` | `{target}` \| `{cancel: true}` | Learn MIDI: the next note-on or controller from an enabled input binds `target` (as Learn MIDI in a control's right-click menu does). Learning a target again replaces its mapping; a message another target uses asks Replace or Keep Both. |
+| `midi.learn_command` | `{}` | Opens Search to pick the command a control runs (Learn MIDI for Command...). |
+| `window.midi_mappings` | `{value?: bool}` | Shows or hides Setup › MIDI › MIDI Mappings. |
+
+Triggers (slot launch, scene, stops, commands) act on a press (a note-on, or a controller rising through 64) with the Session view's own quantised commands; Toggle on a slot launches it, or stops its column when it is the one playing. Faders, pans, stem faders and parameters move along the on-screen control's travel (the fader taper for volume and stems). A move from one control is one undo step until it pauses for half a second.
+
 ## Positions and references
 
 - Tracks: id (number) or name (`"Kick"`).

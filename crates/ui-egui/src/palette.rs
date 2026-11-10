@@ -8,6 +8,8 @@ use egui::{Align2, Key, vec2};
 pub struct PaletteState {
     pub query: String,
     pub selected: usize,
+    /// Learn MIDI for Command...: the command picked is learned (`midi_learn`), not run.
+    pub learn: bool,
 }
 
 struct Entry {
@@ -72,8 +74,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         .anchor(Align2::CENTER_TOP, vec2(0.0, 90.0))
         .fixed_size(vec2(560.0, 380.0))
         .show(ctx, |ui| {
-            let r = ui
-                .add(egui::TextEdit::singleline(&mut app.palette.query).hint_text("Search commands…").desired_width(f32::INFINITY).font(mono(15.0)));
+            if app.palette.learn {
+                ui.label(egui::RichText::new("Learn MIDI: pick the command a control runs").strong());
+            }
+            let hint = if app.palette.learn { "Command to learn…" } else { "Search commands…" };
+            let r = ui.add(egui::TextEdit::singleline(&mut app.palette.query).hint_text(hint).desired_width(f32::INFINITY).font(mono(15.0)));
             r.request_focus();
             let q = app.palette.query.trim().to_string();
             let mut hits: Vec<(i32, Entry)> =
@@ -109,9 +114,18 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
     if let Some(id) = run {
-        close = true;
         let path = entries().into_iter().find(|e| e.id == id).map(|e| e.path.replace(" › ", " > ")).unwrap_or_default();
-        crate::menus::invoke_menu(app, &id, &path);
+        if id == "midi.learn_command" {
+            // Stays open, now picking the command to learn.
+            app.palette = PaletteState { learn: true, ..PaletteState::default() };
+        } else if app.palette.learn {
+            close = true;
+            let params = crate::menus::params_for(&path, &id);
+            crate::midi_learn::start(app, crate::midi_learn::Target::Command { id, params });
+        } else {
+            close = true;
+            crate::menus::invoke_menu(app, &id, &path);
+        }
     }
     if close {
         app.ui.show_search = false;

@@ -18,6 +18,7 @@ mod live_transport;
 pub mod menus;
 pub mod midi_editor;
 pub mod midi_input;
+pub mod midi_learn;
 pub mod midi_record;
 pub mod mix_window;
 pub mod ops_windows;
@@ -210,6 +211,12 @@ pub struct UiState {
     pub midi_keyboard_play: bool,
     /// Setup › MIDI › Live MIDI Inputs.
     pub show_midi_inputs: bool,
+    /// MIDI learn's mappings (`midi.map`, Learn MIDI), kept with the preferences: per machine.
+    /// One that can't be read is skipped rather than failing the preferences.
+    #[serde(deserialize_with = "midi_learn::lenient")]
+    pub midi_mappings: Vec<midi_learn::Mapping>,
+    /// Setup › MIDI › MIDI Mappings.
+    pub show_midi_mappings: bool,
 }
 
 impl Default for UiState {
@@ -274,6 +281,8 @@ impl Default for UiState {
             midi_inputs: Vec::new(),
             midi_keyboard_play: false,
             show_midi_inputs: false,
+            midi_mappings: Vec::new(),
+            show_midi_mappings: false,
         }
     }
 }
@@ -382,6 +391,8 @@ pub struct SoundApp {
     pub midi_host: Option<midi_input::MidiHost>,
     /// The live MIDI target chosen with `midi.target` (see [`midi_input::resolve_target`]).
     pub midi_target: Option<TrackId>,
+    /// MIDI learn and the mapped controls' state (see [`midi_learn`]).
+    pub midi_learn: midi_learn::LearnState,
     /// The live MIDI the target plays, captured for recording (see [`midi_record`]).
     pub midi_capture: Option<soundcraft_playback::MidiCapture>,
     /// The arrangement MIDI take being recorded.
@@ -509,6 +520,7 @@ impl SoundApp {
             midi: midi_editor::MidiEditorState::default(),
             midi_host: None,
             midi_target: None,
+            midi_learn: midi_learn::LearnState::default(),
             midi_capture: None,
             midi_take: None,
             slot_recording: None,
@@ -1388,6 +1400,7 @@ impl SoundApp {
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
         midi_input::frame(self, now);
+        midi_learn::frame(self, now);
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
@@ -1397,8 +1410,9 @@ impl SoundApp {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
                 self.gesture = None;
             }
-            // Keep a running automation pass merged until playback stops.
-            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() {
+            // Keep a running automation pass merged until playback stops, and a MIDI control's
+            // gesture until it pauses.
+            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() && !midi_learn::holds_merge(self) {
                 self.engine.end_merge();
             }
         }
@@ -1479,6 +1493,7 @@ impl SoundApp {
             self.arrange_request = false;
             ctx.memory_mut(|m| m.reset_areas());
         }
+        midi_learn::keys(self, &ctx);
         shortcuts::handle(self, &ctx);
         self.sample_drop_targets.clear();
         self.session_view.drop_targets.clear();
@@ -1503,6 +1518,7 @@ impl SoundApp {
         recovery::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
+        midi_learn::show(self, &ctx);
         dialogs::show(self, &ctx);
         // What a click in this frame asked of the transport (a Session view launch) acts now.
         if !self.engine.transport_requests.is_empty() {

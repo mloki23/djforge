@@ -320,8 +320,18 @@ pub fn fader_slot(r: Rect) -> Rect {
 
 /// A fader: returns the new dB value when dragged. `db` in -144..12.
 pub fn fader(ui: &mut Ui, r: Rect, db: f32, id: egui::Id) -> Option<f32> {
-    let t = Tokens::current();
+    fader_response(ui, r, db, id).0
+}
+
+/// [`fader`], with its response (for a right-click menu).
+pub fn fader_response(ui: &mut Ui, r: Rect, db: f32, id: egui::Id) -> (Option<f32>, Response) {
     let resp = ui.interact(r, id, Sense::click_and_drag());
+    let to = fader_drawn(ui, r, db, &resp);
+    (to, resp)
+}
+
+fn fader_drawn(ui: &mut Ui, r: Rect, db: f32, resp: &Response) -> Option<f32> {
+    let t = Tokens::current();
     let p = ui.painter();
     let slot = fader_slot(r);
     let cap_w = (r.width() * 0.4).clamp(16.0, 18.0);

@@ -181,6 +181,46 @@ mod config_tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// MIDI mappings are preferences: saved and loaded with the settings file, every field kept.
+    #[test]
+    fn midi_mappings_survive_saving_and_loading_the_settings() {
+        use soundcraft_ui_egui::midi_learn::{DeviceKey, Mapping, Matcher, Mode, Target, TrackRef};
+        let directory = std::env::temp_dir().join(format!("soundcraft-midi-map-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("ui.json");
+        let mut ui = soundcraft_ui_egui::UiState::default();
+        let device = DeviceKey { backend_id: "fake:0".into(), raw_name: "DDJ".into(), name: "DDJ".into() };
+        ui.midi_mappings = vec![
+            Mapping {
+                device: device.clone(),
+                matcher: Matcher::Cc { ch: 0, cc: 7 },
+                target: Target::TrackVolume { track: TrackRef { id: 3, name: "Kick".into() } },
+                mode: Mode::Absolute,
+                sensitivity: 0.01,
+                pickup: false,
+            },
+            Mapping {
+                device: device.clone(),
+                matcher: Matcher::Cc { ch: 1, cc: 33 },
+                target: Target::InsertParam { track: TrackRef { id: 4, name: "Bass".into() }, slot: 2, param: "cutoff".into() },
+                mode: Mode::RelTwos,
+                sensitivity: 0.05,
+                pickup: true,
+            },
+            Mapping {
+                device,
+                matcher: Matcher::Note { ch: 9, note: 36 },
+                target: Target::Command { id: "transport.play".into(), params: serde_json::json!({}) },
+                mode: Mode::Momentary,
+                ..Mapping::default()
+            },
+        ];
+        save_ui(&path, &ui).unwrap();
+        let back = load_ui(&path).unwrap().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(back.midi_mappings, ui.midi_mappings);
+    }
+
     #[test]
     fn oversized_settings_are_rejected_and_preserved() {
         let directory = std::env::temp_dir().join(format!("soundcraft-bounded-prefs-{}", std::process::id()));

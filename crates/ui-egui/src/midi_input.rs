@@ -15,7 +15,7 @@
 
 use crate::SoundApp;
 use serde_json::{Value, json};
-use soundcraft_midi_io::{MidiSource, PortChange, PortInfo};
+use soundcraft_midi_io::{MidiEvent, MidiSource, PortChange, PortId, PortInfo, Subscriber};
 use soundcraft_model::{Session, Track, TrackId, TrackKind};
 use soundcraft_playback::Player;
 
@@ -70,11 +70,37 @@ pub struct MidiHost {
     source: Box<dyn MidiSource>,
     /// When the device list was last refreshed (UI time, seconds); `None` before the first frame.
     last_refresh: Option<f64>,
+    /// The UI thread's own queue of every event, for MIDI learn and mapped controls
+    /// (`crate::midi_learn`), drained every frame.
+    control: Option<Subscriber>,
+    /// The ports opened so far (their ids outlive a close), for the mapped-control filter.
+    opened: Vec<PortId>,
 }
 
 impl MidiHost {
     pub fn new(source: Box<dyn MidiSource>) -> MidiHost {
-        MidiHost { source, last_refresh: None }
+        MidiHost { source, last_refresh: None, control: None, opened: Vec::new() }
+    }
+
+    /// The events that arrived since the last call, oldest first (subscribing on the first call:
+    /// nothing earlier is kept).
+    pub fn take_control_events(&mut self) -> Vec<MidiEvent> {
+        if self.control.is_none() {
+            match self.source.subscribe(QUEUE_CAPACITY) {
+                Ok(q) => self.control = Some(q),
+                Err(e) => log::warn!("MIDI control input: {e}"),
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(e) = self.control.as_mut().and_then(Subscriber::pop) {
+            out.push(e);
+        }
+        out
+    }
+
+    /// The ports opened so far.
+    pub fn opened(&self) -> &[PortId] {
+        &self.opened
     }
 
     /// The source, for reading.
@@ -128,8 +154,15 @@ impl MidiHost {
     }
 
     fn open(&mut self, name: &str) {
-        if let Err(e) = self.source.open(name) {
-            log::warn!("{e}");
+        match self.source.open(name) {
+            Ok(id) => self.note_opened(id),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+
+    fn note_opened(&mut self, id: PortId) {
+        if !self.opened.contains(&id) {
+            self.opened.push(id);
         }
     }
 
@@ -158,7 +191,8 @@ impl MidiHost {
         if on {
             prefs.push(MidiInputPref { name: port.name.clone(), raw_name: port.raw_name.clone(), backend_id: port.backend_id.clone() });
             // Enabled even if it won't open now: it opens when it next appears.
-            self.source.open(&port.name).map_err(|e| e.to_string())?;
+            let id = self.source.open(&port.name).map_err(|e| e.to_string())?;
+            self.note_opened(id);
         } else {
             self.source.close(&port.name);
         }
@@ -181,7 +215,7 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         "midi.recover_take" => {
             "{} — places the last MIDI take again (an arrangement take, or a slot take that could not be written) on a new playlist of its track"
         }
-        _ => return None,
+        _ => return crate::midi_learn::params_doc(id),
     })
 }
 

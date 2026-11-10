@@ -366,7 +366,10 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
             if (v - before).abs() > f32::EPSILON {
                 let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": v, "index": i}), &format!("pan:{}:{i}", id.0));
             }
-            let _ = resp;
+            if i == 0 {
+                let tref = crate::midi_learn::TrackRef::of(track);
+                resp.context_menu(|ui| crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::TrackPan { track: tref }));
+            }
             let pr = Rect::from_center_size(pos2(cx, y + 42.0), vec2(ks + 8.0, 13.0));
             inset(ui.painter(), pr, t.counter_bg);
             let (_, entered) =
@@ -419,10 +422,15 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     let fh = (r.max.y - bottom_h - y).max(120.0);
     let wide_meter = (if track.kind == TrackKind::Master { app.engine.session().main_format() } else { track.format }).channels() > 2;
     let fr = Rect::from_min_size(pos2(x0, y), vec2(inner_w * if wide_meter { 0.45 } else { 0.6 }, fh));
-    if let Some(db) = fader(ui, fr, track.mixer.volume_db, ui.id().with(("fader", id.0))) {
+    let (dragged, fresp) = crate::widgets::fader_response(ui, fr, track.mixer.volume_db, ui.id().with(("fader", id.0)));
+    let volume_label = format!("{} volume", track.name);
+    fresp.widget_info(|| egui::WidgetInfo::slider(true, f64::from(track.mixer.volume_db), &volume_label));
+    if let Some(db) = dragged {
         app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db, stem: None });
         let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
     }
+    let tref = crate::midi_learn::TrackRef::of(track);
+    fresp.context_menu(|ui| crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::TrackVolume { track: tref.clone() }));
     let md = app.meters.get(&id).copied().unwrap_or_default();
     let slot = fader_slot(fr);
     let mr = Rect::from_min_max(pos2(fr.max.x + 4.0, slot.min.y - 5.0), pos2(x0 + inner_w - 2.0, slot.max.y + if wide_meter { 17.0 } else { 1.0 }));

@@ -345,9 +345,11 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
         if chosen != current {
             let _ = app.run("live.quantise", json!({"value": chosen.id()}));
         }
-        if ui.button("Stop All").on_hover_text("Shift+0").clicked() {
+        let stop_all = ui.button("Stop All").on_hover_text("Shift+0");
+        if stop_all.clicked() {
             let _ = app.run("live.stop_all", json!({}));
         }
+        stop_all.context_menu(|ui| crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::StopAll));
     });
     ui.add_space(4.0);
     egui::Grid::new("session_grid").spacing(vec2(4.0, 4.0)).show(ui, |ui| {
@@ -379,24 +381,23 @@ fn grid(app: &mut SoundApp, ui: &mut egui::Ui, states: &[ColumnState], now: f64)
             for (c, state) in (0..columns).map(|c| (c, states.get(c).copied().unwrap_or_default())) {
                 slot(app, ui, c, row, state, now);
             }
-            if ui
+            let scene = ui
                 .add_sized(vec2(60.0, CELL.y), egui::Button::new(format!("▶ {}", row + 1)))
-                .on_hover_text(format!("Launch this row in every column (Shift+{})", row + 1))
-                .clicked()
-            {
+                .on_hover_text(format!("Launch this row in every column (Shift+{})", row + 1));
+            if scene.clicked() {
                 let _ = app.run("live.scene", json!({"row": row}));
             }
+            scene.context_menu(|ui| crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::Scene { row }));
             ui.end_row();
         }
         for c in 0..columns {
-            if ui
-                .add_sized(CELL, egui::Button::new(format!("■ Stop {}", c + 1)))
-                .on_hover_text(format!("Stop Live {} at the next boundary", c + 1))
-                .clicked()
-            {
+            let stop =
+                ui.add_sized(CELL, egui::Button::new(format!("■ Stop {}", c + 1))).on_hover_text(format!("Stop Live {} at the next boundary", c + 1));
+            if stop.clicked() {
                 app.session_view.column = c;
                 let _ = app.run("live.stop", json!({"column": c}));
             }
+            stop.context_menu(|ui| crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::StopColumn { column: c }));
         }
         ui.end_row();
     });
@@ -516,6 +517,8 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
     }
     resp.context_menu(|ui| {
         app.session_view.column = column;
+        crate::midi_learn::menu_items(app, ui, crate::midi_learn::Target::SlotLaunch { column, slot: row });
+        ui.separator();
         if instrument {
             if ui.button("New Starter Pattern Here...").clicked() {
                 crate::produce::open_pattern(app, Some((column, row)));

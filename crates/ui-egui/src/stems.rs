@@ -262,12 +262,13 @@ pub fn toggle_mute(app: &mut SoundApp, track: TrackId, i: usize) {
 }
 
 /// Fader position (0..1) of `db`, with +6 dB at the top.
-fn pos_of(db: f32) -> f32 {
+pub(crate) fn pos_of(db: f32) -> f32 {
     let top = soundcraft_model::fader_db_to_pos(MAX_DB).max(f32::EPSILON);
     (soundcraft_model::fader_db_to_pos(db) / top).clamp(0.0, 1.0)
 }
 
-fn db_of(pos: f32) -> f32 {
+/// The level at fader position `pos` (0..1), with +6 dB at the top.
+pub(crate) fn db_of(pos: f32) -> f32 {
     let top = soundcraft_model::fader_db_to_pos(MAX_DB);
     soundcraft_model::fader_pos_to_db(pos.clamp(0.0, 1.0) * top).clamp(MIN_DB, MAX_DB)
 }
@@ -328,6 +329,8 @@ pub(crate) fn faders(app: &mut SoundApp, ui: &mut Ui, track: &Track, sec: Rect) 
         if resp.drag_stopped() {
             app.engine.end_merge();
         }
+        let target = crate::midi_learn::Target::StemFader { track: crate::midi_learn::TrackRef::of(track), stem: (*name).to_string() };
+        resp.context_menu(|ui| crate::midi_learn::menu_items(app, ui, target));
         let mr = Rect::from_center_size(pos2(col.center().x, col.max.y - 10.0), vec2((cw - 4.0).min(18.0), 14.0));
         let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("stem_mute", id.0, i)).max_rect(mr));
         let mute = crate::widgets::text_toggle(&mut c, mr.size(), "M", muted, t.mute, &format!("Mute {name} (click again for its level)"));
