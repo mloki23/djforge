@@ -261,3 +261,71 @@ fn old_midi_input_flags_are_dropped_on_load() {
     assert!(!back.edit.flag("midi.input.Keys"));
     assert!(back.edit.flag("midi.filter.sysex"), "other flags stay");
 }
+
+fn peak(h: &Harness<'_, SoundApp>, track: &str) -> f32 {
+    let t = h.state().engine.session().track_by_name(track).unwrap().id;
+    h.state().player.as_ref().unwrap().meters().tracks.get(&t).map_or(0.0, |m| m.peak[0].max(m.peak[1]))
+}
+
+/// Holds a note from the DDJ on the armed synth until it sounds.
+fn hold_a_note(h: &mut Harness<'_, SoundApp>) {
+    assert!(fake(h).inject("DDJ", MidiMessage::NoteOn { ch: 0, note: 60, vel: 110 }, 0));
+    until(h, "the held note sounds", |h| peak(h, "Lead") > 1e-3);
+}
+
+/// Steps in real time until the synth is silent; false if it still sounds after `secs`.
+fn falls_silent(h: &mut Harness<'_, SoundApp>, secs: f64) -> bool {
+    let start = Instant::now();
+    while start.elapsed().as_secs_f64() < secs {
+        if peak(h, "Lead") < 1e-5 {
+            return true;
+        }
+        step(h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[test]
+fn a_reconnect_or_a_disable_releases_the_notes_the_port_held() {
+    let mut h = harness(&["DDJ"], &["DDJ"]);
+    hold_a_note(&mut h);
+    assert!(!falls_silent(&mut h, 0.6), "a held note keeps sounding");
+    h.state_mut().run("midi.reconnect", json!({"name": "DDJ"})).unwrap();
+    assert!(falls_silent(&mut h, 5.0), "the reconnect released it");
+    hold_a_note(&mut h);
+    h.state_mut().run("midi.input_enable", json!({"name": "DDJ", "enabled": false})).unwrap();
+    assert!(falls_silent(&mut h, 5.0), "disabling released it");
+}
+
+#[test]
+fn only_enabled_listed_ports_offer_reconnect() {
+    let mut h = harness(&["DDJ", "Pads"], &["DDJ"]);
+    h.state_mut().run("window.midi_devices", json!({"value": true})).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(h.get_all_by_label("Reconnect").count(), 1, "DDJ only");
+    let err = h.state_mut().run("midi.reconnect", json!({"name": "Pads"})).unwrap_err();
+    assert!(err.contains("not enabled"), "{err}");
+    assert!(!is_open(&h, "Pads"));
+}
+
+#[test]
+fn midi_wakes_the_ui_at_a_capped_rate_for_lights_and_at_once_for_mappings() {
+    use soundcraft_ui_egui::midi_input::{WAKE_DISPLAY, WAKE_OFF, WAKE_URGENT};
+    let wake = |h: &Harness<'_, SoundApp>| h.state().midi_learn.wake_wanted.load(std::sync::atomic::Ordering::Relaxed);
+    let mut h = harness(&["DDJ"], &[]);
+    assert_eq!(wake(&h), WAKE_OFF, "no light shown");
+    h.state_mut().run("midi.input_enable", json!({"name": "DDJ", "enabled": true})).unwrap();
+    steps(&mut h, 1);
+    assert_eq!(wake(&h), WAKE_DISPLAY, "the Edit toolbar's light");
+    h.state_mut().run("window.mix", json!({})).unwrap();
+    steps(&mut h, 1);
+    assert_eq!(wake(&h), WAKE_OFF, "the Mix window has no light");
+    h.state_mut().run("window.midi_devices", json!({"value": true})).unwrap();
+    steps(&mut h, 1);
+    assert_eq!(wake(&h), WAKE_DISPLAY, "MIDI Devices' lights");
+    let m = json!({"device": "DDJ", "matcher": {"type": "cc", "ch": 0, "cc": 7}, "target": {"kind": "stop_all"}});
+    h.state_mut().run("midi.map", m).unwrap();
+    steps(&mut h, 1);
+    assert_eq!(wake(&h), WAKE_URGENT, "a mapping acts at once");
+}

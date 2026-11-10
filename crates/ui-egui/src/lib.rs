@@ -211,6 +211,7 @@ pub struct UiState {
     /// The on-screen keyboard plays the live target instead of step-entering notes.
     pub midi_keyboard_play: bool,
     /// Setup › MIDI › MIDI Input Devices: the MIDI Devices window.
+    #[serde(alias = "show_midi_inputs")]
     pub show_midi_devices: bool,
     /// MIDI learn's mappings (`midi.map`, Learn MIDI), kept with the preferences: per machine.
     /// One that can't be read is skipped rather than failing the preferences.

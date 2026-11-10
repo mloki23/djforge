@@ -60,13 +60,21 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 
 ### G-02. MIDI devices
 
-- **Missing:** all MIDI hardware I/O. No `midir`/CoreMIDI/WinMM/ALSA sequencer code exists;
-  `setup.midi_input_devices` and `setup.midi_studio` only store names. You cannot record from a
-  keyboard, play a hosted instrument live, drive external synths, or send MIDI clock/MTC.
-  `midi_editor.rs:288` notes audition "needs a live MIDI input path".
-- **Impact:** MIDI production is limited to drawing notes and importing SMF.
-- **Estimate:** ≈ 20–35 h (device layer, realtime input to armed tracks and instruments with
-  timestamps, MIDI record/merge/loop, thru, output tracks, clock out).
+- **Done (stage 7b):** MIDI input. `crates/midi-io` lists and opens ports through `midir`
+  (WinMM, CoreMIDI, ALSA). Live input plays the target instrument track (an override, else the
+  record-armed track, else the selected monitored one) with timestamps, and the on-screen
+  keyboard's Play mode plays the same path. MIDI is recorded into the arrangement and into
+  Session view slots. MIDI learn maps notes and controllers to slots, faders, stems, parameters
+  and commands. Setup › MIDI › MIDI Input Devices (MIDI Devices) enables ports (app preferences,
+  per machine), shows activity, state and the last messages, reconnects a port, releases held
+  notes on an unplug and reopens a replugged port, and shows the live target, latency and drops.
+  `setup.midi_input_devices` is a deprecated shim for it.
+- **Missing:** MIDI output to external synths, MIDI Thru, the input filter
+  (`setup.midi_input_filter` still only stores flags), `setup.midi_studio` (names only), and MIDI
+  Beat Clock / MTC out.
+- **Impact:** djforge plays and records a controller, pad grid or keyboard, but can't drive
+  external gear or sync it.
+- **Estimate:** ≈ 10–20 h (output tracks and ports, thru, the input filter, clock out).
 
 ### G-03. Session interchange with Pro Tools
 
@@ -130,7 +138,7 @@ native-speaker review.
 ### G-10. Control surfaces
 
 None: no HUI or Mackie Control, no EUCON (Avid-proprietary, needs Avid's SDK: owner decision),
-no generic MIDI controller mapping. Pro Tools users on S1/S3/S4/S6/Dock or HUI devices can't
+generic MIDI controllers only through MIDI learn (no personalities). Pro Tools users on S1/S3/S4/S6/Dock or HUI devices can't
 switch. ≈ 40–70 h for HUI/MCU plus a mapping layer; hardware needed to verify.
 
 ### G-11. Sync
@@ -182,8 +190,8 @@ See [`ui-parity.md`](ui-parity.md). ≈ 60–100 h.
 
 ### G-20. MIDI and instrument depth
 
-MIDI learn, a sampler (PR #108), drum machine depth, notation editing (tuplets, lyrics,
-articulations, parts). ≈ 40–60 h.
+A sampler (PR #108), drum machine depth, notation editing (tuplets, lyrics, articulations,
+parts). MIDI learn is done (stage 7b). ≈ 35–55 h.
 
 ### G-21. Compressed export
 

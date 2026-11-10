@@ -83,8 +83,13 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 let state = port["state"].as_str().unwrap_or("closed");
                 let lit = crate::midi_input::port_lit(app, raw, backend, now, flash);
                 light(ui, lit, &format!("{name} activity")).on_hover_text("Lights on each message from this port");
-                let mut on = port["enabled"].as_bool().unwrap_or(false);
-                let tip = format!("{raw}\nbackend: {backend}");
+                let was_on = port["enabled"].as_bool().unwrap_or(false);
+                let mut on = was_on;
+                let error = port["error"].as_str();
+                let tip = match error {
+                    Some(e) => format!("{raw}\nbackend: {backend}\nWon't open: {e}"),
+                    None => format!("{raw}\nbackend: {backend}"),
+                };
                 if ui.checkbox(&mut on, &name).on_hover_text(tip).changed() {
                     if state == "disconnected" && !on {
                         // Not listed, so not by name: drop it from the preferences directly.
@@ -100,10 +105,16 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     "disconnected" => t.meter_red,
                     _ => t.text_dim,
                 };
-                ui.label(egui::RichText::new(state).color(colour));
-                let can = state != "disconnected";
-                if ui
-                    .add_enabled(can, egui::Button::new("Reconnect"))
+                let shown = if error.is_some() && state == "closed" { "closed (won't open)" } else { state };
+                let label = ui.label(egui::RichText::new(shown).color(colour));
+                if let Some(e) = error {
+                    label.on_hover_text(e);
+                }
+                // Only an enabled port that is listed reconnects.
+                if !(was_on && state != "disconnected") {
+                    ui.label("");
+                } else if ui
+                    .button("Reconnect")
                     .on_hover_text("Close the port and open it again (for a device replugged without being noticed)")
                     .clicked()
                 {
@@ -187,7 +198,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             n(&st["dropped_port"]),
             n(&st["dropped_subscribers"]),
             n(&st["dropped_player"])
-        ));
+        ))
+        .on_hover_text(
+            "MIDI messages lost since launch.\nPort: a device's input queue was full, so nothing received them.\nSubscribers: a reader's queue was full (the player's, MIDI learn's or the UI waker's).\nPlayer: the audio thread's live-input buffer was full.",
+        );
         if st["healthy"] == false {
             ui.label(egui::RichText::new("⚠ The MIDI router has stopped: no more input will arrive. Restart the app.").color(t.meter_red));
         }
@@ -204,7 +218,18 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_secs_f64(if crate::midi_input::any_lit(app, now, flash) { FLASH_S } else { 0.5 }));
 }
 
-/// The toolbar's MIDI activity light: hidden with no input enabled. Hover shows the live
+/// Whether the main window shows the Edit window (and so its toolbar).
+fn edit_shown(app: &SoundApp) -> bool {
+    app.ui.mix_separate || app.ui.window == crate::MainWindow::Edit
+}
+
+/// Whether an activity light is on screen: the toolbar's (an input enabled, the Edit window
+/// shown) or MIDI Devices'. MIDI then wakes the UI at a capped rate to draw them.
+pub fn lights_shown(app: &SoundApp) -> bool {
+    app.ui.show_midi_devices || (!app.ui.midi_inputs.is_empty() && edit_shown(app))
+}
+
+/// The toolbar's MIDI activity light (the Edit window's): hidden with no input enabled. Hover shows the live
 /// target; a click opens MIDI Devices.
 pub fn toolbar_light(app: &mut SoundApp, ui: &mut egui::Ui) {
     if app.ui.midi_inputs.is_empty() {

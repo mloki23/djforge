@@ -31,12 +31,12 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Feature | Pro Tools | SoundCraft (all platforms) |
 |---|---|---|
-| MIDI input devices (keyboards, pads) | ✅ | ❌ no MIDI device layer at all (`setup.midi_input_devices` stores names) |
+| MIDI input devices (keyboards, pads) | ✅ | ✅ live play to the target instrument, recording into the arrangement and slots; Setup › MIDI › MIDI Input Devices enables ports, shows activity and the last messages, reconnects, and reopens replugged ports |
 | MIDI output to external gear | ✅ | ❌ |
-| MIDI Thru, input filter | ✅ | ❌ (stored flags only) |
+| MIDI Thru, input filter | ✅ | ❌ (the filter is stored flags only; no Thru) |
 | MIDI Beat Clock out, MTC generate/chase | ✅ | ❌ |
-| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ❌ |
-| Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | 🟡 window exists, no live audition path |
+| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ✅ MIDI learn: notes and controllers to slots, scenes, faders, pans, stems, parameters and commands (Setup › MIDI › MIDI Mappings) |
+| Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | ✅ Play mode plays the live target; step entry otherwise |
 
 ## Control surfaces
 
@@ -45,7 +45,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 | EUCON (S1/S3/S4/S6, Dock, Control app) | ✅ | ❌ Avid-proprietary SDK; owner decision |
 | HUI | ✅ | ❌ |
 | Mackie Control Universal | ✅ (via HUI emulation and personalities) | ❌ |
-| Generic MIDI controller personalities | ✅ | ❌ |
+| Generic MIDI controller personalities | ✅ | 🟡 any controller through MIDI learn; no ready-made personalities |
 
 ## Sync and video hardware
 
@@ -72,6 +72,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-11 | major | MIDI input (stage 7b): live play, keyboard Play mode, recording, MIDI learn, and MIDI Devices with reconnect; MIDI out, Thru and clock out still missing |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |
 | 2026-10-12 | minor | Audio device settings: system, output, input, sample rate and buffer size; opt-in ASIO |
 | 2026-10-10 | major | Created: audit of audio interface, MIDI, control-surface, sync and performance support against Pro Tools 2026.4.1 |

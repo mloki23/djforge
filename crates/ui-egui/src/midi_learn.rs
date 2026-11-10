@@ -485,8 +485,10 @@ pub struct LearnState {
     /// The faders (volume, pan, stems) MIDI moved, and when (UI time): Touch/Latch automation
     /// counts them as touched for [`GESTURE_S`].
     pub(crate) touch: HashMap<(TrackId, soundcraft_model::AutoParam), f64>,
-    /// Set while MIDI should wake the UI (mappings or learning), read by the host's waker.
-    pub wake_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How MIDI should wake the UI, read by the host's waker: [`crate::midi_input::WAKE_URGENT`]
+    /// for mappings or learning, [`crate::midi_input::WAKE_DISPLAY`] for activity lights only,
+    /// else [`crate::midi_input::WAKE_OFF`].
+    pub wake_wanted: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Said once that mapped ports went beyond what the player filters.
     overflow_logged: bool,
     /// The waker couldn't start: try again from this UI time (the next device refresh).
@@ -628,12 +630,15 @@ pub fn frame(app: &mut SoundApp, now: f64) {
         let keys: std::collections::HashSet<String> = app.ui.midi_mappings.iter().map(Mapping::key).collect();
         app.midi_learn.runtime.retain(|k, _| keys.contains(k));
     }
-    // The toolbar's activity light (shown while an input is enabled) and MIDI Devices flash on input too.
-    let wanted = !app.ui.midi_mappings.is_empty()
-        || app.midi_learn.learning.is_some()
-        || app.midi_learn.detect.is_some()
-        || !app.ui.midi_inputs.is_empty()
-        || app.ui.show_midi_devices;
+    use crate::midi_input::{WAKE_DISPLAY, WAKE_OFF, WAKE_URGENT};
+    let wanted = if !app.ui.midi_mappings.is_empty() || app.midi_learn.learning.is_some() || app.midi_learn.detect.is_some() {
+        WAKE_URGENT
+    } else if crate::midi_devices::lights_shown(app) {
+        // Activity lights only: a capped repaint rate is enough.
+        WAKE_DISPLAY
+    } else {
+        WAKE_OFF
+    };
     app.midi_learn.wake_wanted.store(wanted, std::sync::atomic::Ordering::Relaxed);
     sync_controls(app);
 }
@@ -647,10 +652,17 @@ pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
     if let Some(h) = &mut app.midi_host
         && !h.has_waker()
         && due
-        && s.wake_wanted.load(std::sync::atomic::Ordering::Relaxed)
+        && s.wake_wanted.load(std::sync::atomic::Ordering::Relaxed) != crate::midi_input::WAKE_OFF
     {
         let c = ctx.clone();
-        let started = h.set_waker(std::sync::Arc::clone(&s.wake_wanted), Box::new(move || c.request_repaint()));
+        let wake = move |level: u8| {
+            if level >= crate::midi_input::WAKE_URGENT {
+                c.request_repaint();
+            } else {
+                c.request_repaint_after(crate::midi_input::WAKE_DISPLAY_POLL);
+            }
+        };
+        let started = h.set_waker(std::sync::Arc::clone(&s.wake_wanted), Box::new(wake));
         s.waker_retry_at = (!started).then_some(s.now + crate::midi_input::REFRESH_S);
     }
     let s = &app.midi_learn;

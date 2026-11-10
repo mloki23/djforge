@@ -31,16 +31,27 @@ pub const FLASH_S: f64 = 0.15;
 /// How many recent messages the MIDI Devices window's monitor keeps.
 pub const RECENT: usize = 8;
 
-/// How often the waker thread looks at its queue while wanted: the longest a mapped control
-/// waits for the UI to wake while nothing else repaints it.
+/// How often the waker thread looks at its queue while [`WAKE_URGENT`]: the longest a mapped
+/// control waits for the UI to wake while nothing else repaints it.
 pub const WAKE_POLL: std::time::Duration = std::time::Duration::from_millis(4);
+/// How often it looks, and the repaint delay it asks for, while [`WAKE_DISPLAY`]: about 30 frames
+/// a second for activity lights, however fast messages arrive.
+pub const WAKE_DISPLAY_POLL: std::time::Duration = std::time::Duration::from_millis(33);
 /// How often it looks while not wanted (it only empties its queue then).
 pub const WAKE_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// A thread with its own queue of the source's events that wakes the UI (`wake`) when events
-/// arrive and `wanted` is set: egui sleeps between frames while the transport is stopped, and
-/// MIDI input is no egui event. It sleeps between looks ([`WAKE_POLL`] while wanted, else
-/// [`WAKE_IDLE`]); the router does nothing extra for it.
+/// The waker's levels (see [`MidiHost::set_waker`]): no waking.
+pub const WAKE_OFF: u8 = 0;
+/// Waking for display only (activity lights): a repaint within [`WAKE_DISPLAY_POLL`].
+pub const WAKE_DISPLAY: u8 = 1;
+/// Waking at once (mappings, MIDI learn): a repaint now.
+pub const WAKE_URGENT: u8 = 2;
+
+/// A thread with its own queue of the source's events that wakes the UI (`wake`, given the
+/// wanted level) when events arrive and `wanted` is above [`WAKE_OFF`]: egui sleeps between
+/// frames while the transport is stopped, and MIDI input is no egui event. It sleeps between
+/// looks ([`WAKE_POLL`] when urgent, [`WAKE_DISPLAY_POLL`] for display, else [`WAKE_IDLE`]); the
+/// router does nothing extra for it.
 struct Waker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -120,6 +131,8 @@ pub struct MidiHost {
     /// Bumped whenever the device list or an open state changes, so a cached listing knows to
     /// list again.
     generation: u64,
+    /// Why ports (raw name, backend id) last failed to open, until they open.
+    open_errors: Vec<(String, String, String)>,
 }
 
 /// A port's state in the MIDI Devices window.
@@ -154,6 +167,7 @@ impl MidiHost {
             hop_p99_ns: 0,
             last_hop: None,
             generation: 0,
+            open_errors: Vec::new(),
         }
     }
 
@@ -230,9 +244,10 @@ impl MidiHost {
         self.waker.is_some()
     }
 
-    /// Calls `wake` (from another thread) soon after MIDI events arrive while `wanted` is set,
-    /// replacing any earlier waker. False when its thread couldn't start.
-    pub fn set_waker(&mut self, wanted: std::sync::Arc<std::sync::atomic::AtomicBool>, wake: Box<dyn Fn() + Send>) -> bool {
+    /// Calls `wake(level)` (from another thread) soon after MIDI events arrive while the `wanted`
+    /// level is above [`WAKE_OFF`], replacing any earlier waker. False when its thread couldn't
+    /// start.
+    pub fn set_waker(&mut self, wanted: std::sync::Arc<std::sync::atomic::AtomicU8>, wake: Box<dyn Fn(u8) + Send>) -> bool {
         use std::sync::atomic::Ordering;
         self.waker = None;
         let mut sub = match self.source.subscribe(256) {
@@ -246,13 +261,18 @@ impl MidiHost {
         let stopped = std::sync::Arc::clone(&stop);
         let thread = std::thread::Builder::new().name("midi-ui-waker".into()).spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
-                std::thread::park_timeout(if wanted.load(Ordering::Relaxed) { WAKE_POLL } else { WAKE_IDLE });
+                std::thread::park_timeout(match wanted.load(Ordering::Relaxed) {
+                    WAKE_OFF => WAKE_IDLE,
+                    WAKE_DISPLAY => WAKE_DISPLAY_POLL,
+                    _ => WAKE_POLL,
+                });
                 let mut any = false;
                 while sub.pop().is_some() {
                     any = true;
                 }
-                if any && wanted.load(Ordering::Relaxed) {
-                    wake();
+                let level = wanted.load(Ordering::Relaxed);
+                if any && level != WAKE_OFF {
+                    wake(level);
                 }
             }
         });
@@ -299,8 +319,10 @@ impl MidiHost {
             self.last_refresh = Some(now);
             if !prefs.is_empty() {
                 for port in self.source.list() {
-                    if enabled(prefs, &port.raw_name, &port.backend_id) {
-                        self.open(&port.name);
+                    if enabled(prefs, &port.raw_name, &port.backend_id)
+                        && let Err(e) = self.open(&port)
+                    {
+                        notes.push(format!("{} won't open: {e}", port.name));
                     }
                 }
             }
@@ -330,8 +352,11 @@ impl MidiHost {
         // device stayed listed) opens again.
         if !prefs.is_empty() {
             for port in self.source.list() {
-                if enabled(prefs, &port.raw_name, &port.backend_id) && !self.source.is_open(&port.name) && self.open(&port.name) {
-                    notes.push(format!("{} reconnected", port.name));
+                if enabled(prefs, &port.raw_name, &port.backend_id) && !self.source.is_open(&port.name) {
+                    notes.push(match self.open(&port) {
+                        Ok(()) => format!("{} reconnected", port.name),
+                        Err(e) => format!("{} won't open: {e}", port.name),
+                    });
                 }
             }
         }
@@ -340,28 +365,62 @@ impl MidiHost {
 
     /// Closes the port listed as `name` and opens it again: a device unplugged and replugged
     /// between two listings (which WinMM can miss) keeps a silent connection until then.
-    pub fn reconnect(&mut self, name: &str) -> Result<Value, String> {
-        if !self.source.list().iter().any(|p| p.name == name) {
-            return Err(format!("no MIDI input named \"{name}\""));
+    /// Only an enabled port reconnects (`prefs`); its held notes are released on the close.
+    pub fn reconnect(&mut self, name: &str, prefs: &[MidiInputPref], player: Option<&Player>) -> Result<Value, String> {
+        let port = self.listed(name)?;
+        if !enabled(prefs, &port.raw_name, &port.backend_id) {
+            return Err(format!("{name} is not enabled: enable it to use it"));
         }
-        let closed = self.source.close(name);
-        let id = self.source.open(name).map_err(|e| e.to_string())?;
-        self.note_opened(id);
+        let closed = self.close_releasing(&port, player);
+        let r = self.source.open(name);
         self.generation = self.generation.wrapping_add(1);
+        let id = self.opened_or_failed(&port, r)?;
+        self.note_opened(id);
         Ok(json!({"name": name, "closed": closed, "open": self.source.is_open(name)}))
     }
 
-    /// Opens a port by name; false (logged) if it won't open.
-    fn open(&mut self, name: &str) -> bool {
-        match self.source.open(name) {
+    /// The port listed as `name`.
+    fn listed(&self, name: &str) -> Result<PortInfo, String> {
+        self.source.list().into_iter().find(|p| p.name == name).ok_or_else(|| format!("no MIDI input named \"{name}\""))
+    }
+
+    /// Closes a port and has the player release the notes it held; false if it was not open.
+    fn close_releasing(&mut self, port: &PortInfo, player: Option<&Player>) -> bool {
+        let id = self.port_id(&port.raw_name, &port.backend_id);
+        let closed = self.source.close(&port.name);
+        if closed && let (Some(p), Some(id)) = (player, id) {
+            p.midi_port_closed(id);
+        }
+        closed
+    }
+
+    /// Records an open's outcome for the port's row: the error it gave, or none.
+    fn opened_or_failed(&mut self, port: &PortInfo, r: Result<PortId, soundcraft_midi_io::MidiIoError>) -> Result<PortId, String> {
+        self.open_errors.retain(|(raw, backend, _)| !(raw == &port.raw_name && backend == &port.backend_id));
+        r.map_err(|e| {
+            let e = e.to_string();
+            self.open_errors.push((port.raw_name.clone(), port.backend_id.clone(), e.clone()));
+            e
+        })
+    }
+
+    /// Why the port (raw name, backend id) last failed to open, until it opens.
+    pub fn open_error(&self, raw_name: &str, backend_id: &str) -> Option<&str> {
+        self.open_errors.iter().find(|(raw, backend, _)| raw == raw_name && backend == backend_id).map(|(_, _, e)| e.as_str())
+    }
+
+    /// Opens a listed port; the error (also kept for its row) if it won't open.
+    fn open(&mut self, port: &PortInfo) -> Result<(), String> {
+        let r = self.source.open(&port.name);
+        self.generation = self.generation.wrapping_add(1);
+        match self.opened_or_failed(port, r) {
             Ok(id) => {
                 self.note_opened(id);
-                self.generation = self.generation.wrapping_add(1);
-                true
+                Ok(())
             }
             Err(e) => {
                 log::warn!("{e}");
-                false
+                Err(e)
             }
         }
     }
@@ -388,6 +447,7 @@ impl MidiHost {
                     "open": open,
                     "enabled": enabled(prefs, &p.raw_name, &p.backend_id),
                     "state": if open { PortState::Open } else { PortState::Closed }.as_str(),
+                    "error": self.open_error(&p.raw_name, &p.backend_id),
                 })
             })
             .collect();
@@ -404,19 +464,20 @@ impl MidiHost {
         out
     }
 
-    /// Enables or disables the port listed as `name` in `prefs`, and opens or closes it.
-    pub fn set_enabled(&mut self, name: &str, on: bool, prefs: &mut Vec<MidiInputPref>) -> Result<Value, String> {
-        let port: PortInfo = self.source.list().into_iter().find(|p| p.name == name).ok_or_else(|| format!("no MIDI input named \"{name}\""))?;
+    /// Enables or disables the port listed as `name` in `prefs`, and opens or closes it (releasing
+    /// the notes it held).
+    pub fn set_enabled(&mut self, name: &str, on: bool, prefs: &mut Vec<MidiInputPref>, player: Option<&Player>) -> Result<Value, String> {
+        let port = self.listed(name)?;
         prefs.retain(|p| !p.is(&port.raw_name, &port.backend_id));
         if on {
             prefs.push(MidiInputPref { name: port.name.clone(), raw_name: port.raw_name.clone(), backend_id: port.backend_id.clone() });
             // Enabled even if it won't open now: it opens when it next appears.
-            let id = self.source.open(&port.name).map_err(|e| e.to_string())?;
-            self.note_opened(id);
+            self.open(&port)?;
         } else {
-            self.source.close(&port.name);
+            self.close_releasing(&port, player);
+            self.open_errors.retain(|(raw, backend, _)| !(raw == &port.raw_name && backend == &port.backend_id));
+            self.generation = self.generation.wrapping_add(1);
         }
-        self.generation = self.generation.wrapping_add(1);
         Ok(json!({"name": port.name, "enabled": on, "open": self.source.is_open(&port.name)}))
     }
 }
@@ -613,7 +674,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
             let on = p.get("enabled").and_then(Value::as_bool).ok_or("`enabled` (true or false) required")?;
             let host = app.midi_host.as_mut().ok_or("no MIDI input on this system")?;
-            let r = host.set_enabled(name, on, &mut app.ui.midi_inputs);
+            let r = host.set_enabled(name, on, &mut app.ui.midi_inputs, app.player.as_ref());
             // Saved straight away, like the recent sessions.
             app.mark_prefs_changed();
             r
@@ -621,9 +682,12 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
         "midi.reconnect" => (|| {
             let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
             let host = app.midi_host.as_mut().ok_or("no MIDI input on this system")?;
-            let r = host.reconnect(name)?;
-            app.ui.status = if r["open"] == true { format!("{name} reconnected") } else { format!("{name} would not reopen") };
-            Ok(r)
+            let r = host.reconnect(name, &app.ui.midi_inputs, app.player.as_ref());
+            app.ui.status = match &r {
+                Ok(_) => format!("{name} reconnected"),
+                Err(e) => format!("{name} won't reopen: {e}"),
+            };
+            r
         })(),
         "midi.target" => (|| {
             let s = app.engine.session();
@@ -693,29 +757,42 @@ mod tests {
     #[test]
     fn the_waker_wakes_the_ui_for_midi_while_wanted() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
         let mut src = soundcraft_midi_io::FakeSource::new(soundcraft_midi_io::MidiClock::new()).unwrap();
         src.plug("DDJ");
         let mut h = MidiHost::new(Box::new(src));
         h.source_mut().open("DDJ").unwrap();
-        let wanted = Arc::new(AtomicBool::new(true));
+        let wanted = Arc::new(AtomicU8::new(WAKE_URGENT));
         let woken = Arc::new(AtomicUsize::new(0));
-        let w = Arc::clone(&woken);
+        let level = Arc::new(AtomicU8::new(WAKE_OFF));
+        let (w, l) = (Arc::clone(&woken), Arc::clone(&level));
         assert!(h.set_waker(
             Arc::clone(&wanted),
-            Box::new(move || {
+            Box::new(move |at| {
+                l.store(at, Ordering::Relaxed);
                 w.fetch_add(1, Ordering::Relaxed);
             })
         ));
         let cc = soundcraft_midi_io::MidiMessage::ControlChange { ch: 0, cc: 7, value: 1 };
+        let wait_wake = |what: &str| {
+            let start = std::time::Instant::now();
+            while woken.load(Ordering::Relaxed) == 0 {
+                assert!(start.elapsed() < std::time::Duration::from_secs(2), "never woken: {what}");
+                std::thread::yield_now();
+            }
+        };
         assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
-        let start = std::time::Instant::now();
-        while woken.load(Ordering::Relaxed) == 0 {
-            assert!(start.elapsed() < std::time::Duration::from_secs(2), "never woken");
-            std::thread::yield_now();
-        }
-        wanted.store(false, Ordering::Relaxed);
-        std::thread::sleep(WAKE_IDLE + WAKE_POLL * 3);
+        wait_wake("urgent");
+        assert_eq!(level.load(Ordering::Relaxed), WAKE_URGENT, "urgent: a repaint now");
+        // Display only: woken with that level (the UI then repaints at a capped rate).
+        wanted.store(WAKE_DISPLAY, Ordering::Relaxed);
+        std::thread::sleep(WAKE_POLL * 3);
+        woken.store(0, Ordering::Relaxed);
+        assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
+        wait_wake("display");
+        assert_eq!(level.load(Ordering::Relaxed), WAKE_DISPLAY);
+        wanted.store(WAKE_OFF, Ordering::Relaxed);
+        std::thread::sleep(WAKE_IDLE + WAKE_DISPLAY_POLL * 2);
         let before = woken.load(Ordering::Relaxed);
         assert!(h.source_mut().as_fake_mut().unwrap().inject("DDJ", cc, 0));
         std::thread::sleep(WAKE_IDLE * 2);
