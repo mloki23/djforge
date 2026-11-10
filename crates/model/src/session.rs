@@ -596,6 +596,9 @@ impl Session {
         self.next_id = self.next_id.max(max_id.saturating_add(1));
         truncate_chars(&mut self.name, MAX_NAME_CHARS);
         truncate_chars(&mut self.comments, MAX_COMMENT_CHARS);
+        // Live MIDI inputs were once kept here (`setup.midi_input_devices`); they are app
+        // preferences now, and the old flags mean nothing.
+        self.edit.flags.retain(|f| !f.starts_with("midi.input."));
         for t in &mut self.tracks {
             t.mixer.sanitize();
             truncate_chars(&mut t.name, MAX_NAME_CHARS);

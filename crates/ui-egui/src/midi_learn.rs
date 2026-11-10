@@ -500,7 +500,7 @@ pub struct LearnState {
     /// The mapped-control filter last given to the player.
     controls_sent: Option<Vec<(PortId, MidiControl)>>,
     /// The UI time of the last frame.
-    now: f64,
+    pub(crate) now: f64,
 }
 
 /// Starts learning `target`: the next note-on or controller binds it.
@@ -608,7 +608,7 @@ pub fn remove(app: &mut SoundApp, i: usize) -> Option<Mapping> {
 /// keeps the player's mapped-control filter in step (see the module docs).
 pub fn frame(app: &mut SoundApp, now: f64) {
     app.midi_learn.now = now;
-    let events = app.midi_host.as_mut().map(crate::midi_input::MidiHost::take_control_events).unwrap_or_default();
+    let events = app.midi_host.as_mut().map(|h| h.take_control_events(now)).unwrap_or_default();
     for e in events {
         handle(app, &e, now);
     }
@@ -628,7 +628,12 @@ pub fn frame(app: &mut SoundApp, now: f64) {
         let keys: std::collections::HashSet<String> = app.ui.midi_mappings.iter().map(Mapping::key).collect();
         app.midi_learn.runtime.retain(|k, _| keys.contains(k));
     }
-    let wanted = !app.ui.midi_mappings.is_empty() || app.midi_learn.learning.is_some() || app.midi_learn.detect.is_some();
+    // The toolbar's activity light (shown while an input is enabled) and MIDI Devices flash on input too.
+    let wanted = !app.ui.midi_mappings.is_empty()
+        || app.midi_learn.learning.is_some()
+        || app.midi_learn.detect.is_some()
+        || !app.ui.midi_inputs.is_empty()
+        || app.ui.show_midi_devices;
     app.midi_learn.wake_wanted.store(wanted, std::sync::atomic::Ordering::Relaxed);
     sync_controls(app);
 }
@@ -1660,10 +1665,13 @@ mod tests {
     #[test]
     fn the_waker_starts_only_once_midi_is_wanted() {
         let (mut app, _, _) = app();
+        // An enabled input wants it too (the toolbar's activity light): none here.
+        let enabled = std::mem::take(&mut app.ui.midi_inputs);
         let ctx = egui::Context::default();
         frame(&mut app, 0.0);
         wake_on_midi(&mut app, &ctx);
-        assert!(!app.midi_host.as_ref().unwrap().has_waker(), "no mappings, no learn: no waker");
+        assert!(!app.midi_host.as_ref().unwrap().has_waker(), "no mappings, no learn, no input enabled: no waker");
+        app.ui.midi_inputs = enabled;
         map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "stop_all"}), json!({}));
         frame(&mut app, 0.1);
         wake_on_midi(&mut app, &ctx);

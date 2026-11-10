@@ -39,6 +39,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 transport(app, ui);
                 tempo_meter(app, ui);
                 output_meter(app, ui);
+                crate::midi_devices::toolbar_light(app, ui);
             });
         });
 }

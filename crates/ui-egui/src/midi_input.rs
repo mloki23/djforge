@@ -15,7 +15,7 @@
 
 use crate::SoundApp;
 use serde_json::{Value, json};
-use soundcraft_midi_io::{MidiEvent, MidiSource, PortChange, PortId, PortInfo, Subscriber};
+use soundcraft_midi_io::{MidiEvent, MidiMessage, MidiSource, PortChange, PortId, PortInfo, Subscriber};
 use soundcraft_model::{Session, Track, TrackId, TrackKind};
 use soundcraft_playback::Player;
 
@@ -24,6 +24,12 @@ pub const QUEUE_CAPACITY: usize = 4096;
 
 /// Seconds between device-list refreshes.
 pub const REFRESH_S: f64 = 1.0;
+
+/// How long a port's activity light stays lit after a message (UI seconds).
+pub const FLASH_S: f64 = 0.15;
+
+/// How many recent messages the MIDI Devices window's monitor keeps.
+pub const RECENT: usize = 8;
 
 /// How often the waker thread looks at its queue while wanted: the longest a mapped control
 /// waits for the UI to wake while nothing else repaints it.
@@ -103,16 +109,58 @@ pub struct MidiHost {
     /// The ports opened so far (their ids outlive a close), for the mapped-control filter.
     opened: Vec<PortId>,
     waker: Option<Waker>,
+    /// When each port last sent a message (UI seconds), for the activity lights.
+    activity: Vec<(PortId, f64)>,
+    /// The last [`RECENT`] messages with their UI time, oldest first, for the monitor.
+    recent: std::collections::VecDeque<(f64, MidiEvent)>,
+    /// The router's hop delay p99 over the last refresh interval, in nanoseconds.
+    hop_p99_ns: u64,
+    /// When the hop delay was last sampled (UI seconds).
+    last_hop: Option<f64>,
+    /// Bumped whenever the device list or an open state changes, so a cached listing knows to
+    /// list again.
+    generation: u64,
+}
+
+/// A port's state in the MIDI Devices window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortState {
+    Open,
+    Closed,
+    /// Enabled, but its device is not listed (unplugged): it reopens when it appears.
+    Disconnected,
+}
+
+impl PortState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortState::Open => "open",
+            PortState::Closed => "closed",
+            PortState::Disconnected => "disconnected",
+        }
+    }
 }
 
 impl MidiHost {
     pub fn new(source: Box<dyn MidiSource>) -> MidiHost {
-        MidiHost { source, last_refresh: None, control: None, opened: Vec::new(), waker: None }
+        MidiHost {
+            source,
+            last_refresh: None,
+            control: None,
+            opened: Vec::new(),
+            waker: None,
+            activity: Vec::new(),
+            recent: std::collections::VecDeque::with_capacity(RECENT),
+            hop_p99_ns: 0,
+            last_hop: None,
+            generation: 0,
+        }
     }
 
     /// The events that arrived since the last call, oldest first (subscribing on the first call:
-    /// nothing earlier is kept).
-    pub fn take_control_events(&mut self) -> Vec<MidiEvent> {
+    /// nothing earlier is kept). Each lights its port's activity light at UI time `now` and goes
+    /// into the monitor's recent messages.
+    pub fn take_control_events(&mut self, now: f64) -> Vec<MidiEvent> {
         if self.control.is_none() {
             match self.source.subscribe(QUEUE_CAPACITY) {
                 Ok(q) => self.control = Some(q),
@@ -121,9 +169,55 @@ impl MidiHost {
         }
         let mut out = Vec::new();
         while let Some(e) = self.control.as_mut().and_then(Subscriber::pop) {
+            match self.activity.iter_mut().find(|(p, _)| *p == e.port) {
+                Some(a) => a.1 = now,
+                None => self.activity.push((e.port, now)),
+            }
+            if self.recent.len() >= RECENT {
+                self.recent.pop_front();
+            }
+            self.recent.push_back((now, e));
             out.push(e);
         }
         out
+    }
+
+    /// When the port last sent a message (UI seconds), if it has.
+    pub fn last_activity(&self, port: PortId) -> Option<f64> {
+        self.activity.iter().find(|(p, _)| *p == port).map(|(_, at)| *at)
+    }
+
+    /// When any port last sent a message (UI seconds), if one has.
+    pub fn any_activity(&self) -> Option<f64> {
+        self.activity.iter().map(|(_, at)| *at).reduce(f64::max)
+    }
+
+    /// The last [`RECENT`] messages with their UI time, oldest first.
+    pub fn recent(&self) -> impl Iterator<Item = &(f64, MidiEvent)> {
+        self.recent.iter()
+    }
+
+    /// The id of the port (raw name, backend id), once it has been opened.
+    pub fn port_id(&self, raw_name: &str, backend_id: &str) -> Option<PortId> {
+        self.opened.iter().copied().find(|id| self.source.raw_name(*id) == Some(raw_name) && self.source.backend_id(*id) == Some(backend_id))
+    }
+
+    /// Bumped whenever the device list or an open state changes.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The router's hop delay p99 over the last refresh interval, in nanoseconds.
+    pub fn hop_p99_ns(&self) -> u64 {
+        self.hop_p99_ns
+    }
+
+    /// Events lost as (port, subscriber): the port figure counts events dropped before reaching
+    /// any subscriber; the subscriber figure, events dropped by full subscriber queues (the
+    /// player's, MIDI learn's and the waker's).
+    pub fn dropped(&self) -> (u64, u64) {
+        let port = self.control.as_ref().map_or(0, Subscriber::port_dropped);
+        (port, self.source.dropped().saturating_sub(port))
     }
 
     /// The ports opened so far.
@@ -184,13 +278,21 @@ impl MidiHost {
         self.source.as_mut()
     }
 
-    /// One UI frame at `now` seconds (see the module docs).
-    pub fn tick(&mut self, now: f64, prefs: &[MidiInputPref], player: Option<&Player>) {
+    /// One UI frame at `now` seconds (see the module docs). With `watch`, the device list is kept
+    /// up even with nothing enabled (the MIDI Devices window is open). Returns status-line notes:
+    /// a port disconnected, a port reopened.
+    pub fn tick(&mut self, now: f64, prefs: &[MidiInputPref], player: Option<&Player>, watch: bool) -> Vec<String> {
+        let mut notes = Vec::new();
         if let Some(p) = player.filter(|p| !p.has_midi_input()) {
             match self.source.subscribe(QUEUE_CAPACITY) {
                 Ok(q) => p.set_midi_input(Some((q, self.source.clock()))),
                 Err(e) => log::warn!("live MIDI input: {e}"),
             }
+        }
+        if self.last_hop.is_none_or(|at| now - at >= REFRESH_S || now < at) {
+            // A recent window: the counters restart at each sample.
+            self.hop_p99_ns = self.source.hop_stats(true).percentile_ns(0.99);
+            self.last_hop = Some(now);
         }
         let Some(last) = self.last_refresh else {
             // The first frame: open the enabled devices present.
@@ -202,32 +304,65 @@ impl MidiHost {
                     }
                 }
             }
-            return;
+            return notes;
         };
         // Nothing enabled means nothing open (ports open only through the preferences): no
-        // device list to keep up with.
-        if prefs.is_empty() || (now - last < REFRESH_S && now >= last) {
-            return;
+        // device list to keep up with, unless the window shows it.
+        if (prefs.is_empty() && !watch) || (now - last < REFRESH_S && now >= last) {
+            return notes;
         }
         self.last_refresh = Some(now);
-        for change in self.source.refresh() {
-            match change {
-                PortChange::Closed { port, name } => {
-                    log::info!("MIDI input {name} went away");
-                    if let Some(p) = player {
-                        p.midi_port_closed(port);
-                    }
+        let changes = self.source.refresh();
+        if changes.is_empty() {
+            return notes;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        for change in changes {
+            if let PortChange::Closed { port, name } = change {
+                log::info!("MIDI input {name} went away");
+                if let Some(p) = player {
+                    p.midi_port_closed(port);
                 }
-                PortChange::Appeared { name, raw_name, backend_id } if enabled(prefs, &raw_name, &backend_id) => self.open(&name),
-                _ => {}
+                notes.push(format!("{name} disconnected – notes released"));
             }
         }
+        // An enabled port listed but not open (it appeared, or its connection died while its
+        // device stayed listed) opens again.
+        if !prefs.is_empty() {
+            for port in self.source.list() {
+                if enabled(prefs, &port.raw_name, &port.backend_id) && !self.source.is_open(&port.name) && self.open(&port.name) {
+                    notes.push(format!("{} reconnected", port.name));
+                }
+            }
+        }
+        notes
     }
 
-    fn open(&mut self, name: &str) {
+    /// Closes the port listed as `name` and opens it again: a device unplugged and replugged
+    /// between two listings (which WinMM can miss) keeps a silent connection until then.
+    pub fn reconnect(&mut self, name: &str) -> Result<Value, String> {
+        if !self.source.list().iter().any(|p| p.name == name) {
+            return Err(format!("no MIDI input named \"{name}\""));
+        }
+        let closed = self.source.close(name);
+        let id = self.source.open(name).map_err(|e| e.to_string())?;
+        self.note_opened(id);
+        self.generation = self.generation.wrapping_add(1);
+        Ok(json!({"name": name, "closed": closed, "open": self.source.is_open(name)}))
+    }
+
+    /// Opens a port by name; false (logged) if it won't open.
+    fn open(&mut self, name: &str) -> bool {
         match self.source.open(name) {
-            Ok(id) => self.note_opened(id),
-            Err(e) => log::warn!("{e}"),
+            Ok(id) => {
+                self.note_opened(id);
+                self.generation = self.generation.wrapping_add(1);
+                true
+            }
+            Err(e) => {
+                log::warn!("{e}");
+                false
+            }
         }
     }
 
@@ -239,20 +374,34 @@ impl MidiHost {
 
     /// The ports present, with whether each is open and enabled. Lists the devices (a backend
     /// client): for queries, not every frame.
+    /// Enabled ports whose device is not listed come last, `disconnected`.
     pub fn inputs(&self, prefs: &[MidiInputPref]) -> Vec<Value> {
-        self.source
-            .list()
-            .into_iter()
+        let listed = self.source.list();
+        let mut out: Vec<Value> = listed
+            .iter()
             .map(|p| {
+                let open = self.source.is_open(&p.name);
                 json!({
                     "name": p.name,
                     "raw_name": p.raw_name,
                     "backend_id": p.backend_id,
-                    "open": self.source.is_open(&p.name),
+                    "open": open,
                     "enabled": enabled(prefs, &p.raw_name, &p.backend_id),
+                    "state": if open { PortState::Open } else { PortState::Closed }.as_str(),
                 })
             })
-            .collect()
+            .collect();
+        for p in prefs.iter().filter(|p| !listed.iter().any(|l| p.is(&l.raw_name, &l.backend_id))) {
+            out.push(json!({
+                "name": p.name,
+                "raw_name": p.raw_name,
+                "backend_id": p.backend_id,
+                "open": false,
+                "enabled": true,
+                "state": PortState::Disconnected.as_str(),
+            }));
+        }
+        out
     }
 
     /// Enables or disables the port listed as `name` in `prefs`, and opens or closes it.
@@ -267,6 +416,7 @@ impl MidiHost {
         } else {
             self.source.close(&port.name);
         }
+        self.generation = self.generation.wrapping_add(1);
         Ok(json!({"name": port.name, "enabled": on, "open": self.source.is_open(&port.name)}))
     }
 }
@@ -282,7 +432,11 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
     Some(match id {
         "midi.inputs" | "midi.panic" => "{}",
         "midi.input_enable" => "{name, enabled: bool}",
+        "midi.reconnect" => {
+            "{name} — closes the listed input and opens it again (a device replugged between two listings can keep a silent connection)"
+        }
         "midi.target" => "{track?: id | name | null}",
+        "window.midi_devices" => "{value?: bool}",
         "midi.recover_take" => {
             "{} — places the last MIDI take again (an arrangement take, or a slot take that could not be written) on a new playlist of its track"
         }
@@ -290,29 +444,141 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
     })
 }
 
+/// Why live MIDI plays the track it plays (see [`resolve_target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetWhy {
+    /// A slot recording plays its column's instrument.
+    SlotRecording,
+    /// The `midi.target` override.
+    Override,
+    /// The first record-armed instrument track.
+    Armed,
+    /// The first selected instrument track with input monitoring on.
+    SelectedMonitored,
+}
+
+impl TargetWhy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TargetWhy::SlotRecording => "slot recording",
+            TargetWhy::Override => "override",
+            TargetWhy::Armed => "armed",
+            TargetWhy::SelectedMonitored => "selected+monitored",
+        }
+    }
+}
+
 /// The target live MIDI plays now, for display: its name, or `None`.
 pub fn target_name(app: &SoundApp) -> Option<String> {
+    target(app).map(|(_, name, _)| name)
+}
+
+/// The target live MIDI plays now: its id, name and why it was chosen.
+pub fn target(app: &SoundApp) -> Option<(TrackId, String, TargetWhy)> {
     let s = app.engine.session();
-    resolve_target(s, crate::midi_record::target_override(app).or(app.midi_target)).and_then(|t| s.track(t)).map(|t| t.name.clone())
+    let rec = crate::midi_record::target_override(app);
+    let (id, why) = resolve_target_why(s, rec.or(app.midi_target))?;
+    let why = if why == TargetWhy::Override && rec == Some(id) { TargetWhy::SlotRecording } else { why };
+    s.track(id).map(|t| (id, t.name.clone(), why))
 }
 
 /// The track live MIDI input plays: the explicit override (`midi.target`) while it names an
 /// instrument track; else the first record-armed instrument track in track order; else the
 /// first selected instrument track whose input monitoring is on. `None`: live MIDI plays nothing.
 pub fn resolve_target(s: &Session, override_: Option<TrackId>) -> Option<TrackId> {
+    resolve_target_why(s, override_).map(|(t, _)| t)
+}
+
+/// [`resolve_target`], with why.
+pub fn resolve_target_why(s: &Session, override_: Option<TrackId>) -> Option<(TrackId, TargetWhy)> {
     if let Some(t) = override_.and_then(|id| s.track(id)).filter(|t| plays_midi(t)) {
-        return Some(t.id);
+        return Some((t.id, TargetWhy::Override));
     }
     if let Some(t) = s.tracks.iter().find(|t| plays_midi(t) && t.mixer.record_arm) {
-        return Some(t.id);
+        return Some((t.id, TargetWhy::Armed));
     }
-    s.edit.selected_tracks.iter().filter_map(|id| s.track(*id)).find(|t| plays_midi(t) && t.mixer.input_monitor).map(|t| t.id)
+    s.edit
+        .selected_tracks
+        .iter()
+        .filter_map(|id| s.track(*id))
+        .find(|t| plays_midi(t) && t.mixer.input_monitor)
+        .map(|t| (t.id, TargetWhy::SelectedMonitored))
+}
+
+/// The instrument tracks live MIDI can play (the override's choices).
+pub fn target_choices(s: &Session) -> Vec<(TrackId, String)> {
+    s.tracks.iter().filter(|t| plays_midi(t)).map(|t| (t.id, t.name.clone())).collect()
+}
+
+/// A message for the monitor: its type, its channel (1–16) and its data.
+pub fn describe(msg: &MidiMessage) -> (&'static str, u8, String) {
+    let ch = msg.channel().saturating_add(1);
+    match *msg {
+        MidiMessage::NoteOff { note, vel, .. } => ("Note Off", ch, format!("{note} vel {vel}")),
+        MidiMessage::NoteOn { note, vel, .. } => ("Note On", ch, format!("{note} vel {vel}")),
+        MidiMessage::PolyPressure { note, pressure, .. } => ("Poly Pressure", ch, format!("{note} {pressure}")),
+        MidiMessage::ControlChange { cc, value, .. } => ("CC", ch, format!("{cc} = {value}")),
+        MidiMessage::ProgramChange { program, .. } => ("Program", ch, program.to_string()),
+        MidiMessage::ChannelPressure { pressure, .. } => ("Channel Pressure", ch, pressure.to_string()),
+        MidiMessage::PitchBend { value, .. } => ("Pitch Bend", ch, value.to_string()),
+    }
+}
+
+/// How long a light stays lit at this frame rate: [`FLASH_S`], or long enough to be drawn in the
+/// next frame when frames are further apart.
+pub fn flash_s(ctx: &egui::Context) -> f64 {
+    FLASH_S.max(1.5 * f64::from(ctx.input(|i| i.predicted_dt)))
+}
+
+/// Whether the port (raw name, backend id) sent a message within `flash` seconds of `now`.
+pub fn port_lit(app: &SoundApp, raw_name: &str, backend_id: &str, now: f64, flash: f64) -> bool {
+    let Some(h) = &app.midi_host else { return false };
+    h.port_id(raw_name, backend_id).and_then(|id| h.last_activity(id)).is_some_and(|at| (0.0..=flash).contains(&(now - at)))
+}
+
+/// Whether any port sent a message within `flash` seconds of `now`.
+pub fn any_lit(app: &SoundApp, now: f64, flash: f64) -> bool {
+    app.midi_host.as_ref().and_then(MidiHost::any_activity).is_some_and(|at| (0.0..=flash).contains(&(now - at)))
+}
+
+/// What MIDI Devices shows besides the port list, cheap enough for every frame: the latency L,
+/// the hop p99, the dropped counts, the router's health, the target and the recent messages.
+pub fn status(app: &SoundApp, now: f64) -> Value {
+    let h = app.midi_host.as_ref();
+    let (port_dropped, sub_dropped) = h.map_or((0, 0), MidiHost::dropped);
+    let recent: Vec<Value> = h
+        .map(|h| {
+            h.recent()
+                .map(|(at, e)| {
+                    let (kind, ch, data) = describe(&e.msg);
+                    let port = h.source().port_name(e.port).unwrap_or("?");
+                    json!({"port": port, "type": kind, "ch": ch, "data": data, "age_s": (now - at).max(0.0)})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let target = target(app).map(|(id, name, why)| json!({"track": id.0, "name": name, "why": why.as_str()}));
+    json!({
+        "available": h.is_some(),
+        "healthy": h.is_none_or(|h| h.source().healthy()),
+        "latency_ms": app.player.as_ref().map(|p| p.midi_latency_ns() as f64 / 1e6),
+        "hop_p99_ms": h.map(|h| h.hop_p99_ns() as f64 / 1e6),
+        "dropped_port": port_dropped,
+        "dropped_subscribers": sub_dropped,
+        "dropped_player": app.player.as_ref().map(Player::midi_dropped),
+        "target": target,
+        "override": app.midi_target.map(|t| t.0),
+        "recent": recent,
+    })
 }
 
 /// Every UI frame (see the module docs). `now` is the UI clock in seconds.
 pub fn frame(app: &mut SoundApp, now: f64) {
     if let Some(h) = &mut app.midi_host {
-        h.tick(now, &app.ui.midi_inputs, app.player.as_ref());
+        let notes = h.tick(now, &app.ui.midi_inputs, app.player.as_ref(), app.ui.show_midi_devices);
+        if !notes.is_empty() {
+            app.ui.status = notes.join("; ");
+        }
     }
     if let Some(p) = &app.player {
         // A slot recording plays its column's instrument while armed.
@@ -322,19 +588,26 @@ pub fn frame(app: &mut SoundApp, now: f64) {
 }
 
 /// The `midi.*` UI commands; `None` for other ids.
-/// - `midi.inputs {}`: `{ports: [{name, raw_name, backend_id, open, enabled}], latency_ms, dropped}`.
+/// - `midi.inputs {}`: the ports (`name`, `raw_name`, `backend_id`, `open`, `enabled`, `state`)
+///   and [`status`].
 /// - `midi.input_enable {name, enabled}`: enables or disables a port in the preferences and opens
 ///   or closes it.
+/// - `midi.reconnect {name}`: closes a port and opens it again.
 /// - `midi.target {track?}`: the live target override (a track id or name; `null` or nothing
 ///   clears it). Returns the override and the target in effect.
 /// - `midi.panic {}`: every live note off and the controllers reset.
+/// - `setup.midi_input_devices` (the engine's deprecated command, which only kept names in the
+///   session): with `enable` / `disable` names, enables or disables those inputs as
+///   `midi.input_enable` does; otherwise opens MIDI Devices.
 pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     Some(match id {
         "midi.inputs" => {
             let ports = app.midi_host.as_ref().map(|h| h.inputs(&app.ui.midi_inputs)).unwrap_or_default();
-            let latency = app.player.as_ref().map(|p| p.midi_latency_ns() as f64 / 1e6);
-            let dropped = app.player.as_ref().map(Player::midi_dropped);
-            Ok(json!({"ports": ports, "available": app.midi_host.is_some(), "latency_ms": latency, "dropped": dropped}))
+            let mut v = status(app, app.midi_learn.now);
+            v["ports"] = Value::Array(ports);
+            // The player's figure, as before.
+            v["dropped"] = v["dropped_player"].clone();
+            Ok(v)
         }
         "midi.input_enable" => (|| {
             let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
@@ -344,6 +617,13 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             // Saved straight away, like the recent sessions.
             app.mark_prefs_changed();
             r
+        })(),
+        "midi.reconnect" => (|| {
+            let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
+            let host = app.midi_host.as_mut().ok_or("no MIDI input on this system")?;
+            let r = host.reconnect(name)?;
+            app.ui.status = if r["open"] == true { format!("{name} reconnected") } else { format!("{name} would not reopen") };
+            Ok(r)
         })(),
         "midi.target" => (|| {
             let s = app.engine.session();
@@ -370,10 +650,37 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             if let Some(pl) = &app.player {
                 pl.midi_panic();
             }
+            app.ui.status = "MIDI panic: every note off, controllers reset".into();
             Ok(json!({}))
         }
+        "window.midi_devices" => {
+            app.ui.show_midi_devices = p.get("value").and_then(Value::as_bool).unwrap_or(!app.ui.show_midi_devices);
+            Ok(json!({"value": app.ui.show_midi_devices}))
+        }
+        "setup.midi_input_devices" => legacy_input_devices(app, p),
         _ => return None,
     })
+}
+
+/// The deprecated `setup.midi_input_devices` with the app present (see [`command`]).
+fn legacy_input_devices(app: &mut SoundApp, p: &Value) -> Result<Value, String> {
+    let names = |key: &str| -> Vec<String> {
+        p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).take(64).map(str::to_string).collect()).unwrap_or_default()
+    };
+    let (on, off) = (names("enable"), names("disable"));
+    if on.is_empty() && off.is_empty() {
+        app.ui.show_midi_devices = true;
+        return Ok(json!({"deprecated": "use midi.input_enable", "window": "midi_devices"}));
+    }
+    let mut results = Vec::new();
+    for (name, enabled) in on.iter().map(|n| (n, true)).chain(off.iter().map(|n| (n, false))) {
+        let r = command(app, "midi.input_enable", &json!({"name": name, "enabled": enabled})).unwrap_or_else(|| Err("no midi.input_enable".into()));
+        results.push(match r {
+            Ok(v) => v,
+            Err(e) => json!({"name": name, "error": e}),
+        });
+    }
+    Ok(json!({"deprecated": "use midi.input_enable", "results": results}))
 }
 
 #[cfg(test)]

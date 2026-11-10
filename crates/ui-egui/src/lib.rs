@@ -16,6 +16,7 @@ pub mod fonts;
 pub mod icons;
 mod live_transport;
 pub mod menus;
+pub mod midi_devices;
 pub mod midi_editor;
 pub mod midi_input;
 pub mod midi_learn;
@@ -209,8 +210,8 @@ pub struct UiState {
     pub midi_inputs: Vec<midi_input::MidiInputPref>,
     /// The on-screen keyboard plays the live target instead of step-entering notes.
     pub midi_keyboard_play: bool,
-    /// Setup › MIDI › Live MIDI Inputs.
-    pub show_midi_inputs: bool,
+    /// Setup › MIDI › MIDI Input Devices: the MIDI Devices window.
+    pub show_midi_devices: bool,
     /// MIDI learn's mappings (`midi.map`, Learn MIDI), kept with the preferences: per machine.
     /// One that can't be read is skipped rather than failing the preferences.
     #[serde(deserialize_with = "midi_learn::lenient")]
@@ -280,7 +281,7 @@ impl Default for UiState {
             ui_scale: 1.0,
             midi_inputs: Vec::new(),
             midi_keyboard_play: false,
-            show_midi_inputs: false,
+            show_midi_devices: false,
             midi_mappings: Vec::new(),
             show_midi_mappings: false,
         }

@@ -67,9 +67,10 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.rtp", "MIDI Real-Time Properties", "", None),
     ("window.playback_engine", "Playback Engine", "", None),
     ("ui.audio_device", "Audio Device", "", None),
-    ("window.midi_inputs", "Live MIDI Inputs", "", None),
+    ("window.midi_devices", "MIDI Devices", "", None),
     ("midi.inputs", "MIDI Inputs", "", None),
     ("midi.input_enable", "Enable MIDI Input", "", None),
+    ("midi.reconnect", "Reconnect MIDI Input", "", None),
     ("midi.target", "Live MIDI Target", "", None),
     ("midi.panic", "Live MIDI Panic", "", None),
     ("midi.recover_take", "Recover Last MIDI Take (place again)", "", None),
@@ -476,7 +477,8 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > Playback Engine...", "window.playback_engine"),
     ("Setup > I/O...", "window.io_setup"),
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
-    ("Setup > MIDI > Live MIDI Inputs...", "window.midi_inputs"),
+    // The one MIDI devices entry: the catalog's own, which once ran the engine's session-flag command.
+    ("Setup > MIDI > MIDI Input Devices...", "window.midi_devices"),
     ("Setup > MIDI > Live MIDI Panic", "midi.panic"),
     ("Setup > MIDI > MIDI Mappings...", "window.midi_mappings"),
     ("Event > Recover Last MIDI Take (place again)", "midi.recover_take"),
@@ -645,7 +647,6 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.metadata" => toggle(&mut app.ui.show_metadata),
         "window.event_list" => toggle(&mut app.ui.show_event_list),
         "window.midi_keyboard" => toggle(&mut app.ui.show_midi_keyboard),
-        "window.midi_inputs" => toggle(&mut app.ui.show_midi_inputs),
         "window.workspace" | "window.workspace_presets" | "window.workspace_sounds" | "window.workspace_front" => {
             app.ui.show_workspace = true;
             json!({"value": true})

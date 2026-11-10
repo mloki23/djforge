@@ -104,7 +104,7 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"enabled": s.edit.flag("midi.beat_clock"), "offset": s.edit.value("midi.beat_clock.offset", 0.0), "destination": text(&s.edit, "midi.beat_clock.destination")}))
         }),
         cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — filtered kinds are not recorded", always, midi_filter),
-        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]}", always, midi_inputs),
+        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]} — deprecated: inputs are app preferences (midi.input_enable); a no-op headless", always, midi_inputs),
         cmd!(noundo "setup.transcription_settings", "Transcription Settings...", ["Setup"], None, "{enabled?: bool, language?: 'en'}", always, |e, p| {
             let s = e.session_mut();
             if let Some(v) = p.get("enabled").and_then(Value::as_bool) {
@@ -384,22 +384,12 @@ fn midi_filter(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"filtered": filtered}))
 }
 
-fn device_key(name: &str) -> String {
-    let n: String = name.chars().filter(|c| !c.is_control() && *c != '=').take(64).collect();
-    format!("midi.input.{}", n.trim())
-}
-
-fn midi_inputs(e: &mut Engine, p: &Value) -> Result<Value> {
-    let s = e.session_mut();
-    for (key, on) in [("enable", true), ("disable", false)] {
-        for n in p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).take(64).collect::<Vec<_>>()).unwrap_or_default() {
-            if !n.trim().is_empty() {
-                s.edit.set_flag(&device_key(n), on);
-            }
-        }
-    }
-    let enabled: Vec<&str> = s.edit.flags.iter().filter_map(|f| f.strip_prefix("midi.input.")).collect();
-    Ok(json!({"enabled": enabled}))
+/// Deprecated: live MIDI inputs are app preferences now (`midi.input_enable`; the app opens its
+/// MIDI Devices window for this command). Headless it does nothing, taking its old params
+/// (`enable` / `disable` names) so old journals and replays still run; it no longer writes
+/// `midi.input.*` session flags, and sessions drop them on load.
+fn midi_inputs(_e: &mut Engine, _p: &Value) -> Result<Value> {
+    Ok(json!({"enabled": [], "deprecated": "live MIDI inputs are app preferences: use midi.input_enable"}))
 }
 
 fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -591,8 +581,9 @@ mod tests {
         assert_eq!(r["device"], "Interface");
         let r = e.execute("setup.midi_input_filter", &json!({"filter": ["sysex", "bogus"]})).unwrap();
         assert_eq!(r["filtered"], json!(["sysex"]));
-        let r = e.execute("setup.midi_input_devices", &json!({"enable": ["Keys"]})).unwrap();
-        assert_eq!(r["enabled"], json!(["Keys"]));
+        let r = e.execute("setup.midi_input_devices", &json!({"enable": ["Keys"], "disable": ["Pads"]})).unwrap();
+        assert_eq!(r["enabled"], json!([]), "a deprecated no-op: inputs are app preferences");
+        assert!(!e.session().edit.flags.iter().any(|f| f.starts_with("midi.input.")), "no session flags written");
         let r = e.execute("setup.video_sync_offset", &json!({"frames": 2})).unwrap();
         assert_eq!(r["samples"], 3200.0);
     }

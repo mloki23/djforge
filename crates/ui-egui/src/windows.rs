@@ -5,7 +5,7 @@ use crate::theme::{Tokens, mono, rgb};
 use egui::{Color32, Sense, vec2};
 use serde_json::json;
 use soundcraft_midi_io::MidiMessage;
-use soundcraft_model::{AutomationMode, ClipContent, TrackId};
+use soundcraft_model::{AutomationMode, ClipContent};
 use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{AudioSystem, DeviceInfo};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     metadata(app, ctx);
     event_list(app, ctx);
     midi_keyboard(app, ctx);
-    midi_inputs(app, ctx);
+    crate::midi_devices::show(app, ctx);
     workspace(app, ctx);
     configurations(app, ctx);
     playback_engine(app, ctx);
@@ -337,7 +337,7 @@ fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
                 }
             }
             let what = crate::midi_input::target_name(app).map_or_else(
-                || "No target: record-arm an instrument track, or choose one in Setup › MIDI › Live MIDI Inputs.".to_string(),
+                || "No target: record-arm an instrument track, or choose one in Setup › MIDI › MIDI Input Devices.".to_string(),
                 |n| format!("Plays {n}."),
             );
             ui.label(egui::RichText::new(what).small());
@@ -364,93 +364,6 @@ fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
         keyboard_release(app, ctx);
     }
     app.ui.show_midi_keyboard = open;
-}
-
-/// Setup › MIDI › Live MIDI Inputs: which devices play live, the target, and a panic button.
-/// (Task 5 builds the full MIDI Devices window.)
-fn midi_inputs(app: &mut SoundApp, ctx: &egui::Context) {
-    let mut open = app.ui.show_midi_inputs;
-    if !open {
-        return;
-    }
-    let cache = egui::Id::new("soundcraft-midi-inputs");
-    win(ctx, &mut open, "Live MIDI Inputs", vec2(420.0, 260.0), |ui| {
-        // Listing creates a backend client: read on opening and on Refresh, not every frame.
-        let mut ports: Option<Vec<serde_json::Value>> = ui.ctx().data(|d| d.get_temp(cache));
-        if ports.is_none() || ui.button("Refresh").clicked() {
-            ports = match app.run("midi.inputs", json!({})) {
-                Ok(v) => v["ports"].as_array().cloned(),
-                Err(e) => {
-                    app.ui.status = e;
-                    Some(Vec::new())
-                }
-            };
-        }
-        let ports = ports.unwrap_or_default();
-        let mut changed = false;
-        if ports.is_empty() {
-            ui.label("No MIDI input devices.");
-        }
-        for port in &ports {
-            let name = port["name"].as_str().unwrap_or_default().to_string();
-            let mut on = port["enabled"].as_bool().unwrap_or(false);
-            let open_now = port["open"].as_bool().unwrap_or(false);
-            if ui.checkbox(&mut on, format!("{name}{}", if open_now { "" } else { " (closed)" })).changed() {
-                if let Err(e) = app.run("midi.input_enable", json!({"name": name, "enabled": on})) {
-                    app.ui.status = e;
-                }
-                changed = true;
-            }
-        }
-        ui.separator();
-        let tracks: Vec<(TrackId, String)> = app
-            .engine
-            .session()
-            .tracks
-            .iter()
-            .filter(|t| matches!(t.kind, soundcraft_model::TrackKind::Instrument | soundcraft_model::TrackKind::Midi))
-            .map(|t| (t.id, t.name.clone()))
-            .collect();
-        let current =
-            app.midi_target.and_then(|id| tracks.iter().find(|t| t.0 == id)).map_or("Automatic (record-armed track)".to_string(), |t| t.1.clone());
-        ui.horizontal(|ui| {
-            ui.label("Plays");
-            egui::ComboBox::from_id_salt("midi_target").selected_text(current).show_ui(ui, |ui| {
-                if ui.selectable_label(app.midi_target.is_none(), "Automatic (record-armed track)").clicked()
-                    && let Err(e) = app.run("midi.target", json!({"track": null}))
-                {
-                    app.ui.status = e;
-                }
-                for (id, name) in &tracks {
-                    if ui.selectable_label(app.midi_target == Some(*id), name).clicked()
-                        && let Err(e) = app.run("midi.target", json!({"track": id.0}))
-                    {
-                        app.ui.status = e;
-                    }
-                }
-            });
-        });
-        if ui.button("Panic (all live notes off)").clicked()
-            && let Err(e) = app.run("midi.panic", json!({}))
-        {
-            app.ui.status = e;
-        }
-        let next = if changed { None } else { Some(ports) };
-        ui.ctx().data_mut(|d| match next {
-            Some(p) => {
-                d.insert_temp(cache, p);
-            }
-            None => {
-                let _ = d.remove_temp::<Vec<serde_json::Value>>(cache);
-            }
-        });
-    });
-    if !open {
-        ctx.data_mut(|d| {
-            let _ = d.remove_temp::<Vec<serde_json::Value>>(cache);
-        });
-    }
-    app.ui.show_midi_inputs = open;
 }
 
 fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
