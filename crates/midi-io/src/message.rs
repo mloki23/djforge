@@ -35,7 +35,8 @@ impl MidiMessage {
     }
 
     /// The wire bytes, always with an explicit status byte (no running status). Out-of-range fields
-    /// are masked to 4 / 7 / 14 bits. Allocates: meant for tests and output, not the audio thread.
+    /// are masked to 4 / 7 / 14 bits. Allocates: tests only (the `testing` feature).
+    #[cfg(any(test, feature = "testing"))]
     pub fn to_bytes(&self) -> Vec<u8> {
         let st = |kind: u8, ch: u8| kind | (ch & 0x0F);
         match *self {

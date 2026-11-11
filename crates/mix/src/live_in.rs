@@ -29,6 +29,10 @@ pub const LIVE_INBOX: usize = 2048;
 /// Most live keys held on one strip; a note-on beyond it is not played.
 const MAX_HELD: usize = 256;
 
+/// Sources whose sustain pedals are told apart: a pedal lifted while another source's is down
+/// doesn't lift the instrument's sustain. A further source's pedal still sustains and lifts.
+const PEDALS: usize = 8;
+
 /// How long an instrument keeps rendering after its last live event while the transport is
 /// stopped (seconds), on top of the plugin's own tail: its releases ring out.
 const RING_S: f64 = 5.0;
@@ -60,15 +64,15 @@ pub(crate) struct LiveKeys {
     len: usize,
     /// Live holders per pitch.
     count: [u16; 128],
-    /// The source whose sustain pedal is down, if any.
-    sustain: Option<u32>,
+    /// The sources whose sustain pedal is down.
+    sustain: [Option<u32>; PEDALS],
     /// Samples the instrument keeps rendering while the transport is stopped.
     ring: i64,
 }
 
 impl Default for LiveKeys {
     fn default() -> Self {
-        LiveKeys { keys: [Key::default(); MAX_HELD], len: 0, count: [0; 128], sustain: None, ring: 0 }
+        LiveKeys { keys: [Key::default(); MAX_HELD], len: 0, count: [0; 128], sustain: [None; PEDALS], ring: 0 }
     }
 }
 
@@ -83,9 +87,32 @@ impl LiveKeys {
         self.len
     }
 
-    /// Live keys held or the live sustain pedal down: the arrangement's controller resets wait.
+    /// Live keys held or a live sustain pedal down: the arrangement's controller resets wait.
     pub(crate) fn busy(&self) -> bool {
-        self.len > 0 || self.sustain.is_some()
+        self.len > 0 || self.pedal_down()
+    }
+
+    /// A live source's sustain pedal is down.
+    pub(crate) fn pedal_down(&self) -> bool {
+        self.sustain.iter().any(Option::is_some)
+    }
+
+    /// `source`'s pedal went down (`true`) or up. Returns whether the instrument hears it: a pedal
+    /// lifted while another source's is down is not passed on.
+    fn pedal(&mut self, source: u32, down: bool) -> bool {
+        let at = self.sustain.iter().position(|s| *s == Some(source));
+        if down {
+            if at.is_none()
+                && let Some(free) = self.sustain.iter_mut().find(|s| s.is_none())
+            {
+                *free = Some(source);
+            }
+            return true;
+        }
+        if let Some(slot) = at.and_then(|i| self.sustain.get_mut(i)) {
+            *slot = None;
+        }
+        !self.pedal_down()
     }
 
     /// Something to hear while the transport is stopped: keys held or releases ringing.
@@ -107,7 +134,7 @@ impl LiveKeys {
     pub(crate) fn forget(&mut self) {
         self.len = 0;
         self.count = [0; 128];
-        self.sustain = None;
+        self.sustain = [None; PEDALS];
     }
 
     fn find(&self, k: Key) -> Option<usize> {
@@ -156,8 +183,8 @@ impl LiveKeys {
                 }
             }
             0xB0 => {
-                if d1 == 64 {
-                    self.sustain = if d2 >= 64 { Some(ev.source) } else { None };
+                if d1 == 64 && !self.pedal(ev.source, d2 >= 64) {
+                    return;
                 }
                 inst.midi(at, [status, d1, d2]);
             }
@@ -167,7 +194,8 @@ impl LiveKeys {
     }
 
     /// Releases the keys of `source` (every source with `None`) at `offset`, and lifts its
-    /// sustain pedal. Pitches the arrangement or a slot hold (`others`) keep sounding.
+    /// sustain pedal (the instrument's, once no other source's is down). Pitches the arrangement
+    /// or a slot hold (`others`) keep sounding.
     pub(crate) fn release(&mut self, source: Option<u32>, inst: &mut dyn Plugin, offset: usize, others: impl Fn(u8) -> bool) {
         let mut i = 0;
         while i < self.len {
@@ -182,8 +210,14 @@ impl LiveKeys {
                 i += 1;
             }
         }
-        if self.sustain.is_some_and(|s| source.is_none_or(|x| x == s)) {
-            self.sustain = None;
+        let mut lifted = false;
+        for s in &mut self.sustain {
+            if s.is_some_and(|s| source.is_none_or(|x| x == s)) {
+                *s = None;
+                lifted = true;
+            }
+        }
+        if lifted && !self.pedal_down() {
             inst.midi(offset, [0xB0, 64, 0]);
         }
     }
@@ -234,7 +268,7 @@ impl Plugin for Shield<'_> {
         // The arrangement's chases and the slot cuts reset the controllers: not the live
         // player's pedal while it is down, nor anything while live keys are held.
         let [status, cc, value] = msg;
-        let cut = status & 0xF0 == 0xB0 && ((cc == 64 && value < 64 && self.live.sustain.is_some()) || (cc == 121 && self.live.busy()));
+        let cut = status & 0xF0 == 0xB0 && ((cc == 64 && value < 64 && self.live.pedal_down()) || (cc == 121 && self.live.busy()));
         if !cut {
             self.inner.midi(offset, msg);
         }
@@ -311,6 +345,27 @@ mod tests {
         assert!(keys.holds(61) && !keys.holds(60));
         keys.release(None, &mut inst, 0, |_| false);
         assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn two_sources_pedals_dont_lift_each_others_sustain() {
+        let (mut keys, mut inst) = (LiveKeys::default(), Log::default());
+        keys.play(ev(1, [0xB0, 64, 127]), &mut inst, |_| false);
+        keys.play(ev(2, [0xB0, 64, 127]), &mut inst, |_| false);
+        keys.play(ev(1, [0xB0, 64, 0]), &mut inst, |_| false);
+        assert_eq!(inst.0, [('m', 64), ('m', 64)], "source 2 still holds the pedal: not lifted");
+        assert!(keys.pedal_down());
+        keys.play(ev(2, [0xB0, 64, 0]), &mut inst, |_| false);
+        assert_eq!(inst.0.len(), 3, "the last pedal up lifts it");
+        assert!(!keys.pedal_down());
+        // Unplugging one source while the other holds its pedal leaves the sustain on.
+        keys.play(ev(1, [0xB0, 64, 127]), &mut inst, |_| false);
+        keys.play(ev(2, [0xB0, 64, 127]), &mut inst, |_| false);
+        inst.0.clear();
+        keys.release(Some(1), &mut inst, 0, |_| false);
+        assert!(inst.0.is_empty() && keys.pedal_down());
+        keys.release(Some(2), &mut inst, 0, |_| false);
+        assert_eq!(inst.0, [('m', 64)]);
     }
 
     #[test]

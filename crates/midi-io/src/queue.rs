@@ -206,7 +206,8 @@ impl PortSink {
         }
     }
 
-    /// Queues one already-parsed message.
+    /// Queues one already-parsed message (the fake source's injection).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn send(&mut self, msg: MidiMessage, time_ns: u64) {
         self.enqueue(msg, time_ns);
         self.router.unpark();

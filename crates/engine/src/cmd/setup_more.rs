@@ -103,7 +103,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({"enabled": s.edit.flag("midi.beat_clock"), "offset": s.edit.value("midi.beat_clock.offset", 0.0), "destination": text(&s.edit, "midi.beat_clock.destination")}))
         }),
-        cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — filtered kinds are not recorded", always, midi_filter),
+        cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — filtered kinds are left out of MIDI takes (midi.record_take, live.slot_from_take, and what the app records): notes (on and off), poly_aftertouch, cc, program, mono_aftertouch, pitch_bend. Live play is not filtered. Takes never hold sysex or realtime messages (the MIDI input drops them). Returns {filtered}", always, midi_filter),
         cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]} — deprecated: inputs are app preferences (midi.input_enable); a no-op headless", always, midi_inputs),
         cmd!(noundo "setup.transcription_settings", "Transcription Settings...", ["Setup"], None, "{enabled?: bool, language?: 'en'}", always, |e, p| {
             let s = e.session_mut();

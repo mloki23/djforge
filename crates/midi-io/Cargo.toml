@@ -16,6 +16,11 @@ rtrb.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 midir.workspace = true
 
+[features]
+# `FakeSource`, `MidiSource::as_fake_mut` and `MidiMessage::to_bytes`: simulated devices for tests.
+# Enabled only through dev-dependencies (resolver 3 keeps it out of normal builds); not for the app.
+testing = []
+
 [dev-dependencies]
 proptest.workspace = true
 

@@ -444,9 +444,10 @@ impl Engine {
         }
     }
 
-    /// Record an undo point manually (for interactive gestures committed by the UI).
+    /// Record an undo point manually (for interactive gestures committed by the UI). While an
+    /// undo group is open the change joins it instead: the group's commit is its step.
     pub fn push_undo(&mut self, label: &str, before: Arc<Session>) {
-        if Arc::ptr_eq(&before, &self.doc) {
+        if Arc::ptr_eq(&before, &self.doc) || self.undo_group.is_some() {
             return;
         }
         self.undo.push(HistoryEntry { label: label.to_string(), doc: before });

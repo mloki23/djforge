@@ -478,3 +478,61 @@ fn a_take_of_too_many_events_over_its_passes_is_refused() {
     let err = e.execute("midi.record_take", &json!({"track": t.0, "passes": [pass.clone(), pass]})).unwrap_err().to_string();
     assert!(err.contains("1200000 events") && err.contains("at most 1000000"), "{err}");
 }
+
+#[test]
+fn the_midi_input_filter_leaves_its_kinds_out_of_takes() {
+    let (mut e, t) = engine();
+    run(&mut e, "setup.midi_input_filter", json!({"filter": ["cc", "pitch_bend"]}));
+    let s = e.session();
+    let mut ev = note(s, 60, 4.5, 5.0).to_vec();
+    ev.push(json!({"at": at_beat(s, 4.6), "status": 0xB0, "data1": 1, "data2": 90}));
+    ev.push(json!({"at": at_beat(s, 4.7), "status": 0xE0, "data1": 0, "data2": 70}));
+    ev.push(json!({"at": at_beat(s, 4.8), "status": 0xD0, "data1": 30}));
+    let p = take(&e, t, 4.0, 8.0, ev);
+    let r = run(&mut e, "midi.record_take", p);
+    assert_eq!((r["notes"].as_u64(), r["controllers"].as_u64()), (Some(1), Some(1)), "only the aftertouch is kept: {r}");
+    // Notes filtered: a slot take keeps none, so writes nothing.
+    run(&mut e, "setup.midi_input_filter", json!({"filter": ["notes"], "allow": ["cc", "pitch_bend"]}));
+    let p = take(&e, t, 10.0, 12.0, note(e.session(), 62, 10.5, 11.0).to_vec());
+    let r = run(&mut e, "midi.record_take", p);
+    assert_eq!(r["notes"].as_u64(), Some(0));
+    let mut le = live_engine();
+    run(&mut le, "setup.midi_input_filter", json!({"filter": ["notes"]}));
+    let p = json!({"column": 4, "slot": 0, "start": 0, "bars": 1, "events": [{"at": 10, "status": 0x90, "data1": 40, "data2": 90}]});
+    assert_eq!(run(&mut le, "live.slot_from_take", p)["notes"].as_u64(), Some(0));
+}
+
+#[test]
+fn a_manual_undo_point_inside_an_undo_group_joins_the_group() {
+    let (mut e, t) = engine();
+    let steps = e.undo_history().len();
+    e.begin_undo_group("Record");
+    let before = e.session_arc();
+    e.session_mut().track_mut(t).unwrap().name = "Renamed".into();
+    e.push_undo("Rename", before);
+    assert_eq!(e.undo_history().len(), steps, "nothing pushed mid-group");
+    let p = take(&e, t, 4.0, 5.0, note(e.session(), 60, 4.0, 4.5).to_vec());
+    run(&mut e, "midi.record_take", p);
+    e.commit_undo_group();
+    assert_eq!((e.undo_history().len(), e.undo_label()), (steps + 1, Some("Record")));
+    assert!(e.undo());
+    assert_eq!(e.session().track(t).unwrap().name, "Lead", "both undone together");
+    assert_eq!(clip_count(&e, t), 0);
+}
+
+#[test]
+fn a_take_on_a_new_playlist_takes_a_free_name() {
+    let (mut e, t) = engine();
+    let s = e.session();
+    let p = take(&e, t, 4.0, 8.0, note(s, 60, 4.5, 5.0).to_vec());
+    run(&mut e, "midi.record_take", p);
+    // Marty named the only playlist what the next would be called.
+    e.session_mut().track_mut(t).unwrap().playlists[0].name = "Lead.02".into();
+    let s = e.session();
+    let mut p = take(&e, t, 4.0, 8.0, note(s, 62, 4.5, 5.0).to_vec());
+    p["on_overlap"] = json!("new_playlist");
+    run(&mut e, "midi.record_take", p);
+    let (names, active) = playlists(&e, t);
+    assert_eq!(names.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), ["Lead.02", "Lead.03"]);
+    assert_eq!(active, 1);
+}

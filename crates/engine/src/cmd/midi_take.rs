@@ -34,8 +34,50 @@ const RECORD_TAKE: &str = "midi.record_take";
 const RECORD_SLOT: &str = "live.record_slot";
 const SLOT_FROM_TAKE: &str = "live.slot_from_take";
 
-/// Most events one take may hold.
-const MAX_EVENTS: usize = 1_000_000;
+/// Most events one `midi.record_take` (over all its passes) or `live.slot_from_take` takes. The
+/// app places a longer take in several commands, one undo step.
+pub const MAX_TAKE_EVENTS: usize = 1_000_000;
+const MAX_EVENTS: usize = MAX_TAKE_EVENTS;
+
+/// The kinds of message the MIDI Input Filter (`setup.midi_input_filter`, the session's
+/// `midi.filter.*` flags) leaves out of takes: notes (note-ons and note-offs), poly aftertouch,
+/// controllers (`cc`), program changes, mono (channel) aftertouch and pitch bend. Takes never
+/// hold SysEx or real-time messages anyway (the MIDI input drops them), so those two flags change
+/// nothing. Live play is not filtered: what is played is heard, only the take leaves it out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputFilter {
+    /// One bit per channel-message kind left out: bit `(status >> 4) - 8`.
+    out: u8,
+}
+
+impl InputFilter {
+    /// The filter `s` sets.
+    pub fn of(s: &Session) -> InputFilter {
+        let kinds: [(&str, &[u8]); 6] = [
+            ("notes", &[0x80, 0x90]),
+            ("poly_aftertouch", &[0xA0]),
+            ("cc", &[0xB0]),
+            ("program", &[0xC0]),
+            ("mono_aftertouch", &[0xD0]),
+            ("pitch_bend", &[0xE0]),
+        ];
+        let mut out = 0u8;
+        for (kind, statuses) in kinds {
+            if s.edit.flag(&format!("midi.filter.{kind}")) {
+                for st in statuses {
+                    out |= 1 << ((st >> 4) - 8);
+                }
+            }
+        }
+        InputFilter { out }
+    }
+
+    /// Whether a take keeps a message with this status byte.
+    pub fn keeps(self, status: u8) -> bool {
+        let kind = status >> 4;
+        !(8..=14).contains(&kind) || self.out & (1 << (kind - 8)) == 0
+    }
+}
 
 /// Beats in a slot's bar (slots count 4/4 bars).
 const SLOT_BAR_BEATS: i64 = 4;
@@ -83,8 +125,8 @@ struct TakeEvent {
     bytes: [u8; 3],
 }
 
-/// `p`'s `events`, in the order played (a missing list is empty).
-fn events_param(cmd: &str, p: &Value) -> Result<Vec<TakeEvent>> {
+/// `p`'s `events`, in the order played (a missing list is empty), less those `filter` leaves out.
+fn events_param(cmd: &str, p: &Value, filter: InputFilter) -> Result<Vec<TakeEvent>> {
     let list = match p.get("events") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(a)) => a,
@@ -115,7 +157,10 @@ fn events_param(cmd: &str, p: &Value) -> Result<Vec<TakeEvent>> {
         if !(0x80..0xF0).contains(&status) {
             return Err(bad(cmd, format!("event {i}: status {status:#04x} is not a channel message")));
         }
-        out.push(TakeEvent { at, bytes: [status, byte(v, "data1", i)?, byte(v, "data2", i)?] });
+        let bytes = [status, byte(v, "data1", i)?, byte(v, "data2", i)?];
+        if filter.keeps(status) {
+            out.push(TakeEvent { at, bytes });
+        }
     }
     // In time order; events on one sample keep the order they played in.
     out.sort_by_key(|e| e.at);
@@ -230,7 +275,7 @@ fn passes_param(e: &Engine, cmd: &str, p: &Value) -> Result<Vec<Pass>> {
         if end <= start {
             return Err(bad(cmd, "`end` must come after `start`"));
         }
-        Ok(Pass { start, end, events: events_param(cmd, v)? })
+        Ok(Pass { start, end, events: events_param(cmd, v, InputFilter::of(e.session()))? })
     };
     match p.get("passes") {
         None | Some(Value::Null) => Ok(vec![one(p, None)?]),
@@ -392,7 +437,10 @@ fn copy_playlist(s: &mut Session, track: TrackId) {
         copied.push(c);
     }
     if let Some(t) = s.track_mut(track) {
-        let mut pl = soundcraft_model::Playlist::new(format!("{}.{:02}", t.name, t.playlists.len() + 1));
+        // The next free "<track>.NN": a playlist renamed or deleted may have left the count's taken.
+        let taken = |n: &str| t.playlists.iter().any(|p| p.name == n);
+        let name = (t.playlists.len() + 1..).map(|i| format!("{}.{i:02}", t.name)).find(|n| !taken(n)).unwrap_or_else(|| format!("{}.take", t.name));
+        let mut pl = soundcraft_model::Playlist::new(name);
         pl.clips = copied;
         pl.sort();
         t.playlists.push(pl);
@@ -483,7 +531,7 @@ fn slot_from_take(e: &mut Engine, p: &Value) -> Result<Value> {
     let bars = bars_param(id, p)?;
     let replace = replace_param(id, p)?;
     let start = position_param(e, id, p, "start")?.ok_or_else(|| bad(id, "`start` (the sample the recording started on) required"))?;
-    let events = events_param(id, p)?;
+    let events = events_param(id, p, InputFilter::of(e.session()))?;
     let s = e.session();
     four_four(id, s)?;
     refuse_occupied(e, id, column, slot, replace)?;

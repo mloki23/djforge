@@ -223,10 +223,13 @@ impl<C> PortTable<C> {
         self.open.iter().any(|p| p.info.name == name)
     }
 
+    /// The open port listed as `name` (the fake source injects through it).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut OpenPort<C>> {
         self.open.iter_mut().find(|p| p.info.name == name)
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut OpenPort<C>> {
         self.open.iter_mut()
     }

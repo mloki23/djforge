@@ -87,6 +87,7 @@ impl Drop for FakeSource {
 }
 
 impl MidiSource for FakeSource {
+    #[cfg(any(test, feature = "testing"))]
     fn as_fake_mut(&mut self) -> Option<&mut FakeSource> {
         Some(self)
     }

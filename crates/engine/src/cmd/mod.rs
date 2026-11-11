@@ -56,6 +56,7 @@ pub use live::{
     SlotFile, SlotFileJob, fold_into_loop as live_fold_into_loop, launch_margin as live_launch_margin, live_cmds,
     next_boundary as live_next_boundary, slot_file_job,
 };
+pub use midi_take::{InputFilter, MAX_TAKE_EVENTS};
 pub use prep::{
     Analyse as PrepAnalyse, PrepJob, PrepProgress, default_root as prep_default_root, mixforge_analysis as prep_mixforge_analysis, prep_job,
     prep_job_in, run as prep_run, start as prep_start,

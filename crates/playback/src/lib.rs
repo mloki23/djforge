@@ -128,11 +128,17 @@ struct MidiShared {
     has_capture: AtomicBool,
     /// The notes and controllers mapped to controls, which don't play the target.
     controls: midi_in::MidiControls,
+    /// The player's id (see [`Player::id`]).
+    player: u64,
 }
+
+/// The next [`Player::id`].
+static NEXT_PLAYER: AtomicU64 = AtomicU64::new(1);
 
 impl MidiShared {
     fn new() -> MidiShared {
-        MidiShared { target: AtomicU64::new(u64::MAX), ..MidiShared::default() }
+        let player = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
+        MidiShared { target: AtomicU64::new(u64::MAX), player, ..MidiShared::default() }
     }
 }
 
@@ -1361,6 +1367,12 @@ impl Player {
     pub fn set_midi_input(&self, input: Option<(Subscriber, MidiClock)>) {
         self.shared.midi.has_input.store(input.is_some(), Ordering::Relaxed);
         let _ = self.tx.send(Cmd::MidiIn(input));
+    }
+
+    /// A number no other player of this process has: what the UI sends one player (the mapped
+    /// controls, a slot recording's capture) a new one (an audio device change) needs again.
+    pub fn id(&self) -> u64 {
+        self.shared.midi.player
     }
 
     /// Whether this player has a MIDI input queue (a new player needs one).

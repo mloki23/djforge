@@ -78,10 +78,12 @@ impl MidiSource for MidiInputs {
             |id, info| {
                 let port = ports.iter().find(|(i, _)| i.same_port(info)).map(|(_, p)| p).ok_or_else(|| MidiIoError::NoSuchPort(name.to_string()))?;
                 let sink = hub.port_sink(id)?;
-                // On failure the sink is dropped and the router retires its queue.
-                input
-                    .connect(port, "djforge-in", |_device_stamp, bytes, sink: &mut PortSink| sink.feed(bytes), sink)
-                    .map_err(|e| backend(e.to_string()))
+                // On failure the sink is dropped and the router retires its queue. A backend that
+                // panics while connecting (as its enumeration can) is an error, not a crash.
+                let connect = std::panic::AssertUnwindSafe(move || {
+                    input.connect(port, "djforge-in", |_device_stamp, bytes, sink: &mut PortSink| sink.feed(bytes), sink).map_err(|e| e.to_string())
+                });
+                std::panic::catch_unwind(connect).unwrap_or_else(|_| Err("the MIDI backend panicked while connecting".to_string())).map_err(backend)
             },
         )
     }

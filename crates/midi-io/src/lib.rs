@@ -4,8 +4,8 @@
 //!   SysEx, clock, active sensing and the rest of the system messages are dropped.
 //! - [`MidiEvent`]: a message, the port it came from and its arrival time on a shared [`MidiClock`].
 //! - [`MidiSource`]: a set of input ports opened by name. [`MidiInputs`] is the real one (`midir`:
-//!   WinMM, CoreMIDI, ALSA); [`FakeSource`] simulates devices and lets tests inject events at chosen
-//!   times.
+//!   WinMM, CoreMIDI, ALSA); `FakeSource` (the `testing` feature, for tests only) simulates
+//!   devices and lets tests inject events at chosen times.
 //! - [`Subscriber`]: one consumer's bounded, wait-free queue. Every open port's events fan out to
 //!   every subscriber through a router thread (see the `queue` module). Full queues drop and count;
 //!   [`HopStats`] measures the router's delay.
@@ -19,6 +19,7 @@
 //! `ports` module for how listed names relate to all this.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable, clippy::indexing_slicing)]
 
+#[cfg(any(test, feature = "testing"))]
 mod fake;
 #[cfg(not(target_arch = "wasm32"))]
 mod inputs;
@@ -28,6 +29,7 @@ mod queue;
 
 use std::time::Instant;
 
+#[cfg(any(test, feature = "testing"))]
 pub use fake::FakeSource;
 #[cfg(not(target_arch = "wasm32"))]
 pub use inputs::MidiInputs;
@@ -161,7 +163,8 @@ pub trait MidiSource {
     fn healthy(&self) -> bool;
 
     /// The simulated source behind this one, for tests that inject events into a source an app
-    /// owns (`None` for real hardware).
+    /// owns (`None` for real hardware). Tests only (the `testing` feature).
+    #[cfg(any(test, feature = "testing"))]
     fn as_fake_mut(&mut self) -> Option<&mut FakeSource> {
         None
     }

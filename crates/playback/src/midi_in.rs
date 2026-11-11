@@ -164,6 +164,7 @@ impl MidiControls {
     }
 
     /// The row `port` has, if any (for tests of the row's stability).
+    #[cfg(test)]
     pub fn row_of(&self, port: PortId) -> Option<usize> {
         self.ports.iter().position(|r| r.load(Ordering::Acquire) == row_tag(port))
     }
@@ -257,7 +258,7 @@ impl Order {
     }
 }
 
-/// A message as MIDI 1.0 bytes (no allocation, unlike [`MidiMessage::to_bytes`]).
+/// A message as MIDI 1.0 bytes, without allocating (the audio thread and the take JSON use it).
 pub fn raw(msg: MidiMessage) -> [u8; 3] {
     let st = |kind: u8, ch: u8| kind | (ch & 0x0F);
     match msg {
