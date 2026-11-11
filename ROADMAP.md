@@ -2,7 +2,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (readiness by audience with hours to ~95 %) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-11-11 · **Last updated:** 2026-11-11 · **Change:** minor (stage 7 milestone: 7a production, 7b hardware) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -122,6 +122,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 ## Progress log
 
+- **2026-11-11 (stage 7 milestone, djforge):** 7a production: parts and starter patterns over the set, a master that holds -1 dBTP. 7b hardware: MIDI input devices (WinMM, CoreMIDI, ALSA) with activity, reconnect and replug handling (a device on another USB port keeps its settings); live play through the target instrument; MIDI takes into the arrangement and Session view slots that never refuse at stop, are placed whole however long, and wait in a recovery list of the last 8; MIDI learn for slots, faders, stems, parameters and commands, whose mapped notes don't play the target. See `docs/CHANGES-stage7a.md` and `docs/CHANGES-stage7b.md`. MIDI out, Thru and clock out remain (G-02).
 - **2026-10-13:** `mix.instrument` takes the built-in instrument's parameters in `params` (validated, clamped) and refuses any other field, so a synth setting written beside `plugin` is an error instead of being accepted and ignored (#265)
 - **2026-10-13:** A bounce of a bus that an aux returns onto lines up with the timeline: the aux insert's lookahead is compensated like the main mix's (it left the bus late and cut the end off), and tracks routed to that bus wait for it too (#246)
 - **2026-10-13:** Delay compensation covers the inserts of the master faders: a bounce of the main mix with a Maximizer on the master lines up with the same mix without it (it came out 71 samples late) (#351)
@@ -155,6 +156,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-11 | minor | Progress log: stage 7 milestone (7a production, 7b hardware) |
 | 2026-10-13 | trivial | Progress log: mix.instrument params, unknown fields refused (#265) |
 | 2026-10-13 | trivial | Progress log: bus bounce compensates aux returns (#246) |
 | 2026-10-13 | trivial | Progress log: master insert latency compensated (#351) |

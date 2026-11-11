@@ -1,10 +1,11 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (bounces of a bus fed by an aux compensate its latency (#246); previously minor: audio device, rate and buffer choice; ASIO feature) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-11-11 · **Last updated:** 2026-11-11 · **Change:** minor (stage 7b: MIDI input, live play, recording, MIDI learn; review fixes: a device on another USB port keeps its settings, the input filter applies to takes) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
-SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the absence of
-any MIDI-device or control-surface code; Pro Tools' from its documentation and Setup menus.
+SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal), `crates/midi-io`
+(MIDI input through `midir`) and the absence of control-surface code; Pro Tools' from its
+documentation and Setup menus. Stage 7b brought MIDI input: live play, recording and MIDI learn.
 
 **Hardware: ~12 % ready** (estimated). **Performance: ~35 %** (estimated; nothing benchmarked
 against Pro Tools). Remaining ≈ 110–180 h for hardware, 40–70 h for performance.
@@ -33,7 +34,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 |---|---|---|
 | MIDI input devices (keyboards, pads) | ✅ | ✅ live play to the target instrument, recording into the arrangement and slots; Setup › MIDI › MIDI Input Devices enables ports, shows activity and the last messages, reconnects, and reopens replugged ports |
 | MIDI output to external gear | ✅ | ❌ |
-| MIDI Thru, input filter | ✅ | ❌ (the filter is stored flags only; no Thru) |
+| MIDI Thru, input filter | ✅ | 🟡 the input filter leaves its kinds out of takes (live play unfiltered); no Thru |
 | MIDI Beat Clock out, MTC generate/chase | ✅ | ❌ |
 | MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ✅ MIDI learn: notes and controllers to slots, scenes, faders, pans, stems, parameters and commands (Setup › MIDI › MIDI Mappings) |
 | Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | ✅ Play mode plays the live target; step entry otherwise |
@@ -72,6 +73,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-11 | minor | Stage 7b review fixes: a device on another USB port keeps its settings; the input filter applies to takes |
 | 2026-11-11 | major | MIDI input (stage 7b): live play, keyboard Play mode, recording, MIDI learn, and MIDI Devices with reconnect; MIDI out, Thru and clock out still missing |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |
 | 2026-10-12 | minor | Audio device settings: system, output, input, sample rate and buffer size; opt-in ASIO |

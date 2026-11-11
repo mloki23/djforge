@@ -1,6 +1,6 @@
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (G-01: audio device settings and opt-in ASIO) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-11-11 · **Last updated:** 2026-11-11 · **Change:** minor (G-02: stage 7b review fixes; the MIDI input filter applies to takes) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -69,12 +69,14 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
   per machine), shows activity, state and the last messages, reconnects a port, releases held
   notes on an unplug and reopens a replugged port, and shows the live target, latency and drops.
   `setup.midi_input_devices` is a deprecated shim for it.
-- **Missing:** MIDI output to external synths, MIDI Thru, the input filter
-  (`setup.midi_input_filter` still only stores flags), `setup.midi_studio` (names only), and MIDI
-  Beat Clock / MTC out.
+  A device on another USB port keeps its enable and mappings; long takes are placed whole, one
+  undo step; the last 8 takes wait in Event › Recover MIDI Take. The MIDI Input Filter
+  (`setup.midi_input_filter`) leaves its kinds out of takes.
+- **Missing:** MIDI output to external synths, MIDI Thru (and filtering live play),
+  `setup.midi_studio` (names only), and MIDI Beat Clock / MTC out.
 - **Impact:** djforge plays and records a controller, pad grid or keyboard, but can't drive
   external gear or sync it.
-- **Estimate:** ≈ 10–20 h (output tracks and ports, thru, the input filter, clock out).
+- **Estimate:** ≈ 10–18 h (output tracks and ports, thru, clock out).
 
 ### G-03. Session interchange with Pro Tools
 
@@ -207,6 +209,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-11 | minor | G-02: stage 7b review fixes (new USB port keeps settings, long takes, recovery list, input filter on takes) |
 | 2026-10-12 | minor | G-01 shrunk: audio device, rate and buffer choice; opt-in ASIO |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
 | 2026-10-10 | major | Created from the full re-measure against Pro Tools Ultimate 2026.4.1: 22 ranked gaps with evidence and estimates |
