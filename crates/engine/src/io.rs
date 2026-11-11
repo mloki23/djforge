@@ -1486,8 +1486,8 @@ fn back_up(file: &Path) {
 }
 
 /// The file a session saved to `path` goes to: `path`, with `.djforge` added when it has no
-/// extension and isn't an existing file. A SoundCraft `.djforge` path becomes the `.djforge` beside
-/// it, so saving never writes over a `.djforge` file.
+/// extension and isn't an existing file. A SoundCraft `.scraft` path becomes the `.djforge` beside
+/// it, so saving never writes over a `.scraft` file.
 pub fn session_file(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(soundcraft_model::LEGACY_SESSION_EXTENSION)) {
@@ -1542,7 +1542,7 @@ fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
     Err(EngineError::Io(format!("{}: no free file name for {stem}", dir.display())))
 }
 
-/// Open a `.djforge` (or SoundCraft `.djforge`) session and decode its audio files (missing files are reported, not fatal).
+/// Open a `.djforge` (or SoundCraft `.scraft`) session and decode its audio files (missing files are reported, not fatal).
 pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     open_session_linked(e, path, Path::new(path)).map(|r| r.missing)
 }
@@ -2046,7 +2046,7 @@ fn save_session_bundle(e: &mut Engine, path: &str) -> Result<usize> {
 }
 
 /// Open a session from bytes (the browser has no paths): a bundle ([`session_bundle`]) or a bare
-/// `.djforge` or `.djforge`, whose audio is then reported missing. Returns the missing media, like
+/// `.djforge` or `.scraft`, whose audio is then reported missing. Returns the missing media, like
 /// [`open_session`].
 pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Vec<String>> {
     let (text, mut files) = if bytes.starts_with(b"PK\x03\x04") {
@@ -2079,7 +2079,7 @@ pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Ve
     Ok(missing)
 }
 
-/// Unpack a bundle: the one session file (`.djforge` or `.djforge`) at its top level and the files beside it, by relative path.
+/// Unpack a bundle: the one session file (`.djforge` or `.scraft`) at its top level and the files beside it, by relative path.
 fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String, Vec<u8>>)> {
     use std::io::Read as _;
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));

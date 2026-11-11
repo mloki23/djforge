@@ -108,6 +108,14 @@ impl Dialogs {
             "file.import_audio" => Dialog::PathPrompt { cmd: id.into(), title: "Import Audio".into(), path: home, key: "path".into() },
             "file.import_midi" => Dialog::PathPrompt { cmd: id.into(), title: "Import MIDI".into(), path: home, key: "path".into() },
             "session.open" => Dialog::PathPrompt { cmd: id.into(), title: "Open Session".into(), path: home, key: "path".into() },
+            // A session opened from a `.scraft` saves as the `.djforge` beside it. When that file
+            // exists already, Save asks (Save As, with the replace question) instead of failing.
+            "session.save" if e.path.as_deref().is_some_and(|p| saves_over_another(e, p)) => Dialog::PathPrompt {
+                cmd: "session.save_as".into(),
+                title: "Save Session As".into(),
+                path: e.path.as_deref().map(|p| soundcraft_engine::io::session_file(p).to_string_lossy().into_owned()).unwrap_or_default(),
+                key: "path".into(),
+            },
             "session.save" if e.path.is_some() => return false,
             "session.save" | "session.save_as" | "session.save_copy" => Dialog::PathPrompt {
                 cmd: if id == "session.save_copy" { id } else { "session.save_as" }.into(),
@@ -222,6 +230,13 @@ fn path_key(id: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// True when Save of the session at `path` would write another, existing file: a `.scraft`'s
+/// `.djforge`, which Save never replaces without asking.
+fn saves_over_another(e: &Engine, path: &str) -> bool {
+    let file = soundcraft_engine::io::session_file(path);
+    file.as_path() != std::path::Path::new(path) && soundcraft_engine::io::replaces(e, "session.save", &file)
 }
 
 fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
@@ -487,9 +502,13 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
                     ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    // Commands that write a session file pick where to save it; the rest pick a file to read.
+                    let writes_session = matches!(
+                        cmd.as_str(),
+                        "session.save_as" | "session.save_copy" | "session.save_template" | "file.export_selected_tracks_as_session"
+                    );
                     if let Some(pick) = &app.services.pick_open
-                        && cmd != "session.save_as"
-                        && cmd != "session.save_copy"
+                        && !writes_session
                         && key != "dir"
                         && ui.button("Browse…").clicked()
                         && let Some(p) = pick(cmd, &[])
@@ -504,7 +523,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         *path = p;
                     }
                     if let Some(pick) = &app.services.pick_save
-                        && (cmd == "session.save_as" || cmd == "session.save_copy")
+                        && writes_session
                         && ui.button("Browse…").clicked()
                         && let Some(p) = pick(cmd, path)
                     {

@@ -621,8 +621,12 @@ impl SoundApp {
             self.capture_plugin_states();
         }
         let replacing = matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
+        let before = self.engine.path.clone();
         match self.engine.execute(id, &params) {
             Ok(v) => {
+                if matches!(id, "session.save" | "session.save_as") {
+                    self.note_saved_beside_scraft(before.as_deref());
+                }
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
                 }
@@ -646,6 +650,24 @@ impl SoundApp {
                 log::warn!("{id}: {e}");
                 Err(RunError::Engine(e))
             }
+        }
+    }
+
+    /// A session opened from a SoundCraft `.scraft` was just saved as the `.djforge` beside it
+    /// (saving never writes a `.scraft`): say so, and let Open Recent offer the `.djforge` in
+    /// the `.scraft`'s place.
+    fn note_saved_beside_scraft(&mut self, before: Option<&str>) {
+        let (Some(old), Some(new)) = (before, self.engine.path.clone()) else { return };
+        let old_path = std::path::Path::new(old);
+        let legacy =
+            old_path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(soundcraft_model::LEGACY_SESSION_EXTENSION));
+        if !legacy || std::path::Path::new(&new) != old_path.with_extension(soundcraft_model::SESSION_EXTENSION) {
+            return;
+        }
+        let name = |p: &str| std::path::Path::new(p).file_name().map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned());
+        self.ui.status = format!("Saved as {}; {} is unchanged.", name(&new), name(old));
+        if recent::replace(&mut self.ui.recent_sessions, old, &new) {
+            self.recent_changed = true;
         }
     }
 
@@ -1057,12 +1079,14 @@ impl SoundApp {
         let (cause, then) = match trouble {
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
-                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart djforge.",
+                format!("Use Reconnect audio device in Setup ▸ Playback Engine, or restart {APP_NAME}."),
             ),
             OutputTrouble::Gone => {
-                (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")
+                (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.".to_string())
             }
-            OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine."),
+            OutputTrouble::Stalled => {
+                (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine.".to_string())
+            }
         };
         let (recording, playing) = (self.engine.transport.recording, self.engine.transport.playing);
         if recording || playing {

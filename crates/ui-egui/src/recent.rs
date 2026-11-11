@@ -42,6 +42,19 @@ pub fn note(list: &mut Vec<String>, path: &str) -> bool {
     true
 }
 
+/// Puts `new` where `old` was in `list` (a `.scraft` saved as its `.djforge`), dropping any other
+/// entry for `new`. Returns whether the list changed.
+pub fn replace(list: &mut Vec<String>, old: &str, new: &str) -> bool {
+    let Some(at) = list.iter().position(|p| same(p, old)) else { return note(list, new) };
+    list.retain(|p| !same(p, new) || same(p, old));
+    let at = list.iter().position(|p| same(p, old)).unwrap_or(at);
+    match list.get_mut(at) {
+        Some(slot) => *slot = new.to_string(),
+        None => return note(list, new),
+    }
+    true
+}
+
 /// "name — folder" for a session path.
 fn label(path: &str) -> String {
     let p = Path::new(path);
@@ -149,6 +162,16 @@ mod tests {
         let mut l = vec![r"C:\Songs\Mix.djforge".to_string()];
         note(&mut l, "c:/songs/mix.djforge");
         assert_eq!(l.len(), if cfg!(windows) { 1 } else { 2 });
+    }
+
+    #[test]
+    fn a_scraft_saved_as_djforge_takes_its_place() {
+        let mut l = vec!["b.djforge".to_string(), "a.scraft".to_string(), "a.djforge".to_string(), "c.djforge".to_string()];
+        assert!(replace(&mut l, "a.scraft", "a.djforge"));
+        assert_eq!(l, ["b.djforge", "a.djforge", "c.djforge"]);
+        let mut l = vec!["b.djforge".to_string()];
+        assert!(replace(&mut l, "gone.scraft", "gone.djforge"));
+        assert_eq!(l, ["gone.djforge", "b.djforge"]);
     }
 
     #[test]

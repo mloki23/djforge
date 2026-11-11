@@ -9,7 +9,7 @@ fn the_app_is_djforge_and_about_credits_soundcraft() {
     assert_eq!(panels::about_title(), "About djforge");
     assert_eq!(panels::about_credit(), "djforge — a DJ-first DAW. Based on SoundCraft by the ArtCraft team (MIT/Apache-2.0)");
     let about = menus::UI_COMMANDS.iter().find(|c| c.0 == "window.about").map(|c| c.1);
-    assert_eq!(about, Some("About djforge"));
+    assert_eq!(about, Some(panels::about_title().as_str()));
 }
 
 #[test]

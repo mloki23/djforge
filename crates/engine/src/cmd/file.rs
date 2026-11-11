@@ -158,7 +158,7 @@ pub fn specs() -> Vec<CommandSpec> {
             s.tracks.retain(|t| keep.contains(&t.id) || t.kind == soundcraft_model::TrackKind::Master);
             let mut tmp = crate::Engine::new(s);
             crate::io::save_session(&mut tmp, &path)?;
-            Ok(json!({"path": path}))
+            Ok(json!({"path": tmp.path.unwrap_or(path)}))
         }),
         cmd!(noundo "file.export_sibelius", "Sibelius...", ["File", "Export"], None, "{path, tracks?} — MIDI tracks as MusicXML (.musicxml)", always, |e, p| {
             write_score(e, p, "file.export_sibelius", false)

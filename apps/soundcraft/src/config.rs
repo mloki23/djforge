@@ -37,7 +37,7 @@ fn config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -
     if let Some(dir) = env("SOUNDCRAFT_CONFIG_DIR") {
         return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
-    platform_dir(platform, &env, ["djforge", "djforge"])
+    platform_dir(platform, &env, [soundcraft_engine::APP_NAME, soundcraft_engine::APP_NAME])
 }
 
 fn legacy_config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
@@ -61,51 +61,198 @@ fn platform_dir(platform: Platform, env: &impl Fn(&str) -> Option<OsString>, [na
 /// What [`migrate`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Migration {
-    /// Nothing to do: the djforge folder exists already, or there is no SoundCraft folder.
+    /// Nothing to do: the settings were migrated before, or there is no SoundCraft folder.
     None,
-    /// The SoundCraft folder was copied: how many files, and the ones that couldn't be read
-    /// (a file another program holds open, say), which were left out.
-    Copied { files: usize, skipped: Vec<PathBuf> },
+    /// SoundCraft's settings were copied: how many files, the ones that couldn't be read (a file
+    /// another program holds open, a folder without access), which were left out, and the links,
+    /// which are never followed.
+    Copied { files: usize, skipped: Vec<PathBuf>, links: Vec<PathBuf> },
 }
 
-/// First run after the rebrand: when the settings folder `new` doesn't exist but SoundCraft's
-/// `old` does, copy `old` into it once, recursively, leaving `old` untouched. The copy is built
-/// beside `new` and renamed into place, so an interrupted copy leaves no half folder and the next
-/// start tries again; once `new` exists this does nothing. Links are not followed.
+/// Marks a settings folder whose SoundCraft settings were copied (or found nothing to copy).
+pub const MIGRATED_MARKER: &str = "migrated-from-soundcraft.txt";
+/// SoundCraft's autosave folder: only folders holding a session with unsaved work are copied.
+const AUTOSAVE: &str = "Autosave";
+/// Folders copied whole.
+const FOLDERS: &[&str] = &["Presets"];
+/// How often a step another program briefly holds (antivirus, the search indexer) is tried.
+const ATTEMPTS: u32 = 4;
+
+/// First run after the rebrand: copy what matters of SoundCraft's settings folder `old` into
+/// djforge's `new`, once, leaving `old` untouched. That is the settings files at its top level
+/// (`ui.json` and the like; not the logs), `Presets/`, and the autosave folders that still hold
+/// a session (unsaved work to recover), with their modification times, so recovery compares
+/// them as SoundCraft would. Old logs are not copied.
+///
+/// Done is recorded by [`MIGRATED_MARKER`] in `new`, not by `new` existing: a log or autosave
+/// folder made first doesn't stop the copy. The copy merges into `new` and never replaces a file
+/// there, so a second instance racing this one, or a retry after an interrupted copy, only fills
+/// in what is missing. Folders a staging copy of an earlier version left behind are removed.
 pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
-    if new.exists() || !std::fs::symlink_metadata(old).is_ok_and(|m| m.is_dir()) {
+    remove_staging(new);
+    if new.join(MIGRATED_MARKER).exists() || !std::fs::symlink_metadata(old).is_ok_and(|m| m.is_dir()) {
         return Ok(Migration::None);
     }
-    let parent = new.parent().ok_or_else(|| format!("{}: no parent folder", new.display()))?;
-    let name = new.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let staging = parent.join(format!(".{name}.migrating-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staging);
-    let mut files = 0;
-    let mut skipped = Vec::new();
-    let copied = copy_tree(old, &staging, &mut files, &mut skipped).and_then(|()| std::fs::rename(&staging, new));
-    if let Err(error) = copied {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(format!("copying the SoundCraft settings {} to {} failed: {error}", old.display(), new.display()));
+    let failed = |error: std::io::Error| format!("copying the SoundCraft settings {} to {} failed: {error}", old.display(), new.display());
+    std::fs::create_dir_all(new).map_err(failed)?;
+    let mut copy = Copy { files: 0, skipped: Vec::new(), links: Vec::new() };
+    match std::fs::read_dir(old) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let (name, source, target) = (entry.file_name(), entry.path(), new.join(entry.file_name()));
+                let Ok(kind) = entry.file_type() else {
+                    copy.skipped.push(source);
+                    continue;
+                };
+                let name = name.to_string_lossy();
+                if kind.is_symlink() {
+                    copy.links.push(source);
+                } else if kind.is_file() {
+                    if !is_log(&name) {
+                        copy.file(&source, &target);
+                    }
+                } else if FOLDERS.contains(&name.as_ref()) {
+                    copy.tree(&source, &target);
+                } else if name == AUTOSAVE {
+                    copy.autosaves(&source, &target);
+                }
+            }
+        }
+        Err(error) => return Err(failed(error)),
     }
-    Ok(Migration::Copied { files, skipped })
+    let note = format!("SoundCraft settings copied from {}\n", old.display());
+    // `create_new`: a racing instance's marker counts as done too.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(new.join(MIGRATED_MARKER)) {
+        Ok(mut f) => std::io::Write::write_all(&mut f, note.as_bytes()).map_err(failed)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(failed(error)),
+    }
+    Ok(Migration::Copied { files: copy.files, skipped: copy.skipped, links: copy.links })
 }
 
-fn copy_tree(from: &Path, to: &Path, files: &mut usize, skipped: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let (source, target) = (entry.path(), to.join(entry.file_name()));
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_tree(&source, &target, files, skipped)?;
-        } else if kind.is_file() {
-            match std::fs::copy(&source, &target) {
-                Ok(_) => *files += 1,
-                Err(_) => skipped.push(source),
+fn is_log(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".log") || lower.ends_with(".tmp")
+}
+
+/// Removes `.<name>.migrating-*` folders beside `new`, left by an interrupted earlier copy.
+fn remove_staging(new: &Path) {
+    let (Some(parent), Some(name)) = (new.parent(), new.file_name()) else { return };
+    let prefix = format!(".{}.migrating-", name.to_string_lossy());
+    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+struct Copy {
+    files: usize,
+    skipped: Vec<PathBuf>,
+    links: Vec<PathBuf>,
+}
+
+impl Copy {
+    /// Every file under `from`, merged into `to`.
+    fn tree(&mut self, from: &Path, to: &Path) {
+        let entries = match std::fs::read_dir(from) {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.skipped.push(from.to_path_buf());
+                return;
+            }
+        };
+        if std::fs::create_dir_all(to).is_err() {
+            self.skipped.push(from.to_path_buf());
+            return;
+        }
+        for entry in entries {
+            let Ok(entry) = entry else {
+                self.skipped.push(from.to_path_buf());
+                continue;
+            };
+            let (source, target) = (entry.path(), to.join(entry.file_name()));
+            match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => self.links.push(source),
+                Ok(kind) if kind.is_dir() => self.tree(&source, &target),
+                Ok(kind) if kind.is_file() => self.file(&source, &target),
+                Ok(_) => {}
+                Err(_) => self.skipped.push(source),
             }
         }
     }
-    Ok(())
+
+    /// The autosave folders under `from` that hold a session: unsaved work, not history.
+    fn autosaves(&mut self, from: &Path, to: &Path) {
+        let Ok(entries) = std::fs::read_dir(from) else {
+            self.skipped.push(from.to_path_buf());
+            return;
+        };
+        for entry in entries.flatten() {
+            let folder = entry.path();
+            let holds_session = ["session.scraft", "session.djforge"].iter().any(|f| folder.join(f).is_file());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) && holds_session {
+                self.tree(&folder, &to.join(entry.file_name()));
+            }
+        }
+    }
+
+    /// Copies `from` to `to` unless `to` exists, keeping its modification time. The bytes go to
+    /// a temporary file that is then linked into place, which fails rather than replace a file
+    /// that appeared meanwhile.
+    fn file(&mut self, from: &Path, to: &Path) {
+        if std::fs::symlink_metadata(to).is_ok() {
+            return;
+        }
+        match copy_file(from, to) {
+            Ok(true) => self.files += 1,
+            Ok(false) => {}
+            Err(_) => self.skipped.push(from.to_path_buf()),
+        }
+    }
+}
+
+/// Whether `from` was copied to `to` (false: `to` appeared meanwhile and was kept).
+fn copy_file(from: &Path, to: &Path) -> std::io::Result<bool> {
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = to.with_file_name(format!(".{name}.copy-{}", std::process::id()));
+    let result = (|| {
+        let modified = std::fs::metadata(from)?.modified()?;
+        retry(|| std::fs::copy(from, &tmp).map(|_| ()))?;
+        std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
+        match retry(|| std::fs::hard_link(&tmp, to)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            // No hard links on this volume: rename, still never over a file that exists.
+            Err(_) if !to.exists() => retry(|| std::fs::rename(&tmp, to)).map(|()| true),
+            Err(e) => Err(e),
+        }
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Runs `step`, again after a short wait while another program briefly holds the file
+/// (permission denied, sharing violations), up to [`ATTEMPTS`] times.
+fn retry(mut step: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut wait = std::time::Duration::from_millis(50);
+    let mut attempt = 1;
+    loop {
+        match step() {
+            Err(e) if attempt < ATTEMPTS && transient(&e) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// An error another program holding the file causes for a moment (Windows sharing and lock
+/// violations are raw OS errors 32 and 33).
+fn transient(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
 }
 
 /// Read bounded settings, recovering unreadable docking metadata independently of other settings.
@@ -365,30 +512,64 @@ mod config_tests {
         dir
     }
 
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
     #[test]
     fn the_soundcraft_settings_are_copied_once_and_left_untouched() {
         let base = migration_dir("once");
         let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
-        std::fs::create_dir_all(old.join("Autosave/Song 1")).unwrap();
-        std::fs::create_dir_all(old.join("Presets")).unwrap();
-        std::fs::write(old.join("ui.json"), r#"{"ui_scale": 1.5}"#).unwrap();
-        std::fs::write(old.join("Autosave/Song 1/session.scraft"), "{}").unwrap();
-        std::fs::write(old.join("Presets/Lead.json"), "preset").unwrap();
+        write(&old.join("ui.json"), r#"{"ui_scale": 1.5}"#);
+        write(&old.join("Presets/EQ/Lead.json"), "preset");
+        write(&old.join("Autosave/Song 1/session.scraft"), "{}");
+        write(&old.join("Autosave/Song 1/lock"), "");
+        write(&old.join("Autosave/Song 1/Audio Files/Take.wav"), "wav");
+        write(&old.join("Autosave/Empty/origin"), "history without a session");
+        write(&old.join("logs/soundcraft.log"), "old log");
+        write(&old.join("soundcraft.log"), "stray log");
+        // A log or autosave folder made before the migration ran doesn't stop it.
+        write(&new.join("logs/djforge.log"), "new log");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(old.join("Autosave/Song 1/session.scraft")).unwrap().set_modified(stamp).unwrap();
+        // An earlier version's interrupted staging copy is cleared away.
+        std::fs::create_dir_all(base.join(".djforge.migrating-123/Presets")).unwrap();
 
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 3, skipped: vec![] }));
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 5, skipped: vec![], links: vec![] }));
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#);
-        assert_eq!(std::fs::read_to_string(new.join("Autosave/Song 1/session.scraft")).unwrap(), "{}");
-        assert_eq!(std::fs::read_to_string(new.join("Presets/Lead.json")).unwrap(), "preset");
+        assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
+        assert_eq!(std::fs::read_to_string(new.join("Autosave/Song 1/Audio Files/Take.wav")).unwrap(), "wav");
+        assert!(new.join("Autosave/Song 1/lock").is_file());
+        let modified = std::fs::metadata(new.join("Autosave/Song 1/session.scraft")).unwrap().modified().unwrap();
+        assert_eq!(modified, stamp, "copies keep their modification time");
+        assert!(!new.join("Autosave/Empty").exists(), "autosave history isn't copied");
+        assert!(!new.join("logs/soundcraft.log").exists() && !new.join("soundcraft.log").exists(), "old logs aren't copied");
+        assert_eq!(std::fs::read_to_string(new.join("logs/djforge.log")).unwrap(), "new log");
+        assert!(new.join(MIGRATED_MARKER).is_file());
+        assert!(!base.join(".djforge.migrating-123").exists());
         assert_eq!(std::fs::read_to_string(old.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#, "the old folder stays");
-        assert!(old.join("Autosave/Song 1/session.scraft").is_file());
-        let left: Vec<_> = std::fs::read_dir(&base).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(left.len(), 2, "no staging folder left behind: {left:?}");
+        assert!(old.join("logs/soundcraft.log").is_file() && old.join("Autosave/Song 1/session.scraft").is_file());
 
         // Idempotent: djforge's own changes are never overwritten by a second copy.
         std::fs::write(new.join("ui.json"), "{}").unwrap();
         std::fs::write(old.join("ui.json"), r#"{"ui_scale": 2.0}"#).unwrap();
         assert_eq!(migrate(&new, &old), Ok(Migration::None));
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unfinished_copy_resumes_without_replacing_what_is_there() {
+        let base = migration_dir("resume");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&old.join("ui.json"), "old settings");
+        write(&old.join("Presets/EQ/Lead.json"), "preset");
+        // Another instance (or an interrupted run) already wrote ui.json, but no marker.
+        write(&new.join("ui.json"), "newer settings");
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![] }));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "newer settings");
+        assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -401,6 +582,20 @@ mod config_tests {
         std::fs::write(&old, "a file, not a folder").unwrap();
         assert_eq!(migrate(&new, &old), Ok(Migration::None));
         assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_reported_and_not_followed() {
+        let base = migration_dir("links");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&base.join("elsewhere/secret.json"), "not ours");
+        write(&old.join("ui.json"), "{}");
+        std::os::unix::fs::symlink(base.join("elsewhere/secret.json"), old.join("Presets.json")).unwrap();
+        let Ok(Migration::Copied { links, .. }) = migrate(&new, &old) else { panic!("copied") };
+        assert_eq!(links, vec![old.join("Presets.json")]);
+        assert!(!new.join("Presets.json").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

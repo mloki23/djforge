@@ -20,7 +20,7 @@ pub const LEGACY_SESSION_EXTENSION: &str = "scraft";
 /// Every extension a session file may have, the native one first.
 pub const SESSION_EXTENSIONS: &[&str] = &[SESSION_EXTENSION, LEGACY_SESSION_EXTENSION];
 
-/// True when `path` names a session file (`.djforge` or `.djforge`, any case).
+/// True when `path` names a session file (`.djforge` or `.scraft`, any case).
 pub fn is_session_path(path: &str) -> bool {
     std::path::Path::new(path).extension().and_then(|x| x.to_str()).is_some_and(|x| SESSION_EXTENSIONS.iter().any(|e| x.eq_ignore_ascii_case(e)))
 }

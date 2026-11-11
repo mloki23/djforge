@@ -138,10 +138,13 @@ fn migrate_settings() -> Option<String> {
     let (new, old) = (config::config_dir()?, config::legacy_config_dir()?);
     match config::migrate(&new, &old) {
         Ok(config::Migration::None) => None,
-        Ok(config::Migration::Copied { files, skipped }) => {
+        Ok(config::Migration::Copied { files, skipped, links }) => {
             log::info!("copied {files} files of the SoundCraft settings {} to {}", old.display(), new.display());
             for file in &skipped {
                 log::warn!("not copied from the SoundCraft settings (couldn't be read): {}", file.display());
+            }
+            for link in &links {
+                log::warn!("not copied from the SoundCraft settings (a link, not followed): {}", link.display());
             }
             let left_out = if skipped.is_empty() { String::new() } else { format!(" ({} files couldn't be read; see the log)", skipped.len()) };
             Some(format!("Your SoundCraft settings were copied to {}{left_out}. The SoundCraft folder is unchanged.", new.display()))
@@ -192,7 +195,10 @@ fn services() -> Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
-                "session.open" => d.add_filter(format!("{APP_NAME} Session"), soundcraft_engine::model::SESSION_EXTENSIONS),
+                // Open and Import Session Data read `.djforge` and SoundCraft's `.scraft`.
+                "session.open" | "file.import_session_data" => {
+                    d.add_filter(format!("{APP_NAME} Session"), soundcraft_engine::model::SESSION_EXTENSIONS)
+                }
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(
                     "Audio",
@@ -311,9 +317,11 @@ fn main() -> eframe::Result {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = SoundApp::new(engine, player, services());
-            app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
+            // Runs without preferences (agents' test runs) keep out of the settings folder entirely.
+            let settings = if prefs_enabled() { config_dir() } else { None };
+            app.autosave_dir = settings.as_ref().map(|d| d.join("Autosave"));
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
-            app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
+            app.preset_dir = settings.map(|d| d.join("Presets"));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
             if let Some(note) = migrated {
