@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  djforge MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
+
+    wix build djforge.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -d DocDir=... -o out.msi
+
+  djforge's own identity: its UpgradeCode, component GUIDs and ProgIds are not SoundCraft's, so
+  the two install side by side and neither upgrades nor removes the other.
+
+  Per-machine install into Program Files, a Start Menu shortcut, `.djforge` (and `.scraft`) sessions owned by
+  djforge, and djforge offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
+  (without taking over the user's default player for them).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="djforge"
+      Manufacturer="the djforge contributors"
+      Version="$(var.Version)"
+      UpgradeCode="EBB5FFBA-5FE3-4819-A2ED-C90C7DBE227F"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="djforge — DJ-first DAW" Manufacturer="the djforge contributors" />
+    <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
+         (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of djforge is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="DjforgeIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="DjforgeIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/mloki23/djforge" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/mloki23/djforge/releases" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/mloki23/djforge/issues" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="djforge" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="djforge" Level="1">
+      <ComponentGroupRef Id="DjforgeFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="DjforgeFiles" Directory="INSTALLFOLDER">
+      <Component Id="DjforgeApp" Guid="4FB9BEBE-CCD3-42B5-A0AA-44DB3EAFEAEA">
+        <File Id="DjforgeExe" Source="$(var.BinDir)\djforge.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="djforge"
+              Description="djforge — DJ-first DAW" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+              Icon="DjforgeIcon.ico" IconIndex="0" />
+        </File>
+
+        <!-- .djforge: djforge's own session format (and SoundCraft's .scraft, which it still opens);
+             djforge is their default app. -->
+        <ProgId Id="djforge.Session" Description="djforge Session" Icon="DjforgeExe" IconIndex="0">
+          <Extension Id="djforge" ContentType="application/x-soundcraft-session">
+            <Verb Id="open" Command="Open" TargetFile="DjforgeExe" Argument="&quot;%1&quot;" />
+          </Extension>
+          <Extension Id="scraft" ContentType="application/x-soundcraft-session">
+            <Verb Id="open" Command="Open" TargetFile="DjforgeExe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+        <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
+             as the default. -->
+        <ProgId Id="djforge.Audio" Description="Audio File" Icon="DjforgeExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\djforge.Audio\shell\open\command" Value="&quot;[#DjforgeExe]&quot; &quot;%1&quot;" Type="string" />
+        <ProgId Id="djforge.Midi" Description="MIDI File" Icon="DjforgeExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\djforge.Midi\shell\open\command" Value="&quot;[#DjforgeExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="djforge.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="djforge.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="djforge.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="djforge.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="djforge.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="djforge.Midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="djforge.Midi" Value="" Type="string" />
+
+        <!-- "Open with" app list and the Run dialog (Win+R "djforge"). -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe" Name="FriendlyAppName" Value="djforge" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\shell\open\command" Value="&quot;[#DjforgeExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".djforge" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".scraft" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".aiff" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".flac" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".mp3" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".mid" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\djforge.exe\SupportedTypes" Name=".midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\djforge.exe" Value="[#DjforgeExe]" Type="string" />
+      </Component>
+
+      <Component Id="DjforgeCli" Guid="04271147-1411-454C-A067-FA8AA34E4560">
+        <File Id="DjforgeCliExe" Source="$(var.BinDir)\djforge-cli.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- The licences and notices (djforge's, and SoundCraft's that it keeps) ship with it. -->
+      <Component Id="DjforgeNotices" Guid="902B7894-4BFB-49B9-8137-5421713702FB">
+        <File Id="LicenseMit" Source="$(var.DocDir)\LICENSE-MIT" KeyPath="yes" />
+        <File Id="LicenseApache" Source="$(var.DocDir)\LICENSE-APACHE" />
+        <File Id="Notice" Source="$(var.DocDir)\NOTICE" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

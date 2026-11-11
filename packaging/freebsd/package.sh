@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build and package djforge for FreeBSD:
 #
-#   $DIST/soundcraft-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
-#       soundcraft-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
-#       share/metainfo, share/doc/soundcraft}
+#   $DIST/djforge-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
+#       djforge-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
+#       share/metainfo, share/doc/djforge}
 #
 # Install by copying the tree's contents into /usr/local, e.g.
-#   tar -xzf soundcraft-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
+#   tar -xzf djforge-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
 #
 # Usage: packaging/freebsd/package.sh [--skip-build]
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 LINUX="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.soundcraft
+APP_ID=io.github.mloki23.djforge
 
 SKIP_BUILD=0
 while [ $# -gt 0 ]; do
@@ -34,7 +34,7 @@ case "$(uname -m)" in
   arm64 | aarch64) ARCH=aarch64 ;;
   *) echo "unsupported architecture $(uname -m)" >&2; exit 2 ;;
 esac
-BASENAME="soundcraft-$VERSION-freebsd-$ARCH"
+BASENAME="djforge-$VERSION-freebsd-$ARCH"
 
 echo "==> djforge $VERSION for FreeBSD $ARCH"
 
@@ -48,7 +48,7 @@ rm -rf "$WORK"
 
 # ---- stage a /usr/local-style tree ---------------------------------------------------------------
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/mime/packages" "$STAGE/share/metainfo" \
-  "$STAGE/share/icons" "$STAGE/share/doc/soundcraft"
+  "$STAGE/share/icons" "$STAGE/share/doc/djforge"
 install -m 755 "$BIN/djforge" "$BIN/djforge-cli" "$STAGE/bin/"
 strip "$STAGE/bin/djforge" "$STAGE/bin/djforge-cli" 2>/dev/null || true
 # The desktop entry, MIME type and metainfo are the freedesktop files the Linux packages use.
@@ -57,7 +57,7 @@ install -m 644 "$LINUX/$APP_ID.mime.xml" "$STAGE/share/mime/packages/$APP_ID.xml
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
   "$LINUX/$APP_ID.metainfo.xml.in" >"$STAGE/share/metainfo/$APP_ID.metainfo.xml"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/share/icons/"
-copy_docs "$STAGE/share/doc/soundcraft"
+copy_docs "$STAGE/share/doc/djforge"
 
 # ---- .tar.gz -------------------------------------------------------------------------------------
 tar -C "$WORK" -czf "$DIST/$BASENAME.tar.gz" "$BASENAME"

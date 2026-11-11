@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "assets" / "app-icon"
-APP_ID = "ai.storyteller.soundcraft"  # Linux app id: the hicolor file names follow it.
+APP_ID = "io.github.mloki23.djforge"  # Linux app id: the hicolor file names follow it.
 
 BG = "#111317"
 FG = "#f8d200"

@@ -1,49 +1,59 @@
 #!/usr/bin/env python3
 """Regenerate background.tiff and dmg-layout.DS_Store for the macOS DMG window (see README.md here).
 
-Needs resvg on PATH and:
+Needs:
     pip install 'pillow>=12' ds_store==1.3.3 mac_alias==2.2.3
 
-Runs on any OS, no Mac needed. Both outputs come from this script alone, so they carry nothing
-from the machine that made them: no local paths, user or disk names, dates or volume UUIDs.
+Runs on any OS, no Mac needed. The background is drawn here with Pillow (djforge's dark field,
+a light band under the two icons so Finder's black labels stay readable, and the djforge icon
+from tools/icon/make_icon.py), so no SVG renderer is needed. Both outputs come from this script
+alone, so they carry nothing from the machine that made them: no local paths, user or disk
+names, dates or volume UUIDs.
 
     python3 packaging/macos/dmg/generate.py
 """
 
 import datetime
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 
 from ds_store import DSStore
 from mac_alias import Alias, TargetInfo, VolumeInfo
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools", "icon"))
+import make_icon  # noqa: E402  (djforge's icon geometry and colours)
 
 # Keep in sync with package.sh (volume name) and README.md (layout).
-VOLUME = "SoundCraft"
+VOLUME = "djforge"
 WIDTH, HEIGHT = 660, 400  # window content, pt; the background's 1x size
 TITLE_BAR = 32
 ICON_SIZE = 128
 PALETTE = 16  # colours in background.tiff
-ICONS = {"SoundCraft.app": (326, 205), "Applications": (574, 205)}
+ICONS = {"djforge.app": (326, 205), "Applications": (574, 205)}
 # A fixed date for the alias and the colour profile. Finder never matches it against the image
 # (each build is a new volume): it finds the background by volume name and path.
 FIXED_DATE = datetime.datetime(2026, 10, 8, tzinfo=datetime.timezone.utc)
+BAND = "#e6e8ec"  # light band behind the icons and their labels
 
 
-def render(svg, width, out):
-    # The SVG's text is already outlined and no fonts are loaded, so every machine draws the
-    # same pixels.
-    subprocess.run(
-        ["resvg", "--skip-system-fonts", "-w", str(width), svg, out],
-        check=True,
-    )
-    with Image.open(out) as im:
-        return im.convert("RGB")
+def render(scale):
+    """The background at `scale` (1 or 2): the dark field, the band and the djforge icon."""
+    w, h = WIDTH * scale, HEIGHT * scale
+    im = Image.new("RGB", (w, h), make_icon.BG)
+    d = ImageDraw.Draw(im)
+    # The band: from above the icons to below their labels, rounded, inset from the edges.
+    top, bottom = (205 - ICON_SIZE // 2 - 22) * scale, (205 + ICON_SIZE // 2 + 46) * scale
+    d.rounded_rectangle((240 * scale, top, 648 * scale, bottom), radius=24 * scale, fill=BAND)
+    # An arrow from the app to Applications, dark on the band.
+    y = 205 * scale
+    d.line((410 * scale, y, 488 * scale, y), fill=make_icon.BG, width=6 * scale)
+    d.polygon([(500 * scale, y), (484 * scale, y - 12 * scale), (484 * scale, y + 12 * scale)], fill=make_icon.BG)
+    # The djforge icon on the left, on the dark field.
+    icon = make_icon.tile(112 * scale)
+    im.paste(icon, (48 * scale, (h - icon.height) // 2), icon)
+    return im
 
 
 def quantize(im):
@@ -61,14 +71,11 @@ def srgb_profile():
     return bytes(icc)
 
 
-def write_tiff(svg, out):
+def write_tiff(out):
     """1x (72 dpi) and 2x (144 dpi) in one TIFF, as `tiffutil -cathidpicheck` writes them."""
-    with tempfile.TemporaryDirectory() as tmp:
-        one, two = (
-            quantize(render(svg, WIDTH * s, os.path.join(tmp, f"{s}x.png"))) for s in (1, 2)
-        )
+    one, two = (quantize(render(s)) for s in (1, 2))
     two.encoderinfo = {"dpi": (144, 144)}  # the rest as the first page
-    # Opaque 16-colour palette, Deflate: the artwork is three inks plus antialiasing, and a palette
+    # Opaque 16-colour palette, Deflate: the artwork is a few flat colours plus antialiasing, and a palette
     # keeps the file under ~100 KB (repository assets must stay small). As PhotoCraft's.
     one.save(
         out,
@@ -148,9 +155,7 @@ def write_ds_store(out):
 
 
 def main():
-    if not shutil.which("resvg"):
-        sys.exit("error: resvg not found (brew install resvg / cargo install resvg --locked)")
-    write_tiff(os.path.join(HERE, "background.svg"), os.path.join(HERE, "background.tiff"))
+    write_tiff(os.path.join(HERE, "background.tiff"))
     write_ds_store(os.path.join(HERE, "dmg-layout.DS_Store"))
 
 

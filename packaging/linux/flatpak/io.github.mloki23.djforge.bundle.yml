@@ -1,7 +1,7 @@
 # Flatpak manifest for the single-file bundle attached to every GitHub release
-# (soundcraft-<version>-linux-<arch>.flatpak). Build it with packaging/linux/flatpak-bundle.sh.
+# (djforge-<version>-linux-<arch>.flatpak). Build it with packaging/linux/flatpak-bundle.sh.
 #
-# It repackages the release's own Linux tarball (soundcraft-<version>-linux-<arch>.tar.gz,
+# It repackages the release's own Linux tarball (djforge-<version>-linux-<arch>.tar.gz,
 # built on Ubuntu 22.04 by package.sh) instead of compiling Rust inside flatpak-builder: no
 # network and no vendored crate sources during the build, a few seconds instead of 20+ minutes,
 # and byte-for-byte the same binaries as the AppImage/deb/rpm. The script unpacks the tarball
@@ -10,13 +10,13 @@
 # (plus alsa-lib's PulseAudio plugin), and the GPU driver comes from its
 # org.freedesktop.Platform.GL extension.
 #
-# ai.storyteller.soundcraft.yml (same directory) is the from-source manifest for Flathub. Keep
+# io.github.mloki23.djforge.yml (same directory) is the from-source manifest for Flathub. Keep
 # runtime-version, finish-args and add-extensions identical in both (packaging-lint checks this).
-id: ai.storyteller.soundcraft
+id: io.github.mloki23.djforge
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
-command: soundcraft
+command: djforge
 finish-args:
   # Display: Wayland first; X11 only when no Wayland compositor is running.
   - --socket=wayland
@@ -29,7 +29,7 @@ finish-args:
   # PulseAudio plugin to this socket, which PipeWire's pulse server provides on modern desktops
   # (and PulseAudio itself on older ones). Deliberately not granted: --device=all (raw /dev/snd
   # for direct ALSA hardware access, which would bypass the sound server) and JACK, which
-  # SoundCraft doesn't use (cpal's jack feature is off; there is no live MIDI I/O either).
+  # djforge doesn't use (cpal's jack feature is off; there is no live MIDI I/O either).
   - --socket=pulseaudio
   # Open/Save dialogs use the file-chooser portal (rfd) and drag-and-drop the document portal,
   # so broad filesystem access isn't needed. Music is granted for sessions and their
@@ -55,17 +55,17 @@ add-extensions:
     subdirectories: true
     no-autodownload: true
 modules:
-  - name: soundcraft
+  - name: djforge
     buildsystem: simple
     build-commands:
-      - install -Dm755 bin/soundcraft /app/bin/soundcraft
+      - install -Dm755 bin/djforge /app/bin/djforge
       - install -Dm755 bin/djforge-cli /app/bin/djforge-cli
-      - install -Dm644 share/applications/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
+      - install -Dm644 share/applications/io.github.mloki23.djforge.desktop /app/share/applications/io.github.mloki23.djforge.desktop
       # Session files; the runtime's shared-mime-info already knows WAV, AIFF, FLAC, MP3 and MIDI.
-      - install -Dm644 share/mime/packages/ai.storyteller.soundcraft.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml
+      - install -Dm644 share/mime/packages/io.github.mloki23.djforge.xml /app/share/mime/packages/io.github.mloki23.djforge.xml
       # Already has the release's version and date substituted by package.sh.
-      - install -Dm644 share/metainfo/ai.storyteller.soundcraft.metainfo.xml /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml
-      - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/soundcraft /app/share/doc/
+      - install -Dm644 share/metainfo/io.github.mloki23.djforge.metainfo.xml /app/share/metainfo/io.github.mloki23.djforge.metainfo.xml
+      - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/djforge /app/share/doc/
       # Mount point for the plugin extensions (add-extensions).
       - install -d /app/extensions/Plugins
     sources:

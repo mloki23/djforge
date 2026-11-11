@@ -16,7 +16,7 @@ fn main() {
     res.set_icon("../../assets/app-icon/djforge.ico")
         .set("ProductName", "djforge")
         .set("FileDescription", "djforge — DJ-first DAW")
-        .set("CompanyName", "Learning Machines LLC")
+        .set("CompanyName", "the djforge contributors")
         .set("LegalCopyright", "Copyright (c) the djforge and SoundCraft authors. MIT OR Apache-2.0.")
         .set("OriginalFilename", "djforge.exe")
         .set("InternalName", "djforge");

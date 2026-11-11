@@ -228,7 +228,7 @@ fn app_icon() -> Option<egui::IconData> {
     #[cfg(target_os = "macos")]
     let png: &[u8] = include_bytes!("../../../assets/app-icon/djforge-macos-512.png");
     #[cfg(not(target_os = "macos"))]
-    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.soundcraft.png");
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/io.github.mloki23.djforge.png");
     eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
 }
 
@@ -295,7 +295,7 @@ fn main() -> eframe::Result {
             .with_maximized(prefs.window_maximized)
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("ai.storyteller.soundcraft"),
+            .with_app_id("io.github.mloki23.djforge"),
         ..Default::default()
     };
     if let Some(icon) = app_icon() {

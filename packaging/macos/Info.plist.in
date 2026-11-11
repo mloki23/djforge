@@ -11,9 +11,9 @@
   <key>CFBundleName</key>
   <string>djforge</string>
   <key>CFBundleExecutable</key>
-  <string>SoundCraft</string>
+  <string>djforge</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.storyteller.soundcraft</string>
+  <string>io.github.mloki23.djforge</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>
@@ -24,12 +24,12 @@
   <string>@SHORT_VERSION@</string>
   <key>CFBundleVersion</key>
   <string>@SHORT_VERSION@</string>
-  <key>SoundCraftVersion</key>
+  <key>DjforgeVersion</key>
   <string>@VERSION@</string>
-  <key>SoundCraftBuildCommit</key>
+  <key>DjforgeBuildCommit</key>
   <string>@BUILD_SHA@</string>
   <key>CFBundleIconFile</key>
-  <string>SoundCraft</string>
+  <string>djforge</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.music</string>
   <!-- Must match MACOSX_DEPLOYMENT_TARGET in package.sh. Big Sur is the first release on
@@ -53,7 +53,7 @@
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
-      <string>ai.storyteller.soundcraft.session</string>
+      <string>io.github.mloki23.djforge.session</string>
       <key>UTTypeDescription</key>
       <string>djforge Session</string>
       <key>UTTypeConformsTo</key>
@@ -62,7 +62,7 @@
         <string>public.content</string>
       </array>
       <key>UTTypeIconFile</key>
-      <string>SoundCraft</string>
+      <string>djforge</string>
       <key>UTTypeTagSpecification</key>
       <dict>
         <key>public.filename-extension</key>
@@ -83,9 +83,9 @@
       <key>LSHandlerRank</key>
       <string>Owner</string>
       <key>CFBundleTypeIconFile</key>
-      <string>SoundCraft</string>
+      <string>djforge</string>
       <key>LSItemContentTypes</key>
-      <array><string>ai.storyteller.soundcraft.session</string></array>
+      <array><string>io.github.mloki23.djforge.session</string></array>
     </dict>
     <!-- Audio and MIDI: offered under "Open With" (imported into a session), never taking over
          the user's default player. -->

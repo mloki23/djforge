@@ -35,7 +35,7 @@ SoundCraft's placeholder nightingale icon.
 | `djforge-macos-512.png` | Runtime window/Dock icon on macOS (Apple grid margin) |
 | `djforge.icns` | macOS bundle icon (16–1024 px) |
 | `djforge.ico` | Windows icon (16–256 px), embedded in `djforge.exe` and used by the MSI |
-| `hicolor/<size>x<size>/apps/ai.storyteller.soundcraft.png` | Linux/FreeBSD icon theme, 16–512 px, plus `scalable/` (named after the Linux app id, which is unchanged) |
+| `hicolor/<size>x<size>/apps/io.github.mloki23.djforge.png` | Linux/FreeBSD icon theme, 16–512 px, plus `scalable/` (named after the Linux app id, which is unchanged) |
 
 Regenerate everything with `python tools/icon/make_icon.py` (or `packaging/icons.sh`). It needs
 Python 3 and Pillow, and nothing else: the shapes are defined once in the script, which writes the

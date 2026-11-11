@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build and package djforge for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
 #
-#   $DIST/soundcraft-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
-#   $DIST/soundcraft-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
-#   $DIST/soundcraft-<version>-linux-<arch>.deb       Debian, Ubuntu, Mint, Pop!_OS, ...
-#   $DIST/soundcraft-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
-#   $DIST/soundcraft-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
+#   $DIST/djforge-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
+#   $DIST/djforge-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
+#   $DIST/djforge-<version>-linux-<arch>.deb       Debian, Ubuntu, Mint, Pop!_OS, ...
+#   $DIST/djforge-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
+#   $DIST/djforge-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
 #
 # Usage: packaging/linux/package.sh [--skip-build] [--formats "appimage deb rpm tar"]
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 HERE="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.soundcraft
+APP_ID=io.github.mloki23.djforge
 
 SKIP_BUILD=0
 FORMATS="appimage deb rpm tar"
@@ -41,8 +41,8 @@ case "$ARCH" in
   riscv64) DEB_ARCH=riscv64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-export SOUNDCRAFT_MAINTAINER="${SOUNDCRAFT_MAINTAINER:-SoundCraft maintainers <soundcraft@storyteller.ai>}"
-BASENAME="soundcraft-$VERSION-linux-$ARCH"
+export SOUNDCRAFT_MAINTAINER="${SOUNDCRAFT_MAINTAINER:-djforge contributors <noreply@github.com>}"
+BASENAME="djforge-$VERSION-linux-$ARCH"
 
 echo "==> djforge $VERSION for Linux $ARCH ($FORMATS)"
 
@@ -69,8 +69,8 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
   "$HERE/$APP_ID.metainfo.xml.in" >"$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
 mkdir -p "$STAGE/usr/share/icons"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
-mkdir -p "$STAGE/usr/share/doc/soundcraft"
-copy_docs "$STAGE/usr/share/doc/soundcraft"
+mkdir -p "$STAGE/usr/share/doc/djforge"
+copy_docs "$STAGE/usr/share/doc/djforge"
 
 if command -v desktop-file-validate >/dev/null; then
   desktop-file-validate "$STAGE/usr/share/applications/$APP_ID.desktop"
@@ -103,7 +103,7 @@ fi
 
 # ---- AppImage -----------------------------------------------------------------------------------
 if has appimage; then
-  APPDIR="$WORK/SoundCraft.AppDir"
+  APPDIR="$WORK/djforge.AppDir"
   cp -R "$STAGE" "$APPDIR"
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
   ln -s usr/bin/djforge "$APPDIR/AppRun"
@@ -130,8 +130,8 @@ if has appimage; then
   # fetch only the blocks that changed in a newer release, through the .zsync published next to
   # each AppImage on GitHub Releases. `latest` is the newest published release that is not a
   # pre-release. A fork's builds point at its own releases through GITHUB_REPOSITORY.
-  REPO="${GITHUB_REPOSITORY:-storytold/soundcraft}"
-  UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|soundcraft-*-linux-$ARCH.AppImage.zsync"
+  REPO="${GITHUB_REPOSITORY:-mloki23/djforge}"
+  UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|djforge-*-linux-$ARCH.AppImage.zsync"
   # Extract-and-run: works without FUSE (containers, CI). The output embeds the static runtime,
   # so users don't need libfuse2 either. With zsyncmake on the host (CI installs the zsync
   # package) appimagetool also writes the .zsync, into its working directory, hence the cd.

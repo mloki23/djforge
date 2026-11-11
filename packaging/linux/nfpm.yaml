@@ -3,7 +3,7 @@
 # exports VERSION and NFPM_ARCH.
 #
 #   nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/release/
-name: soundcraft
+name: djforge
 arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
@@ -13,13 +13,14 @@ release: 1
 section: sound
 priority: optional
 maintainer: ${SOUNDCRAFT_MAINTAINER}
-vendor: Learning Machines LLC
-homepage: https://getartcraft.com/apps/soundcraft
+vendor: the djforge contributors
+homepage: https://github.com/mloki23/djforge
 license: MIT OR Apache-2.0
 description: |-
-  Open-source, native digital audio workstation. Record, edit and mix
-  multitrack audio and MIDI in Edit and Mix windows; built-in EQ, dynamics,
-  reverb, delay and instruments; imports WAV, AIFF, FLAC, MP3 and MIDI.
+  A DJ-first digital audio workstation, based on SoundCraft. Build, prep and
+  play DJ sets with a full multitrack editor and mixer underneath; built-in
+  EQ, dynamics, reverb, delay and instruments; imports WAV, AIFF, FLAC, MP3
+  and MIDI.
   Includes djforge-cli, a headless editor, bounce tool and MCP server.
 
 # The app links glibc, libgcc_s and ALSA (libasound, for audio I/O through cpal; PulseAudio and

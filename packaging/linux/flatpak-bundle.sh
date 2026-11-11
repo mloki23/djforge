@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Repackage a SoundCraft Linux tarball as a single-file Flatpak bundle:
+# Repackage a djforge Linux tarball as a single-file Flatpak bundle:
 #
-#   $DIST/soundcraft-<version>-linux-<arch>.flatpak
+#   $DIST/djforge-<version>-linux-<arch>.flatpak
 #
 # Usage: packaging/linux/flatpak-bundle.sh [--no-test] [TARBALL]
 #
-# TARBALL defaults to $DIST/soundcraft-<version>-linux-<arch>.tar.gz from package.sh. The bundle
+# TARBALL defaults to $DIST/djforge-<version>-linux-<arch>.tar.gz from package.sh. The bundle
 # is built for the host architecture (x86_64 or aarch64), which must match the tarball's.
 # Needs flatpak, flatpak-builder and the SVG pixbuf loader (librsvg2-common) for the host's
 # `appstreamcli compose`; the freedesktop runtime and SDK named in the manifest are
 # installed per-user from Flathub. Unless --no-test, the bundle is then installed per-user and
 # `djforge-cli --version` is run inside the sandbox as a smoke test.
-# Manifest: packaging/linux/flatpak/ai.storyteller.soundcraft.bundle.yml.
+# Manifest: packaging/linux/flatpak/io.github.mloki23.djforge.bundle.yml.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 HERE="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.soundcraft
+APP_ID=io.github.mloki23.djforge
 FLATHUB=https://dl.flathub.org/repo/flathub.flatpakrepo
 
 TEST=1
@@ -36,14 +36,14 @@ case "$ARCH" in
   aarch64 | arm64) ARCH=aarch64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-BASENAME="soundcraft-$VERSION-linux-$ARCH"
+BASENAME="djforge-$VERSION-linux-$ARCH"
 TARBALL="${TARBALL:-$DIST/$BASENAME.tar.gz}"
 [ -f "$TARBALL" ] || { echo "error: $TARBALL not found (run packaging/linux/package.sh --formats tar first)" >&2; exit 1; }
 for tool in flatpak flatpak-builder; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found (apt install flatpak flatpak-builder librsvg2-common)" >&2; exit 1; }
 done
 
-echo "==> SoundCraft $VERSION Flatpak bundle for $ARCH from $(basename "$TARBALL")"
+echo "==> djforge $VERSION Flatpak bundle for $ARCH from $(basename "$TARBALL")"
 
 WORK="$CARGO_TARGET_DIR/flatpak-bundle"
 rm -rf "$WORK"
