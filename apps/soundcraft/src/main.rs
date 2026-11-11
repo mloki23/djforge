@@ -138,7 +138,7 @@ fn migrate_settings() -> Option<String> {
     let (new, old) = (config::config_dir()?, config::legacy_config_dir()?);
     match config::migrate(&new, &old) {
         Ok(config::Migration::None) => None,
-        Ok(config::Migration::Copied { files, skipped, links }) => {
+        Ok(config::Migration::Copied { files, skipped, links, finished }) => {
             log::info!("copied {files} files of the SoundCraft settings {} to {}", old.display(), new.display());
             for file in &skipped {
                 log::warn!("not copied from the SoundCraft settings (couldn't be read): {}", file.display());
@@ -146,7 +146,9 @@ fn migrate_settings() -> Option<String> {
             for link in &links {
                 log::warn!("not copied from the SoundCraft settings (a link, not followed): {}", link.display());
             }
-            let left_out = if skipped.is_empty() { String::new() } else { format!(" ({} files couldn't be read; see the log)", skipped.len()) };
+            let again = if finished { "" } else { "; they will be tried again next start" };
+            let left_out =
+                if skipped.is_empty() { String::new() } else { format!(" ({} files couldn't be read{again}; see the log)", skipped.len()) };
             Some(format!("Your SoundCraft settings were copied to {}{left_out}. The SoundCraft folder is unchanged.", new.display()))
         }
         Err(error) => {

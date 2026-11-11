@@ -27,7 +27,8 @@ permissions:
 jobs:
   windows-arm64:
     # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
-    uses: storytold/craft-common-actions/.github/workflows/windows-arm64.yml@main
+    # Upstream workflow pinned to a commit (main on 2026-11-12). Vendor it into this repo before any signed release.
+    uses: storytold/craft-common-actions/.github/workflows/windows-arm64.yml@15058dc71e9de4bb84fcc43b514d3c1844ebf515
     with:
       app-name: djforge
       app-dir: djforge

@@ -65,8 +65,9 @@ pub enum Migration {
     None,
     /// SoundCraft's settings were copied: how many files, the ones that couldn't be read (a file
     /// another program holds open, a folder without access), which were left out, and the links,
-    /// which are never followed.
-    Copied { files: usize, skipped: Vec<PathBuf>, links: Vec<PathBuf> },
+    /// which are never followed. `finished` is false when a settings file at the top level was
+    /// left out: no [`MIGRATED_MARKER`] is written, so the next start tries again.
+    Copied { files: usize, skipped: Vec<PathBuf>, links: Vec<PathBuf>, finished: bool },
 }
 
 /// Marks a settings folder whose SoundCraft settings were copied (or found nothing to copy).
@@ -87,21 +88,30 @@ const ATTEMPTS: u32 = 4;
 /// Done is recorded by [`MIGRATED_MARKER`] in `new`, not by `new` existing: a log or autosave
 /// folder made first doesn't stop the copy. The copy merges into `new` and never replaces a file
 /// there, so a second instance racing this one, or a retry after an interrupted copy, only fills
-/// in what is missing. Folders a staging copy of an earlier version left behind are removed.
+/// in what is missing. Folders a staging copy of an earlier version left behind are removed, and
+/// so are the temporary files an interrupted copy left in `new`.
 pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
+    migrate_with(new, old, true)
+}
+
+/// [`migrate`]; `hard_links` false copies as on a volume without hard links (tests).
+fn migrate_with(new: &Path, old: &Path, hard_links: bool) -> Result<Migration, String> {
     remove_staging(new);
     if new.join(MIGRATED_MARKER).exists() || !std::fs::symlink_metadata(old).is_ok_and(|m| m.is_dir()) {
         return Ok(Migration::None);
     }
     let failed = |error: std::io::Error| format!("copying the SoundCraft settings {} to {} failed: {error}", old.display(), new.display());
     std::fs::create_dir_all(new).map_err(failed)?;
-    let mut copy = Copy { files: 0, skipped: Vec::new(), links: Vec::new() };
+    remove_copy_temps(new);
+    let mut copy = Copy { files: 0, skipped: Vec::new(), links: Vec::new(), hard_links };
+    let mut finished = true;
     match std::fs::read_dir(old) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let (name, source, target) = (entry.file_name(), entry.path(), new.join(entry.file_name()));
                 let Ok(kind) = entry.file_type() else {
                     copy.skipped.push(source);
+                    finished = false;
                     continue;
                 };
                 let name = name.to_string_lossy();
@@ -109,7 +119,9 @@ pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
                     copy.links.push(source);
                 } else if kind.is_file() {
                     if !is_log(&name) {
+                        let skipped = copy.skipped.len();
                         copy.file(&source, &target);
+                        finished &= copy.skipped.len() == skipped;
                     }
                 } else if FOLDERS.contains(&name.as_ref()) {
                     copy.tree(&source, &target);
@@ -120,6 +132,9 @@ pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
         }
         Err(error) => return Err(failed(error)),
     }
+    if !finished {
+        return Ok(Migration::Copied { files: copy.files, skipped: copy.skipped, links: copy.links, finished });
+    }
     let note = format!("SoundCraft settings copied from {}\n", old.display());
     // `create_new`: a racing instance's marker counts as done too.
     match std::fs::OpenOptions::new().write(true).create_new(true).open(new.join(MIGRATED_MARKER)) {
@@ -127,7 +142,7 @@ pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(failed(error)),
     }
-    Ok(Migration::Copied { files: copy.files, skipped: copy.skipped, links: copy.links })
+    Ok(Migration::Copied { files: copy.files, skipped: copy.skipped, links: copy.links, finished })
 }
 
 fn is_log(name: &str) -> bool {
@@ -146,10 +161,31 @@ fn remove_staging(new: &Path) {
     }
 }
 
+/// Removes, anywhere under `dir`, the `.<name>.copy-<pid>` files an interrupted [`copy_file`]
+/// left behind. Links are not followed.
+fn remove_copy_temps(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => remove_copy_temps(&entry.path()),
+            Ok(kind) if kind.is_file() && is_copy_temp(&entry.file_name().to_string_lossy()) => {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `name` is a [`copy_file`] temporary: `.<name>.copy-<digits>`.
+fn is_copy_temp(name: &str) -> bool {
+    name.starts_with('.') && name.rsplit_once(".copy-").is_some_and(|(_, pid)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
 struct Copy {
     files: usize,
     skipped: Vec<PathBuf>,
     links: Vec<PathBuf>,
+    /// Whether to place copies with hard links; false once the volume refuses one.
+    hard_links: bool,
 }
 
 impl Copy {
@@ -197,14 +233,12 @@ impl Copy {
         }
     }
 
-    /// Copies `from` to `to` unless `to` exists, keeping its modification time. The bytes go to
-    /// a temporary file that is then linked into place, which fails rather than replace a file
-    /// that appeared meanwhile.
+    /// Copies `from` to `to` unless `to` exists, keeping its modification time ([`copy_file`]).
     fn file(&mut self, from: &Path, to: &Path) {
         if std::fs::symlink_metadata(to).is_ok() {
             return;
         }
-        match copy_file(from, to) {
+        match copy_file(from, to, &mut self.hard_links) {
             Ok(true) => self.files += 1,
             Ok(false) => {}
             Err(_) => self.skipped.push(from.to_path_buf()),
@@ -212,34 +246,68 @@ impl Copy {
     }
 }
 
-/// Whether `from` was copied to `to` (false: `to` appeared meanwhile and was kept).
-fn copy_file(from: &Path, to: &Path) -> std::io::Result<bool> {
-    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = to.with_file_name(format!(".{name}.copy-{}", std::process::id()));
-    let result = (|| {
-        let modified = std::fs::metadata(from)?.modified()?;
-        retry(|| std::fs::copy(from, &tmp).map(|_| ()))?;
-        std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
-        match retry(|| std::fs::hard_link(&tmp, to)) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            // No hard links on this volume: rename, still never over a file that exists.
-            Err(_) if !to.exists() => retry(|| std::fs::rename(&tmp, to)).map(|()| true),
-            Err(e) => Err(e),
+/// Whether `from` was copied to `to` (false: `to` appeared meanwhile and was kept). Never
+/// replaces a file. With `hard_links`, the bytes go to a temporary file that is then linked into
+/// place, so `to` appears whole or not at all. A volume that refuses the link (a network share,
+/// FAT) clears `hard_links` for the rest of the run, and the copy is written straight into a new
+/// `to` instead.
+fn copy_file(from: &Path, to: &Path, hard_links: &mut bool) -> std::io::Result<bool> {
+    let modified = std::fs::metadata(from)?.modified()?;
+    if *hard_links {
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = to.with_file_name(format!(".{name}.copy-{}", std::process::id()));
+        let linked = (|| {
+            retry(|| std::fs::copy(from, &tmp).map(|_| ()))?;
+            std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
+            // Not retried on permission denied: that is how some shares refuse hard links.
+            retry_if(|| std::fs::hard_link(&tmp, to), sharing_violation)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) if std::fs::symlink_metadata(to).is_ok() => return Ok(false),
+            Err(_) => *hard_links = false,
         }
+    }
+    copy_new(from, to, modified)
+}
+
+/// Copies `from` into a new file `to` with modification time `modified`; false if `to` exists.
+/// A copy that fails partway is removed, so the next start tries again.
+fn copy_new(from: &Path, to: &Path, modified: std::time::SystemTime) -> std::io::Result<bool> {
+    let mut target = match std::fs::OpenOptions::new().write(true).create_new(true).open(to) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let written = (|| {
+        let mut source = None;
+        retry(|| std::fs::File::open(from).map(|f| source = Some(f)))?;
+        let Some(mut source) = source else { return Err(std::io::Error::other("the source was not opened")) };
+        std::io::copy(&mut source, &mut target)?;
+        target.set_modified(modified)
     })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+    if written.is_err() {
+        drop(target);
+        let _ = std::fs::remove_file(to);
+    }
+    written.map(|()| true)
 }
 
 /// Runs `step`, again after a short wait while another program briefly holds the file
 /// (permission denied, sharing violations), up to [`ATTEMPTS`] times.
-fn retry(mut step: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+fn retry(step: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    retry_if(step, transient)
+}
+
+/// [`retry`], waiting only on the errors `again` accepts.
+fn retry_if(mut step: impl FnMut() -> std::io::Result<()>, again: fn(&std::io::Error) -> bool) -> std::io::Result<()> {
     let mut wait = std::time::Duration::from_millis(50);
     let mut attempt = 1;
     loop {
         match step() {
-            Err(e) if attempt < ATTEMPTS && transient(&e) => {
+            Err(e) if attempt < ATTEMPTS && again(&e) => {
                 std::thread::sleep(wait);
                 wait *= 2;
                 attempt += 1;
@@ -252,7 +320,12 @@ fn retry(mut step: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
 /// An error another program holding the file causes for a moment (Windows sharing and lock
 /// violations are raw OS errors 32 and 33).
 fn transient(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+    e.kind() == std::io::ErrorKind::PermissionDenied || sharing_violation(e)
+}
+
+/// A Windows sharing or lock violation (raw OS errors 32 and 33).
+fn sharing_violation(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
 }
 
 /// Read bounded settings, recovering unreadable docking metadata independently of other settings.
@@ -536,7 +609,7 @@ mod config_tests {
         // An earlier version's interrupted staging copy is cleared away.
         std::fs::create_dir_all(base.join(".djforge.migrating-123/Presets")).unwrap();
 
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 5, skipped: vec![], links: vec![] }));
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 5, skipped: vec![], links: vec![], finished: true }));
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#);
         assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
         assert_eq!(std::fs::read_to_string(new.join("Autosave/Song 1/Audio Files/Take.wav")).unwrap(), "wav");
@@ -567,9 +640,64 @@ mod config_tests {
         write(&old.join("Presets/EQ/Lead.json"), "preset");
         // Another instance (or an interrupted run) already wrote ui.json, but no marker.
         write(&new.join("ui.json"), "newer settings");
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![] }));
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true }));
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "newer settings");
         assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn without_hard_links_files_are_copied_whole_and_never_replace_one() {
+        let base = migration_dir("no-links");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&old.join("ui.json"), "old settings");
+        write(&old.join("midi.json"), "mappings");
+        write(&old.join("Presets/EQ/Lead.json"), "preset");
+        write(&new.join("ui.json"), "newer settings");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options().write(true).open(old.join("midi.json")).unwrap().set_modified(stamp).unwrap();
+        assert_eq!(migrate_with(&new, &old, false), Ok(Migration::Copied { files: 2, skipped: vec![], links: vec![], finished: true }));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "newer settings", "never replaced");
+        assert_eq!(std::fs::read_to_string(new.join("midi.json")).unwrap(), "mappings");
+        assert_eq!(std::fs::metadata(new.join("midi.json")).unwrap().modified().unwrap(), stamp);
+        assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
+        assert!(new.join(MIGRATED_MARKER).is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn temporary_copies_an_interrupted_run_left_are_removed() {
+        let base = migration_dir("temps");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&old.join("ui.json"), "{}");
+        write(&new.join(".ui.json.copy-4242"), "half a copy");
+        write(&new.join("Presets/EQ/.Lead.json.copy-17"), "half a preset");
+        write(&new.join("Presets/.notes.copy-me"), "a user's file");
+        assert!(matches!(migrate(&new, &old), Ok(Migration::Copied { finished: true, .. })));
+        assert!(!new.join(".ui.json.copy-4242").exists() && !new.join("Presets/EQ/.Lead.json.copy-17").exists());
+        assert!(new.join("Presets/.notes.copy-me").is_file(), "only copy temporaries are removed");
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_tried_again_next_start() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let base = migration_dir("locked");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&old.join("ui.json"), "settings");
+        write(&old.join("midi.json"), "mappings");
+        // Another program holds ui.json open without sharing it.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(old.join("ui.json")).unwrap();
+        let Ok(Migration::Copied { files: 1, skipped, finished: false, .. }) = migrate(&new, &old) else { panic!("partly copied") };
+        assert_eq!(skipped, vec![old.join("ui.json")]);
+        assert!(!new.join(MIGRATED_MARKER).exists(), "no marker: the next start tries again");
+        assert!(!new.join("ui.json").exists());
+        drop(held);
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true }));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "settings");
+        assert!(new.join(MIGRATED_MARKER).is_file());
         let _ = std::fs::remove_dir_all(&base);
     }
 

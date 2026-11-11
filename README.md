@@ -241,7 +241,7 @@ estimates are in [`ROADMAP.md`](ROADMAP.md); the full assessment is in
 [`docs/target-app-parity.md`](docs/target-app-parity.md), the ranked list of what's missing in
 [`docs/gaps.md`](docs/gaps.md), and the menu-by-menu comparison in
 [`docs/parity-checklist.md`](docs/parity-checklist.md). Bug reports and wish lists are
-very welcome, in the issues or on Discord.
+very welcome, in the issues.
 
 ## Downloads
 

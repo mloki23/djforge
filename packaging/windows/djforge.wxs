@@ -7,8 +7,8 @@
   djforge's own identity: its UpgradeCode, component GUIDs and ProgIds are not SoundCraft's, so
   the two install side by side and neither upgrades nor removes the other.
 
-  Per-machine install into Program Files, a Start Menu shortcut, `.djforge` (and `.scraft`) sessions owned by
-  djforge, and djforge offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
+  Per-machine install into Program Files, a Start Menu shortcut, `.djforge` sessions owned by
+  djforge, and djforge offered under "Open with" for SoundCraft .scraft sessions, WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
@@ -52,16 +52,15 @@
               Icon="DjforgeIcon.ico" IconIndex="0" />
         </File>
 
-        <!-- .djforge: djforge's own session format (and SoundCraft's .scraft, which it still opens);
-             djforge is their default app. -->
+        <!-- .djforge: djforge's own session format; djforge is its default app. -->
         <ProgId Id="djforge.Session" Description="djforge Session" Icon="DjforgeExe" IconIndex="0">
           <Extension Id="djforge" ContentType="application/x-soundcraft-session">
             <Verb Id="open" Command="Open" TargetFile="DjforgeExe" Argument="&quot;%1&quot;" />
           </Extension>
-          <Extension Id="scraft" ContentType="application/x-soundcraft-session">
-            <Verb Id="open" Command="Open" TargetFile="DjforgeExe" Argument="&quot;%1&quot;" />
-          </Extension>
         </ProgId>
+        <!-- SoundCraft's .scraft, which djforge still opens: offered under "Open with", never taken
+             over from SoundCraft as the default. -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\.scraft\OpenWithProgids" Name="djforge.Session" Value="" Type="string" />
         <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
              as the default. -->
         <ProgId Id="djforge.Audio" Description="Audio File" Icon="DjforgeExe" IconIndex="0" />
