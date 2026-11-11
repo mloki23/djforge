@@ -26,6 +26,10 @@ fn the_about_window_shows_the_credit_and_the_licence() {
     h.run_steps(3);
     h.get_by_label("About djforge");
     h.get_by_label(&panels::about_credit());
-    h.get_by_label("Dual-licensed MIT OR Apache-2.0. Made with Rust and egui.");
+    for line in panels::ABOUT_NOTICES {
+        h.get_by_label(line);
+    }
+    h.get_by_label("Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors.");
     assert!(h.query_by_label("About SoundCraft").is_none());
+    assert!(h.query_by_label_contains("Discord").is_none() && h.query_by_label_contains("getartcraft").is_none(), "no ArtCraft links");
 }

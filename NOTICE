@@ -1,11 +1,20 @@
+djforge
+Copyright (c) 2026 the djforge contributors.
+
+djforge is a modified version of SoundCraft:
+
 SoundCraft
 Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors.
 Licensed under the MIT License or the Apache License, Version 2.0, at your option
 (LICENSE-MIT, LICENSE-APACHE).
 
-The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
-not open source and are not covered by the license above; their terms are in
-docs/brand/LICENSE-brand.txt.
+Modifications: djforge renames the app (djforge, djforge-cli), saves sessions as .djforge,
+moves its settings folder, replaces the app icon, and adds DJ features (set import, transitions,
+track prep, stems, Session view, Rekordbox and Mixxx export), among other changes; the Git
+history has the details. djforge's changes are licensed under the same terms (MIT OR
+Apache-2.0, at your option).
+
+The ArtCraft name and logos are trademarks of the ArtCraft Team and are not part of djforge.
 
 Third-party material
 
@@ -15,6 +24,6 @@ list (author, source, license) is in ATTRIBUTION.md.
 Signalsmith Stretch and Signalsmith Linear (MIT, Signalsmith Audio) and the signalsmith-stretch-rs
 C wrapper (MIT, Colin Marc) are vendored as source in crates/stretch/vendor/.
 
-Otherwise every bundled asset is original to SoundCraft. Icons are drawn in code; demo audio is
+Otherwise every bundled asset is original to SoundCraft or djforge. Icons are drawn in code; demo audio is
 synthesised in code. The egui default fonts (Ubuntu-Light, Hack, Noto Emoji, Emoji Icon Font) ship
 inside the egui crate under their own open licenses (see ATTRIBUTION.md).

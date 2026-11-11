@@ -602,6 +602,13 @@ pub fn about_title() -> String {
     format!("About {}", soundcraft_engine::APP_NAME)
 }
 
+/// The About window's copyright and licence lines, under [`about_credit`].
+pub const ABOUT_NOTICES: &[&str] = &[
+    "Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors.",
+    "Copyright (c) 2026 the djforge contributors.",
+    "Dual-licensed MIT OR Apache-2.0. Made with Rust and egui.",
+];
+
 /// The About window's line on what the app is and where it comes from.
 pub fn about_credit() -> String {
     format!("{} — a DJ-first DAW. Based on SoundCraft by the ArtCraft team (MIT/Apache-2.0)", soundcraft_engine::APP_NAME)
@@ -631,10 +638,9 @@ fn about(app: &mut SoundApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(soundcraft_engine::APP_NAME).font(bold(22.0)));
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.label(about_credit());
-                ui.label("Dual-licensed MIT OR Apache-2.0. Made with Rust and egui.");
-                ui.label("SoundCraft:");
-                ui.hyperlink_to("getartcraft.com/apps/soundcraft", "https://getartcraft.com/apps/soundcraft");
-                ui.hyperlink_to("Join us on Discord", "https://discord.gg/artcraft");
+                for line in ABOUT_NOTICES {
+                    ui.label(*line);
+                }
             }
         }
     });
