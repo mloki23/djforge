@@ -968,7 +968,7 @@ pub(super) fn can_launch(e: &Engine, cmd: &str) -> Result<()> {
     if !e.live_audio {
         return Err(bad(
             cmd,
-            "Session view launches need the app's audio engine: run this in SoundCraft (or `soundcraft --control` and `soundcraft-cli mcp --connect`)",
+            "Session view launches need the app's audio engine: run this in djforge (or `djforge --control` and `djforge-cli mcp --connect`)",
         ));
     }
     four_four(cmd, e.session())

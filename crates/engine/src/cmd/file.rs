@@ -36,19 +36,19 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = str_param(p, "path").map(str::to_string).or_else(|| e.path.clone()).ok_or_else(|| bad("session.save", "no path yet: pass `path` (Save As)"))?;
             refuse_replacing(e, "session.save", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session(e, &path)?;
-            Ok(json!({"path": path, "audio_files_written": written}))
+            Ok(json!({"path": e.path.clone().unwrap_or(path), "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_as", "Save Session As...", ["File"], Some("Cmd+Shift+S"), "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_as", "`path` required"))?.to_string();
             refuse_replacing(e, "session.save_as", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session(e, &path)?;
-            Ok(json!({"path": path, "audio_files_written": written}))
+            Ok(json!({"path": e.path.clone().unwrap_or(path), "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false, copy_audio?: false (true: every source's audio goes into the copy's Audio Files, files referenced in place too)}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
             refuse_replacing(e, "session.save_copy", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session_copy(e, &path, bool_or(p, "copy_audio", false))?;
-            Ok(json!({"path": path, "audio_files_written": written}))
+            Ok(json!({"path": crate::io::session_file(&path), "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_template", "Save As Template...", ["File"], None, "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_template", "`path` required"))?.to_string();
@@ -65,7 +65,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if cfg!(target_arch = "wasm32") {
                 crate::io::write_file(&file.to_string_lossy(), text.as_bytes())?;
             } else {
-                crate::io::replace_file(&file.with_extension("scraft.tmp"), &file, text.as_bytes())?;
+                crate::io::replace_file(&file.with_extension(format!("{}.tmp", soundcraft_model::SESSION_EXTENSION)), &file, text.as_bytes())?;
             }
             Ok(json!({"path": file}))
         }),
@@ -530,7 +530,7 @@ mod tests {
             let p = entry.path();
             if p.is_dir() {
                 remove_media(&p);
-            } else if p.extension().is_some_and(|x| x != "scraft") {
+            } else if p.extension().is_some_and(|x| x != "djforge") {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -541,7 +541,7 @@ mod tests {
         let mut e = crate::demo::demo_engine();
         let dir = std::env::temp_dir().join(format!("soundcraft-open-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("Gone.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Gone.djforge").to_string_lossy().into_owned();
         e.execute("session.save_as", &json!({"path": path})).unwrap();
         let mut ok = Engine::default();
         assert!(ok.execute("session.open", &json!({"path": path})).unwrap()["missing"].as_array().is_some_and(Vec::is_empty));
@@ -556,7 +556,7 @@ mod tests {
     fn saving_a_session_without_audio_creates_its_folder() {
         let dir = std::env::temp_dir().join(format!("soundcraft-new-folder-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("Song").join("Song.scraft");
+        let path = dir.join("Song").join("Song.djforge");
         Engine::default().execute("session.save_as", &json!({"path": path.to_string_lossy()})).unwrap();
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -709,7 +709,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-consolidate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Tone.scraft");
+        let path = dir.join("Tone.djforge");
         e.execute("session.save_as", &json!({"path": path.to_string_lossy()})).unwrap();
         let mut opened = Engine::default();
         opened.execute("session.open", &json!({"path": path.to_string_lossy()})).unwrap();
@@ -727,13 +727,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-save-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let original = dir.join("Original.scraft");
+        let original = dir.join("Original.djforge");
         e.execute("session.save_as", &json!({"path": original.to_string_lossy()})).unwrap();
         e.execute("track.new", &json!({"count": 1, "name": "Extra", "format": "mono"})).unwrap();
         assert!(e.is_dirty());
         let copy_dir = dir.join("copy");
         std::fs::create_dir_all(&copy_dir).unwrap();
-        let copy = copy_dir.join("Copy.scraft");
+        let copy = copy_dir.join("Copy.djforge");
         e.execute("session.save_copy", &json!({"path": copy.to_string_lossy()})).unwrap();
         assert_eq!(e.path.as_deref(), Some(original.to_string_lossy().as_ref()));
         assert_eq!(e.session().name, "Original");

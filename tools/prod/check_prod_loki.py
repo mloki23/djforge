@@ -2,7 +2,7 @@
 
     python -I tools/prod/check_prod_loki.py "<produce folder>"
 
-Reads, from the folder: `loki produce.scraft`, `loki produce.wav` (the mix, bars 896..968) and
+Reads, from the folder: `loki produce.djforge` (or an older `loki produce.scraft`), `loki produce.wav` (the mix, bars 896..968) and
 `loki produce (parts only).wav` (the same window with Deck A/B muted; prod_loki.cmds' header
 gives the command that bounces it). Needs numpy and scipy.
 """
@@ -68,7 +68,10 @@ def segments(name, x):
 def main():
     folder = Path(sys.argv[1])
     ok = True
-    s = json.loads((folder / "loki produce.scraft").read_text(encoding="utf-8"))
+    session = folder / "loki produce.djforge"
+    if not session.exists():
+        session = folder / "loki produce.scraft"
+    s = json.loads(session.read_text(encoding="utf-8"))
     tracks = {t["name"]: t for t in s["tracks"]}
 
     def clips(name):

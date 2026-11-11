@@ -597,13 +597,23 @@ fn eq_curve(ui: &mut Ui, id: &str, ins: &soundcraft_model::Insert) {
     ui.painter().add(egui::Shape::line(pts, Stroke::new(2.0, t.counter_text)));
 }
 
+/// The About window's title.
+pub fn about_title() -> String {
+    format!("About {}", soundcraft_engine::APP_NAME)
+}
+
+/// The About window's line on what the app is and where it comes from.
+pub fn about_credit() -> String {
+    format!("{} — a DJ-first DAW. Based on SoundCraft by the ArtCraft team (MIT/Apache-2.0)", soundcraft_engine::APP_NAME)
+}
+
 fn about(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_about;
     if !open {
         return;
     }
     let tab_id = egui::Id::new("about_tab");
-    egui::Window::new("About SoundCraft").open(&mut open).default_size(vec2(640.0, 420.0)).collapsible(false).show(ctx, |ui| {
+    egui::Window::new(about_title()).open(&mut open).default_size(vec2(640.0, 420.0)).collapsible(false).show(ctx, |ui| {
         let mut tab = ui.data_mut(|d| d.get_temp::<u8>(tab_id)).unwrap_or(0);
         ui.horizontal(|ui| {
             for (i, l) in (0u8..).zip(["About", "Contributors", "Models"]) {
@@ -618,10 +628,11 @@ fn about(app: &mut SoundApp, ctx: &egui::Context) {
             1 => crate::credits::contributors_ui(ui),
             2 => crate::credits::models_ui(ui),
             _ => {
-                ui.label(egui::RichText::new("SoundCraft").font(bold(22.0)));
+                ui.label(egui::RichText::new(soundcraft_engine::APP_NAME).font(bold(22.0)));
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("An open-source digital audio workstation from the ArtCraft team.");
+                ui.label(about_credit());
                 ui.label("Dual-licensed MIT OR Apache-2.0. Made with Rust and egui.");
+                ui.label("SoundCraft:");
                 ui.hyperlink_to("getartcraft.com/apps/soundcraft", "https://getartcraft.com/apps/soundcraft");
                 ui.hyperlink_to("Join us on Discord", "https://discord.gg/artcraft");
             }

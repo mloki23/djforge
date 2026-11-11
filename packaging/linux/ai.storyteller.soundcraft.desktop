@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=SoundCraft
-GenericName=Digital Audio Workstation
+Name=djforge
+GenericName=DJ-first Digital Audio Workstation
 Comment=Record, edit and mix audio and MIDI
-Exec=soundcraft %F
-TryExec=soundcraft
+Exec=djforge %F
+TryExec=djforge
 Icon=ai.storyteller.soundcraft
 Terminal=false
 StartupNotify=true

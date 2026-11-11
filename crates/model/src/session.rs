@@ -7,17 +7,32 @@ use crate::{
 };
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
-/// Native session file extension.
-pub const SESSION_EXTENSION: &str = "scraft";
+/// The app's name, as people see it in titles, menus, dialogs and messages.
+pub const APP_NAME: &str = "djforge";
+
+/// Native session file extension: new sessions are saved with it.
+pub const SESSION_EXTENSION: &str = "djforge";
+
+/// Extension of sessions saved by SoundCraft, which djforge is based on. They still open, but
+/// are never written: saving one writes a `.djforge` beside it.
+pub const LEGACY_SESSION_EXTENSION: &str = "scraft";
+
+/// Every extension a session file may have, the native one first.
+pub const SESSION_EXTENSIONS: &[&str] = &[SESSION_EXTENSION, LEGACY_SESSION_EXTENSION];
+
+/// True when `path` names a session file (`.djforge` or `.djforge`, any case).
+pub fn is_session_path(path: &str) -> bool {
+    std::path::Path::new(path).extension().and_then(|x| x.to_str()).is_some_and(|x| SESSION_EXTENSIONS.iter().any(|e| x.eq_ignore_ascii_case(e)))
+}
 
 /// `EditState::values` key holding the feet+frames reading of sample 0, in frames.
 pub const FEET_FRAMES_START: &str = "feet_frames.start";
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SessionError {
-    #[error("not a SoundCraft session: {0}")]
+    #[error("not a {APP_NAME} session: {0}")]
     Format(String),
-    #[error("session file version {0} is newer than this SoundCraft supports")]
+    #[error("session file version {0} is newer than this {APP_NAME} supports")]
     Version(u32),
     #[error("{0}")]
     Invalid(String),
@@ -698,6 +713,19 @@ pub fn truncate_chars(s: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_are_djforge_files_and_old_soundcraft_ones_still_count() {
+        assert_eq!(APP_NAME, "djforge");
+        assert_eq!(SESSION_EXTENSION, "djforge");
+        for p in ["Set.djforge", "a/b/Set.DJFORGE", "Old.scraft", r"C:\Music\Old.SCRAFT"] {
+            assert!(is_session_path(p), "{p}");
+        }
+        for p in ["Set", "Set.scraftz", "Set.djforgez", "a.wav", "djforge", "Set.scraft.tmp"] {
+            assert!(!is_session_path(p), "{p}");
+        }
+        assert_eq!(SessionError::Version(9).to_string(), "session file version 9 is newer than this djforge supports");
+    }
 
     #[test]
     fn add_tracks_names_and_order() {

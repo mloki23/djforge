@@ -255,7 +255,7 @@ impl Movie {
             None => (Codec::Unsupported("the video track has no sample description".into()), "unknown", "unknown".into()),
         };
         if u64::from(width) * u64::from(height) > MAX_PIXELS {
-            return Err(VideoError::Unsupported(format!("{width}x{height} is larger than SoundCraft decodes")));
+            return Err(VideoError::Unsupported(format!("{width}x{height} is larger than djforge decodes")));
         }
         let info = MovieInfo {
             width,

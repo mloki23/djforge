@@ -7,11 +7,11 @@ use std::io::{BufRead, Write};
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "SoundCraft is a digital audio workstation (Pro Tools-class). Everything a user can do is a \
+const INSTRUCTIONS: &str = "djforge is a DJ-first digital audio workstation (based on SoundCraft, Pro Tools-class). Everything a user can do is a \
 command: call `list_commands` to discover ids and their params, then `execute` (or `batch`). Positions are samples \
 (integers), `{\"seconds\": x}`, or time strings like \"bars_beats:5|1|000\" / \"0:12.500\". Tracks are referenced by id \
 or name. Verify your work with `inspect_session` (tracks, clips, mixer, automation, markers, selection). Programmatic \
-calls never open dialogs. Tools marked APP_ONLY need the desktop app (`soundcraft --control 0` + `soundcraft-cli mcp --connect PORT`).";
+calls never open dialogs. Tools marked APP_ONLY need the desktop app (`djforge --control 0` + `djforge-cli mcp --connect PORT`).";
 
 pub struct Server<B: Backend> {
     pub backend: B,
@@ -25,7 +25,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "list_commands",
-            "List SoundCraft commands (id, label, menu path, shortcut, params doc, enabled).",
+            "List djforge commands (id, label, menu path, shortcut, params doc, enabled).",
             json!({"filter": {"type": "string", "description": "substring of id or label"}}),
             &[],
         ),
@@ -53,7 +53,7 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({"name": {"type": "string"}, "sample_rate": {"type": "integer"}, "template": {"type": "string", "enum": ["blank", "demo"]}}),
             &[],
         ),
-        tool("open_session", "Open a .scraft session file.", json!({"path": {"type": "string"}}), &["path"]),
+        tool("open_session", "Open a .djforge session file.", json!({"path": {"type": "string"}}), &["path"]),
         tool(
             "save_session",
             "Save the session (path required the first time; replace: true to save over another existing file).",
@@ -205,7 +205,7 @@ impl<B: Backend> Server<B> {
                 Ok(json!({
                     "protocolVersion": ver,
                     "capabilities": {"tools": {}, "resources": {}},
-                    "serverInfo": {"name": "soundcraft", "version": env!("CARGO_PKG_VERSION")},
+                    "serverInfo": {"name": "djforge", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": format!("{INSTRUCTIONS}\nBackend: {}.", self.backend.describe()),
                 }))
             }

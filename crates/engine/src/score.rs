@@ -241,7 +241,7 @@ pub fn musicxml(parts: &[Part], setup: &ScoreSetup) -> String {
     if !setup.composer.is_empty() {
         let _ = writeln!(x, "    <creator type=\"composer\">{}</creator>", xml_escape(&setup.composer));
     }
-    x.push_str("    <encoding><software>SoundCraft</software></encoding>\n  </identification>\n  <part-list>\n");
+    let _ = writeln!(x, "    <encoding><software>{}</software></encoding>\n  </identification>\n  <part-list>", crate::APP_NAME);
     for (i, p) in parts.iter().enumerate() {
         let _ = writeln!(x, "    <score-part id=\"P{}\"><part-name>{}</part-name></score-part>", i + 1, xml_escape(&p.name));
     }

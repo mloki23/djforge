@@ -1190,7 +1190,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-dj-open-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Warped.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Warped.djforge").to_string_lossy().into_owned();
         e.execute("session.save_as", &json!({"path": path})).unwrap();
         // An engine at 120 bpm, holding beat-locked clips of its own.
         let (mut other, _, _) = warped();
@@ -1477,7 +1477,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-dj-unlocked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Unlocked.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Unlocked.djforge").to_string_lossy().into_owned();
         crate::io::save_session(&mut e, &path).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("\"lock\""), "the saved file still has a lock");
         let mut opened = Engine::default();

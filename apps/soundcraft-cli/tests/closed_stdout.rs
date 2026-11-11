@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 
 fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soundcraft-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_djforge-cli"));
     cmd.env("SOUNDCRAFT_NO_PREFS", "1");
     // The binary sets up mixforge, Demucs and the app's stem cache: under test none of them may
     // reach the real ones.
@@ -33,7 +33,7 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 fn run_with_closed_stdout_still_bounces_and_saves() {
     let dir = temp_dir("run");
     let wav = dir.join("mix.wav");
-    let session = dir.join("Synthetic.scraft");
+    let session = dir.join("Synthetic.djforge");
     let output = bin()
         .arg("run")
         .arg("--cmd")
@@ -59,10 +59,10 @@ fn run_with_closed_stdout_still_bounces_and_saves() {
 #[test]
 fn script_with_closed_stdout_still_bounces_and_saves() {
     let dir = temp_dir("script");
-    let script = dir.join("edit.scraft.txt");
+    let script = dir.join("edit.djforge.txt");
     std::fs::write(&script, "track.new {\"name\":\"Synthetic\",\"count\":1,\"format\":\"stereo\"}\n").unwrap();
     let wav = dir.join("mix.wav");
-    let session = dir.join("Synthetic.scraft");
+    let session = dir.join("Synthetic.djforge");
     let output = bin()
         .arg("script")
         .arg(&script)
@@ -88,7 +88,7 @@ fn script_with_closed_stdout_still_bounces_and_saves() {
 fn bounce_then_save_with_closed_stdout_writes_the_wav() {
     let dir = temp_dir("bounce");
     let wav = dir.join("mix.wav");
-    let session = dir.join("Empty.scraft");
+    let session = dir.join("Empty.djforge");
     let output = bin()
         .arg("run")
         .arg("--bounce")

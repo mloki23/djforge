@@ -236,7 +236,7 @@ fn a_reopened_session_keeps_its_stems_playable() {
     let c = cache(&dir);
     let key = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
     let played = mix(&e);
-    let set_path = dir.join("music").join("Set.scraft");
+    let set_path = dir.join("music").join("Set.djforge");
     run(&mut e, "session.save_as", json!({"path": set_path}));
     assert!(!dir.join("music").join("Audio Files").exists(), "nothing was copied into the session");
     let roots = AutomationRoots::new(Some(&dir.join("music")), Some(&dir.join("music"))).unwrap();
@@ -280,7 +280,7 @@ fn a_stem_file_gone_on_reopen_unsplits_the_clip_and_says_so() {
     let (mut e, a, _) = two_decks(&path);
     let c = cache(&dir);
     let key = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
-    let set_path = dir.join("music").join("Set.scraft");
+    let set_path = dir.join("music").join("Set.djforge");
     run(&mut e, "session.save_as", json!({"path": set_path}));
     std::fs::remove_file(c.root().join(&key).join("drums.flac")).unwrap();
     let mut r = Engine::default();
@@ -414,7 +414,7 @@ fn a_file_split_again_reuses_its_stem_sources() {
     assert_eq!((r["hit"].as_bool(), r["clips"].clone()), (Some(true), json!([again.0])), "{r}");
     assert_eq!(stem_sources(&e), 4);
     assert_eq!(stems_of(&e, again), stems_of(&e, a));
-    run(&mut e, "session.save_as", json!({"path": dir.join("music").join("Set.scraft")}));
+    run(&mut e, "session.save_as", json!({"path": dir.join("music").join("Set.djforge")}));
     assert!(!dir.join("music").join("Audio Files").exists(), "nothing was copied into the session");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -502,7 +502,7 @@ fn a_file_at_another_rate_shares_its_split_and_copies_its_stems() {
         assert_eq!(e.session().pool.get(id).unwrap().buffer.sample_rate, RATE);
     }
     let played = mix(&e);
-    let set_path = dir.join("music").join("Set.scraft");
+    let set_path = dir.join("music").join("Set.djforge");
     run(&mut e, "session.save_as", json!({"path": set_path}));
     let text = std::fs::read_to_string(&set_path).unwrap();
     assert!(!text.contains(&in_json(c.root())), "the saved session names the cache");
@@ -525,7 +525,7 @@ fn crafted_stem_paths_are_matched_by_where_they_lead() {
     let (mut e, a, _) = two_decks(&path);
     let c = cache(&dir);
     let key = split(&mut e, a, &c, &fake(&Arc::new(AtomicUsize::new(0)), LEVEL))["key"].as_str().unwrap().to_string();
-    let set_path = dir.join("music").join("Set.scraft");
+    let set_path = dir.join("music").join("Set.djforge");
     run(&mut e, "session.save_as", json!({"path": set_path}));
     let set = stems_of(&e, a).unwrap();
     let entry = c.root().join(&key);
@@ -569,7 +569,7 @@ fn imported_session_data_brings_the_stems_where_automation_is_confined() {
     let path = source(&dir, "track.wav", LEVEL);
     let (mut e, a, _) = two_decks(&path);
     split(&mut e, a, &cache(&dir), &fake(&Arc::new(AtomicUsize::new(0)), LEVEL));
-    let set_path = dir.join("music").join("Set.scraft");
+    let set_path = dir.join("music").join("Set.djforge");
     run(&mut e, "session.save_as", json!({"path": set_path}));
     let roots = AutomationRoots::new(Some(&dir.join("music")), Some(&dir.join("music"))).unwrap();
     let mut r = Engine::default();

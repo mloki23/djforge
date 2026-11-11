@@ -37,7 +37,7 @@ impl Headless {
     }
 
     /// Confine every file the session's commands read and write to `roots`
-    /// (`soundcraft-cli mcp --automation-read-root … --automation-write-root …`).
+    /// (`djforge-cli mcp --automation-read-root … --automation-write-root …`).
     pub fn with_automation_roots(mut self, roots: Option<Arc<AutomationRoots>>) -> Self {
         self.roots = roots;
         self
@@ -59,7 +59,7 @@ impl Headless {
                 Ok(soundcraft_engine::inspect::session(&self.engine, params.get("detail").and_then(Value::as_str) == Some("full")))
             }
             m if m.starts_with("ui.") => {
-                Err(format!("`{m}` needs the desktop app: start `soundcraft --control 0` and use `soundcraft-cli mcp --connect PORT`"))
+                Err(format!("`{m}` needs the desktop app: start `djforge --control 0` and use `djforge-cli mcp --connect PORT`"))
             }
             other => Err(format!("unknown method `{other}`")),
         }
@@ -98,8 +98,8 @@ impl Remote {
             return Ok(());
         }
         let sock = self.addr.parse().map_err(|e| format!("{}: {e}", self.addr))?;
-        let s =
-            TcpStream::connect_timeout(&sock, Duration::from_millis(800)).map_err(|e| format!("cannot reach SoundCraft at {}: {e}", self.addr))?;
+        let s = TcpStream::connect_timeout(&sock, Duration::from_millis(800))
+            .map_err(|e| format!("cannot reach {} at {}: {e}", soundcraft_engine::APP_NAME, self.addr))?;
         s.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
         let r = s.try_clone().map_err(|e| e.to_string())?;
         self.conn = Some((s, BufReader::new(r)));
@@ -143,7 +143,7 @@ impl Backend for Remote {
         true
     }
     fn describe(&self) -> String {
-        format!("SoundCraft app at {}", self.addr)
+        format!("{} app at {}", soundcraft_engine::APP_NAME, self.addr)
     }
 }
 

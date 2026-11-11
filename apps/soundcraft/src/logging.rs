@@ -4,8 +4,8 @@
 //! audio devices that failed to open or broke, plugins that refused their stored state or failed
 //! to activate, CLAP plugins' own log messages, decode errors on import) vanished. A launch from a
 //! desktop menu has no terminal, so the file is what a bug report can attach:
-//! `<settings dir>/logs/soundcraft.log`, beside `ui.json`, `Autosave/` and `Presets/`. Each start
-//! moves the previous log to `soundcraft.1.log` (and that one to `.2`), so the log of a run that
+//! `<settings dir>/logs/djforge.log`, beside `ui.json`, `Autosave/` and `Presets/`. Each start
+//! moves the previous log to `djforge.1.log` (and that one to `.2`), so the log of a run that
 //! crashed survives the next launch. Runs without preferences (`SOUNDCRAFT_NO_PREFS`, agents' test
 //! runs) log to standard error only, so they don't rotate away the user's own logs.
 //!
@@ -39,10 +39,10 @@ use std::time::SystemTime;
 use log::LevelFilter;
 
 /// The current log file's name inside the log directory.
-pub const LOG_FILE: &str = "soundcraft.log";
+pub const LOG_FILE: &str = "djforge.log";
 /// The log directory inside the settings directory.
 pub const LOG_DIR: &str = "logs";
-/// How many previous logs are kept (`soundcraft.1.log` … `soundcraft.<KEEP>.log`).
+/// How many previous logs are kept (`djforge.1.log` … `djforge.<KEEP>.log`).
 pub const KEEP: usize = 2;
 /// The log file stops growing past this size (a runaway warning can't fill the disk).
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -137,7 +137,7 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 }
 
 fn numbered(dir: &Path, n: usize) -> PathBuf {
-    if n == 0 { dir.join(LOG_FILE) } else { dir.join(format!("soundcraft.{n}.log")) }
+    if n == 0 { dir.join(LOG_FILE) } else { dir.join(format!("djforge.{n}.log")) }
 }
 
 /// Shift the previous logs up one (`.log` → `.1.log` → … → `.<KEEP>.log`, the oldest dropped)
@@ -545,9 +545,9 @@ mod tests {
             std::fs::write(&path, format!("run {run}")).expect("write");
         }
         assert_eq!(read(&dir.join(LOG_FILE)), "run 4");
-        assert_eq!(read(&dir.join("soundcraft.1.log")), "run 3");
-        assert_eq!(read(&dir.join("soundcraft.2.log")), "run 2");
-        assert!(!dir.join("soundcraft.3.log").exists(), "only {KEEP} old logs are kept");
+        assert_eq!(read(&dir.join("djforge.1.log")), "run 3");
+        assert_eq!(read(&dir.join("djforge.2.log")), "run 2");
+        assert!(!dir.join("djforge.3.log").exists(), "only {KEEP} old logs are kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -640,7 +640,7 @@ mod tests {
     fn the_logger_filters_records_and_writes_them_to_the_attached_file() {
         let dir = temp_dir("logger");
         let logger = AppLogger::new(Filter::parse(DEFAULT_FILTER), false);
-        record(&logger, log::Level::Info, "soundcraft", "SoundCraft starting");
+        record(&logger, log::Level::Info, "soundcraft", "djforge starting");
         record(&logger, log::Level::Info, "wgpu_core::device", "too chatty");
         let path = logger.attach_dir(&dir).expect("attach");
         assert_eq!(path, dir.join(LOG_FILE));
@@ -649,14 +649,14 @@ mod tests {
         let text = read(&path);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
-        assert!(lines.first().is_some_and(|l| l.contains(" INFO  [") && l.ends_with("soundcraft: SoundCraft starting")), "{text}");
+        assert!(lines.first().is_some_and(|l| l.contains(" INFO  [") && l.ends_with("soundcraft: djforge starting")), "{text}");
         assert!(lines.get(1).is_some_and(|l| l.ends_with("wgpu_hal::vulkan: a real warning")), "{text}");
         assert!(logger.enabled(&log::Metadata::builder().level(log::Level::Info).target("soundcraft_engine").build()));
         assert!(!logger.enabled(&log::Metadata::builder().level(log::Level::Info).target("naga").build()));
         // A second launch rotates: the first log becomes `.1`.
         let second = AppLogger::new(Filter::parse(DEFAULT_FILTER), false);
         assert_eq!(second.attach_dir(&dir).expect("attach again"), dir.join(LOG_FILE));
-        assert_eq!(read(&dir.join("soundcraft.1.log")), text);
+        assert_eq!(read(&dir.join("djforge.1.log")), text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

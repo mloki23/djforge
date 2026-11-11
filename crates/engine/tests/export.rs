@@ -202,7 +202,7 @@ fn a_saved_and_reopened_set_still_exports_the_original_files() {
     let dir = scratch("reopened");
     let lib = dir.join("lib");
     let mut e = set(&lib);
-    let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+    let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
     soundcraft_engine::io::save_session(&mut e, &path).unwrap();
     let mut r = Engine::default();
     soundcraft_engine::io::open_session(&mut r, &path).unwrap();
@@ -275,7 +275,7 @@ fn an_original_changed_since_import_exports_the_session_s_audio() {
     let dir = scratch("changed");
     let lib = dir.join("lib");
     let mut e = set(&lib);
-    let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+    let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
     soundcraft_engine::io::save_session(&mut e, &path).unwrap();
     // Unchanged, the original is exported.
     let r = export(&e, &dir.join("before"), analysis());
@@ -437,7 +437,7 @@ fn a_session_copy_of_an_mp3_moves_its_grid_by_the_priming() {
     }
     e.execute("dj.transition", &json!({"out_clip": clips[0], "in_clip": clips[1], "entry_bar": 5, "build_bars": 1, "out_bars": 1})).unwrap();
     // Saved: the session keeps a resampled WAV copy of a.mp3.
-    let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+    let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
     soundcraft_engine::io::save_session(&mut e, &path).unwrap();
 
     let first = |root: &str| {

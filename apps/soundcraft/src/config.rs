@@ -1,7 +1,7 @@
 //! Per-user settings and automation profile directories.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
 enum Platform {
@@ -10,31 +10,102 @@ enum Platform {
     Other,
 }
 
-/// SoundCraft's settings folder. A nonempty `$SOUNDCRAFT_CONFIG_DIR` overrides the platform default.
+/// djforge's settings folder. A nonempty `$SOUNDCRAFT_CONFIG_DIR` overrides the platform default.
 /// The override is the complete directory; no application-name suffix is appended. An explicitly
 /// empty value disables the settings directory instead of falling back to a personal profile.
 pub fn config_dir() -> Option<PathBuf> {
-    let platform = if cfg!(target_os = "macos") {
+    config_dir_with(platform(), |name| std::env::var_os(name))
+}
+
+/// The settings folder SoundCraft used, which djforge's first run copies across ([`migrate`]).
+/// None with `$SOUNDCRAFT_CONFIG_DIR` set: an overridden folder has nothing to migrate.
+pub fn legacy_config_dir() -> Option<PathBuf> {
+    legacy_config_dir_with(platform(), |name| std::env::var_os(name))
+}
+
+fn platform() -> Platform {
+    if cfg!(target_os = "macos") {
         Platform::Mac
     } else if cfg!(windows) {
         Platform::Windows
     } else {
         Platform::Other
-    };
-    config_dir_with(platform, |name| std::env::var_os(name))
+    }
 }
 
 fn config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if let Some(dir) = env("SOUNDCRAFT_CONFIG_DIR") {
         return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
+    platform_dir(platform, &env, ["djforge", "djforge"])
+}
+
+fn legacy_config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if env("SOUNDCRAFT_CONFIG_DIR").is_some() {
+        return None;
+    }
+    platform_dir(platform, &env, ["SoundCraft", "soundcraft"])
+}
+
+/// The platform's per-user settings folder named `name` (macOS and Windows) or `unix` (elsewhere).
+fn platform_dir(platform: Platform, env: &impl Fn(&str) -> Option<OsString>, [name, unix]: [&str; 2]) -> Option<PathBuf> {
     match platform {
-        Platform::Mac => env("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/SoundCraft")),
-        Platform::Windows => env("APPDATA").map(|a| PathBuf::from(a).join("SoundCraft")),
+        Platform::Mac => env("HOME").map(|h| PathBuf::from(h).join("Library/Application Support").join(name)),
+        Platform::Windows => env("APPDATA").map(|a| PathBuf::from(a).join(name)),
         Platform::Other => {
-            env("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config"))).map(|c| c.join("soundcraft"))
+            env("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config"))).map(|c| c.join(unix))
         }
     }
+}
+
+/// What [`migrate`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// Nothing to do: the djforge folder exists already, or there is no SoundCraft folder.
+    None,
+    /// The SoundCraft folder was copied: how many files, and the ones that couldn't be read
+    /// (a file another program holds open, say), which were left out.
+    Copied { files: usize, skipped: Vec<PathBuf> },
+}
+
+/// First run after the rebrand: when the settings folder `new` doesn't exist but SoundCraft's
+/// `old` does, copy `old` into it once, recursively, leaving `old` untouched. The copy is built
+/// beside `new` and renamed into place, so an interrupted copy leaves no half folder and the next
+/// start tries again; once `new` exists this does nothing. Links are not followed.
+pub fn migrate(new: &Path, old: &Path) -> Result<Migration, String> {
+    if new.exists() || !std::fs::symlink_metadata(old).is_ok_and(|m| m.is_dir()) {
+        return Ok(Migration::None);
+    }
+    let parent = new.parent().ok_or_else(|| format!("{}: no parent folder", new.display()))?;
+    let name = new.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let staging = parent.join(format!(".{name}.migrating-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    let mut files = 0;
+    let mut skipped = Vec::new();
+    let copied = copy_tree(old, &staging, &mut files, &mut skipped).and_then(|()| std::fs::rename(&staging, new));
+    if let Err(error) = copied {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("copying the SoundCraft settings {} to {} failed: {error}", old.display(), new.display()));
+    }
+    Ok(Migration::Copied { files, skipped })
+}
+
+fn copy_tree(from: &Path, to: &Path, files: &mut usize, skipped: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&source, &target, files, skipped)?;
+        } else if kind.is_file() {
+            match std::fs::copy(&source, &target) {
+                Ok(_) => *files += 1,
+                Err(_) => skipped.push(source),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read bounded settings, recovering unreadable docking metadata independently of other settings.
@@ -265,13 +336,72 @@ mod config_tests {
     #[test]
     fn config_unset_override_keeps_platform_defaults() {
         let vars = [("HOME", "/user"), ("APPDATA", "/roaming"), ("XDG_CONFIG_HOME", "/xdg")];
-        assert_eq!(resolve(Platform::Mac, &vars), Some(PathBuf::from("/user/Library/Application Support/SoundCraft")));
-        assert_eq!(resolve(Platform::Windows, &vars), Some(PathBuf::from("/roaming/SoundCraft")));
-        assert_eq!(resolve(Platform::Other, &vars), Some(PathBuf::from("/xdg/soundcraft")));
-        assert_eq!(resolve(Platform::Other, &[("HOME", "/user")]), Some(PathBuf::from("/user/.config/soundcraft")));
+        assert_eq!(resolve(Platform::Mac, &vars), Some(PathBuf::from("/user/Library/Application Support/djforge")));
+        assert_eq!(resolve(Platform::Windows, &vars), Some(PathBuf::from("/roaming/djforge")));
+        assert_eq!(resolve(Platform::Other, &vars), Some(PathBuf::from("/xdg/djforge")));
+        assert_eq!(resolve(Platform::Other, &[("HOME", "/user")]), Some(PathBuf::from("/user/.config/djforge")));
         for platform in [Platform::Mac, Platform::Windows, Platform::Other] {
             assert_eq!(resolve(platform, &[]), None);
         }
+    }
+
+    #[test]
+    fn the_soundcraft_folder_is_where_soundcraft_kept_its_settings() {
+        let legacy = |platform, vars: &[(&str, &str)]| {
+            legacy_config_dir_with(platform, |name| vars.iter().find_map(|(key, value)| (*key == name).then(|| OsString::from(value))))
+        };
+        let vars = [("HOME", "/user"), ("APPDATA", "/roaming"), ("XDG_CONFIG_HOME", "/xdg")];
+        assert_eq!(legacy(Platform::Mac, &vars), Some(PathBuf::from("/user/Library/Application Support/SoundCraft")));
+        assert_eq!(legacy(Platform::Windows, &vars), Some(PathBuf::from("/roaming/SoundCraft")));
+        assert_eq!(legacy(Platform::Other, &vars), Some(PathBuf::from("/xdg/soundcraft")));
+        let overridden = [("SOUNDCRAFT_CONFIG_DIR", "/isolated"), ("APPDATA", "/roaming")];
+        assert_eq!(legacy(Platform::Windows, &overridden), None, "an overridden folder migrates nothing");
+    }
+
+    fn migration_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("djforge-migrate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_soundcraft_settings_are_copied_once_and_left_untouched() {
+        let base = migration_dir("once");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        std::fs::create_dir_all(old.join("Autosave/Song 1")).unwrap();
+        std::fs::create_dir_all(old.join("Presets")).unwrap();
+        std::fs::write(old.join("ui.json"), r#"{"ui_scale": 1.5}"#).unwrap();
+        std::fs::write(old.join("Autosave/Song 1/session.scraft"), "{}").unwrap();
+        std::fs::write(old.join("Presets/Lead.json"), "preset").unwrap();
+
+        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 3, skipped: vec![] }));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#);
+        assert_eq!(std::fs::read_to_string(new.join("Autosave/Song 1/session.scraft")).unwrap(), "{}");
+        assert_eq!(std::fs::read_to_string(new.join("Presets/Lead.json")).unwrap(), "preset");
+        assert_eq!(std::fs::read_to_string(old.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#, "the old folder stays");
+        assert!(old.join("Autosave/Song 1/session.scraft").is_file());
+        let left: Vec<_> = std::fs::read_dir(&base).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 2, "no staging folder left behind: {left:?}");
+
+        // Idempotent: djforge's own changes are never overwritten by a second copy.
+        std::fs::write(new.join("ui.json"), "{}").unwrap();
+        std::fs::write(old.join("ui.json"), r#"{"ui_scale": 2.0}"#).unwrap();
+        assert_eq!(migrate(&new, &old), Ok(Migration::None));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn nothing_is_migrated_without_a_soundcraft_folder() {
+        let base = migration_dir("none");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        assert_eq!(migrate(&new, &old), Ok(Migration::None));
+        assert!(!new.exists(), "no empty djforge folder is made");
+        std::fs::write(&old, "a file, not a folder").unwrap();
+        assert_eq!(migrate(&new, &old), Ok(Migration::None));
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

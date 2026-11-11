@@ -305,7 +305,7 @@ mod tests {
         for n in ["a.wav", "B.FLAC", "x.mp3", "y.ogg", "z.aiff", "/tmp/k.Wav"] {
             assert!(is_audio_name(n), "{n}");
         }
-        for n in ["song.scraft", "beat.mid", "noext", "", "pic.png"] {
+        for n in ["song.djforge", "beat.mid", "noext", "", "pic.png"] {
             assert!(!is_audio_name(n), "{n}");
         }
     }

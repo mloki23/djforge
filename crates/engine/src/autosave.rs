@@ -12,7 +12,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
-const SESSION: &str = "session.scraft";
+const SESSION: &str = "session.djforge";
+/// The session file of folders SoundCraft wrote (a settings folder copied across keeps them).
+const LEGACY_SESSION: &str = "session.scraft";
 const ORIGIN: &str = "origin";
 const LOCK: &str = "lock";
 /// The plan of a recording still running when the folder was written.
@@ -251,6 +253,13 @@ impl Autosave {
     }
 }
 
+/// The session file in the autosave folder `dir`: `session.djforge`, or the `session.scraft` of a
+/// folder SoundCraft wrote.
+fn session_in(dir: &Path) -> PathBuf {
+    let legacy = dir.join(LEGACY_SESSION);
+    if !dir.join(SESSION).exists() && legacy.is_file() { legacy } else { dir.join(SESSION) }
+}
+
 /// Unsaved work left behind in an autosave folder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Leftover {
@@ -275,12 +284,13 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         }
         let origin = std::fs::read_to_string(dir.join(ORIGIN)).ok().filter(|o| !o.is_empty());
         let origin_saved = origin.as_ref().and_then(|o| std::fs::metadata(o).and_then(|m| m.modified()).ok());
-        let saved = std::fs::metadata(dir.join(SESSION)).and_then(|m| m.modified());
+        let file = session_in(&dir);
+        let saved = std::fs::metadata(&file).and_then(|m| m.modified());
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
             Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
-                let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
                 out.push(Leftover { dir, name, origin, saved, recording });
@@ -304,7 +314,7 @@ pub fn recover(e: &mut Engine, left: &Leftover) -> Result<Vec<String>> {
 /// [`recover`], also reporting audio files that changed or were modified on disk since.
 pub fn recover_checked(e: &mut Engine, left: &Leftover) -> Result<crate::io::OpenReport> {
     let mut r = Engine::default();
-    let session = left.dir.join(SESSION);
+    let session = session_in(&left.dir);
     let links = left.origin.as_deref().map_or(session.as_path(), Path::new);
     let mut report = open_session_linked(&mut r, &session.to_string_lossy(), links)?;
     let mut s = r.session().clone();
@@ -368,14 +378,14 @@ fn repair_take(path: &Path, folders: &[PathBuf], channels: usize, rate: u32) -> 
     }
     let folder = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
     if !folder.is_some_and(|d| folders.contains(&d)) {
-        return Err(refuse("not in a folder SoundCraft records into"));
+        return Err(refuse(&format!("not in a folder {} records into", crate::APP_NAME)));
     }
     let header = |frames| soundcraft_audio_io::wav_float_header(channels, rate, frames).map_err(std::io::Error::other);
     let expected = header(0)?;
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let mut head = vec![0u8; expected.len()];
     if std::io::Read::read_exact(&mut f, &mut head).is_err() || !is_take_header(&head, &expected) {
-        return Err(refuse("not a take SoundCraft recorded"));
+        return Err(refuse(&format!("not a take {} recorded", crate::APP_NAME)));
     }
     let audio = f.metadata()?.len().saturating_sub(expected.len() as u64);
     let frames = audio / (channels.max(1) as u64 * 4);
@@ -512,7 +522,7 @@ mod tests {
     #[test]
     fn saved_audio_is_referenced_and_takes_are_copied_once() {
         let dir = folder("autosave-copies");
-        let path = dir.join("Song/Song.scraft");
+        let path = dir.join("Song/Song.djforge");
         let mut e = Engine::default();
         record(&mut e, 0.5);
         crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
@@ -571,6 +581,26 @@ mod tests {
         let mut r = Engine::default();
         recover(&mut r, &leftovers(&root)[0]).unwrap();
         assert_eq!(r.session().sources.len(), 6);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_autosave_soundcraft_left_is_still_recovered() {
+        let root = folder("autosave-legacy");
+        let w = Autosaver::new(root.clone());
+        let mut e = Engine::default();
+        record(&mut e, 0.5);
+        w.write(e.session_arc(), None, None);
+        w.flush().unwrap();
+        drop(w);
+        // The folder as SoundCraft wrote it (a settings folder copied across keeps such folders).
+        let dir = std::fs::read_dir(&root).unwrap().flatten().map(|d| d.path()).next().unwrap();
+        std::fs::rename(dir.join(SESSION), dir.join(LEGACY_SESSION)).unwrap();
+        let left = leftovers(&root);
+        assert_eq!(left.len(), 1);
+        let mut r = Engine::default();
+        recover(&mut r, &left[0]).unwrap();
+        assert_eq!(r.session().sources.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -656,7 +686,7 @@ mod tests {
     #[test]
     fn unsaved_work_is_offered_once_its_session_closes() {
         let dir = folder("autosave-leftovers");
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         let root = dir.join("Autosave");
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = Engine::default();

@@ -1,6 +1,6 @@
 # Stage 6 gate: loki journey with Session view slots ready to jam (Marty opens it in the app,
 # View > Session, clicks the window, then 1-8 / Shift+1-8 / 0 / Shift+0).
-#   soundcraft-cli script tools/live/jam_loki.cmds --save "C:/Users/marty/Music/djforge-tests/jam/loki jam.scraft"
+#   djforge-cli script tools/live/jam_loki.cmds --save "C:/Users/marty/Music/djforge-tests/jam/loki jam.djforge"
 session.new {"name": "loki jam", "sample_rate": 48000}
 dj.import_set {"plan": "C:/Users/marty/Music/mixforge/sets/loki journey/plan.json"}
 dj.split_stems {"clip": 7}

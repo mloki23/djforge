@@ -34,8 +34,8 @@ pub use mixer::{
     Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
 };
 pub use session::{
-    BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,
-    TrackView, ZoomState, ZoomToggle, truncate_chars,
+    APP_NAME, BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, LEGACY_SESSION_EXTENSION, MAX_COMMENT_CHARS, MAX_NAME_CHARS,
+    SESSION_EXTENSION, SESSION_EXTENSIONS, Session, SessionError, Tool, TrackView, ZoomState, ZoomToggle, is_session_path, truncate_chars,
 };
 pub use source::{Source, SourceAudio, SourcePool, VideoSource, camelot_of};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};

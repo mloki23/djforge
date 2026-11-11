@@ -1,52 +1,41 @@
 <p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
+  <img alt="The djforge app icon: four yellow waveform bars on a dark rounded square" src="assets/app-icon/djforge-1024.png" width="128">
 </p>
 
-<h1 align="center">SoundCraft</h1>
+<h1 align="center">djforge</h1>
 
 <p align="center">
-  <b>Recording, editing and mixing audio; an open-source, clean-room reimplementation of Avid Pro Tools, rebuilt in pure Rust.</b>
+  <b>A DJ-first DAW: build, prep and play DJ sets with a full multitrack editor and mixer underneath.</b>
 </p>
 
 <p align="center">
-  A complete digital audio workstation that runs natively on macOS, Windows, Linux and FreeBSD, and
-  in the browser. Multitrack editing, a full mixer with plugins, sends and automation, MIDI, recording
-  and bouncing, and every action scriptable from the command line or by an AI agent.
+  djforge is a fork of <a href="https://github.com/storytold/soundcraft">SoundCraft</a>, the open-source,
+  pure-Rust digital audio workstation by the <a href="https://getartcraft.com/">ArtCraft</a> team. It keeps
+  SoundCraft's Edit and Mix windows, plugins, automation, MIDI and recording, and adds what a DJ needs on
+  top: set import from mixforge plans, beat-locked transitions, track prep, stems, Session view slots to
+  jam with, and exports to Rekordbox and Mixxx. Everything stays scriptable from the command line or by
+  an AI agent.
 </p>
 
 <p align="center">
   <img alt="Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
-  <img alt="egui" src="https://img.shields.io/badge/UI-egui-14a9c4?style=flat-square">
-  <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20FreeBSD%20%C2%B7%20Web-0b7385?style=flat-square">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square">
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square">
 </p>
 
-<p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
-
-<p align="center">
-  <a href="https://getartcraft.com/apps/soundcraft"><b>SoundCraft on getartcraft.com</b></a> ·
-  <a href="https://getartcraft.com/">ArtCraft</a> ·
-  <a href="https://getartcraft.com/apps">All Crafting Apps</a>
-</p>
-
-<p align="center">
-  <img alt="SoundCraft's Edit window with a nine-track session: drums, bass, pad, keys and lead, a reverb aux and a master fader" src="docs/images/edit.png" width="100%">
-  <br>
-  <sub>The Edit window: tracks, waveforms, MIDI, rulers, markers and the transport, playing the built-in demo song (every sound in it is synthesised by SoundCraft itself).</sub>
-</p>
-
 > [!NOTE]
-> **ArtCraft is a community of artists from all walks of life.** Painters, photographers,
-> filmmakers, illustrators, designers, animators, hobbyists, and people who picked up a pencil
-> last week. If you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
+> **Based on SoundCraft.** djforge is built on SoundCraft by the ArtCraft team, dual-licensed
+> MIT OR Apache-2.0; its licence and credit notices are kept in [LICENSE-MIT](LICENSE-MIT),
+> [LICENSE-APACHE](LICENSE-APACHE), [NOTICE](NOTICE) and [ATTRIBUTION.md](ATTRIBUTION.md). Most of
+> what this page describes is SoundCraft's work. djforge saves sessions as `.djforge` files and still
+> opens SoundCraft's `.scraft` sessions (it never writes over them). The apps are `djforge` and
+> `djforge-cli`.
+
+<p align="center">
+  <img alt="The Edit window with a nine-track session: drums, bass, pad, keys and lead, a reverb aux and a master fader" src="docs/images/edit.png" width="100%">
+  <br>
+  <sub>The Edit window: tracks, waveforms, MIDI, rulers, markers and the transport, playing the built-in demo song (every sound in it is synthesised by the app itself).</sub>
+</p>
 
 <p align="center">
   <a href="#what-it-does">What it does</a> ·
@@ -61,7 +50,7 @@
 
 ## What it does
 
-SoundCraft follows the workflow audio engineers already know: an **Edit window** for arranging and
+Under the DJ features, djforge follows the workflow audio engineers already know (from SoundCraft): an **Edit window** for arranging and
 editing, a **Mix window** for balancing, edit modes, tools, playlists, memory locations, AudioSuite
 processing and the rest. If you've spent years in that workflow, your hands should already know
 where things are.
@@ -77,7 +66,7 @@ where things are.
   </tr>
   <tr>
     <td width="50%"><img alt="Volume automation drawn on the Pad track, with the Memory Locations and Big Counter windows open" src="docs/images/automation.png"></td>
-    <td width="50%"><img alt="The SoundCraft app icon: a singing nightingale on a teal field" src="assets/app-icon/soundcraft-1024.png" width="70%"></td>
+    <td width="50%"><img alt="The djforge app icon: four yellow waveform bars on a dark rounded square" src="assets/app-icon/djforge-1024.png" width="70%"></td>
   </tr>
   <tr>
     <td><b>Automation and markers.</b> Breakpoint automation for volume, pan, mute, sends and every plugin parameter, written live in Write, Touch and Latch, plus memory locations and a big counter.</td>
@@ -145,7 +134,7 @@ minimum remains Rust 1.90):
 ```sh
 git clone https://github.com/storytold/soundcraft
 cd soundcraft
-cargo run --release -p soundcraft -- --demo     # opens the demo song
+cargo run --release -p soundcraft -- --demo     # opens the demo song (the binary is djforge)
 ```
 
 Linux needs the ALSA headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora).
@@ -163,20 +152,21 @@ new tracks. **Setup › Keyboard Shortcuts** lists them all.
 
 ### Logs
 
-The desktop app writes its `log` records to standard error and to `logs/soundcraft.log` in the
-settings directory, beside `ui.json`, `Autosave/` and `Presets/` (Linux `~/.config/soundcraft/logs/`,
-or `$XDG_CONFIG_HOME/soundcraft/logs/`; macOS `~/Library/Application Support/SoundCraft/logs/`;
-Windows `%APPDATA%\SoundCraft\logs\`). A start from a desktop menu or the Dock has no terminal, so
+The desktop app writes its `log` records to standard error and to `logs/djforge.log` in the
+settings directory, beside `ui.json`, `Autosave/` and `Presets/` (Linux `~/.config/djforge/logs/`,
+or `$XDG_CONFIG_HOME/djforge/logs/`; macOS `~/Library/Application Support/djforge/logs/`;
+Windows `%APPDATA%\djforge\logs\`). On its first run djforge copies an existing SoundCraft
+settings folder (`%APPDATA%\SoundCraft` and the like) into its own once, leaving the old one as it was. A start from a desktop menu or the Dock has no terminal, so
 this file is what to attach to a bug report: the engine's panic report, audio devices that failed to
 open or broke, plugins that refused their stored state, CLAP plugins' own messages and files that
-failed to open land there. Each launch moves the previous log to `soundcraft.1.log` (and that one to
-`soundcraft.2.log`), so the log of a run that crashed survives the next start. The file stops
+failed to open land there. Each launch moves the previous log to `djforge.1.log` (and that one to
+`djforge.2.log`), so the log of a run that crashed survives the next start. The file stops
 growing at 16 MiB. `--version` writes no file, and runs with `SOUNDCRAFT_NO_PREFS` log to standard
 error only.
 
 | Variable | Effect |
 |---|---|
-| `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for SoundCraft's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,soundcraft_mix=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`soundcraft*=debug`). |
+| `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for the app's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,soundcraft_mix=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`soundcraft*=debug`). |
 | `SOUNDCRAFT_NO_PREFS` | No preferences read or written and no log file (agents' test runs). |
 
 The realtime audio thread never writes a record itself: the logger keeps the first one it logs
@@ -192,35 +182,35 @@ are reachable from the menus, the keyboard, the command line, a JSON control cha
 
 ```sh
 # Headless: load the demo, turn the kick down, add an EQ, bounce.
-soundcraft-cli run --demo \
+djforge-cli run --demo \
   --cmd 'mix.volume={"track":"Kick","db":-6}' \
   --cmd 'mix.insert={"track":"Bass","plugin":"eq_7band"}' \
   --bounce mix.wav
 
 # Drive the running app.
-soundcraft --demo --control 7801 &
-soundcraft-cli app --port 7801 transport.play
-soundcraft-cli app --port 7801 ui.screenshot '{"path":"shot.png"}'
+djforge --demo --control 7801 &
+djforge-cli app --port 7801 transport.play
+djforge-cli app --port 7801 ui.screenshot '{"path":"shot.png"}'
 
 # Give Claude a DAW.
-claude mcp add soundcraft -- soundcraft-cli mcp --demo
+claude mcp add djforge -- djforge-cli mcp --demo
 
 # Or keep the agent to some folders (reads and writes are separate roots).
-soundcraft-cli mcp --automation-read-root DIR --automation-write-root DIR
+djforge-cli mcp --automation-read-root DIR --automation-write-root DIR
 ```
 
 See [`docs/control-protocol.md`](docs/control-protocol.md) and [`docs/mcp.md`](docs/mcp.md).
-`soundcraft-cli commands` lists every command.
+`djforge-cli commands` lists every command.
 
-Open **SoundCraft › Session Audio Health** to check loaded audio availability, sample-rate
+Open **djforge › Session Audio Health** to check loaded audio availability, sample-rate
 mismatches and clip source bounds across all playlists, including alternate takes. The report
 offers a refresh button and suggests how to resolve each issue. Scripts can obtain the same JSON
-report with `soundcraft-cli run --demo --cmd 'session.audio_health={}'`. This checks loaded media,
+report with `djforge-cli run --demo --cmd 'session.audio_health={}'`. This checks loaded media,
 not files on disk, signal levels, plugins or routing.
 
 ## How it's built
 
-SoundCraft is a Cargo workspace of small crates with strict layering: nothing below the UI knows
+djforge, like SoundCraft, is a Cargo workspace of small crates with strict layering: nothing below the UI knows
 about egui, so the interface could be swapped for another one.
 
 | Crate | What it does |
@@ -242,7 +232,7 @@ and layering checks and the WebAssembly build.
 
 ## Status and roadmap
 
-SoundCraft is **pre-alpha**: it covers 94 % of the incumbent's menu items (measured), about 70 % of
+djforge (and SoundCraft under it) is **pre-alpha**: it covers 94 % of the incumbent's menu items (measured), about 70 % of
 its features by presence, and is roughly 40 % of the way to replacing it for real work: record,
 edit, mix and bounce work end to end, but choosing an audio interface and buffer size,
 recording MIDI from a controller and session interchange (AAF/OMF) are still missing, and those
@@ -255,7 +245,8 @@ very welcome, in the issues or on Discord.
 
 ## Downloads
 
-**Download SoundCraft** from GitHub: the [latest release](https://github.com/storytold/soundcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/soundcraft/releases) have earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+djforge has no release builds yet: build it from source (above). The builds below are
+**SoundCraft's**, from GitHub: the [latest release](https://github.com/storytold/soundcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/soundcraft/releases) have earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
 
 ### Windows
 
@@ -275,7 +266,7 @@ PowerShell, from the folder containing the executable:
 
 ```powershell
 $env:WGPU_BACKEND = "vulkan"
-& .\soundcraft.exe
+& .\djforge.exe
 Remove-Item Env:WGPU_BACKEND                     # restore the default for later launches
 ```
 
@@ -319,7 +310,7 @@ RISC-V (riscv64): `soundcraft-<ver>-linux-riscv64.tar.gz`, a tarball only (glibc
 
 ## The Crafting Apps
 
-SoundCraft is one of the **Crafting Apps**: free, open-source creative tools from the
+djforge is based on SoundCraft, one of the **Crafting Apps**: free, open-source creative tools from the
 [ArtCraft](https://getartcraft.com/) team, each written from scratch in Rust and each able to
 stand on its own.
 
@@ -332,7 +323,7 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | Motion graphics and visual effects | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/soundcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.soundcraft.png" alt="" width="32" height="32"> | **SoundCraft** | **Recording, editing and mixing audio · you are here** | [GitHub](https://github.com/storytold/soundcraft) | [Website](https://getartcraft.com/apps/soundcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/soundcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.soundcraft.png" alt="" width="32" height="32"> | **SoundCraft** | **Recording, editing and mixing audio · djforge is based on it** | [GitHub](https://github.com/storytold/soundcraft) | [Website](https://getartcraft.com/apps/soundcraft) |
 
 And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video studio for artists who want real control.
 
@@ -360,24 +351,25 @@ And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video stud
 
 ## License and credits
 
-SoundCraft is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors. Required notices are in [NOTICE](NOTICE).
+djforge is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option,
+like SoundCraft, which it is based on. Copyright (c) 2026 ArtCraft Team and the SoundCraft
+contributors, and the djforge contributors. Required notices are in [NOTICE](NOTICE).
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
 Every icon in the interface is drawn in code, the app icon is original, and the demo song and the
-screenshots' audio are synthesised by SoundCraft itself, so there are no samples or artwork from
+screenshots' audio are synthesised by the app itself, so there are no samples or artwork from
 anyone else in this repository.
 
 The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
+ArtCraft Team and are not covered by this license; djforge doesn't use them as its own. They may be used only unmodified, and only as
 part of this repository and SoundCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
 Forks and modified versions must remove them.
 
-<sub>Avid and Pro Tools are trademarks or registered trademarks of Avid Technology, Inc. in the United States and/or other countries. SoundCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Avid Technology, Inc.; these names are used only to describe the workflows it is compatible with.</sub>
+<sub>Avid and Pro Tools are trademarks or registered trademarks of Avid Technology, Inc. in the United States and/or other countries. SoundCraft and djforge are independent, open-source projects and are not affiliated with, sponsored by or endorsed by Avid Technology, Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
-<sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. SoundCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
+<sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. SoundCraft and djforge are independent, open-source projects and are not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <p align="center">
   <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>

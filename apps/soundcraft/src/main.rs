@@ -1,12 +1,12 @@
-//! SoundCraft desktop app.
+//! djforge desktop app.
 //!
-//! Usage: `soundcraft [--demo] [--control <port>] [--no-audio] [session.scraft | audio files…]`
+//! Usage: `djforge [--demo] [--control <port>] [--no-audio] [session.djforge | session.scraft | audio files…]`
 //!
 //! `--control <port>` (or `SOUNDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server
 //! (`0` picks a free port and prints it): `{"id":1,"method":"ui.inspect","params":{}}` →
 //! `{"id":1,"ok":true,"result":…}`. See `soundcraft_ui_egui::control` for the methods.
 //!
-//! `log` records go to standard error and `<settings dir>/logs/soundcraft.log` (`RUST_LOG` sets the
+//! `log` records go to standard error and `<settings dir>/logs/djforge.log` (`RUST_LOG` sets the
 //! levels); see [`logging`].
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -19,7 +19,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
 
-use soundcraft_engine::Engine;
+use soundcraft_engine::{APP_NAME, Engine};
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
 use std::sync::Arc;
 
@@ -79,16 +79,8 @@ impl eframe::App for App {
         }
         // With the system menu bar there is no egui bar showing the window and dirty state, so the
         // title carries them; elsewhere the egui menu bar already does.
-        let title = if self.0.native_menu_bar {
-            format!(
-                "{}{} — SoundCraft — {}",
-                self.0.engine.session().name,
-                if self.0.engine.is_dirty() { " *" } else { "" },
-                if self.0.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" }
-            )
-        } else {
-            format!("{} — SoundCraft", self.0.engine.session().name)
-        };
+        let window = if self.0.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" };
+        let title = window_title(&self.0.engine.session().name, self.0.engine.is_dirty(), self.0.native_menu_bar.then_some(window));
         set_title(ctx, title);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -110,9 +102,19 @@ impl eframe::App for App {
     }
 }
 
+/// The window title: the session's name, then the app's. With the system menu bar there is no egui
+/// bar showing the dirty state and the `window` (Edit or Mix), so the title carries them.
+fn window_title(session: &str, dirty: bool, window: Option<&str>) -> String {
+    match window {
+        Some(w) => format!("{session}{} — {APP_NAME} — {w}", if dirty { " *" } else { "" }),
+        None => format!("{session} — {APP_NAME}"),
+    }
+}
+
+/// Session files open; MIDI and audio import. `.djforge` and SoundCraft's `.scraft` both open.
 fn open_path(app: &mut SoundApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    let r = if lower.ends_with(".scraft") {
+    let r = if soundcraft_engine::model::is_session_path(&lower) {
         dialogs::run_or_ask(app, "session.open", serde_json::json!({"path": p}))
     } else if lower.ends_with(".mid") || lower.ends_with(".midi") || lower.ends_with(".smf") {
         app.run("file.import_midi", serde_json::json!({"path": p}))
@@ -128,6 +130,27 @@ fn open_path(app: &mut SoundApp, p: &str) {
 /// The per-user settings directory: `ui.json`, `Autosave/`, `Presets/` and `logs/` live here.
 fn config_dir() -> Option<std::path::PathBuf> {
     config::config_dir()
+}
+
+/// First run after the rebrand: copy SoundCraft's settings folder into djforge's (see
+/// [`config::migrate`]). Returns the status note telling what happened, if anything did.
+fn migrate_settings() -> Option<String> {
+    let (new, old) = (config::config_dir()?, config::legacy_config_dir()?);
+    match config::migrate(&new, &old) {
+        Ok(config::Migration::None) => None,
+        Ok(config::Migration::Copied { files, skipped }) => {
+            log::info!("copied {files} files of the SoundCraft settings {} to {}", old.display(), new.display());
+            for file in &skipped {
+                log::warn!("not copied from the SoundCraft settings (couldn't be read): {}", file.display());
+            }
+            let left_out = if skipped.is_empty() { String::new() } else { format!(" ({} files couldn't be read; see the log)", skipped.len()) };
+            Some(format!("Your SoundCraft settings were copied to {}{left_out}. The SoundCraft folder is unchanged.", new.display()))
+        }
+        Err(error) => {
+            log::warn!("{error}");
+            Some(format!("Your SoundCraft settings couldn't be copied (see the log): {APP_NAME} starts with fresh settings."))
+        }
+    }
 }
 
 fn prefs_path() -> Option<std::path::PathBuf> {
@@ -169,7 +192,7 @@ fn services() -> Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
-                "session.open" => d.add_filter("SoundCraft Session", &["scraft"]),
+                "session.open" => d.add_filter(format!("{APP_NAME} Session"), soundcraft_engine::model::SESSION_EXTENSIONS),
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(
                     "Audio",
@@ -182,12 +205,13 @@ fn services() -> Services {
             let path = std::path::Path::new(default);
             let mut d = match purpose {
                 "file.bounce_mix" => rfd::FileDialog::new().add_filter("Audio", &["wav", "aif", "aiff", "flac"]),
-                _ => rfd::FileDialog::new().add_filter("SoundCraft Session", &["scraft"]),
+                _ => rfd::FileDialog::new().add_filter(format!("{APP_NAME} Session"), &[soundcraft_engine::model::SESSION_EXTENSION]),
             };
             if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
                 d = d.set_directory(dir);
             }
-            if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+            // A SoundCraft `.scraft` is offered as the `.djforge` beside it, never written over.
+            if let Some(n) = soundcraft_engine::io::session_file(default).file_name().and_then(|n| n.to_str()) {
                 d = d.set_file_name(n);
             }
             d.save_file().map(|p| p.to_string_lossy().into_owned())
@@ -199,10 +223,10 @@ fn services() -> Services {
 }
 
 /// The window, Dock, taskbar and Alt-Tab icon. macOS gets Apple's icon grid (transparent margin);
-/// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
+/// elsewhere the full tile. Regenerate with `tools/icon/make_icon.py`.
 fn app_icon() -> Option<egui::IconData> {
     #[cfg(target_os = "macos")]
-    let png: &[u8] = include_bytes!("../../../assets/app-icon/soundcraft-macos-512.png");
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/djforge-macos-512.png");
     #[cfg(not(target_os = "macos"))]
     let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.soundcraft.png");
     eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
@@ -214,7 +238,7 @@ fn main() -> eframe::Result {
     let logger = logging::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("SoundCraft {}", env!("CARGO_PKG_VERSION"));
+        println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let demo = args.iter().any(|a| a == "--demo" || a == "--sample");
@@ -231,7 +255,9 @@ fn main() -> eframe::Result {
         .filter(|(i, a)| !(a.starts_with("--") || (i > &0 && args.get(i - 1).is_some_and(|p| p == "--control"))))
         .map(|(_, a)| a.clone())
         .collect();
-    log::info!("SoundCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    log::info!("{APP_NAME} {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    // Before anything reads or writes the settings directory.
+    let migrated = if prefs_enabled() { migrate_settings() } else { None };
     // The log file lives in the settings directory; opened after the arguments, so `--version`
     // leaves no file behind. Records logged until now are written to it first. Runs without
     // preferences (agents' test runs) log to standard error only, so they don't rotate away the
@@ -264,7 +290,7 @@ fn main() -> eframe::Result {
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SoundCraft")
+            .with_title(APP_NAME)
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_maximized(prefs.window_maximized)
             .with_min_inner_size([960.0, 600.0])
@@ -279,7 +305,7 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "windows")]
     graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
     eframe::run_native(
-        "SoundCraft",
+        APP_NAME,
         options,
         Box::new(move |cc| {
             let player =
@@ -290,6 +316,9 @@ fn main() -> eframe::Result {
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
+            if let Some(note) = migrated {
+                app.ui.status = note;
+            }
             // Live MIDI input: the devices enabled in the preferences open on the first frame.
             app.midi_host = soundcraft_ui_egui::midi_input::system_host();
             if let Some(port) = control_port {
@@ -328,7 +357,14 @@ fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::set_title;
+    use super::{set_title, window_title};
+
+    #[test]
+    fn the_title_names_the_session_then_djforge() {
+        assert_eq!(window_title("Song", false, None), "Song — djforge");
+        assert_eq!(window_title("Song", true, Some("Mix")), "Song * — djforge — Mix");
+        assert_eq!(window_title("Song", false, Some("Edit")), "Song — djforge — Edit");
+    }
 
     #[test]
     fn the_title_is_sent_only_when_it_changes() {
@@ -338,8 +374,8 @@ mod tests {
             out.textures_delta.clear();
             out.viewport_output.values().flat_map(|v| &v.commands).filter(|c| matches!(c, egui::ViewportCommand::Title(_))).count()
         };
-        assert_eq!(titles("Song — SoundCraft"), 1);
-        assert_eq!(titles("Song — SoundCraft"), 0);
-        assert_eq!(titles("Song * — SoundCraft"), 1);
+        assert_eq!(titles("Song — djforge"), 1);
+        assert_eq!(titles("Song — djforge"), 0);
+        assert_eq!(titles("Song * — djforge"), 1);
     }
 }

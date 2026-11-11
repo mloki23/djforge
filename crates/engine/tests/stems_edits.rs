@@ -151,7 +151,7 @@ fn a_session_saved_and_reopened_keeps_the_stems_and_their_audio() {
     let dir = std::env::temp_dir().join(format!("djforge-stems-edits-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("Set").join("Set.scraft").to_string_lossy().into_owned();
+    let path = dir.join("Set").join("Set.djforge").to_string_lossy().into_owned();
     let (mut e, _, id, set) = split_deck();
     e.session_mut().tracks[0].mixer.stem_gain_db = [0.0, -3.0, -144.0, 6.0];
     run(&mut e, "session.save_as", json!({"path": path}));

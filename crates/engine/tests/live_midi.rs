@@ -325,7 +325,7 @@ fn shrinking_a_midi_slot_drops_notes_only_when_asked_and_reloads_as_held() {
     let dir = std::env::temp_dir().join(format!("djforge-slot-shrink-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("shrink.scraft");
+    let file = dir.join("shrink.djforge");
     soundcraft_engine::io::save_session(&mut e, file.to_str().unwrap()).unwrap();
     let mut back = Engine::default();
     let opened = soundcraft_engine::io::open_session(&mut back, file.to_str().unwrap());

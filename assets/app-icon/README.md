@@ -1,44 +1,42 @@
-# SoundCraft app icon (placeholder)
+# djforge app icon
 
-**A nightingale singing**, as an engraving-style head-and-shoulders portrait in the Crafting Apps'
-owl-template framing (craftrules `standards/icon-design.md`): a full-bleed colour field, the bird
-in three-quarter view with its bill open and its eye on the viewer, its breast and wing running off
-the bottom and right edges, three song arcs leaving the bill.
-
-This is a **placeholder** until the owner draws SoundCraft's icon in ArtCraft like the other apps'
-icons. Replace `icon.svg` and run `packaging/icons.sh`; nothing else needs to change.
+**Four waveform bars**: a stylised waveform in djforge yellow on a dark rounded square, simple
+enough to read at 16 px.
 
 ## Palette
 
-Exactly three colours:
+Exactly two colours, from djforge's studio palette:
 
 | Colour | Hex | Used for |
 |---|---|---|
-| Ink | `#0b0b0c` | Line work and contour |
-| Paper | `#efe9dc` | The bird and the song arcs |
-| SoundCraft teal (app colour) | `#14a9c4` | The full-bleed background field |
+| djforge yellow (accent) | `#f8d200` | The four waveform bars |
+| Background | `#111317` | The rounded square |
 
 ## Geometry
 
-A 512 × 512 viewBox, clipped to a rounded square with `rx=112`. Windows and Linux use the full
-tile. The macOS icons (`soundcraft.icns`, `soundcraft-macos-512.png`) sit on Apple's grid: an
-824/1024 body with a transparent margin.
+A 512 × 512 grid: a full-bleed rounded square (`rx=112`) and four bars 64 wide with 40 between
+them, centred, with rounded ends and heights 176, 328, 248 and 136. Every bitmap is drawn at its
+own size with the bars snapped to whole pixels (at 16 px: 2 px bars, 1 px gaps), so small icons
+stay crisp. Windows and Linux use the full tile. The macOS icons (`djforge.icns`,
+`djforge-macos-512.png`) sit on Apple's grid: an 824/1024 body with a transparent margin.
 
 ## Provenance and licence
 
-Drawn from scratch as hand-placed SVG paths by the SoundCraft contributors; no source image was
-traced or copied. MIT OR Apache-2.0, like the code (see `ATTRIBUTION.md`).
+Original, drawn from scratch by the djforge contributors as simple geometric shapes; nothing was
+traced or copied. MIT OR Apache-2.0, like the code (see `ATTRIBUTION.md`). It replaces
+SoundCraft's placeholder nightingale icon.
 
 ## Files
 
 | File | What it is |
 |---|---|
 | `icon.svg` | The canonical vector |
-| `soundcraft-1024.png` | 1024 px render |
-| `soundcraft-macos-512.png` | Runtime window/Dock icon on macOS (Apple grid margin) |
-| `soundcraft.icns` | macOS bundle icon |
-| `soundcraft.ico` | Windows icon (16–256 px), embedded in `soundcraft.exe` and used by the MSI |
-| `hicolor/<size>x<size>/apps/ai.storyteller.soundcraft.png` | Linux/FreeBSD icon theme, 16–512 px, plus `scalable/` |
+| `djforge-1024.png` | 1024 px render |
+| `djforge-macos-512.png` | Runtime window/Dock icon on macOS (Apple grid margin) |
+| `djforge.icns` | macOS bundle icon (16–1024 px) |
+| `djforge.ico` | Windows icon (16–256 px), embedded in `djforge.exe` and used by the MSI |
+| `hicolor/<size>x<size>/apps/ai.storyteller.soundcraft.png` | Linux/FreeBSD icon theme, 16–512 px, plus `scalable/` (named after the Linux app id, which is unchanged) |
 
-Regenerate everything with `packaging/icons.sh` (needs `resvg`, and `iconutil` on macOS for the
-`.icns`).
+Regenerate everything with `python tools/icon/make_icon.py` (or `packaging/icons.sh`). It needs
+Python 3 and Pillow, and nothing else: the shapes are defined once in the script, which writes the
+SVG and draws every bitmap itself.

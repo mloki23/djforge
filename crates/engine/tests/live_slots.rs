@@ -112,7 +112,7 @@ fn setup_makes_four_stereo_live_tracks_once_and_rebinds_a_deleted_one() {
     let gone = e.session().live.columns[1].track;
     run(&mut e, "track.delete", json!({"tracks": [gone.0]}));
     // Saved and opened again meanwhile, the column stays (lost, slots and all) and is reported.
-    let file = dir.0.join("lost.scraft");
+    let file = dir.0.join("lost.djforge");
     soundcraft_engine::io::save_session(&mut e, file.to_str().unwrap()).unwrap();
     let mut e = Engine::default();
     let missing = soundcraft_engine::io::open_session(&mut e, file.to_str().unwrap()).unwrap();
@@ -402,7 +402,7 @@ fn slots_and_their_stems_survive_save_and_reopen() {
     run(&mut e, "live.slot_from_selection", json!({"column": 0, "slot": 3}));
     run(&mut e, "live.slot_from_file", json!({"column": 1, "path": wav(&dir.0, "hit.wav", 0.5)}));
     run(&mut e, "live.quantise", json!({"value": 2}));
-    let file = dir.0.join("set").join("set.scraft");
+    let file = dir.0.join("set").join("set.djforge");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     soundcraft_engine::io::save_session(&mut e, file.to_str().unwrap()).unwrap();
     let mut back = Engine::default();
@@ -574,7 +574,7 @@ fn a_template_keeps_the_live_columns_but_not_their_slots() {
     let mut e = Engine::default();
     run(&mut e, "live.setup", json!({}));
     run(&mut e, "live.slot_from_file", json!({"column": 0, "path": wav(&dir.0, "a.wav", 1.0)}));
-    let file = dir.0.join("t.scraft");
+    let file = dir.0.join("t.djforge");
     run(&mut e, "session.save_template", json!({"path": file}));
     let mut t = Engine::default();
     soundcraft_engine::io::open_session(&mut t, file.to_str().unwrap()).unwrap();

@@ -1,11 +1,15 @@
 [package]
 name = "soundcraft"
-description = "SoundCraft desktop app"
+description = "djforge desktop app (the binary is djforge)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-default-run = "soundcraft"
+default-run = "djforge"
+
+[[bin]]
+name = "djforge"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -27,7 +31,7 @@ log.workspace = true
 rfd.workspace = true
 
 [build-dependencies]
-# Icon + VERSIONINFO for soundcraft.exe; build.rs only uses it when the target is Windows.
+# Icon + VERSIONINFO for djforge.exe; build.rs only uses it when the target is Windows.
 winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

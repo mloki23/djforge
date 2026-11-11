@@ -171,7 +171,7 @@ fn escape_cancels_and_the_session_cannot_be_replaced_while_it_preps() {
     h.state_mut().prep = Some(job);
     reached.recv_timeout(Duration::from_secs(60)).unwrap();
     for id in ["session.new", "session.open", "session.close", "session.revert"] {
-        let err = h.state_mut().run(id, json!({"path": dir.join("Other.scraft").to_string_lossy()})).unwrap_err();
+        let err = h.state_mut().run(id, json!({"path": dir.join("Other.djforge").to_string_lossy()})).unwrap_err();
         assert!(err.contains("prep"), "{id}: {err}");
     }
     assert_eq!(h.state().engine.session().tracks.len(), tracks);
@@ -198,7 +198,7 @@ fn file_and_session_commands_wait_for_the_prep_while_playing_and_editing_go_on()
     for (id, params) in [
         ("file.import_audio", json!({"paths": [copy]})),
         ("file.relink_audio", json!({"file": copy})),
-        ("session.save_as", json!({"path": dir.join("Mine.scraft").to_string_lossy()})),
+        ("session.save_as", json!({"path": dir.join("Mine.djforge").to_string_lossy()})),
         ("session.new", json!({})),
         ("dj.import_set", json!({"plan": dir.join("plan.json").to_string_lossy(), "report": copy})),
         ("prep.tracks", json!({"source": src.to_string_lossy(), "out": dir.join("other").to_string_lossy()})),
@@ -206,7 +206,7 @@ fn file_and_session_commands_wait_for_the_prep_while_playing_and_editing_go_on()
         let err = h.state_mut().run(id, params).unwrap_err();
         assert_eq!(err, "Wait for the prep to finish (or cancel it)", "{id}");
     }
-    assert!(!dir.join("other").exists() && !dir.join("Mine.scraft").exists());
+    assert!(!dir.join("other").exists() && !dir.join("Mine.djforge").exists());
     // The Bounce dialog starts its bounce without `run`, and is held back too.
     soundcraft_ui_egui::bounce::start(h.state_mut(), &json!({"path": dir.join("Mix.wav").to_string_lossy()}));
     assert!(h.state().bounce.is_none());

@@ -49,7 +49,7 @@ pub fn start() {
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>SoundCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => el.set_inner_html(&format!("<p>djforge failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
             }
         }
     });
@@ -67,7 +67,8 @@ enum Purpose {
     Midi,
 }
 
-const SESSION_EXTS: &[&str] = &[io::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION];
+const SESSION_EXTS: &[&str] =
+    &[io::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION, io::LEGACY_BUNDLE_EXTENSION, soundcraft_model::LEGACY_SESSION_EXTENSION];
 const AUDIO_EXTS: &[&str] =
     &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "m4b", "aac", "mp4", "caf", "mkv", "webm"];
 const MIDI_EXTS: &[&str] = &["mid", "midi", "smf"];
@@ -97,7 +98,7 @@ impl Purpose {
 
     fn filter(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Session => ("SoundCraft Session", SESSION_EXTS),
+            Self::Session => ("djforge Session", SESSION_EXTS),
             Self::Audio => ("Audio", AUDIO_EXTS),
             Self::Midi => ("MIDI", MIDI_EXTS),
         }
@@ -234,14 +235,14 @@ fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
     opts.set_type(match name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).as_deref() {
-        Some("scraftz") => "application/zip",
+        Some("djforgez" | "scraftz") => "application/zip",
         Some("wav") => "audio/wav",
         Some("aif" | "aiff") => "audio/aiff",
         Some("flac") => "audio/flac",
         Some("mid" | "midi") => "audio/midi",
         Some("svg") => "image/svg+xml",
         Some("txt") => "text/plain",
-        Some("json" | "scraft") => "application/json",
+        Some("json" | "djforge" | "scraft") => "application/json",
         Some("musicxml") => "application/vnd.recordare.musicxml+xml",
         _ => "application/octet-stream",
     });

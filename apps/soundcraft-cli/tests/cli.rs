@@ -1,4 +1,4 @@
-//! `soundcraft-cli mcp` with the automation root flags, run as the real binary.
+//! `djforge-cli mcp` with the automation root flags, run as the real binary.
 // Integration tests: unwrapping and panicking on failure is fine here, unlike in shipped code (AGENTS.md).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -9,7 +9,7 @@ use std::process::{Command, Output, Stdio};
 use serde_json::Value;
 
 fn bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soundcraft-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_djforge-cli"));
     cmd.env("SOUNDCRAFT_NO_PREFS", "1");
     // The binary sets up mixforge, Demucs and the app's stem cache: under test none of them may
     // reach the real ones.
@@ -32,7 +32,7 @@ fn tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Send `calls` (tool name, arguments) to `soundcraft-cli mcp <args>`; returns whether it exited
+/// Send `calls` (tool name, arguments) to `djforge-cli mcp <args>`; returns whether it exited
 /// cleanly, its stderr, and the stdout lines after `initialize`, one per call.
 fn mcp_session(args: &[&str], calls: &[(&str, Value)]) -> (bool, String, Vec<Value>) {
     let mut child = bin().arg("mcp").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -76,8 +76,8 @@ fn mcp_automation_roots_confine_the_server() {
     let calls = [
         ("import_audio", serde_json::json!({"path": work.join("in.wav").to_str().unwrap()})),
         ("import_audio", serde_json::json!({"path": secret})),
-        ("save_session", serde_json::json!({"path": work.join("saved.scraft").to_str().unwrap()})),
-        ("save_session", serde_json::json!({"path": elsewhere.join("saved.scraft").to_str().unwrap()})),
+        ("save_session", serde_json::json!({"path": work.join("saved.djforge").to_str().unwrap()})),
+        ("save_session", serde_json::json!({"path": elsewhere.join("saved.djforge").to_str().unwrap()})),
         ("bounce_mix", serde_json::json!({"path": elsewhere.join("mix.wav").to_str().unwrap()})),
     ];
     let (success, stderr, replies) = mcp_session(&[&read_flag, "--automation-write-root", work_s], &calls);
@@ -87,12 +87,12 @@ fn mcp_automation_roots_confine_the_server() {
     assert_eq!(replies[1]["result"]["isError"], true);
     assert!(text(&replies[1]).contains("outside the read root"), "{}", text(&replies[1]));
     assert_eq!(replies[2]["result"]["isError"], false, "{}", replies[2]);
-    assert!(work.join("saved.scraft").exists());
+    assert!(work.join("saved.djforge").exists());
     assert_eq!(replies[3]["result"]["isError"], true);
     assert!(text(&replies[3]).contains("outside the write root"), "{}", text(&replies[3]));
     assert_eq!(replies[4]["result"]["isError"], true);
     assert!(text(&replies[4]).contains("outside the write root"), "{}", text(&replies[4]));
-    assert!(!elsewhere.join("saved.scraft").exists() && !elsewhere.join("mix.wav").exists());
+    assert!(!elsewhere.join("saved.djforge").exists() && !elsewhere.join("mix.wav").exists());
 
     // A root left out grants none of its access.
     let (_, _, replies) = mcp_session(&[&read_flag], &calls[2..3]);

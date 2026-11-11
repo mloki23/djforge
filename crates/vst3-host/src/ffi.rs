@@ -639,7 +639,7 @@ impl IHostApplicationTrait for HostContext {
         // SAFETY: the plugin passes a pointer to a writable String128 (or null, handled).
         match unsafe { name.as_mut() } {
             Some(n) => {
-                write_c16("SoundCraft", n);
+                write_c16("djforge", n);
                 sb::kResultOk
             }
             None => sb::kInvalidArgument,
@@ -2186,8 +2186,8 @@ mod tests {
     #[test]
     fn strings_are_bounded() {
         let mut b = [0u16; 4];
-        write_c16("SoundCraft", &mut b);
-        assert_eq!(read_c16(&b), "Sou");
+        write_c16("djforge", &mut b);
+        assert_eq!(read_c16(&b), "djf");
         let full: Vec<u16> = "abcd".encode_utf16().collect();
         assert_eq!(read_c16(&full), "abcd");
         let c: Vec<c_char> = b"Fx|EQ\0junk".iter().map(|&x| x as c_char).collect();
@@ -2250,7 +2250,7 @@ mod tests {
             assert_eq!(h.getName(&mut name), sb::kResultOk);
             assert_eq!(h.restartComponent(sv::RestartFlags_::kLatencyChanged as i32), sb::kResultOk);
         }
-        assert_eq!(read_c16(&name), "SoundCraft");
+        assert_eq!(read_c16(&name), "djforge");
         assert!(h.latency_changed.load(Ordering::Relaxed));
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
     }

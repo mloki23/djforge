@@ -116,7 +116,7 @@ impl Dialogs {
                 path: if home.is_empty() {
                     format!("{name}.{}", soundcraft_engine::io::BUNDLE_EXTENSION)
                 } else {
-                    format!("{home}/{name}/{name}.scraft")
+                    format!("{home}/{name}/{name}.djforge")
                 },
                 key: "path".into(),
             },
@@ -234,7 +234,7 @@ fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
         "file.print_score" => ".svg",
         "file.export_clip_groups" => ".scgrp",
         "file.export_session_text" => ".txt",
-        _ if id.contains("session") => ".scraft",
+        _ if id.contains("session") => ".djforge",
         _ => "",
     };
     let path = if importing || key == "dir" { format!("{home}/") } else { format!("{home}/{name}{ext}") };

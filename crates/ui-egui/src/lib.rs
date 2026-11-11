@@ -44,7 +44,7 @@ pub mod widgets;
 pub mod windows;
 
 use serde_json::{Value, json};
-use soundcraft_engine::{Engine, TransportRequest};
+use soundcraft_engine::{APP_NAME, Engine, TransportRequest};
 use soundcraft_model::TrackId;
 use soundcraft_playback::record::Trouble;
 use soundcraft_playback::{OutputTrouble, Player};
@@ -953,9 +953,9 @@ impl SoundApp {
         self.panic_rev = self.engine.revision;
         let saved = self.engine.is_dirty() && self.write_autosave();
         self.ui.status = if saved {
-            "SoundCraft hit an internal error (see the log). Your changes were autosaved: save them, then restart SoundCraft.".into()
+            format!("{APP_NAME} hit an internal error (see the log). Your changes were autosaved: save them, then restart {APP_NAME}.")
         } else {
-            "SoundCraft hit an internal error (see the log). Restart SoundCraft to be safe.".into()
+            format!("{APP_NAME} hit an internal error (see the log). Restart {APP_NAME} to be safe.")
         };
     }
 
@@ -988,7 +988,7 @@ impl SoundApp {
         for d in std::fs::read_dir(dir).ok()?.flatten() {
             for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
                 let p = f.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("scraft")
+                if soundcraft_model::is_session_path(&p.to_string_lossy())
                     && let Ok(m) = f.metadata().and_then(|m| m.modified())
                     && best.as_ref().is_none_or(|(t, _)| m > *t)
                 {
@@ -1057,7 +1057,7 @@ impl SoundApp {
         let (cause, then) = match trouble {
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
-                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
+                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart djforge.",
             ),
             OutputTrouble::Gone => {
                 (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")

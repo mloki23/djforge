@@ -7,9 +7,9 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>SoundCraft</string>
+  <string>djforge</string>
   <key>CFBundleName</key>
-  <string>SoundCraft</string>
+  <string>djforge</string>
   <key>CFBundleExecutable</key>
   <string>SoundCraft</string>
   <key>CFBundleIdentifier</key>
@@ -42,20 +42,20 @@
   <true/>
   <key>NSRequiresAquaSystemAppearance</key>
   <false/>
-  <!-- Shown by macOS the first time SoundCraft opens an input device (recording). -->
+  <!-- Shown by macOS the first time djforge opens an input device (recording). -->
   <key>NSMicrophoneUsageDescription</key>
-  <string>SoundCraft records audio from the input you choose.</string>
+  <string>djforge records audio from the input you choose.</string>
   <key>NSHumanReadableCopyright</key>
-  <string>Copyright © the SoundCraft authors. MIT OR Apache-2.0.</string>
+  <string>Copyright © the djforge and SoundCraft authors. MIT OR Apache-2.0.</string>
 
-  <!-- SoundCraft's own format: a JSON session file next to an "Audio Files" folder. -->
+  <!-- djforge's own format (.djforge, and SoundCraft's .scraft): a JSON session file next to an "Audio Files" folder. -->
   <key>UTExportedTypeDeclarations</key>
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
       <string>ai.storyteller.soundcraft.session</string>
       <key>UTTypeDescription</key>
-      <string>SoundCraft Session</string>
+      <string>djforge Session</string>
       <key>UTTypeConformsTo</key>
       <array>
         <string>public.data</string>
@@ -66,7 +66,7 @@
       <key>UTTypeTagSpecification</key>
       <dict>
         <key>public.filename-extension</key>
-        <array><string>scraft</string></array>
+        <array><string>djforge</string><string>scraft</string></array>
         <key>public.mime-type</key>
         <array><string>application/x-soundcraft-session</string></array>
       </dict>
@@ -77,7 +77,7 @@
   <array>
     <dict>
       <key>CFBundleTypeName</key>
-      <string>SoundCraft Session</string>
+      <string>djforge Session</string>
       <key>CFBundleTypeRole</key>
       <string>Editor</string>
       <key>LSHandlerRank</key>

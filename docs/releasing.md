@@ -13,7 +13,7 @@ User-facing names say **SoundCraft**. Files, binaries and ids stay lowercase
 
 1. **Bump the version** on `main`. The only place it lives is `[workspace.package] version` in
    the root `Cargo.toml`; the app reads it from `CARGO_PKG_VERSION` (*About SoundCraft*,
-   `soundcraft --version`, `soundcraft-cli --version`).
+   `djforge --version`, `djforge-cli --version`).
 
    ```sh
    cargo xtask version                 # prints the current version, e.g. 0.1.0
@@ -44,7 +44,7 @@ web build and are checked, the signing jobs are refused, and no release is draft
 
 | Platform | Artifacts | Built on |
 |---|---|---|
-| macOS 11+ (universal: Apple silicon + Intel) | `soundcraft-<v>-macos-universal.dmg`, `soundcraft-cli-<v>-macos-universal.zip` | `macos-15` |
+| macOS 11+ (universal: Apple silicon + Intel) | `soundcraft-<v>-macos-universal.dmg`, `djforge-cli-<v>-macos-universal.zip` | `macos-15` |
 | Windows 10+ x64 | `soundcraft-<v>-windows-x64.msi`, `soundcraft-<v>-windows-x64-portable.zip` | `windows-latest` |
 | Windows 10+ x86 (32-bit) | `soundcraft-<v>-windows-x86.msi`, `soundcraft-<v>-windows-x86-portable.zip` | `windows-latest` |
 | Windows 11 ARM64 | `soundcraft-<v>-windows-arm64.msi`, `soundcraft-<v>-windows-arm64-portable.zip` | `windows-latest` (cross-compiled; `windows-arm64.yml` installs and runs it on ARM64) |
@@ -84,7 +84,7 @@ plugins), and WebAudio in the browser.
 `MACOSX_DEPLOYMENT_TARGET=11.0`, joins them with `lipo`, and assembles `SoundCraft.app`:
 
 - `Info.plist` is generated from `Info.plist.in`. The bundle id is `ai.storyteller.soundcraft`.
-  It declares the `.scraft` session type (`ai.storyteller.soundcraft.session`, MIME
+  It declares the `.djforge` session type (and `.scraft`) (`ai.storyteller.soundcraft.session`, MIME
   `application/x-soundcraft-session`, role Editor, rank Owner) and lists WAV, AIFF/AIFC, FLAC,
   MP3 and MIDI as Viewer/Alternate, so SoundCraft appears under *Open With* without taking over
   the default player. `NSMicrophoneUsageDescription` explains the recording prompt.
@@ -98,7 +98,7 @@ plugins), and WebAudio in the browser.
   Its Finder window (background, icon size and positions) comes from
   [`packaging/macos/dmg/`](../packaging/macos/dmg/README.md), and its volume is named `SoundCraft`
   without the version, which the window's background needs; the DMG file name keeps the version.
-- **CLI:** the universal `soundcraft-cli` is signed with the hardened runtime, zipped and
+- **CLI:** the universal `djforge-cli` is signed with the hardened runtime, zipped and
   notarized.
 
 Locally, without certificates, the script signs ad-hoc (`codesign -s -`) and skips notarization:
@@ -115,15 +115,15 @@ open dist/release/soundcraft-*-macos-*.dmg
 (in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, so host build scripts aren't affected), so neither the MSI
 nor the portable zip needs the Visual C++ redistributable.
 
-- `apps/soundcraft/build.rs` embeds the icon (`assets/app-icon/soundcraft.ico`) and VERSIONINFO
+- `apps/soundcraft/build.rs` embeds the icon (`assets/app-icon/djforge.ico`) and VERSIONINFO
   with `winresource`, only when targeting Windows. Release packaging sets
   `SOUNDCRAFT_REQUIRE_WINRES=1` so a missing resource compiler fails the build.
-- The script checks both PE headers: the machine type matches `-Arch`, `soundcraft.exe` is a GUI
-  app (no console window) and `soundcraft-cli.exe` a console app.
+- The script checks both PE headers: the machine type matches `-Arch`, `djforge.exe` is a GUI
+  app (no console window) and `djforge-cli.exe` a console app.
 - `soundcraft.wxs` (WiX v5) is a per-machine install into Program Files with an advertised Start
-  Menu shortcut. SoundCraft becomes the default app for `.scraft` and is listed under *Open with*
+  Menu shortcut. djforge becomes the default app for `.djforge` and `.scraft` and is listed under *Open with*
   for `.wav`, `.aif`, `.aiff`, `.flac`, `.mp3`, `.mid` and `.midi`. It also registers App Paths
-  (Win+R `soundcraft`). The MSI version is the numeric `X.Y.Z`; same-version upgrades let release
+  (Win+R `djforge`). The MSI version is the numeric `X.Y.Z`; same-version upgrades let release
   candidates replace each other. The upgrade code `EE53D3E5-D0AE-40F9-808D-9417FDEBF61A` is fixed
   forever.
 - **Signing:** `packaging/windows/sign.ps1` signs both `.exe` files and then the `.msi` with
@@ -138,7 +138,7 @@ Locally on Windows: `dotnet tool install -g wix --version 5.0.2`, then
 `packaging/linux/package.sh` stages one FHS tree and makes every format from it: both binaries,
 `ai.storyteller.soundcraft.desktop` (with `MimeType=` for sessions, WAV, AIFF, FLAC, MP3 and
 MIDI), hicolor icons from 16 px to 512 px plus a scalable SVG, AppStream metainfo, and a
-shared-mime-info file declaring `application/x-soundcraft-session` (`*.scraft`).
+shared-mime-info file declaring `application/x-soundcraft-session` (`*.djforge`, `*.scraft`).
 
 - **AppImage** (maintained `AppImage/appimagetool`, static runtime: no libfuse2 needed). Each
   embeds the update information
@@ -150,7 +150,7 @@ shared-mime-info file declaring `application/x-soundcraft-session` (`*.scraft`).
 - **.tar.gz** for people who manage their own `/opt` or `~/.local`.
 - **Flatpak**: the `flatpak` job runs `packaging/linux/flatpak-bundle.sh` on the Linux job's
   tarball (no Rust build) with `flatpak/ai.storyteller.soundcraft.bundle.yml`, then installs the
-  bundle and runs `soundcraft-cli --version` in the sandbox. Install with
+  bundle and runs `djforge-cli --version` in the sandbox. Install with
   `flatpak install --user soundcraft-<v>-linux-<arch>.flatpak`. Both manifests use the freedesktop
   25.08 runtime with Wayland/X11, `dri`, PulseAudio and `xdg-music`; other files go through the
   portals. For the VST3 and CLAP hosts they grant `~/.vst3` and `~/.clap` read-only and mount
@@ -205,12 +205,12 @@ environment, ruleset and secrets for a new repo: craftrules `release/signing-set
 
 ## Icons
 
-`assets/app-icon/icon.svg` is the canonical icon: a **placeholder** singing nightingale, drawn as
-original SVG in the three-colour icon palette (ink, paper, SoundCraft teal `#14a9c4`); see
-`assets/app-icon/README.md`. `packaging/icons.sh` regenerates the 1024 px PNG, the macOS 512 px
-window icon, the `.icns`, the `.ico` (packed by `cargo xtask ico`) and the hicolor PNGs from it.
-It needs `resvg`, plus `iconutil` on macOS. The outputs are committed, so packaging never needs
-those tools. `apps/soundcraft/src/main.rs` sets the runtime window/Dock/taskbar icon from them.
+`assets/app-icon/icon.svg` is the canonical icon: djforge's four yellow (`#f8d200`) waveform bars on
+a dark (`#111317`) rounded square; see `assets/app-icon/README.md`. `tools/icon/make_icon.py` (also
+run by `packaging/icons.sh`) draws it and writes the SVG, the 1024 px PNG, the macOS 512 px window
+icon, the `.icns`, the `.ico` and the hicolor PNGs. It needs Python with Pillow only. The outputs
+are committed, so packaging never needs it. `apps/soundcraft/src/main.rs` sets the runtime
+window/Dock/taskbar icon from them.
 
 ## Checks
 

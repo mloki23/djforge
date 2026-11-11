@@ -592,7 +592,7 @@ mod tests {
     fn import_session_data_brings_tracks_and_audio() {
         let dir = std::env::temp_dir().join(format!("sc-import-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let path = dir.join("donor.djforge").to_string_lossy().into_owned();
         let mut donor = crate::demo::demo_engine();
         crate::io::save_session(&mut donor, &path).unwrap();
         let mut e = Engine::default();
@@ -614,7 +614,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-import-origins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let path = dir.join("donor.djforge").to_string_lossy().into_owned();
         let local = dir.join("kick.wav");
         let mut donor = crate::demo::demo_engine();
         let s = donor.session_mut();
@@ -641,7 +641,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sc-import-stems-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let path = dir.join("donor.djforge").to_string_lossy().into_owned();
         let mut donor = crate::demo::demo_engine();
         let s = donor.session_mut();
         let kick = s.track_by_name("Kick").unwrap().clips()[0].clone();
@@ -677,7 +677,7 @@ mod tests {
         let mut donor = Engine::default();
         donor.execute("track.new", &json!({"count": 1, "name": "Pads", "kind": "instrument"})).unwrap();
         donor.execute("mix.sampler_load", &json!({"track": "Pads", "path": wav.to_string_lossy()})).unwrap();
-        let path = dir.join("donor.scraft").to_string_lossy().into_owned();
+        let path = dir.join("donor.djforge").to_string_lossy().into_owned();
         crate::io::save_session(&mut donor, &path).unwrap();
         let mut e = crate::demo::demo_engine();
         e.execute("file.import_session_data", &json!({"path": path, "tracks": ["Pads"]})).unwrap();

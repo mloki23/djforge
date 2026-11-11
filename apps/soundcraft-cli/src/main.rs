@@ -1,21 +1,21 @@
-//! `soundcraft-cli`: SoundCraft without a window.
+//! `djforge-cli`: djforge without a window.
 //!
 //! ```text
-//! soundcraft-cli info FILE                       audio file or .scraft summary
-//! soundcraft-cli convert IN OUT [--bit-depth 16|24|32f] [--rate HZ] [--normalize]
-//! soundcraft-cli run [--in S.scraft | --demo] [--cmd ID[=JSON]]… [--bounce OUT] [--start T --end T] [--save S.scraft] [--inspect]
-//! soundcraft-cli script FILE [--in S | --demo] [--save S] [--bounce OUT]   (one `ID JSON` per line)
-//! soundcraft-cli commands [FILTER]               list commands
-//! soundcraft-cli describe ID                     one command's details
-//! soundcraft-cli app [--port P] METHOD [JSON]     call a running app's control channel
-//! soundcraft-cli mcp [--connect PORT] [--demo] [--automation-read-root DIR] [--automation-write-root DIR]
+//! djforge-cli info FILE                          audio file or .djforge summary
+//! djforge-cli convert IN OUT [--bit-depth 16|24|32f] [--rate HZ] [--normalize]
+//! djforge-cli run [--in S.djforge | --demo] [--cmd ID[=JSON]]… [--bounce OUT] [--start T --end T] [--save S.djforge] [--inspect]
+//! djforge-cli script FILE [--in S | --demo] [--save S] [--bounce OUT]   (one `ID JSON` per line)
+//! djforge-cli commands [FILTER]                  list commands
+//! djforge-cli describe ID                        one command's details
+//! djforge-cli app [--port P] METHOD [JSON]        call a running app's control channel
+//! djforge-cli mcp [--connect PORT] [--demo] [--automation-read-root DIR] [--automation-write-root DIR]
 //!                                                 MCP server on stdio. The two roots confine every file the
 //!                                                 agent's commands read (open, import, presets) and write
 //!                                                 (save, bounce, export) to those folders, links followed;
 //!                                                 a root left out grants none of its access. They run the
 //!                                                 in-process server, so they conflict with --connect.
-//! soundcraft-cli parity [--write PATH]            parity report (markdown)
-//! soundcraft-cli plugins                          list built-in plugins
+//! djforge-cli parity [--write PATH]               parity report (markdown)
+//! djforge-cli plugins                             list built-in plugins
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -42,7 +42,7 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("soundcraft-cli: {msg}");
+    eprintln!("djforge-cli: {msg}");
     ExitCode::FAILURE
 }
 
@@ -60,13 +60,13 @@ fn help_text() -> String {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().cloned() else {
-        eprintln!("usage: soundcraft-cli <info|convert|run|script|commands|describe|app|mcp|parity|plugins> …  (see --help)");
+        eprintln!("usage: djforge-cli <info|convert|run|script|commands|describe|app|mcp|parity|plugins> …  (see --help)");
         return ExitCode::FAILURE;
     };
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let code = match cmd.as_str() {
         "--version" | "-V" | "version" => {
-            outln!("SoundCraft CLI {}", env!("CARGO_PKG_VERSION"));
+            outln!("{} CLI {}", soundcraft_engine::APP_NAME, env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         "--help" | "-h" | "help" => {
@@ -97,7 +97,7 @@ fn main() -> ExitCode {
 
 fn info(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else { return fail("info FILE") };
-    if path.ends_with(".scraft") {
+    if soundcraft_engine::model::is_session_path(path) {
         let mut e = with_stems(Engine::default());
         match soundcraft_engine::io::open_session_checked(&mut e, path) {
             Ok(report) => warn_media(&report),
@@ -460,7 +460,7 @@ fn mcp(args: &[String]) -> ExitCode {
             // Every thread of this process, not only the server's: nothing reaches past the roots.
             file_access::confine_process(roots.clone());
             let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
-            eprintln!("soundcraft-cli: files confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
+            eprintln!("djforge-cli: files confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
             h = h.with_automation_roots(Some(roots));
         }
         let mut s = Server::new(h);
@@ -475,8 +475,8 @@ fn mcp(args: &[String]) -> ExitCode {
 fn parity(args: &[String]) -> ExitCode {
     let p = soundcraft_engine::catalog::parity_json();
     let mut md = String::new();
-    md.push_str("# Parity report\n\nGenerated by `soundcraft-cli parity --write docs/parity-checklist.md` (also `cargo xtask parity`).\n");
-    md.push_str("It compares the incumbent's menu tree (feature names observed black-box, `crates/engine/catalog/menus.txt`) with SoundCraft's command registry.\n");
+    md.push_str("# Parity report\n\nGenerated by `djforge-cli parity --write docs/parity-checklist.md` (also `cargo xtask parity`).\n");
+    md.push_str("It compares the incumbent's menu tree (feature names observed black-box, `crates/engine/catalog/menus.txt`) with djforge's command registry.\n");
     md.push_str("UI-layer commands (windows, AudioSuite) are counted by the app's own report (`engine.parity` over the control channel).\n\n");
     md.push_str(&format!(
         "**Menu items implemented by the engine: {} / {} ({}%)**\n\n| Menu | Implemented | Total |\n|---|---:|---:|\n",
@@ -555,8 +555,8 @@ mod tests {
     #[test]
     fn help_text_is_only_the_usage_block() {
         let help = help_text();
-        assert!(help.starts_with("soundcraft-cli info FILE"));
-        assert!(help.ends_with("soundcraft-cli plugins                          list built-in plugins"));
+        assert!(help.starts_with("djforge-cli info FILE"));
+        assert!(help.ends_with("djforge-cli plugins                             list built-in plugins"));
         assert!(help.contains("--automation-read-root DIR") && help.contains("--automation-write-root DIR"));
         assert!(!help.contains("```"));
         assert!(!help.contains("#![") && !help.contains("use serde_json"));

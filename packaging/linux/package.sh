@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and package SoundCraft for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
+# Build and package djforge for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
 #
 #   $DIST/soundcraft-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
 #   $DIST/soundcraft-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
@@ -44,7 +44,7 @@ esac
 export SOUNDCRAFT_MAINTAINER="${SOUNDCRAFT_MAINTAINER:-SoundCraft maintainers <soundcraft@storyteller.ai>}"
 BASENAME="soundcraft-$VERSION-linux-$ARCH"
 
-echo "==> SoundCraft $VERSION for Linux $ARCH ($FORMATS)"
+echo "==> djforge $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   if [ -n "${CROSS_TARGET:-}" ]; then
@@ -59,9 +59,9 @@ STAGE="$WORK/root"
 rm -rf "$WORK"
 
 # ---- stage an FHS tree (shared by every format) -------------------------------------------------
-install -Dm755 "$BIN/soundcraft" "$STAGE/usr/bin/soundcraft"
-install -Dm755 "$BIN/soundcraft-cli" "$STAGE/usr/bin/soundcraft-cli"
-"${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/soundcraft" "$STAGE/usr/bin/soundcraft-cli" 2>/dev/null || true
+install -Dm755 "$BIN/djforge" "$STAGE/usr/bin/djforge"
+install -Dm755 "$BIN/djforge-cli" "$STAGE/usr/bin/djforge-cli"
+"${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/djforge" "$STAGE/usr/bin/djforge-cli" 2>/dev/null || true
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "$HERE/$APP_ID.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
@@ -106,7 +106,7 @@ if has appimage; then
   APPDIR="$WORK/SoundCraft.AppDir"
   cp -R "$STAGE" "$APPDIR"
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
-  ln -s usr/bin/soundcraft "$APPDIR/AppRun"
+  ln -s usr/bin/djforge "$APPDIR/AppRun"
   cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
   cp "$ROOT/assets/app-icon/hicolor/256x256/apps/$APP_ID.png" "$APPDIR/$APP_ID.png"
   ln -s "$APP_ID.png" "$APPDIR/.DirIcon"
@@ -145,9 +145,9 @@ if has appimage; then
 fi
 
 if [ -z "${CROSS_TARGET:-}" ]; then
-  "$STAGE/usr/bin/soundcraft-cli" --version
+  "$STAGE/usr/bin/djforge-cli" --version
 elif [ -n "${EMULATOR:-}" ]; then
-  "$EMULATOR" "$STAGE/usr/bin/soundcraft-cli" --version
+  "$EMULATOR" "$STAGE/usr/bin/djforge-cli" --version
 fi
 echo "==> done"
 ls -lh "$DIST"

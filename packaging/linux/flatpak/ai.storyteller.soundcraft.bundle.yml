@@ -59,7 +59,7 @@ modules:
     buildsystem: simple
     build-commands:
       - install -Dm755 bin/soundcraft /app/bin/soundcraft
-      - install -Dm755 bin/soundcraft-cli /app/bin/soundcraft-cli
+      - install -Dm755 bin/djforge-cli /app/bin/djforge-cli
       - install -Dm644 share/applications/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
       # Session files; the runtime's shared-mime-info already knows WAV, AIFF, FLAC, MP3 and MIDI.
       - install -Dm644 share/mime/packages/ai.storyteller.soundcraft.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml

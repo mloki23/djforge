@@ -23,7 +23,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.narrow_mix", "Narrow Mix", "View > Narrow Mix", Some("Cmd+Alt+M")),
     ("window.session_info", "Session Info", "", None),
     ("window.audio_health", "Session Audio Health", "", None),
-    ("window.about", "About SoundCraft", "", None),
+    ("window.about", "About djforge", "", None),
     ("window.close", "Close Window", "Window > Close Window", Some("Cmd+W")),
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
@@ -279,8 +279,8 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
         ui,
         |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("SoundCraft", |ui| {
-                    if ui.button("About SoundCraft").clicked() {
+                ui.menu_button(soundcraft_engine::APP_NAME, |ui| {
+                    if ui.button(crate::panels::about_title()).clicked() {
                         app.ui.show_about = true;
                     }
                     if ui.button("Session Info").clicked() {
@@ -843,7 +843,7 @@ mod tests {
         app.dialogs.open = None;
 
         let dir = std::env::temp_dir().join(format!("soundcraft-save-{}", std::process::id()));
-        let path = dir.join("Song.scraft");
+        let path = dir.join("Song.djforge");
         app.run("session.save_as", json!({"path": path.to_string_lossy()})).unwrap();
         app.run("track.new", json!({})).unwrap();
         assert!(!invoke_shortcut_dialog(&mut app, "session.save"));

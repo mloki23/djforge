@@ -71,7 +71,7 @@ modules:
     build-commands:
       - cargo --offline build --release --locked -p soundcraft -p soundcraft-cli
       - install -Dm755 target/release/soundcraft /app/bin/soundcraft
-      - install -Dm755 target/release/soundcraft-cli /app/bin/soundcraft-cli
+      - install -Dm755 target/release/djforge-cli /app/bin/djforge-cli
       - install -Dm644 packaging/linux/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
       - install -Dm644 packaging/linux/ai.storyteller.soundcraft.mime.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml
       - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/

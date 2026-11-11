@@ -28,7 +28,7 @@ pub(crate) fn at_rate(mut buf: AudioBuffer, rate: u32, limit: usize) -> Option<A
 // ─── Checked file access ──────────────────────────────────────────────────────────────────────
 //
 // Every file a command names by path is read and written through the helpers below, so the
-// automation roots (`crate::file_access`, `soundcraft-cli mcp --automation-read-root` and
+// automation roots (`crate::file_access`, `djforge-cli mcp --automation-read-root` and
 // `--automation-write-root`) are checked in one place. A test in `file_access` keeps the rest of
 // the engine from calling `std::fs` itself. Audio is decoded into the session's pool the moment it
 // enters it (import, open, sampler load), so playback and bounce read nothing from disk and
@@ -83,7 +83,7 @@ pub fn stored_path(stored: &str, session: &Path) -> std::result::Result<PathBuf,
 pub(crate) fn stored_path_in(stored: &str, folder: Option<&Path>) -> std::result::Result<PathBuf, String> {
     match folder {
         // The document's folder is what counts; its file name doesn't.
-        Some(f) => stored_path(stored, &f.join("session.scraft")),
+        Some(f) => stored_path(stored, &f.join(format!("session.{}", soundcraft_model::SESSION_EXTENSION))),
         None => craft_docpath::resolve_absolute(stored, None).map_err(|why| format!("not opened: {why}")),
     }
 }
@@ -1296,11 +1296,11 @@ pub fn sanitize_name(n: &str) -> String {
     if s.is_empty() { "untitled".into() } else { s.chars().take(100).collect() }
 }
 
-/// Save the session to `path` (a `.scraft` file). Audio that only exists in memory is written
+/// Save the session to `path` (a `.djforge` file; see [`session_file`]). Audio that only exists in memory is written
 /// as 32-bit float WAV into `Audio Files/` next to it. Returns how many audio files were written.
 ///
 /// In the browser there are no folders: the session and all its audio go out as one bundle file
-/// (`<name>.scraftz`, see [`session_bundle`]) through the host's delivery hook ([`set_deliver`]).
+/// (`<name>.djforgez`, see [`session_bundle`]) through the host's delivery hook ([`set_deliver`]).
 pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
     if cfg!(target_arch = "wasm32") {
         return save_session_bundle(e, path);
@@ -1415,7 +1415,7 @@ fn write_session(session: &Session, path: &str, overwrite: bool, copy_audio: boo
     let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
     make_dir(&dir)?;
     // Atomic-ish write: temp file then rename.
-    let tmp = p.with_extension("scraft.tmp");
+    let tmp = p.with_extension(format!("{}.tmp", soundcraft_model::SESSION_EXTENSION));
     if !overwrite && read_file(&p).is_ok_and(|old| old != text.as_bytes()) {
         back_up(&p);
     }
@@ -1485,10 +1485,14 @@ fn back_up(file: &Path) {
     }
 }
 
-/// The file a session saved to `path` goes to: `path`, with `.scraft` added when it has no
-/// extension and isn't an existing file.
+/// The file a session saved to `path` goes to: `path`, with `.djforge` added when it has no
+/// extension and isn't an existing file. A SoundCraft `.djforge` path becomes the `.djforge` beside
+/// it, so saving never writes over a `.djforge` file.
 pub fn session_file(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
+    if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(soundcraft_model::LEGACY_SESSION_EXTENSION)) {
+        return p.with_extension(soundcraft_model::SESSION_EXTENSION);
+    }
     // Only a path the write root allows is probed, so a refused one can't be used to test for files.
     let is_file = crate::file_access::check_write(&p).is_ok() && p.is_file();
     if p.extension().is_none() && !is_file { p.with_extension(soundcraft_model::SESSION_EXTENSION) } else { p }
@@ -1538,7 +1542,7 @@ fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
     Err(EngineError::Io(format!("{}: no free file name for {stem}", dir.display())))
 }
 
-/// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
+/// Open a `.djforge` (or SoundCraft `.djforge`) session and decode its audio files (missing files are reported, not fatal).
 pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     open_session_linked(e, path, Path::new(path)).map(|r| r.missing)
 }
@@ -1852,10 +1856,13 @@ pub fn relink_audio(e: &mut Engine, only: Option<SourceId>, dir: Option<&Path>, 
 
 // ─── Hosts without a filesystem (the browser) ─────────────────────────────────────────────────
 
-/// Extension of a session bundle: one zip file holding the `.scraft` session and its
+/// Extension of a session bundle: one zip file holding the `.djforge` session and its
 /// `Audio Files/`, the same layout as a saved session folder. The browser has no folders, so it
 /// saves and opens sessions as bundles.
-pub const BUNDLE_EXTENSION: &str = "scraftz";
+pub const BUNDLE_EXTENSION: &str = "djforgez";
+
+/// Extension of bundles saved by SoundCraft: they still open.
+pub const LEGACY_BUNDLE_EXTENSION: &str = "scraftz";
 
 /// Most entries and bytes a bundle may unpack to (bundles are hostile input).
 const MAX_BUNDLE_ENTRIES: usize = 10_000;
@@ -1985,7 +1992,7 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))
 }
 
-/// The session as a bundle: `<name>.scraft` plus every source's audio as 32-bit float WAV under
+/// The session as a bundle: `<name>.djforge` plus every source's audio as 32-bit float WAV under
 /// `Audio Files/` (stored, not compressed: audio barely compresses). Returns the bytes and the
 /// session with its source paths pointing into the bundle.
 pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
@@ -2039,14 +2046,14 @@ fn save_session_bundle(e: &mut Engine, path: &str) -> Result<usize> {
 }
 
 /// Open a session from bytes (the browser has no paths): a bundle ([`session_bundle`]) or a bare
-/// `.scraft`, whose audio is then reported missing. Returns the missing media, like
+/// `.djforge` or `.djforge`, whose audio is then reported missing. Returns the missing media, like
 /// [`open_session`].
 pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Vec<String>> {
     let (text, mut files) = if bytes.starts_with(b"PK\x03\x04") {
         read_bundle(bytes)?
     } else {
         (
-            String::from_utf8(bytes.to_vec()).map_err(|_| EngineError::Io(format!("{name}: not a SoundCraft session")))?,
+            String::from_utf8(bytes.to_vec()).map_err(|_| EngineError::Io(format!("{name}: not a {} session", soundcraft_model::APP_NAME)))?,
             std::collections::HashMap::new(),
         )
     };
@@ -2072,7 +2079,7 @@ pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Ve
     Ok(missing)
 }
 
-/// Unpack a bundle: the one `.scraft` at its top level and the files beside it, by relative path.
+/// Unpack a bundle: the one session file (`.djforge` or `.djforge`) at its top level and the files beside it, by relative path.
 fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String, Vec<u8>>)> {
     use std::io::Read as _;
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
@@ -2095,14 +2102,14 @@ fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String
         let mut data = Vec::new();
         // The declared size is hostile too: never read past it.
         f.by_ref().take(size).read_to_end(&mut data).map_err(|err| EngineError::Io(format!("bundle: {rel}: {err}")))?;
-        let is_session = !rel.contains('/') && Path::new(&rel).extension().and_then(|x| x.to_str()) == Some(soundcraft_model::SESSION_EXTENSION);
+        let is_session = !rel.contains('/') && soundcraft_model::is_session_path(&rel);
         if is_session && text.is_none() {
             text = Some(String::from_utf8(data).map_err(|_| EngineError::Io(format!("bundle: {rel} is not text")))?);
         } else {
             files.insert(rel, data);
         }
     }
-    let text = text.ok_or_else(|| EngineError::Io("bundle: no .scraft session inside".into()))?;
+    let text = text.ok_or_else(|| EngineError::Io("bundle: no .djforge session inside".into()))?;
     Ok((text, files))
 }
 
@@ -2317,7 +2324,7 @@ mod record_tests {
         assert_eq!(plan, vec![(vox, vec![1], dir.join("Audio Files/Vox_02.wav")), (gtr, vec![2, 3], dir.join("Audio Files/Gtr_01.wav"))]);
         assert_eq!(plan_takes(&e, &dir, 2)[1].1, vec![0, 1]);
 
-        let session = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let session = dir.join("Song.djforge").to_string_lossy().into_owned();
         e.execute("session.save_as", &json!({"path": session})).unwrap();
         write_take(&plan[0].2, 4_800);
         let clips = add_recording(&mut e, 96_000, vec![(vox, plan[0].2.clone())], None);
@@ -2339,7 +2346,7 @@ mod record_tests {
         let mut e = Engine::default();
         let vox = armed(&mut e, "Vox", "mono", "In 1");
         assert_eq!(add_recording(&mut e, 1_000, vec![(vox, path.clone())], Some(400)).len(), 3);
-        assert_eq!(save_copy(&e, &dir.join("Untitled.scraft").to_string_lossy()).unwrap(), 0);
+        assert_eq!(save_copy(&e, &dir.join("Untitled.djforge").to_string_lossy()).unwrap(), 0);
         let t = e.session().track(vox).unwrap();
         let passes: Vec<_> = t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| (c.source_offset(), c.start, c.length))).collect();
         assert_eq!(passes, vec![(0, 1_000, 400), (400, 1_000, 400), (800, 1_000, 250)]);
@@ -2370,7 +2377,7 @@ mod save_tests {
         let mut e = crate::demo::demo_engine();
         e.execute("mix.volume", &serde_json::json!({"track": "Kick", "db": -7.0})).unwrap();
         let dir = std::env::temp_dir().join(format!("soundcraft-autosave-{}", std::process::id()));
-        let path = dir.join("Midnight Groove.scraft");
+        let path = dir.join("Midnight Groove.djforge");
         let p = path.to_string_lossy().into_owned();
         let n1 = save_copy(&e, &p).unwrap();
         let n2 = save_copy(&e, &p).unwrap();
@@ -2400,15 +2407,78 @@ mod save_tests {
     }
 
     #[test]
+    fn new_sessions_save_as_djforge_files_and_load_back() {
+        let dir = std::env::temp_dir().join(format!("djforge-ext-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut e = with_take(0.5);
+        // No extension: `.djforge` is added.
+        let r = e.execute("session.save_as", &json!({"path": dir.join("Set/Set").to_string_lossy()})).unwrap();
+        let file = dir.join("Set/Set.djforge");
+        assert!(file.is_file());
+        assert_eq!(r["path"], json!(file.to_string_lossy()));
+        assert_eq!(e.path.as_deref(), Some(file.to_string_lossy().as_ref()));
+        let back = reopen(&file.to_string_lossy());
+        assert_eq!(back.session().pool.get(back.session().sources[0].id).unwrap().buffer.channels[0][0], 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn soundcraft_sessions_open_and_saving_them_never_writes_over_the_scraft() {
+        let dir = std::env::temp_dir().join(format!("djforge-ext-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A session SoundCraft saved: the same JSON, with the `.scraft` extension.
+        save_session(&mut with_take(0.5), &dir.join("Old/Old.djforge").to_string_lossy()).unwrap();
+        let old = dir.join("Old/Old.scraft");
+        std::fs::rename(dir.join("Old/Old.djforge"), &old).unwrap();
+        let original = std::fs::read(&old).unwrap();
+        let mut e = reopen(&old.to_string_lossy());
+        assert_eq!(e.session().pool.get(e.session().sources[0].id).unwrap().buffer.channels[0][0], 0.5);
+
+        // Save As suggests and writes the `.djforge` beside it, even when given the `.scraft` itself.
+        assert_eq!(session_file(&old.to_string_lossy()), dir.join("Old/Old.djforge"));
+        assert_eq!(session_file(&dir.join("Old/OLD.SCRAFT").to_string_lossy()), dir.join("Old/OLD.djforge"));
+        e.session_mut().tracks[0].mixer.volume_db = -3.0;
+        let r = e.execute("session.save_as", &json!({"path": old.to_string_lossy()})).unwrap();
+        let new = dir.join("Old/Old.djforge");
+        assert_eq!(r["path"], json!(new.to_string_lossy()));
+        assert_eq!(std::fs::read(&old).unwrap(), original, "the .scraft is untouched");
+        assert_eq!(reopen(&new.to_string_lossy()).session().tracks[0].mixer.volume_db, -3.0);
+        // Plain Save of a session opened from a `.scraft` goes to the `.djforge` too.
+        let mut e = reopen(&old.to_string_lossy());
+        e.session_mut().tracks[0].mixer.volume_db = -6.0;
+        e.execute("session.save", &json!({"replace": true})).unwrap();
+        assert_eq!(e.path.as_deref(), Some(new.to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read(&old).unwrap(), original, "the .scraft is still untouched");
+        assert_eq!(reopen(&new.to_string_lossy()).session().tracks[0].mixer.volume_db, -6.0);
+        // Save Copy In and templates never write a `.scraft` either.
+        e.execute("session.save_copy", &json!({"path": dir.join("Copy/Copy.scraft").to_string_lossy()})).unwrap();
+        e.execute("session.save_template", &json!({"path": dir.join("Tpl.scraft").to_string_lossy()})).unwrap();
+        assert!(dir.join("Copy/Copy.djforge").is_file() && !dir.join("Copy/Copy.scraft").exists());
+        assert!(dir.join("Tpl.djforge").is_file() && !dir.join("Tpl.scraft").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn soundcraft_bundles_and_bare_sessions_open_from_bytes() {
+        let e = with_take(0.5);
+        let (bytes, _) = session_bundle(e.session()).unwrap();
+        let mut r = Engine::default();
+        assert!(open_session_bytes(&mut r, "Old Set.scraftz", &bytes).unwrap().is_empty());
+        assert_eq!(r.path.as_deref(), Some("Old Set.djforgez"), "saved back as a djforge bundle");
+        let text = e.session().to_json().unwrap();
+        assert!(open_session_bytes(&mut r, "Old.scraft", text.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn saving_never_replaces_audio_of_another_session() {
         let dir = std::env::temp_dir().join(format!("soundcraft-no-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
-        save_session(&mut with_take(0.5), &path("A/A.scraft")).unwrap();
-        save_session(&mut with_take(-0.25), &path("A/A v2.scraft")).unwrap();
-        save_session(&mut with_take(0.75), &path("B/B.scraft")).unwrap();
-        save_session(&mut reopen(&path("B/B.scraft")), &path("A/B.scraft")).unwrap();
-        let levels = ["A/A.scraft", "A/A v2.scraft", "B/B.scraft", "A/B.scraft"].map(|p| {
+        save_session(&mut with_take(0.5), &path("A/A.djforge")).unwrap();
+        save_session(&mut with_take(-0.25), &path("A/A v2.djforge")).unwrap();
+        save_session(&mut with_take(0.75), &path("B/B.djforge")).unwrap();
+        save_session(&mut reopen(&path("B/B.djforge")), &path("A/B.djforge")).unwrap();
+        let levels = ["A/A.djforge", "A/A v2.djforge", "B/B.djforge", "A/B.djforge"].map(|p| {
             let r = reopen(&path(p));
             r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0]
         });
@@ -2420,7 +2490,7 @@ mod save_tests {
     fn consolidating_twice_keeps_both_renders() {
         let dir = std::env::temp_dir().join(format!("soundcraft-consolidate-twice-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         let mut e = crate::demo::demo_engine();
         let kick = e.session().track_by_name("Kick").unwrap().id;
         let end = e.session().content_end();
@@ -2437,7 +2507,7 @@ mod save_tests {
     fn saving_after_undo_reuses_the_saved_audio() {
         let dir = std::env::temp_dir().join(format!("soundcraft-undo-resave-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         let mut e = with_take(0.5);
         e.execute("track.new", &json!({})).unwrap();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
@@ -2453,24 +2523,24 @@ mod save_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
         let level = |r: &Engine| r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0];
-        save_session(&mut with_take(-0.25), &path("B/Other.scraft")).unwrap();
+        save_session(&mut with_take(-0.25), &path("B/Other.djforge")).unwrap();
         let mut e = with_take(0.5);
-        save_session(&mut e, &path("A/A.scraft")).unwrap();
+        save_session(&mut e, &path("A/A.djforge")).unwrap();
         e.execute("track.new", &json!({})).unwrap();
-        save_session(&mut e, &path("B/B.scraft")).unwrap();
+        save_session(&mut e, &path("B/B.djforge")).unwrap();
         e.execute("edit.undo", &json!({})).unwrap();
         e.execute("session.save", &json!({})).unwrap();
-        assert_eq!(level(&reopen(&path("B/B.scraft"))), 0.5);
-        e.execute("session.save_copy", &json!({"path": path("A/Copy.scraft")})).unwrap();
+        assert_eq!(level(&reopen(&path("B/B.djforge"))), 0.5);
+        e.execute("session.save_copy", &json!({"path": path("A/Copy.djforge")})).unwrap();
         e.execute("session.save", &json!({})).unwrap();
-        assert_eq!(level(&reopen(&path("B/B.scraft"))), 0.5);
+        assert_eq!(level(&reopen(&path("B/B.djforge"))), 0.5);
         std::fs::remove_file(dir.join("A/Audio Files/Audio 1_02.wav")).unwrap();
         let mut missing = Engine::default();
-        open_session(&mut missing, &path("A/A.scraft")).unwrap();
-        save_session(&mut missing, &path("B/Moved.scraft")).unwrap();
+        open_session(&mut missing, &path("A/A.djforge")).unwrap();
+        save_session(&mut missing, &path("B/Moved.djforge")).unwrap();
         let mut r = Engine::default();
         assert_eq!(
-            open_session(&mut r, &path("B/Moved.scraft")).unwrap(),
+            open_session(&mut r, &path("B/Moved.djforge")).unwrap(),
             vec![dir.join("A").join("Audio Files/Audio 1_02.wav").display().to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2480,7 +2550,7 @@ mod save_tests {
     fn saving_over_another_session_needs_replace() {
         let dir = std::env::temp_dir().join(format!("soundcraft-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         let mut first = with_take(0.5);
         first.execute("session.save_as", &json!({"path": path})).unwrap();
         first.execute("session.save", &json!({})).unwrap();
@@ -2493,7 +2563,7 @@ mod save_tests {
             assert!(err.to_string().contains("`replace: true`"), "{id}: {err}");
         }
         assert_eq!(std::fs::read_dir(dir.join("Audio Files")).unwrap().count(), 1);
-        Engine::default().execute("session.save_as", &json!({"path": dir.join("New/New.scraft")})).unwrap();
+        Engine::default().execute("session.save_as", &json!({"path": dir.join("New/New.djforge")})).unwrap();
         std::fs::copy(&path, dir.join("Song")).unwrap();
         let mut bare = Engine::default();
         open_session(&mut bare, &dir.join("Song").to_string_lossy()).unwrap();
@@ -2509,7 +2579,7 @@ mod save_tests {
         let dir = std::env::temp_dir().join(format!("soundcraft-backups-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Song.scraft");
+        let path = dir.join("Song.djforge");
         let mut e = Engine::default();
         let mut versions = Vec::new();
         for i in 0..12 {
@@ -2518,7 +2588,7 @@ mod save_tests {
             save_session(&mut e, &path.to_string_lossy()).unwrap();
             versions.push(std::fs::read(&path).unwrap());
         }
-        let backup = |n: usize| std::fs::read(dir.join(format!("Backups/Song backup {n}.scraft"))).ok();
+        let backup = |n: usize| std::fs::read(dir.join(format!("Backups/Song backup {n}.djforge"))).ok();
         assert_eq!(std::fs::read_dir(dir.join("Backups")).unwrap().count(), 10);
         assert_eq!((backup(1), backup(2), backup(11)), (None, Some(versions[1].clone()), Some(versions[10].clone())));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2535,7 +2605,7 @@ mod save_tests {
         let dir = std::env::temp_dir().join(format!("soundcraft-shared-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Shared.scraft");
+        let path = dir.join("Shared.djforge");
         save_session(&mut e, &path.to_string_lossy()).unwrap();
         let paths: Vec<_> = e.session().sources.iter().map(|src| src.path.clone()).collect();
         assert_eq!(paths.len(), 2);
@@ -2575,7 +2645,7 @@ mod open_tests {
         for _ in 0..3 {
             add_source(&mut s, "k", audio.clone(), Some("k.wav"), FileFormat::Wav);
         }
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         std::fs::write(&path, s.to_json().unwrap()).unwrap();
         let mut e = Engine::default();
         assert!(open_session(&mut e, &path).unwrap().is_empty());
@@ -2597,13 +2667,13 @@ mod open_tests {
             add_source(&mut s, "k", audio.clone(), Some("Audio Files/k.wav"), FileFormat::Wav);
         }
         s.sources.iter_mut().for_each(|src| src.unsaved = false);
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         std::fs::write(&path, s.to_json().unwrap()).unwrap();
         let mut e = Engine::default();
         open_session(&mut e, &path).unwrap();
         assert_eq!(save_session(&mut e, &path).unwrap(), 0);
         assert!(e.session().sources.iter().all(|src| src.path == "Audio Files/k.wav"));
-        assert_eq!(save_copy(&e, &dir.join("copy/Song.scraft").to_string_lossy()).unwrap(), 1);
+        assert_eq!(save_copy(&e, &dir.join("copy/Song.djforge").to_string_lossy()).unwrap(), 1);
         assert_eq!(std::fs::read_dir(dir.join("copy/Audio Files")).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2621,7 +2691,7 @@ mod open_tests {
         crate::edit::place_clip(&mut saved, t, Clip::audio(id, "k", src, 0, 0, 480));
         // In a folder of its own, so a movie named `k.wav` is not relinked to a file beside it.
         std::fs::create_dir_all(dir.join("s")).unwrap();
-        let path = dir.join("s").join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("s").join("Song.djforge").to_string_lossy().into_owned();
         let mut stored = vec![r"\\192.0.2.1\share\x.wav".to_string(), "file://192.0.2.1/s/x.wav".to_string()];
         // Linux reads `//tmp/…` as the local `/tmp/…`, so only the path check keeps it from being read.
         if cfg!(unix) {
@@ -2724,7 +2794,7 @@ mod pipe_tests {
         let mut s = Session::default();
         let audio = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 10]] };
         add_source(&mut s, "pipe", audio, Some(&fifo.to_string_lossy()), FileFormat::Wav);
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.djforge").to_string_lossy().into_owned();
         std::fs::write(&path, s.to_json().unwrap()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let pipe = fifo.to_string_lossy().into_owned();
@@ -2804,7 +2874,7 @@ mod bundle_tests {
         assert!(bytes.starts_with(b"PK\x03\x04"));
         assert!(fresh.sources.iter().all(|s| s.path.starts_with("Audio Files/") && !s.unsaved));
         let mut r = Engine::default();
-        let missing = open_session_bytes(&mut r, "Midnight Groove.scraftz", &bytes).unwrap();
+        let missing = open_session_bytes(&mut r, "Midnight Groove.djforgez", &bytes).unwrap();
         assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(r.session().track_by_name("Kick").unwrap().mixer.volume_db, -7.0);
         assert_eq!(r.session().tracks.len(), e.session().tracks.len());
@@ -2813,7 +2883,7 @@ mod bundle_tests {
             assert_eq!(a.buffer.channels, b.buffer.channels, "{}: float WAV keeps every sample", src.name);
         }
         assert!(!r.is_dirty());
-        assert_eq!(r.path.as_deref(), Some("Midnight Groove.scraftz"));
+        assert_eq!(r.path.as_deref(), Some("Midnight Groove.djforgez"));
     }
 
     #[test]
@@ -2827,7 +2897,7 @@ mod bundle_tests {
         let paths: std::collections::HashSet<_> = fresh.sources.iter().map(|s| s.path.clone()).collect();
         assert_eq!(paths.len(), n);
         let mut r = Engine::default();
-        assert!(open_session_bytes(&mut r, "x.scraftz", &bytes).unwrap().is_empty());
+        assert!(open_session_bytes(&mut r, "x.djforgez", &bytes).unwrap().is_empty());
     }
 
     #[test]
@@ -2836,7 +2906,7 @@ mod bundle_tests {
         let (_, fresh) = session_bundle(e.session()).unwrap();
         let text = fresh.to_json().unwrap();
         let mut r = Engine::default();
-        let missing = open_session_bytes(&mut r, "Song.scraft", text.as_bytes()).unwrap();
+        let missing = open_session_bytes(&mut r, "Song.djforge", text.as_bytes()).unwrap();
         assert_eq!(missing.len(), fresh.sources.len());
         assert_eq!(r.session().tracks.len(), fresh.tracks.len());
     }
@@ -2845,13 +2915,13 @@ mod bundle_tests {
     fn hostile_bundles_are_errors_not_panics() {
         let mut r = Engine::default();
         for bad in [&b"PK\x03\x04 not really a zip"[..], b"", b"{ not json", b"\xff\xfe\x00"] {
-            assert!(open_session_bytes(&mut r, "bad.scraftz", bad).is_err());
+            assert!(open_session_bytes(&mut r, "bad.djforgez", bad).is_err());
         }
         // A valid zip without a session inside.
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         w.start_file("Audio Files/a.wav", zip::write::SimpleFileOptions::default()).unwrap();
         let only_audio = w.finish().unwrap().into_inner();
-        assert!(open_session_bytes(&mut r, "a.scraftz", &only_audio).is_err());
+        assert!(open_session_bytes(&mut r, "a.djforgez", &only_audio).is_err());
         assert_eq!(r.session().tracks.len(), 0, "a failed open leaves the document alone");
     }
 
@@ -2891,11 +2961,11 @@ mod in_place_tests {
         (path.to_string_lossy().into_owned(), samples)
     }
 
-    /// A 44.1 kHz session with one referenced import of `wav`, saved to `dir/Set/Set.scraft`.
+    /// A 44.1 kHz session with one referenced import of `wav`, saved to `dir/Set/Set.djforge`.
     fn saved_with(dir: &Path, wav: &str) -> (Engine, String) {
         let mut e = session_at(44_100);
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 0);
         (e, path)
     }
@@ -2927,7 +2997,7 @@ mod in_place_tests {
         let (wav, audio) = library_wav(&dir.join("Library"), 44_100);
         let mut e = session_at(44_100);
         e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 0);
         assert!(!dir.join("Set/Audio Files").exists());
         let saved = stored(&path);
@@ -2936,7 +3006,7 @@ mod in_place_tests {
         let mut r = reopen(&path);
         assert_eq!(first_audio(&r), audio);
         // The absolute path still finds the audio from another folder, and is not copied there.
-        let moved = dir.join("Moved/Moved.scraft").to_string_lossy().into_owned();
+        let moved = dir.join("Moved/Moved.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut r, &moved).unwrap(), 0);
         assert!(!dir.join("Moved/Audio Files").exists());
         assert_eq!(first_audio(&reopen(&moved)), audio);
@@ -2949,7 +3019,7 @@ mod in_place_tests {
         let (wav, _) = library_wav(&dir.join("Library"), 44_100);
         let mut e = session_at(48_000);
         e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
         assert_eq!(std::fs::read_dir(dir.join("Set/Audio Files")).unwrap().count(), 1);
         assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
@@ -2963,7 +3033,7 @@ mod in_place_tests {
         let (wav, _) = library_wav(&dir.join("Library"), 44_100);
         let mut e = session_at(48_000);
         e.execute("dj.load_warped", &json!({"path": wav, "bpm": 120, "first_beat": 0.0})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         save_session(&mut e, &path).unwrap();
         let reopened = reopen(&path);
         let src = &reopened.session().sources[0];
@@ -2981,7 +3051,7 @@ mod in_place_tests {
         let r = e.execute("file.import_audio", &json!({"path": wav})).unwrap();
         let clip = r["imported"][0]["clip"].as_u64().unwrap();
         e.execute("audiosuite.process", &json!({"process": "invert", "clips": [clip]})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
         assert_eq!(std::fs::read_dir(dir.join("Set/Audio Files")).unwrap().count(), 1);
         assert_eq!(std::fs::read(&wav).unwrap(), original);
@@ -3002,7 +3072,7 @@ mod in_place_tests {
         let (wav, audio) = wav_named(&dir.join("Lib"), "AC\u{FF0F}DC.wav", 44_100, 44_100);
         let mut e = session_at(44_100);
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
         assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
         assert_eq!(first_audio(&reopen(&path)), audio);
@@ -3023,7 +3093,7 @@ mod in_place_tests {
         }
         let mut e = session_at(44_100);
         e.execute("file.import_audio", &json!({"path": unc})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
         assert!(stored(&path).sources[0].path.starts_with("Audio Files/"));
         assert_eq!(first_audio(&reopen(&path)), audio);
@@ -3038,7 +3108,7 @@ mod in_place_tests {
         let mut e = session_at(44_100);
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
         wav_named(&dir.join("Lib"), "track.wav", 44_100, 22_050);
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 1);
         assert_eq!(first_audio(&reopen(&path)), audio);
         // Changed after the save: opening says so instead of loading it silently.
@@ -3109,7 +3179,7 @@ mod in_place_tests {
         touch_later(Path::new(&wav));
         let src = e.session().sources[0].clone();
         let audio = e.session().pool.get(src.id).unwrap().clone();
-        let session = dir.join("Set/Set.scraft");
+        let session = dir.join("Set/Set.djforge");
         let before = REDECODES.with(std::cell::Cell::get);
         for _ in 0..3 {
             assert_eq!(kept_reference(&src.path, &session, &audio), None);
@@ -3162,10 +3232,10 @@ mod in_place_tests {
         let dir = folder("in-place-copy");
         let (wav, audio) = library_wav(&dir.join("Lib"), 44_100);
         let (mut e, _) = saved_with(&dir, &wav);
-        let plain = dir.join("Plain/Plain.scraft").to_string_lossy().into_owned();
+        let plain = dir.join("Plain/Plain.djforge").to_string_lossy().into_owned();
         let r = e.execute("session.save_copy", &json!({"path": plain})).unwrap();
         assert_eq!(r["audio_files_written"], 0);
-        let full = dir.join("Full/Full.scraft").to_string_lossy().into_owned();
+        let full = dir.join("Full/Full.djforge").to_string_lossy().into_owned();
         let r = e.execute("session.save_copy", &json!({"path": full, "copy_audio": true})).unwrap();
         assert_eq!(r["audio_files_written"], 1);
         assert!(stored(&full).sources[0].path.starts_with("Audio Files/"));
@@ -3183,7 +3253,7 @@ mod in_place_tests {
         let mut e = session_at(44_100);
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
         e.execute("file.import_audio", &json!({"path": wav})).unwrap();
-        let path = dir.join("Set/Set.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Set/Set.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut e, &path).unwrap(), 0);
         assert!(stored(&path).sources.iter().all(|x| x.path == wav));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3209,7 +3279,7 @@ mod in_place_tests {
         assert_eq!(r.session().sources[0].origin.as_deref().map(Path::new), Some(moved.join("1A - 128 - track.wav").as_path()));
         assert_eq!(first_audio(&r), audio);
         // Saved again, it references the file where it now is.
-        let again = dir.join("Again/Again.scraft").to_string_lossy().into_owned();
+        let again = dir.join("Again/Again.djforge").to_string_lossy().into_owned();
         assert_eq!(save_session(&mut r, &again).unwrap(), 0);
         assert_eq!(first_audio(&reopen(&again)), audio);
         // Nothing to find: reported as still missing.

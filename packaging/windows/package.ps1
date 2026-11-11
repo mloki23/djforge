@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  Build, sign and package SoundCraft for Windows.
+  Build, sign and package djforge for Windows.
 
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
     soundcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    soundcraft-<version>-windows-<arch>-portable.zip   soundcraft.exe + soundcraft-cli.exe
+    soundcraft-<version>-windows-<arch>-portable.zip   djforge.exe + djforge-cli.exe
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -53,7 +53,7 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if (-not $env:SOUNDCRAFT_BUILD_SHA) { $env:SOUNDCRAFT_BUILD_SHA = (git -C $Root rev-parse HEAD 2>$null) }
 if (-not $env:SOUNDCRAFT_BUILD_DATE) { $env:SOUNDCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') }
 
-Write-Output "SoundCraft $Version for Windows $Arch ($Target)"
+Write-Output "djforge $Version for Windows $Arch ($Target)"
 
 if (-not $SkipBuild) {
   # Static CRT: no VC++ redistributable needed. Scoped to the target so host build scripts and
@@ -77,7 +77,7 @@ function Get-PeHeader([string] $Path) {
   return @{ Machine = [BitConverter]::ToUInt16($bytes, $pe + 4); Subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C) }
 }
 $Machine = switch ($Arch) { 'x64' { 0x8664 } 'x86' { 0x14C } 'arm64' { 0xAA64 } }
-foreach ($check in @(@('soundcraft.exe', 2), @('soundcraft-cli.exe', 3))) {
+foreach ($check in @(@('djforge.exe', 2), @('djforge-cli.exe', 3))) {
   $h = Get-PeHeader (Join-Path $Bin $check[0])
   if ($h.Machine -ne $Machine) { throw "$($check[0]) is for machine 0x$('{0:X}' -f $h.Machine), expected 0x$('{0:X}' -f $Machine) ($Arch)" }
   if ($h.Subsystem -ne $check[1]) { throw "$($check[0]) has PE subsystem $($h.Subsystem), expected $($check[1])" }
@@ -86,9 +86,9 @@ foreach ($check in @(@('soundcraft.exe', 2), @('soundcraft-cli.exe', 3))) {
 $Stage = Join-Path $TargetDir "windows-package\$Arch"
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item (Join-Path $Bin 'soundcraft.exe'), (Join-Path $Bin 'soundcraft-cli.exe') $Stage
+Copy-Item (Join-Path $Bin 'djforge.exe'), (Join-Path $Bin 'djforge-cli.exe') $Stage
 
-& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'soundcraft.exe') (Join-Path $Stage 'soundcraft-cli.exe')
+& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'djforge.exe') (Join-Path $Stage 'djforge-cli.exe')
 
 # ---- MSI ---------------------------------------------------------------------------------------
 $Msi = Join-Path $Dist "soundcraft-$Version-windows-$Arch.msi"
@@ -118,8 +118,8 @@ Compress-Archive -Path $Portable -DestinationPath $Zip
 # here; .github/workflows/windows-arm64.yml installs and runs it on ARM64 instead.
 $HostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
 if ($Arch -ne 'arm64' -or $HostArch -eq 'arm64') {
-  Invoke-Native 'soundcraft-cli --version' { & (Join-Path $Stage 'soundcraft-cli.exe') --version }
+  Invoke-Native 'djforge-cli --version' { & (Join-Path $Stage 'djforge-cli.exe') --version }
 } else {
-  Write-Output "skipping soundcraft-cli --version: an $Arch build doesn't run on this $HostArch machine"
+  Write-Output "skipping djforge-cli --version: an $Arch build doesn't run on this $HostArch machine"
 }
 Get-Item $Msi, $Zip | Format-Table Name, Length

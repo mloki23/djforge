@@ -28,7 +28,7 @@ fn track<'a>(sess: &'a Value, name: &str) -> &'a Value {
 fn handshake_and_tool_list() {
     let mut s = Server::new(Headless::new(Engine::default()));
     let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
-    assert_eq!(r["result"]["serverInfo"]["name"], "soundcraft");
+    assert_eq!(r["result"]["serverInfo"]["name"], "djforge");
     let r = rpc(&mut s, 2, "tools/list", json!({}));
     assert!(r["result"]["tools"].as_array().unwrap().len() >= 10);
     assert!(s.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
@@ -116,7 +116,7 @@ fn agent_builds_and_mixes_a_session() {
     assert_eq!(&bytes[0..4], b"RIFF");
 
     // 9. Save, reopen, and the mix survives.
-    let sp = dir.join("Agent Mix").join("Agent Mix.scraft");
+    let sp = dir.join("Agent Mix").join("Agent Mix.djforge");
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     tool(&mut s, "save_session", json!({"path": sp.to_string_lossy()}));
     tool(&mut s, "new_session", json!({}));

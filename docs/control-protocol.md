@@ -6,11 +6,11 @@ input), and every command is reachable from:
 
 | Surface | How |
 |---|---|
-| Desktop app control channel | `soundcraft --control <port>` (`0` = pick a free port; printed as `SOUNDCRAFT_CONTROL_PORT=…`) |
-| CLI against a running app | `soundcraft-cli app --port <port> <method or command id> [JSON]` |
-| Headless CLI | `soundcraft-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav` |
-| MCP (headless) | `soundcraft-cli mcp [--demo]` |
-| MCP (bridged to the app) | `soundcraft-cli mcp --connect <port>` |
+| Desktop app control channel | `djforge --control <port>` (`0` = pick a free port; printed as `SOUNDCRAFT_CONTROL_PORT=…`) |
+| CLI against a running app | `djforge-cli app --port <port> <method or command id> [JSON]` |
+| Headless CLI | `djforge-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav` |
+| MCP (headless) | `djforge-cli mcp [--demo]` |
+| MCP (bridged to the app) | `djforge-cli mcp --connect <port>` |
 
 ## Isolated automation profiles
 
@@ -96,11 +96,11 @@ Triggers (slot launch, scene, stops, commands) act on a press (a note-on, or a c
 ## Examples
 
 ```sh
-P=$(soundcraft --demo --control 0 | sed -n 's/SOUNDCRAFT_CONTROL_PORT=//p')   # or read stderr
-soundcraft-cli app --port $P mix.solo '{"track":"Bass"}'
-soundcraft-cli app --port $P transport.play
-soundcraft-cli app --port $P ui.screenshot '{"path":"/tmp/shot.png"}'
-soundcraft-cli app --port $P ui.menu.invoke '{"path":"Track > New..."}'
+P=$(djforge --demo --control 0 | sed -n 's/SOUNDCRAFT_CONTROL_PORT=//p')   # or read stderr
+djforge-cli app --port $P mix.solo '{"track":"Bass"}'
+djforge-cli app --port $P transport.play
+djforge-cli app --port $P ui.screenshot '{"path":"/tmp/shot.png"}'
+djforge-cli app --port $P ui.menu.invoke '{"path":"Track > New..."}'
 ```
 
 Offscreen (no window): `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png script.jsonl`,

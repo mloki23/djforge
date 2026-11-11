@@ -4,27 +4,27 @@ SoundCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) 
 Claude and other agents can make music with it.
 
 ```sh
-soundcraft-cli mcp                    # headless engine (no window, no audio device)
-soundcraft-cli mcp --demo             # headless, starting from the demo session
-soundcraft-cli mcp --automation-read-root DIR --automation-write-root DIR   # headless, confined to folders
-soundcraft --control 7801 &           # the desktop app…
-soundcraft-cli mcp --connect 7801     # …driven over MCP: same tools plus screenshots and clicks
+djforge-cli mcp                    # headless engine (no window, no audio device)
+djforge-cli mcp --demo             # headless, starting from the demo session
+djforge-cli mcp --automation-read-root DIR --automation-write-root DIR   # headless, confined to folders
+djforge --control 7801 &           # the desktop app…
+djforge-cli mcp --connect 7801     # …driven over MCP: same tools plus screenshots and clicks
 ```
 
 Claude Code:
 
 ```sh
-claude mcp add soundcraft -- soundcraft-cli mcp --demo
+claude mcp add djforge -- djforge-cli mcp --demo
 ```
 
 ## Confining file access
 
 ```sh
-soundcraft-cli mcp --automation-read-root /work/project --automation-write-root /work/project/out
+djforge-cli mcp --automation-read-root /work/project --automation-write-root /work/project/out
 ```
 
 ```json
-{"mcpServers": {"soundcraft": {"command": "soundcraft-cli",
+{"mcpServers": {"soundcraft": {"command": "djforge-cli",
   "args": ["mcp", "--automation-read-root", "/work/project", "--automation-write-root", "/work/project/out"]}}}
 ```
 
@@ -64,7 +64,7 @@ works across the suite) keep the agent to the folders you give it:
 
 The flags confine the in-process server, so `--connect` together with them is an error: the server
 would otherwise talk to an app that isn't confined. SoundCraft's desktop app has no equivalent flags
-yet, so a running app (`soundcraft --control`) is not confined. `--demo` is the operator's own
+yet, so a running app (`djforge --control`) is not confined. `--demo` is the operator's own
 choice and is built before the roots apply.
 
 Playback and bounce need no check of their own. SoundCraft decodes audio into the session when it
@@ -92,7 +92,7 @@ files it was given rather than guarding against other software on the computer.
 | `execute` | Run one command with JSON params. |
 | `batch` | Run several commands in order (`keep_going` optional). Any failed call makes the tool result `isError: true`; with `keep_going` the remaining calls still run and every result is listed. |
 | `inspect_session` | Verify work: tracks, clips, mixer, plugins, sends, automation, markers, selection; each `sources[]` entry includes `loaded` (decoded audio in the pool). |
-| `new_session`, `open_session`, `save_session` | Session files (`.scraft`, audio in `Audio Files/`). `open_session` returns `missing`: the media files that could not be loaded (empty when all are found). `save_session` won't save over another existing file unless `replace` is true. |
+| `new_session`, `open_session`, `save_session` | Session files (`.djforge`; SoundCraft's `.scraft` opens too; audio in `Audio Files/`). `open_session` returns `missing`: the media files that could not be loaded (empty when all are found). `save_session` won't save over another existing file unless `replace` is true. |
 | `import_audio` | WAV, AIFF, FLAC, MP3, OGG, AAC/M4A, ALAC, CAF onto a new or existing track. |
 | `bounce_mix` | Render to WAV/AIFF/FLAC; returns peak dBFS and integrated LUFS. |
 | `parity` | Feature-parity report. |

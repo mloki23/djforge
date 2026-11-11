@@ -338,13 +338,13 @@ fn an_agent_s_export_runs_in_the_background_and_jobs_wait_for_each_other() {
         ("dj.split_stems", json!({"clip": 1})),
         ("dj.import_set", json!({"plan": dir.join("plan.json").to_string_lossy()})),
         ("file.import_audio", json!({"paths": [copy]})),
-        ("session.save_as", json!({"path": dir.join("Mine.scraft").to_string_lossy()})),
+        ("session.save_as", json!({"path": dir.join("Mine.djforge").to_string_lossy()})),
         ("session.new", json!({})),
         ("session.close", json!({})),
     ] {
         assert_eq!(h.state_mut().run(id, params).unwrap_err(), WAIT, "{id}");
     }
-    assert!(!dir.join("other").exists() && !dir.join("Mine.scraft").exists());
+    assert!(!dir.join("other").exists() && !dir.join("Mine.djforge").exists());
     assert_eq!(h.state().engine.session().tracks.len(), tracks);
     soundcraft_ui_egui::prep::start(h.state_mut(), &json!({"source": dir.join("lib").to_string_lossy()}));
     assert!(h.state().prep.is_none(), "{}", h.state().ui.status);

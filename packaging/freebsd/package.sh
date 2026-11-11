@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and package SoundCraft for FreeBSD:
+# Build and package djforge for FreeBSD:
 #
 #   $DIST/soundcraft-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
 #       soundcraft-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
@@ -36,7 +36,7 @@ case "$(uname -m)" in
 esac
 BASENAME="soundcraft-$VERSION-freebsd-$ARCH"
 
-echo "==> SoundCraft $VERSION for FreeBSD $ARCH"
+echo "==> djforge $VERSION for FreeBSD $ARCH"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli)
@@ -49,8 +49,8 @@ rm -rf "$WORK"
 # ---- stage a /usr/local-style tree ---------------------------------------------------------------
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/mime/packages" "$STAGE/share/metainfo" \
   "$STAGE/share/icons" "$STAGE/share/doc/soundcraft"
-install -m 755 "$BIN/soundcraft" "$BIN/soundcraft-cli" "$STAGE/bin/"
-strip "$STAGE/bin/soundcraft" "$STAGE/bin/soundcraft-cli" 2>/dev/null || true
+install -m 755 "$BIN/djforge" "$BIN/djforge-cli" "$STAGE/bin/"
+strip "$STAGE/bin/djforge" "$STAGE/bin/djforge-cli" 2>/dev/null || true
 # The desktop entry, MIME type and metainfo are the freedesktop files the Linux packages use.
 install -m 644 "$LINUX/$APP_ID.desktop" "$STAGE/share/applications/$APP_ID.desktop"
 install -m 644 "$LINUX/$APP_ID.mime.xml" "$STAGE/share/mime/packages/$APP_ID.xml"
@@ -63,6 +63,6 @@ copy_docs "$STAGE/share/doc/soundcraft"
 tar -C "$WORK" -czf "$DIST/$BASENAME.tar.gz" "$BASENAME"
 echo "wrote $DIST/$BASENAME.tar.gz"
 
-"$STAGE/bin/soundcraft-cli" --version
+"$STAGE/bin/djforge-cli" --version
 echo "==> done"
 ls -lh "$DIST"

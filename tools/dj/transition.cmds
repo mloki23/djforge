@@ -1,6 +1,6 @@
 # Stage 1 gate: Mental Atmosphere -> I Feel Love, beat-locked from mixforge's analysis.
 # Run from the repo root (DJFORGE_PYTHON and DJFORGE_MIXFORGE must be set):
-#   soundcraft-cli script tools/dj/transition.cmds --save OUT.scraft --bounce OUT.wav --start 400 --end 520
+#   djforge-cli script tools/dj/transition.cmds --save OUT.djforge --bounce OUT.wav --start 400 --end 520
 # Mental Atmosphere's first downbeat lands on bar 2, so its bar k plays at session bar k + 2;
 # I Feel Love comes in on bar 238 (12 s into the 400 s excerpt), 16 bars before the outro of
 # Mental Atmosphere at bar 254 (39.7 s), where the bass swap lands (Marty, by ear).
