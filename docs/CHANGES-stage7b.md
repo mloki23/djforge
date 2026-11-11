@@ -28,6 +28,9 @@ for the DDJ, the pad grid and the keyboard. What follows changes behaviour you m
   device: its enable and its mappings move to the new id, and the status line says "DDJ found
   on a new USB port; settings moved". With several ports of that name nothing is guessed: MIDI
   Devices lists them with "Use settings from …" (`midi.move_settings`).
+- That match only looks at names: while an enabled DDJ is unplugged, its settings can move to an
+  identical DDJ that was never enabled and is still plugged in. Plug the right one back in, or
+  move them back with `midi.move_settings`.
 - A failed subscription to the MIDI router is logged once and tried again once a second, not
   every frame. A backend that panics while connecting a port is an error, not a crash.
 
@@ -54,7 +57,9 @@ for the DDJ, the pad grid and the keyboard. What follows changes behaviour you m
 - **Long takes are never refused.** Redundant controller events are thinned as they arrive (a
   controller repeating its value is dropped; a second value on one tick replaces the first). A
   take longer than one command (the engine takes 1,000,000 events per `midi.record_take`) is
-  placed in several commands inside one undo step, split where no note is held. A take is
+  placed in several commands inside one undo step, split where no note is held. Over an existing
+  clip, each part that overlaps one goes on a new playlist of its own, so such a take can leave
+  intermediate playlists (each a copy of the one before, so nothing is lost). A take is
   bounded in memory: past 2,000,000 events controller events are dropped, past 3,000,000 notes
   too, and the status line says how many.
 - **The MIDI Input Filter works.** `setup.midi_input_filter`'s kinds (notes, poly and mono
@@ -66,7 +71,10 @@ for the DDJ, the pad grid and the keyboard. What follows changes behaviour you m
   Event › Recover MIDI Take ▸ lists them newest first with their age, track and note count;
   `midi.recover_take` places the newest (or `{index}`; `{list: true}` lists them) again on a
   new playlist, one undo step. A take from another session goes on the MIDI track of its name,
-  else on a new MIDI track. Takes never placed are not pushed out by placed ones.
+  else on a new MIDI track. Takes never placed are not pushed out by placed ones. The file is
+  written atomically (a crash mid-write leaves the old copy whole); one that can't be read is
+  moved aside as `last_midi_takes.json.corrupt-<time>`, never written over. The old single-take
+  `last_midi_take.json` from before is no longer read and can be deleted.
 - **Slot recordings.** Editing a playing MIDI slot keeps the pitches still covered sounding;
   notes added behind the playhead send no note-off. A slot recording is refused on an inactive
   column track, cancelled (and kept for recovery) by an audio device change, and while it runs

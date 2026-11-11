@@ -412,6 +412,20 @@ pub struct TakeWriter {
     latest: Arc<AtomicU64>,
     /// Held while writing.
     lock: Arc<Mutex<()>>,
+    /// Writes running on their own thread, joined by [`TakeWriter::flush`].
+    running: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+impl TakeWriter {
+    /// Waits for the writes running on their own thread (at quit).
+    pub fn flush(&self) {
+        let running = std::mem::take(&mut *self.running.lock().unwrap_or_else(PoisonError::into_inner));
+        for t in running {
+            if t.join().is_err() {
+                log::warn!("the MIDI takes' writer ended abnormally");
+            }
+        }
+    }
 }
 
 /// The live target a slot recording sets while armed (it comes before `midi.target`'s).
@@ -457,7 +471,8 @@ fn dropped_note(app: &SoundApp, since: u64, full: u64) -> String {
 }
 
 /// Loads the copy of the kept takes from the autosave folder once (after a crash), behind the
-/// takes kept since.
+/// takes kept since. A copy that can't be read is moved aside (`<file>.corrupt-<time>`), never
+/// written over, and the status line says where.
 pub fn ensure_loaded(app: &mut SoundApp) {
     if app.midi_takes_loaded {
         return;
@@ -465,12 +480,18 @@ pub fn ensure_loaded(app: &mut SoundApp) {
     app.midi_takes_loaded = true;
     let Some(dir) = &app.autosave_dir else { return };
     let path = dir.join(TAKES_FILE);
-    if !path.is_file() {
-        return;
-    }
-    let read: Option<Vec<KeptTake>> = soundcraft_engine::io::read_file(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    match read {
-        Some(takes) => {
+    let bytes = match soundcraft_engine::io::read_file(&path) {
+        Ok(b) => b,
+        // None kept yet (or unreadable: a later save replaces it atomically, as before).
+        Err(e) => {
+            if path.exists() {
+                log::warn!("reading the kept MIDI takes: {e}");
+            }
+            return;
+        }
+    };
+    match serde_json::from_slice::<Vec<KeptTake>>(&bytes) {
+        Ok(takes) => {
             for t in takes.into_iter().take(KEPT_TAKES) {
                 if !app.midi_takes.contains(&t) {
                     app.midi_takes.push(t);
@@ -478,7 +499,18 @@ pub fn ensure_loaded(app: &mut SoundApp) {
             }
             evict(app);
         }
-        None => log::warn!("{}: not a list of MIDI takes", path.display()),
+        Err(e) => {
+            let line = match soundcraft_engine::io::move_aside(&path) {
+                Ok(to) => format!("The kept MIDI takes couldn't be read ({e}): the file is kept as {}", to.display()),
+                Err(why) => {
+                    // Not moved: saving must not write over it.
+                    app.take_writer.latest.store(u64::MAX, Ordering::SeqCst);
+                    format!("The kept MIDI takes couldn't be read ({e}) or moved aside ({why}): they are left as they are")
+                }
+            };
+            log::warn!("{line}");
+            app.ui.status = line;
+        }
     }
 }
 
@@ -511,7 +543,9 @@ fn write_takes(takes: &[KeptTake], path: &str, w: &TakeWriter, turn: u64) {
     if w.latest.load(Ordering::SeqCst) != turn {
         return;
     }
-    let r = serde_json::to_vec(takes).map_err(|e| e.to_string()).and_then(|b| soundcraft_engine::io::write_file(path, &b).map_err(|e| e.to_string()));
+    let r = serde_json::to_vec(takes)
+        .map_err(|e| e.to_string())
+        .and_then(|b| soundcraft_engine::io::write_file_atomic(std::path::Path::new(path), &b).map_err(|e| e.to_string()));
     if let Err(e) = r {
         log::warn!("keeping the MIDI takes for recovery: {e}");
     }
@@ -522,11 +556,20 @@ fn save_takes(app: &SoundApp) {
     let Some(dir) = &app.autosave_dir else { return };
     let path = dir.join(TAKES_FILE).to_string_lossy().into_owned();
     let w = app.take_writer.clone();
+    if w.latest.load(Ordering::SeqCst) == u64::MAX {
+        // An unreadable copy that couldn't be moved aside: never written over.
+        return;
+    }
     let turn = w.latest.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     if cfg!(not(target_arch = "wasm32")) && app.midi_takes.iter().map(KeptTake::events).sum::<usize>() > WRITE_INLINE_EVENTS {
         let (takes, p, w2) = (app.midi_takes.clone(), path.clone(), w.clone());
         match std::thread::Builder::new().name("midi-takes".into()).spawn(move || write_takes(&takes, &p, &w2, turn)) {
-            Ok(_) => return,
+            Ok(t) => {
+                let mut running = w.running.lock().unwrap_or_else(PoisonError::into_inner);
+                running.retain(|t| !t.is_finished());
+                running.push(t);
+                return;
+            }
             // Written here instead.
             Err(e) => log::warn!("writing the MIDI takes on a thread: {e}"),
         }
@@ -813,7 +856,6 @@ pub fn finish_take(app: &mut SoundApp, end: Samples, punch: Option<Range>) -> Op
 fn place(app: &mut SoundApp, track: TrackId, passes: &[KeptPass], fresh: bool) -> Result<Value, String> {
     let parts = chunks(passes, CHUNK_EVENTS);
     let grouped = parts.len() > 1 && !app.engine.in_undo_group();
-    let steps = app.engine.undo_history().len();
     if grouped {
         app.engine.begin_undo_group(TAKE_GROUP);
     }
@@ -831,11 +873,9 @@ fn place(app: &mut SoundApp, track: TrackId, passes: &[KeptPass], fresh: bool) -
                 last = v;
             }
             Err(e) => {
-                if grouped {
-                    app.engine.commit_undo_group();
-                    if app.engine.undo_history().len() > steps {
-                        app.engine.undo();
-                    }
+                // What the group placed goes again: the step its commit pushed, if any.
+                if grouped && app.engine.commit_undo_group() {
+                    app.engine.undo();
                 }
                 return Err(e.to_string());
             }
@@ -916,7 +956,8 @@ fn split_pass(p: &KeptPass, max: usize, out: &mut Vec<KeptPass>) {
     held.clear();
     let (mut from, mut start) = (0usize, p.start);
     let mut lead: Vec<(Samples, [u8; 3])> = Vec::new();
-    while ev.len() - from + lead.len() > max {
+    // At least one event per part (`from` stays inside `ev`), even with more notes held than `max`.
+    while from + 1 < ev.len() && ev.len() - from + lead.len() > max {
         let limit = (from + max.saturating_sub(lead.len()).max(1)).min(ev.len() - 1);
         let clean = (from + 1..=limit).rev().find(|i| quiet.get(*i).copied().unwrap_or(false));
         let mut cut = clean.unwrap_or(limit).max(from + 1);
@@ -956,7 +997,7 @@ fn recover_track(app: &mut SoundApp, take: &KeptTake) -> Result<(TrackId, String
     let v = app.run("track.new", json!({"kind": "midi", "name": name}))?;
     let id = TrackId(v["tracks"][0].as_u64().ok_or("no track was made for the take")?);
     let made = app.engine.session().track(id).map(|t| t.name.clone()).unwrap_or_default();
-    Ok((id, format!(" (its track isn't in this session: on the new MIDI track `{made}`)")))
+    Ok((id, format!(" (its track isn't in this session: on the new MIDI track `{made}`, which has no instrument yet: give it one to hear it)")))
 }
 
 /// `midi.recover_take {index?, list?}`: places a kept take (`index` in the list, 0 the newest,
@@ -987,16 +1028,13 @@ pub fn recover(app: &mut SoundApp, p: &Value) -> Result<Value, String> {
         });
     };
     let grouped = !app.engine.in_undo_group();
-    let steps = app.engine.undo_history().len();
     if grouped {
         app.engine.begin_undo_group(TAKE_GROUP);
     }
     let r = recover_track(app, &take).and_then(|(track, how)| place(app, track, &take.passes, true).map(|v| (v, how)));
-    if grouped {
-        app.engine.commit_undo_group();
-        if r.is_err() && app.engine.undo_history().len() > steps {
-            app.engine.undo();
-        }
+    if grouped && app.engine.commit_undo_group() && r.is_err() {
+        // A new track made for it goes again.
+        app.engine.undo();
     }
     let (mut v, how) = r?;
     if let Some(t) = app.midi_takes.get_mut(index) {
@@ -1208,5 +1246,65 @@ mod tests {
         let t = KeptTake { at_s: 1_000, track: 1, track_name: "Bass".into(), notes: 16, placed: true, passes: vec![] };
         assert_eq!(t.label(1_130), "2 min ago · Bass · 16 notes");
         assert_eq!(KeptTake { placed: false, notes: 1, ..t }.label(1_000), "just now · Bass · 1 note (not placed)");
+    }
+
+    #[test]
+    fn an_unreadable_takes_file_is_moved_aside_never_written_over() {
+        let dir = std::env::temp_dir().join(format!("djforge-bad-takes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(TAKES_FILE);
+        let truncated = br#"[{"at_s":1,"track":3,"track_name":"Le"#;
+        std::fs::write(&file, truncated).unwrap();
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        app.autosave_dir = Some(dir.clone());
+        ensure_loaded(&mut app);
+        assert!(app.midi_takes.is_empty(), "the list starts empty");
+        assert!(app.ui.status.contains("couldn't be read") && app.ui.status.contains(".corrupt-"), "{}", app.ui.status);
+        let aside: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.to_string_lossy().contains(".corrupt-")).collect();
+        assert_eq!(aside.len(), 1);
+        assert!(!file.exists(), "moved, not copied");
+        keep(&mut app, kept(false, 4));
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), truncated, "the bad file is kept as it was");
+        let back: Vec<KeptTake> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(back.len(), 1, "a new list beside it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_split_with_more_notes_held_than_a_part_holds_still_ends() {
+        // 40 notes held, then controllers: parts of 8 can't even hold the notes struck again.
+        let mut ev: Vec<(Samples, [u8; 3])> = (0..40).map(|i| (i, [0x90, i as u8, 100])).collect();
+        ev.extend((40..60).map(|i| (i, [0xB0, 1, (i % 128) as u8])));
+        let parts = chunks(&[pass(ev, 100)], 8);
+        let flat: Vec<&KeptPass> = parts.iter().flatten().collect();
+        assert!(flat.len() < 60, "every part takes at least one event");
+        assert_eq!(flat.last().unwrap().end, 100);
+    }
+
+    #[test]
+    fn a_failed_recovery_with_a_full_history_leaves_nothing_behind() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        app.engine.history_limit = 2;
+        for _ in 0..3 {
+            app.run("track.new", json!({"kind": "audio"})).unwrap();
+        }
+        assert_eq!(app.engine.undo_history().len(), 2, "full");
+        let tracks = app.engine.session().tracks.len();
+        // Its track is gone (a new MIDI track is made) and its pass is bad (the engine refuses it).
+        let bad = KeptTake {
+            at_s: 1,
+            track: 999,
+            track_name: "Gone".into(),
+            notes: 1,
+            placed: false,
+            passes: vec![KeptPass { start: 10, end: 5, events: vec![(10, [0x90, 60, 100])] }],
+        };
+        app.midi_takes = vec![bad];
+        app.midi_takes_loaded = true;
+        assert!(app.run("midi.recover_take", json!({})).is_err());
+        assert_eq!(app.engine.session().tracks.len(), tracks, "the new track went again");
+        assert!(!app.midi_takes[0].placed);
     }
 }

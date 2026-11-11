@@ -940,6 +940,8 @@ impl SoundApp {
         if let Some(w) = &self.autosaver {
             let _ = w.flush();
         }
+        // A large copy of the kept MIDI takes may still be on its way to disk.
+        self.take_writer.flush();
     }
 
     /// Run part of a frame. If it panics, the session is autosaved (once per change) and the app

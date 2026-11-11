@@ -386,20 +386,24 @@ impl Engine {
 
     /// Closes the open undo group (the outermost of nested ones): one step for what changed
     /// since it opened (none if nothing did). It ends any merged gesture, so what comes after
-    /// never merges into the group's step. Undo and redo close it first.
-    pub fn commit_undo_group(&mut self) {
+    /// never merges into the group's step. Undo and redo close it first. Returns whether this
+    /// commit pushed a step (false for an inner commit, or when nothing changed): a caller
+    /// rolling the group back undoes exactly that step, however full the history is.
+    pub fn commit_undo_group(&mut self) -> bool {
         self.undo_depth = self.undo_depth.saturating_sub(1);
-        if self.undo_depth == 0 {
-            self.close_undo_group();
-        }
+        self.undo_depth == 0 && self.close_undo_group()
     }
 
-    /// Closes the open undo group whatever its nesting.
-    fn close_undo_group(&mut self) {
+    /// Closes the open undo group whatever its nesting; whether it pushed a step.
+    fn close_undo_group(&mut self) -> bool {
         self.undo_depth = 0;
         self.merge_key = None;
-        if let Some((label, before)) = self.undo_group.take() {
-            self.push_undo(&label, before);
+        match self.undo_group.take() {
+            Some((label, before)) if !Arc::ptr_eq(&before, &self.doc) => {
+                self.push_undo(&label, before);
+                true
+            }
+            _ => false,
         }
     }
 

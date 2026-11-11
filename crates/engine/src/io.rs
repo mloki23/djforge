@@ -1915,6 +1915,29 @@ pub fn replace_user_file(s: &Session, path: &Path, bytes: &[u8]) -> Result<()> {
 /// [`replace_user_file`] refusing `sources`, taken from a session earlier.
 pub fn replace_file_refusing(sources: &SourceFiles, path: &Path, bytes: &[u8]) -> Result<()> {
     sources.refuse(path)?;
+    replace_atomically(path, bytes, "; close the file in any player and run again")
+}
+
+/// Writes `bytes` to `path` atomically: into a temporary file beside it, synced, then renamed
+/// over it, so a crash mid-write leaves the old file whole (never a truncated one).
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    replace_atomically(path, bytes, "")
+}
+
+/// Moves the file at `path` aside to `<name>.corrupt-<unix seconds>` beside it (a file that
+/// couldn't be read, kept rather than overwritten). Returns where it went.
+pub fn move_aside(path: &Path) -> Result<PathBuf> {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let name = path.file_name().ok_or_else(|| EngineError::Io(format!("{}: not a file name", path.display())))?;
+    let mut aside = std::ffi::OsString::from(name);
+    aside.push(format!(".corrupt-{secs}"));
+    let to = path.with_file_name(aside);
+    rename_path(path, &to)?;
+    Ok(to)
+}
+
+/// [`write_file_atomic`], with `hint` after a failed rename's error.
+fn replace_atomically(path: &Path, bytes: &[u8], hint: &str) -> Result<()> {
     let shown = path.display();
     if cfg!(target_arch = "wasm32") {
         return write_file(path.to_str().ok_or_else(|| EngineError::Io(format!("{shown}: not a Unicode path")))?, bytes);
@@ -1942,7 +1965,7 @@ pub fn replace_file_refusing(sources: &SourceFiles, path: &Path, bytes: &[u8]) -
     drop(file);
     std::fs::rename(&tmp, path).map_err(|err| {
         let _ = std::fs::remove_file(&tmp);
-        EngineError::Io(format!("{shown}: {err}; close the file in any player and run again"))
+        EngineError::Io(format!("{shown}: {err}{hint}"))
     })
 }
 

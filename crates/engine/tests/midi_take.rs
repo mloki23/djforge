@@ -536,3 +536,33 @@ fn a_take_on_a_new_playlist_takes_a_free_name() {
     assert_eq!(names.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), ["Lead.02", "Lead.03"]);
     assert_eq!(active, 1);
 }
+
+#[test]
+fn commit_says_whether_it_pushed_a_step_even_with_the_history_full() {
+    let (mut e, t) = engine();
+    e.history_limit = 3;
+    for i in 0..5 {
+        let p = take(
+            &e,
+            t,
+            4.0 + 2.0 * f64::from(i),
+            5.0 + 2.0 * f64::from(i),
+            note(e.session(), 60, 4.0 + 2.0 * f64::from(i), 4.5 + 2.0 * f64::from(i)).to_vec(),
+        );
+        run(&mut e, "midi.record_take", p);
+    }
+    assert_eq!(e.undo_history().len(), 3, "full");
+    e.begin_undo_group("Record MIDI");
+    let p = take(&e, t, 20.0, 21.0, note(e.session(), 62, 20.0, 20.5).to_vec());
+    run(&mut e, "midi.record_take", p);
+    assert!(e.commit_undo_group(), "pushed, though the history's length didn't grow");
+    assert_eq!(e.undo_history().len(), 3);
+    e.begin_undo_group("Nothing");
+    assert!(!e.commit_undo_group(), "nothing changed: nothing pushed");
+    e.begin_undo_group("Outer");
+    e.begin_undo_group("Inner");
+    let p = take(&e, t, 22.0, 23.0, note(e.session(), 64, 22.0, 22.5).to_vec());
+    run(&mut e, "midi.record_take", p);
+    assert!(!e.commit_undo_group(), "an inner commit pushes nothing");
+    assert!(e.commit_undo_group());
+}
