@@ -1,7 +1,9 @@
 //! The stage 7b gate: the whole MIDI hardware chain through the app, scripted end to end. Two
 //! fake devices (a `FakeSource`: no real MIDI port is ever opened) on the silent clock: "Keys"
 //! plays and records a 4-bar bassline into a `prod.new_part` bass part, "DDJ" learns a stem
-//! fader on a split drums clip and a Session view slot launch, then is unplugged and replugged.
+//! fader on a split drums clip and a Session view slot launch, then is unplugged and replugged;
+//! a mapped pad never sounds on the bass, through an audio device change and a replug into
+//! another USB socket (a new backend id).
 //! Stems are split by a fake Demucs into a scratch stem cache, never the app's own.
 #![allow(clippy::unwrap_used)]
 
@@ -178,6 +180,22 @@ fn bassline() -> Vec<(u32, u8, u8)> {
     notes
 }
 
+/// Presses the mapped pad (DDJ note 37 ch 10, mapped to Window › Transport): its command runs,
+/// and for 400 ms nothing sounds on the bass.
+fn pad_is_silent(h: &mut Harness<'_, SoundApp>, clock: &MidiClock, bass: TrackId, what: &str) {
+    let shown = h.state().ui.show_transport;
+    send(h, "DDJ", MidiMessage::NoteOn { ch: 9, note: 37, vel: 120 }, clock.now_ns());
+    until(h, &format!("{what} runs its command"), |a| a.ui.show_transport != shown);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(400) {
+        step(h);
+        assert!(peak(h.state(), bass) < 1e-5, "{what}: the mapped note sounded on the bass");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    send(h, "DDJ", MidiMessage::NoteOff { ch: 9, note: 37, vel: 0 }, clock.now_ns());
+    steps(h, 2);
+}
+
 #[test]
 fn stage_7b_end_to_end_with_fake_devices() {
     let Rig { mut h, clock, bass, drums, dir } = rig();
@@ -352,6 +370,42 @@ fn stage_7b_end_to_end_with_fake_devices() {
     assert!(h.query_by_label("disconnected").is_none());
     assert_eq!(h.state().ui.midi_mappings.len(), 2, "the mappings survive the replug");
     send(&mut h, "DDJ", cc(5), clock.now_ns());
+
+    // --- A mapped pad is a control, not music: it never sounds on the bass (the live target). ---
+    h.state_mut()
+        .run(
+            "midi.map",
+            json!({"device": "DDJ", "matcher": {"type": "note", "ch": 9, "note": 37}, "target": {"kind": "command", "id": "window.transport"}}),
+        )
+        .unwrap();
+    steps(&mut h, 2);
+    until(&mut h, "quiet", |a| peak(a, bass) < 1e-5);
+    pad_is_silent(&mut h, &clock, bass, "the pad");
+
+    // --- An audio device change: a new player, which still filters the mapped pad. ---
+    let old = h.state().player.as_ref().unwrap().id();
+    let fresh = soundcraft_playback::Player::silent(h.state().engine.session_arc());
+    h.state_mut().player = Some(fresh);
+    steps(&mut h, 3);
+    assert_ne!(h.state().player.as_ref().unwrap().id(), old);
+    assert_eq!(h.state().player.as_ref().unwrap().midi_target(), Some(bass), "the new player plays the bass");
+    pad_is_silent(&mut h, &clock, bass, "the pad after the device change");
+    // An unmapped key still plays the bass on the new player.
+    send(&mut h, "DDJ", MidiMessage::NoteOn { ch: 0, note: 45, vel: 110 }, clock.now_ns());
+    until(&mut h, "an unmapped key sounds on the new player", |a| peak(a, bass) > 1e-3);
+    send(&mut h, "DDJ", MidiMessage::NoteOff { ch: 0, note: 45, vel: 0 }, clock.now_ns());
+    until(&mut h, "released", |a| peak(a, bass) < 1e-5);
+
+    // --- The DDJ plugged into another USB socket: a new backend id, the same device. ---
+    assert!(fake(&mut h).unplug("DDJ"));
+    until(&mut h, "the unplug is noticed", |a| !is_open(a, "DDJ"));
+    fake(&mut h).plug_device("DDJ", "usb:another-socket");
+    until(&mut h, "found on the new port", |a| is_open(a, "DDJ"));
+    assert!(h.state().ui.status.contains("DDJ found on a new USB port; settings moved"), "{}", h.state().ui.status);
+    let ddj: Vec<_> = h.state().ui.midi_inputs.iter().filter(|p| p.raw_name == "DDJ").cloned().collect();
+    assert_eq!((ddj.len(), ddj[0].backend_id.as_str()), (1, "usb:another-socket"));
+    assert!(h.state().ui.midi_mappings.iter().all(|m| m.device.backend_id == "usb:another-socket"), "every mapping followed");
+    pad_is_silent(&mut h, &clock, bass, "the pad on the new socket");
 
     // --- Nothing is left sounding. ---
     steps(&mut h, 2);

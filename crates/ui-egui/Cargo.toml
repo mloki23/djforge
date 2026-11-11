@@ -29,6 +29,7 @@ log.workspace = true
 image.workspace = true
 
 [dev-dependencies]
+soundcraft-midi-io = { workspace = true, features = ["testing"] }
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 
 [lints]

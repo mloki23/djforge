@@ -217,6 +217,9 @@ pub struct UiState {
     /// One that can't be read is skipped rather than failing the preferences.
     #[serde(deserialize_with = "midi_learn::lenient")]
     pub midi_mappings: Vec<midi_learn::Mapping>,
+    /// The mappings removed last (Delete, Remove All, `midi.unmap`), for Undo Remove: one level.
+    #[serde(deserialize_with = "midi_learn::lenient")]
+    pub midi_mappings_backup: Vec<midi_learn::Mapping>,
     /// Setup › MIDI › MIDI Mappings.
     pub show_midi_mappings: bool,
 }
@@ -284,6 +287,7 @@ impl Default for UiState {
             midi_keyboard_play: false,
             show_midi_devices: false,
             midi_mappings: Vec::new(),
+            midi_mappings_backup: Vec::new(),
             show_midi_mappings: false,
         }
     }
@@ -401,8 +405,12 @@ pub struct SoundApp {
     pub midi_take: Option<midi_record::MidiTake>,
     /// The Session view slot recording armed or running.
     pub slot_recording: Option<midi_record::SlotRecording>,
-    /// The last MIDI take (`midi.record_take` parameters), for Recover Last MIDI Take.
-    pub last_take: Option<Value>,
+    /// The MIDI takes kept for recovery, newest first (see [`midi_record`]).
+    pub midi_takes: Vec<midi_record::KeptTake>,
+    /// Whether the kept takes' copy in the autosave folder was read in.
+    pub midi_takes_loaded: bool,
+    /// Writes that copy in order.
+    pub(crate) take_writer: midi_record::TakeWriter,
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
@@ -526,7 +534,9 @@ impl SoundApp {
             midi_capture: None,
             midi_take: None,
             slot_recording: None,
-            last_take: None,
+            midi_takes: Vec::new(),
+            midi_takes_loaded: false,
+            take_writer: midi_record::TakeWriter::default(),
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
@@ -1258,6 +1268,8 @@ impl SoundApp {
                     self.session_view = session_view::SessionView { open: self.session_view.open, ..Default::default() };
                     midi_record::cancel_slot(self, "Slot recording cancelled: another session");
                     self.midi_take = None;
+                    // The live target override named a track of the old session.
+                    self.midi_target = None;
                     if let Some(p) = &self.player {
                         p.stop();
                         p.set_recording(false);

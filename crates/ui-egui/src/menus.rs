@@ -71,13 +71,15 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("midi.inputs", "MIDI Inputs", "", None),
     ("midi.input_enable", "Enable MIDI Input", "", None),
     ("midi.reconnect", "Reconnect MIDI Input", "", None),
+    ("midi.move_settings", "Move MIDI Input Settings", "", None),
     ("midi.target", "Live MIDI Target", "", None),
     ("midi.panic", "Live MIDI Panic", "", None),
-    ("midi.recover_take", "Recover Last MIDI Take (place again)", "", None),
+    ("midi.recover_take", "Recover MIDI Take", "", None),
     ("window.midi_mappings", "MIDI Mappings", "", None),
     ("midi.mappings", "List MIDI Mappings", "", None),
     ("midi.map", "Map MIDI Control", "", None),
     ("midi.unmap", "Remove MIDI Mapping", "", None),
+    ("midi.restore_mappings", "Undo Remove MIDI Mappings", "", None),
     ("midi.learn", "Learn MIDI", "", None),
     ("midi.learn_command", "Learn MIDI for Command...", "", None),
     ("window.io_setup", "I/O Setup", "", None),
@@ -305,6 +307,11 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                                 crate::recent::menu(app, ui);
                             }
                         }
+                        if root.label == "Event" {
+                            // The kept takes, newest first: drawn here, they change as takes are recorded.
+                            ui.separator();
+                            crate::midi_record::menu(app, ui);
+                        }
                         if root.label == "AudioSuite" {
                             ui.separator();
                             ui.label(egui::RichText::new("Processes selected clips offline").small().color(t.text_dim));
@@ -481,7 +488,6 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > MIDI > MIDI Input Devices...", "window.midi_devices"),
     ("Setup > MIDI > Live MIDI Panic", "midi.panic"),
     ("Setup > MIDI > MIDI Mappings...", "window.midi_mappings"),
-    ("Event > Recover Last MIDI Take (place again)", "midi.recover_take"),
     ("Setup > Session", "setup.session"),
     ("Event > Beat Detective", "window.beat_detective"),
     ("Event > Tempo Operations > Tempo Operations Window", "window.tempo_ops"),

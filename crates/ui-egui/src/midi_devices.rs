@@ -123,6 +123,20 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 ui.end_row();
             }
         });
+        // Enabled inputs not listed whose name several ports have: Marty picks which is his.
+        let ambiguous: Vec<_> = app.midi_host.as_ref().map(|h| h.ambiguous().to_vec()).unwrap_or_default();
+        for (old, ports) in &ambiguous {
+            ui.label(egui::RichText::new(format!("{} isn't on its USB port, and several ports have its name:", old.name)).color(t.text_dim));
+            for port in ports {
+                ui.horizontal(|ui| {
+                    ui.label(&port.name);
+                    if ui.button(format!("Use settings from {}", old.name)).on_hover_text("Its enabled state and MIDI mappings move to this port").clicked() {
+                        run(app, "midi.move_settings", json!({"raw_name": old.raw_name, "backend_id": old.backend_id, "to": port.name}));
+                        stale = true;
+                    }
+                });
+            }
+        }
         let gen_now = app.midi_host.as_ref().map(MidiHost::generation);
         if gen_now == generation && !stale {
             ui.ctx().data_mut(|d| d.insert_temp(cache, (generation, ports.clone())));

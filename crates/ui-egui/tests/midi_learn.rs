@@ -287,3 +287,44 @@ fn learn_midi_for_command_picks_the_command_in_search_and_never_leaks_into_it() 
     steps(&mut h, 2);
     assert!(!h.state().palette.learn, "learn mode leaked into the next Search");
 }
+
+/// A new player (an audio device change: `apply_audio_config` and `reconnect_audio` make one)
+/// starts with no mapped-control filter: it gets the filter again, so the mapped pad still
+/// doesn't play the target.
+#[test]
+fn a_mapped_note_still_does_not_play_the_instrument_after_an_audio_device_change() {
+    let (mut app, t) = synth();
+    let mut src = FakeSource::new(MidiClock::new()).unwrap();
+    src.plug("Pads");
+    app.midi_host = Some(MidiHost::new(Box::new(src)));
+    app.run("midi.input_enable", json!({"name": "Pads", "enabled": true})).unwrap();
+    app.run(
+        "midi.map",
+        json!({"device": "Pads", "matcher": {"type": "note", "ch": 0, "note": 60}, "target": {"kind": "command", "id": "window.transport"}}),
+    )
+    .unwrap();
+    let ctx = egui::Context::default();
+    for _ in 0..3 {
+        frame(&ctx, &mut app);
+    }
+    let old = app.player.as_ref().unwrap().id();
+    app.player = Some(soundcraft_playback::Player::silent(app.engine.session_arc()));
+    assert_ne!(app.player.as_ref().unwrap().id(), old);
+    for _ in 0..3 {
+        frame(&ctx, &mut app);
+    }
+    assert_eq!(app.player.as_ref().unwrap().midi_target(), Some(t), "the new player has the target");
+    assert!(app.midi_host.as_mut().unwrap().source_mut().as_fake_mut().unwrap().inject("Pads", MidiMessage::NoteOn { ch: 0, note: 60, vel: 127 }, 0));
+    let start = Instant::now();
+    while !app.ui.show_transport {
+        assert!(start.elapsed() < Duration::from_secs(5), "the pad never ran its command");
+        frame(&ctx, &mut app);
+        std::thread::yield_now();
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(400) {
+        frame(&ctx, &mut app);
+        assert!(peak(&app, t) < 1e-3, "after the device change the mapped note played the synth");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

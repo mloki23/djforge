@@ -54,8 +54,12 @@
 //! sustain pedal and its kin) sends it 0 on the live target, so a pedal held then can't stick. Learning a target again replaces its mapping; binding a
 //! message another target already uses asks whether to replace that mapping or keep both.
 //!
+//! **Removing.** Delete, Remove All (after a confirmation) and `midi.unmap` keep what they
+//! removed in the preferences (`midi_mappings_backup`, one level): Undo Remove in the MIDI
+//! Mappings window, or `midi.restore_mappings`, puts it back.
+//!
 //! **Commands** (UI commands, see [`command`]): `midi.mappings`, `midi.map`, `midi.unmap`,
-//! `midi.learn`, `midi.learn_command` and `window.midi_mappings`.
+//! `midi.restore_mappings`, `midi.learn`, `midi.learn_command` and `window.midi_mappings`.
 
 use crate::SoundApp;
 use serde::{Deserialize, Serialize};
@@ -499,10 +503,13 @@ pub struct LearnState {
     runtime: HashMap<String, Runtime>,
     /// The merged gesture (its key) and the time of its last event.
     gesture: Option<(String, f64)>,
-    /// The mapped-control filter last given to the player.
-    controls_sent: Option<Vec<(PortId, MidiControl)>>,
+    /// The mapped-control filter last given to a player, and that player's id: a new player
+    /// (an audio device change) starts with none, so it gets the filter again.
+    controls_sent: Option<(u64, Vec<(PortId, MidiControl)>)>,
     /// The UI time of the last frame.
     pub(crate) now: f64,
+    /// Remove All asks first: the question is up.
+    pub confirm_remove_all: bool,
 }
 
 /// Starts learning `target`: the next note-on or controller binds it.
@@ -598,16 +605,51 @@ pub fn resolve_conflict(app: &mut SoundApp, replace: bool) {
     }
 }
 
-/// Removes mapping `i`.
+/// Removes mapping `i`, kept for Undo Remove.
 pub fn remove(app: &mut SoundApp, i: usize) -> Option<Mapping> {
     (i < app.ui.midi_mappings.len()).then(|| {
-        app.mark_prefs_changed();
-        app.ui.midi_mappings.remove(i)
+        let m = app.ui.midi_mappings.remove(i);
+        backup(app, vec![m.clone()]);
+        m
     })
 }
 
+/// Removes the mappings `gone` says, keeping them for Undo Remove; how many went.
+pub fn remove_where(app: &mut SoundApp, gone: impl Fn(&Mapping) -> bool) -> usize {
+    let (out, kept): (Vec<Mapping>, Vec<Mapping>) = std::mem::take(&mut app.ui.midi_mappings).into_iter().partition(|m| gone(m));
+    app.ui.midi_mappings = kept;
+    let n = out.len();
+    if n > 0 {
+        backup(app, out);
+    }
+    n
+}
+
+/// Keeps `removed` as the one level Undo Remove restores (replacing the one before), saved with
+/// the preferences.
+fn backup(app: &mut SoundApp, removed: Vec<Mapping>) {
+    app.ui.midi_mappings_backup = removed;
+    app.mark_prefs_changed();
+}
+
+/// Undo Remove: the mappings removed last come back (a target mapped again since keeps its new
+/// mapping and gets the old one too, as Keep Both would). How many came back.
+pub fn restore(app: &mut SoundApp) -> usize {
+    let back = std::mem::take(&mut app.ui.midi_mappings_backup);
+    let mut n = 0;
+    for m in back {
+        if !app.ui.midi_mappings.contains(&m) {
+            app.ui.midi_mappings.push(m);
+            n += 1;
+        }
+    }
+    app.mark_prefs_changed();
+    n
+}
+
 /// Every UI frame at UI time `now`, after the MIDI host's: learns, dispatches, ends gestures and
-/// keeps the player's mapped-control filter in step (see the module docs).
+/// keeps the player's mapped-control filter in step (see the module docs): a new player gets it
+/// too.
 pub fn frame(app: &mut SoundApp, now: f64) {
     app.midi_learn.now = now;
     let events = app.midi_host.as_mut().map(|h| h.take_control_events(now)).unwrap_or_default();
@@ -697,9 +739,9 @@ fn controls(app: &SoundApp) -> Vec<(PortId, MidiControl)> {
 
 fn sync_controls(app: &mut SoundApp) {
     let Some(p) = &app.player else { return };
-    let now = controls(app);
+    let now = (p.id(), controls(app));
     if app.midi_learn.controls_sent.as_ref() != Some(&now) {
-        if !p.set_midi_controls(&now) && !app.midi_learn.overflow_logged {
+        if !p.set_midi_controls(&now.1) && !app.midi_learn.overflow_logged {
             log::warn!(
                 "MIDI mappings on more than {} ports: mapped notes of the others also play the live target",
                 soundcraft_playback::CONTROL_PORTS
@@ -1014,7 +1056,8 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         "midi.map" => {
             "{device: listed input name | {backend_id, raw_name, name}, matcher: {type: note|cc, ch, note|cc}, target: {kind: slot_launch {column, slot} | scene {row} | stop_column {column} | stop_all | track_volume {track} | track_pan {track} | stem_fader {track, stem} | instrument_param {track, param} | insert_param {track, slot, param} | command {id, params}}, mode?: momentary|toggle|absolute|rel_twos|rel_offset|rel_sign_mag, sensitivity?, pickup?: bool, replace?: bool} — track: id | name | {id, name}; replace also removes another target's mapping of the same message"
         }
-        "midi.unmap" => "{index} | {target} | {device, matcher} | {all: true}",
+        "midi.unmap" => "{index} | {target} | {device, matcher} | {all: true} — what it removes is kept for midi.restore_mappings (one level)",
+        "midi.restore_mappings" => "{} — the mappings removed last (Delete, Remove All, midi.unmap) come back",
         "midi.learn" => "{target} | {cancel: true} — the next note-on or controller from an enabled input binds target",
         _ => return None,
     })
@@ -1105,27 +1148,28 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             Ok(json!({"index": i, "mapping": app.ui.midi_mappings.get(i).map(Mapping::json)}))
         })(),
         "midi.unmap" => (|| {
-            let before = app.ui.midi_mappings.len();
-            if p.get("all").and_then(Value::as_bool) == Some(true) {
-                app.ui.midi_mappings.clear();
+            let removed = if p.get("all").and_then(Value::as_bool) == Some(true) {
+                remove_where(app, |_| true)
             } else if let Some(i) = p.get("index").and_then(Value::as_u64) {
                 remove(app, usize::try_from(i).unwrap_or(usize::MAX)).ok_or_else(|| format!("no mapping {i}"))?;
+                1
             } else if let Some(t) = p.get("target") {
                 let target = parse_target(app.engine.session(), t)?;
-                app.ui.midi_mappings.retain(|m| m.target != target);
+                remove_where(app, |m| m.target == target)
             } else if let (Some(d), Some(mv)) = (p.get("device"), p.get("matcher")) {
                 let device = parse_device(app, d)?;
                 let matcher: Matcher = serde_json::from_value(mv.clone()).map_err(|e| format!("bad `matcher`: {e}"))?;
-                app.ui.midi_mappings.retain(|m| !(m.device.same(&device) && m.matcher == matcher));
+                remove_where(app, |m| m.device.same(&device) && m.matcher == matcher)
             } else {
                 return Err("`index`, `target`, `device` and `matcher`, or `all` required".into());
-            }
-            let removed = before - app.ui.midi_mappings.len();
-            if removed > 0 {
-                app.mark_prefs_changed();
-            }
-            Ok(json!({"removed": removed}))
+            };
+            Ok(json!({"removed": removed, "backup": app.ui.midi_mappings_backup.len()}))
         })(),
+        "midi.restore_mappings" => {
+            let n = restore(app);
+            app.ui.status = format!("{n} MIDI mapping(s) restored");
+            Ok(json!({"restored": n}))
+        }
         "midi.learn" => (|| {
             if p.get("cancel").and_then(Value::as_bool) == Some(true) {
                 cancel(app);
@@ -1157,8 +1201,7 @@ pub fn menu_items(app: &mut SoundApp, ui: &mut egui::Ui, target: Target) {
         ui.close();
     }
     if n > 0 && ui.button("Remove MIDI Mapping").clicked() {
-        app.ui.midi_mappings.retain(|m| m.target != target);
-        app.mark_prefs_changed();
+        remove_where(app, |m| m.target == target);
         ui.close();
     }
 }
@@ -1341,11 +1384,36 @@ fn mappings_window(app: &mut SoundApp, ctx: &egui::Context) {
                 let _ = app.run("midi.learn_command", json!({}));
             }
             if !app.ui.midi_mappings.is_empty() && ui.button("Remove All").clicked() {
-                app.ui.midi_mappings.clear();
-                changed = true;
+                app.midi_learn.confirm_remove_all = true;
+            }
+            let back = app.ui.midi_mappings_backup.len();
+            if back > 0 && ui.button(format!("Undo Remove ({back})")).on_hover_text("Put back the mapping(s) removed last").clicked() {
+                let _ = app.run("midi.restore_mappings", json!({}));
             }
         });
     });
+    if app.midi_learn.confirm_remove_all {
+        let n = app.ui.midi_mappings.len();
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("midi_mappings_remove_all")).show(ctx, |ui| {
+            ui.label(egui::RichText::new(format!("Remove all {n} MIDI mapping(s)?")).strong());
+            ui.label("Undo Remove in this window puts them back.");
+            ui.horizontal(|ui| {
+                if ui.button("Remove All").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(yes) = answer {
+            app.midi_learn.confirm_remove_all = false;
+            if yes {
+                let _ = app.run("midi.unmap", json!({"all": true}));
+            }
+        }
+    }
     if let Some(i) = delete {
         remove(app, i);
     }
@@ -1800,5 +1868,46 @@ mod tests {
         assert_eq!(app.run("midi.unmap", json!({"target": {"kind": "track_volume", "track": "Kick"}})).unwrap()["removed"], 1);
         assert_eq!(app.run("midi.unmap", json!({"index": 0})).unwrap()["removed"], 1);
         assert!(app.run("midi.unmap", json!({"index": 0})).is_err());
+    }
+
+    #[test]
+    fn removed_mappings_are_kept_for_undo_remove() {
+        let (mut app, _, _) = app();
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "track_volume", "track": "Kick"}), json!({}));
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 8}), json!({"kind": "track_volume", "track": "Bass"}), json!({}));
+        let r = app.run("midi.unmap", json!({"all": true})).unwrap();
+        assert_eq!((r["removed"].as_u64(), r["backup"].as_u64()), (Some(2), Some(2)));
+        assert!(app.ui.midi_mappings.is_empty());
+        let back: crate::UiState = serde_json::from_value(serde_json::to_value(&app.ui).unwrap()).unwrap();
+        assert_eq!(back.midi_mappings_backup.len(), 2, "the backup is in the preferences");
+        assert_eq!(app.run("midi.restore_mappings", json!({})).unwrap()["restored"], 2);
+        assert_eq!(app.ui.midi_mappings.len(), 2);
+        // A single Delete has the same one-level restore.
+        remove(&mut app, 0);
+        assert_eq!((app.ui.midi_mappings.len(), app.ui.midi_mappings_backup.len()), (1, 1));
+        restore(&mut app);
+        assert_eq!(app.ui.midi_mappings.len(), 2);
+        assert!(app.ui.midi_mappings_backup.is_empty());
+    }
+
+    #[test]
+    fn remove_all_in_the_window_asks_first() {
+        let (mut app, _, _) = app();
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "stop_all"}), json!({}));
+        app.ui.show_midi_mappings = true;
+        let ctx = egui::Context::default();
+        let frame = |app: &mut SoundApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| show(app, ui.ctx())).textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        app.midi_learn.confirm_remove_all = true;
+        frame(&mut app, vec![]);
+        assert_eq!(app.ui.midi_mappings.len(), 1, "nothing removed until answered");
+        assert!(app.midi_learn.confirm_remove_all, "the question is up");
     }
 }

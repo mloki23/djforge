@@ -10,6 +10,15 @@
 //!   opening enabled devices that appear;
 //! - sends the player the live target ([`resolve_target`]), which only goes out when it changes.
 //!
+//! **A device on a new port.** Enabled inputs and mappings name a port by backend id and raw
+//! name. On WinMM the backend id is the device-interface path, which changes when the device is
+//! plugged into another USB socket or hub; on ALSA it changes on every replug. So when an enabled
+//! port isn't listed but exactly one listed port (not enabled under its own id) has its raw name,
+//! it is taken to be the same device: the enabled input and its mappings move to the new backend
+//! id, and the status line says "<name> found on a new USB port; settings moved". With several
+//! such ports nothing is guessed: MIDI Devices lists them, each with "Use settings from <old>"
+//! (`midi.move_settings`).
+//!
 //! The `midi.*` commands live here as UI commands (like `ui.audio_device`): they need the
 //! device list, the preferences and the player, which the app owns and the engine does not.
 
@@ -85,8 +94,8 @@ impl MidiInputPref {
     }
 }
 
-/// Whether the port (raw name, backend id) is enabled in `prefs`. On ALSA a replugged device
-/// gets a new backend id, so it is enabled again by hand.
+/// Whether the port (raw name, backend id) is enabled in `prefs` (see the module docs for a
+/// device on a new port).
 pub fn enabled(prefs: &[MidiInputPref], raw_name: &str, backend_id: &str) -> bool {
     prefs.iter().any(|p| p.is(raw_name, backend_id))
 }
@@ -133,6 +142,49 @@ pub struct MidiHost {
     generation: u64,
     /// Why ports (raw name, backend id) last failed to open, until they open.
     open_errors: Vec<(String, String, String)>,
+    /// Enabled inputs moved to a new backend id since the app last took them ([`MidiHost::take_moved`]).
+    moved: Vec<Moved>,
+    /// Enabled inputs not listed whose raw name several listed ports have: not guessed.
+    ambiguous: Vec<(MidiInputPref, Vec<PortInfo>)>,
+    /// A subscription failed: none is tried again until the next refresh, and it was logged once.
+    subscribe_waits: bool,
+    subscribe_logged: bool,
+}
+
+/// An enabled input found on a new port: its raw name, the backend ids from and to, and the
+/// name it is listed under now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub raw_name: String,
+    pub from: String,
+    pub to: String,
+    pub name: String,
+}
+
+/// Moves each enabled input in `prefs` that `listed` lacks to the one listed port with its raw
+/// name that is not enabled under its own id. Returns what moved, and the inputs several such
+/// ports could be (left as they are).
+pub fn relocate(listed: &[PortInfo], prefs: &mut [MidiInputPref]) -> (Vec<Moved>, Vec<(MidiInputPref, Vec<PortInfo>)>) {
+    let (mut moved, mut ambiguous) = (Vec::new(), Vec::new());
+    for i in 0..prefs.len() {
+        let Some(p) = prefs.get(i).cloned() else { continue };
+        if listed.iter().any(|l| p.is(&l.raw_name, &l.backend_id)) {
+            continue;
+        }
+        let free: Vec<PortInfo> =
+            listed.iter().filter(|l| l.raw_name == p.raw_name && !prefs.iter().any(|q| q.is(&l.raw_name, &l.backend_id))).cloned().collect();
+        match free.as_slice() {
+            [] => {}
+            [l] => {
+                moved.push(Moved { raw_name: p.raw_name.clone(), from: p.backend_id.clone(), to: l.backend_id.clone(), name: l.name.clone() });
+                if let Some(q) = prefs.get_mut(i) {
+                    (q.backend_id, q.name) = (l.backend_id.clone(), l.name.clone());
+                }
+            }
+            _ => ambiguous.push((p, free)),
+        }
+    }
+    (moved, ambiguous)
 }
 
 /// A port's state in the MIDI Devices window.
@@ -168,6 +220,10 @@ impl MidiHost {
             last_hop: None,
             generation: 0,
             open_errors: Vec::new(),
+            moved: Vec::new(),
+            ambiguous: Vec::new(),
+            subscribe_waits: false,
+            subscribe_logged: false,
         }
     }
 
@@ -176,10 +232,7 @@ impl MidiHost {
     /// into the monitor's recent messages.
     pub fn take_control_events(&mut self, now: f64) -> Vec<MidiEvent> {
         if self.control.is_none() {
-            match self.source.subscribe(QUEUE_CAPACITY) {
-                Ok(q) => self.control = Some(q),
-                Err(e) => log::warn!("MIDI control input: {e}"),
-            }
+            self.control = self.try_subscribe("MIDI control input");
         }
         let mut out = Vec::new();
         while let Some(e) = self.control.as_mut().and_then(Subscriber::pop) {
@@ -194,6 +247,28 @@ impl MidiHost {
             out.push(e);
         }
         out
+    }
+
+    /// A new queue, or `None` when subscribing failed: logged once, tried again at the next
+    /// device refresh (not every frame).
+    fn try_subscribe(&mut self, what: &str) -> Option<Subscriber> {
+        if self.subscribe_waits {
+            return None;
+        }
+        match self.source.subscribe(QUEUE_CAPACITY) {
+            Ok(q) => {
+                self.subscribe_logged = false;
+                Some(q)
+            }
+            Err(e) => {
+                if !self.subscribe_logged {
+                    log::warn!("{what}: {e} (tried again at each device refresh)");
+                    self.subscribe_logged = true;
+                }
+                self.subscribe_waits = true;
+                None
+            }
+        }
     }
 
     /// When the port last sent a message (UI seconds), if it has.
@@ -214,6 +289,46 @@ impl MidiHost {
     /// The id of the port (raw name, backend id), once it has been opened.
     pub fn port_id(&self, raw_name: &str, backend_id: &str) -> Option<PortId> {
         self.opened.iter().copied().find(|id| self.source.raw_name(*id) == Some(raw_name) && self.source.backend_id(*id) == Some(backend_id))
+    }
+
+    /// The enabled inputs moved to a new port since the last call (see the module docs).
+    pub fn take_moved(&mut self) -> Vec<Moved> {
+        std::mem::take(&mut self.moved)
+    }
+
+    /// Enabled inputs not listed whose raw name several listed ports have, with those ports.
+    pub fn ambiguous(&self) -> &[(MidiInputPref, Vec<PortInfo>)] {
+        &self.ambiguous
+    }
+
+    /// Moves the enabled input (`raw_name`, `from`) in `prefs` onto the port listed as `to`, and
+    /// opens it. Returns the move (for the mappings to follow).
+    pub fn move_to(&mut self, raw_name: &str, from: &str, to: &str, prefs: &mut [MidiInputPref]) -> Result<Moved, String> {
+        let port = self.listed(to)?;
+        if port.raw_name != raw_name {
+            return Err(format!("{to} is another device (\"{}\", not \"{raw_name}\")", port.raw_name));
+        }
+        if prefs.iter().any(|p| p.is(&port.raw_name, &port.backend_id)) {
+            return Err(format!("{to} is enabled with settings of its own"));
+        }
+        let p = prefs.iter_mut().find(|p| p.is(raw_name, from)).ok_or_else(|| format!("no enabled input \"{raw_name}\" with backend id {from}"))?;
+        (p.backend_id, p.name) = (port.backend_id.clone(), port.name.clone());
+        self.ambiguous.retain(|(a, _)| !a.is(raw_name, from));
+        self.generation = self.generation.wrapping_add(1);
+        if !self.source.is_open(&port.name) {
+            self.open(&port)?;
+        }
+        Ok(Moved { raw_name: raw_name.to_string(), from: from.to_string(), to: port.backend_id, name: port.name })
+    }
+
+    /// Finds enabled inputs on new ports in `listed` (see [`relocate`]).
+    fn relocate(&mut self, listed: &[PortInfo], prefs: &mut [MidiInputPref]) {
+        let (moved, ambiguous) = relocate(listed, prefs);
+        if !moved.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.moved.extend(moved);
+        self.ambiguous = ambiguous;
     }
 
     /// Bumped whenever the device list or an open state changes.
@@ -301,24 +416,27 @@ impl MidiHost {
     /// One UI frame at `now` seconds (see the module docs). With `watch`, the device list is kept
     /// up even with nothing enabled (the MIDI Devices window is open). Returns status-line notes:
     /// a port disconnected, a port reopened.
-    pub fn tick(&mut self, now: f64, prefs: &[MidiInputPref], player: Option<&Player>, watch: bool) -> Vec<String> {
+    pub fn tick(&mut self, now: f64, prefs: &mut [MidiInputPref], player: Option<&Player>, watch: bool) -> Vec<String> {
         let mut notes = Vec::new();
-        if let Some(p) = player.filter(|p| !p.has_midi_input()) {
-            match self.source.subscribe(QUEUE_CAPACITY) {
-                Ok(q) => p.set_midi_input(Some((q, self.source.clock()))),
-                Err(e) => log::warn!("live MIDI input: {e}"),
-            }
+        if let Some(p) = player.filter(|p| !p.has_midi_input())
+            && let Some(q) = self.try_subscribe("live MIDI input")
+        {
+            p.set_midi_input(Some((q, self.source.clock())));
         }
         if self.last_hop.is_none_or(|at| now - at >= REFRESH_S || now < at) {
             // A recent window: the counters restart at each sample.
             self.hop_p99_ns = self.source.hop_stats(true).percentile_ns(0.99);
             self.last_hop = Some(now);
+            // A failed subscription is tried again at this rate.
+            self.subscribe_waits = false;
         }
         let Some(last) = self.last_refresh else {
             // The first frame: open the enabled devices present.
             self.last_refresh = Some(now);
             if !prefs.is_empty() {
-                for port in self.source.list() {
+                let listed = self.source.list();
+                self.relocate(&listed, prefs);
+                for port in listed {
                     if enabled(prefs, &port.raw_name, &port.backend_id)
                         && let Err(e) = self.open(&port)
                     {
@@ -351,7 +469,9 @@ impl MidiHost {
         // An enabled port listed but not open (it appeared, or its connection died while its
         // device stayed listed) opens again.
         if !prefs.is_empty() {
-            for port in self.source.list() {
+            let listed = self.source.list();
+            self.relocate(&listed, prefs);
+            for port in listed {
                 if enabled(prefs, &port.raw_name, &port.backend_id) && !self.source.is_open(&port.name) {
                     notes.push(match self.open(&port) {
                         Ok(()) => format!("{} reconnected", port.name),
@@ -484,7 +604,7 @@ impl MidiHost {
 
 /// A track that plays live MIDI: an active instrument or MIDI track (its instrument plays the
 /// notes; an inactive track doesn't render).
-fn plays_midi(t: &Track) -> bool {
+pub(crate) fn plays_midi(t: &Track) -> bool {
     matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !t.inactive
 }
 
@@ -498,8 +618,11 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         }
         "midi.target" => "{track?: id | name | null}",
         "window.midi_devices" => "{value?: bool}",
+        "midi.move_settings" => {
+            "{raw_name, backend_id (an enabled input's, not listed), to (a listed port's name)} — the enabled input and its mappings move to that port (a device on another USB port, when several ports have its name)"
+        }
         "midi.recover_take" => {
-            "{} — places the last MIDI take again (an arrangement take, or a slot take that could not be written) on a new playlist of its track"
+            "{index?: 0 (the newest) | n, list?: bool} — places a kept MIDI take again (the last 8: arrangement takes, and slot takes that could not be written) on a new playlist of its track (by id while it has its name, else the MIDI track of its name, else a new MIDI track), one undo step; list: {takes: [{index, label, track, track_name, notes, placed, at_s, events}]}"
         }
         _ => return crate::midi_learn::params_doc(id),
     })
@@ -633,12 +756,30 @@ pub fn status(app: &SoundApp, now: f64) -> Value {
     })
 }
 
+/// The mappings of a device that moved to a new port follow it (the enabled input already has).
+fn settings_moved(app: &mut SoundApp, m: &Moved) {
+    for x in &mut app.ui.midi_mappings {
+        if x.device.raw_name == m.raw_name && x.device.backend_id == m.from {
+            (x.device.backend_id, x.device.name) = (m.to.clone(), m.name.clone());
+        }
+    }
+    app.mark_prefs_changed();
+    log::info!("MIDI input {} moved from backend id {} to {}", m.raw_name, m.from, m.to);
+}
+
 /// Every UI frame (see the module docs). `now` is the UI clock in seconds.
 pub fn frame(app: &mut SoundApp, now: f64) {
     if let Some(h) = &mut app.midi_host {
-        let notes = h.tick(now, &app.ui.midi_inputs, app.player.as_ref(), app.ui.show_midi_devices);
-        if !notes.is_empty() {
-            app.ui.status = notes.join("; ");
+        let mut notes = h.tick(now, &mut app.ui.midi_inputs, app.player.as_ref(), app.ui.show_midi_devices);
+        let moved = h.take_moved();
+        for m in &moved {
+            settings_moved(app, m);
+        }
+        // Said first: it explains the reconnect after it.
+        let mut said: Vec<String> = moved.iter().map(|m| format!("{} found on a new USB port; settings moved", m.name)).collect();
+        said.append(&mut notes);
+        if !said.is_empty() {
+            app.ui.status = said.join("; ");
         }
     }
     if let Some(p) = &app.player {
@@ -709,7 +850,17 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             }
             Ok(json!({"override": app.midi_target.map(|t| t.0), "target": target.map(|t| t.0)}))
         })(),
-        "midi.recover_take" => crate::midi_record::recover(app),
+        "midi.recover_take" => crate::midi_record::recover(app, p),
+        "midi.move_settings" => (|| {
+            let raw = p.get("raw_name").and_then(Value::as_str).ok_or("`raw_name` required")?;
+            let from = p.get("backend_id").and_then(Value::as_str).ok_or("`backend_id` (the enabled input's old one) required")?;
+            let to = p.get("to").and_then(Value::as_str).ok_or("`to` (the listed name of the port to use) required")?;
+            let host = app.midi_host.as_mut().ok_or("no MIDI input on this system")?;
+            let m = host.move_to(raw, from, to, &mut app.ui.midi_inputs)?;
+            settings_moved(app, &m);
+            app.ui.status = format!("{to} uses the settings of {raw} now");
+            Ok(json!({"name": m.name, "backend_id": m.to}))
+        })(),
         "midi.panic" => {
             if let Some(pl) = &app.player {
                 pl.midi_panic();

@@ -329,3 +329,52 @@ fn midi_wakes_the_ui_at_a_capped_rate_for_lights_and_at_once_for_mappings() {
     steps(&mut h, 1);
     assert_eq!(wake(&h), WAKE_URGENT, "a mapping acts at once");
 }
+
+/// A DDJ plugged into another USB socket (WinMM: a new interface path; ALSA: a new client id)
+/// is the same device: its enable and its mappings move to the new backend id.
+#[test]
+fn a_replug_with_another_backend_id_moves_the_enable_and_the_mappings() {
+    let mut h = harness(&["DDJ"], &["DDJ"]);
+    h.state_mut()
+        .run("midi.map", json!({"device": "DDJ", "matcher": {"type": "note", "ch": 0, "note": 36}, "target": {"kind": "stop_all"}}))
+        .unwrap();
+    let old = h.state().ui.midi_inputs[0].backend_id.clone();
+    assert!(fake(&mut h).unplug("DDJ"));
+    until(&mut h, "the unplug is noticed", |h| !is_open(h, "DDJ"));
+    fake(&mut h).plug_device("DDJ", "usb:other-socket");
+    until(&mut h, "found on the new port", |h| is_open(h, "DDJ"));
+    assert!(h.state().ui.status.contains("DDJ found on a new USB port; settings moved"), "{}", h.state().ui.status);
+    let a = h.state();
+    assert_eq!(a.ui.midi_inputs.len(), 1);
+    assert_eq!(a.ui.midi_inputs[0].backend_id, "usb:other-socket");
+    assert_eq!(a.ui.midi_mappings[0].device.backend_id, "usb:other-socket", "the mapping followed");
+    assert_ne!(old, "usb:other-socket");
+    assert!(h.state_mut().take_recent_changed(), "saved");
+}
+
+/// Two listed ports with the DDJ's name and neither its backend id: nothing is guessed; MIDI
+/// Devices offers each, and the choice moves the settings.
+#[test]
+fn a_replug_that_two_ports_could_be_is_not_guessed() {
+    let mut h = harness(&["DDJ"], &["DDJ"]);
+    h.state_mut()
+        .run("midi.map", json!({"device": "DDJ", "matcher": {"type": "note", "ch": 0, "note": 36}, "target": {"kind": "stop_all"}}))
+        .unwrap();
+    let old = h.state().ui.midi_inputs[0].backend_id.clone();
+    assert!(fake(&mut h).unplug("DDJ"));
+    until(&mut h, "the unplug is noticed", |h| !is_open(h, "DDJ"));
+    fake(&mut h).plug_device("DDJ", "usb:a");
+    fake(&mut h).plug_device("DDJ", "usb:b");
+    until(&mut h, "both are seen", |h| !h.state().midi_host.as_ref().unwrap().ambiguous().is_empty());
+    assert_eq!(h.state().ui.midi_inputs[0].backend_id, old, "not guessed");
+    assert_eq!(h.state().ui.midi_mappings[0].device.backend_id, old);
+    assert!(!is_open(&h, "DDJ") && !is_open(&h, "DDJ #2"));
+    h.state_mut().run("window.midi_devices", json!({"value": true})).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(h.query_all(By::new().label_contains("Use settings from DDJ")).count(), 2, "one offer per port");
+    let r = h.state_mut().run("midi.move_settings", json!({"raw_name": "DDJ", "backend_id": old, "to": "DDJ #2"})).unwrap();
+    assert_eq!(r["backend_id"], "usb:b");
+    assert!(is_open(&h, "DDJ #2"));
+    assert_eq!(h.state().ui.midi_mappings[0].device.backend_id, "usb:b");
+    assert!(h.state().midi_host.as_ref().unwrap().ambiguous().is_empty());
+}

@@ -166,7 +166,7 @@ fn a_take_over_a_clip_goes_on_a_new_playlist_and_the_last_take_recovers() {
     assert_eq!(tr.playlists[0].clips.len(), 1, "the clip under it is intact on the playlist before");
     assert_eq!(tr.playlists[1].clips.len(), 2, "the take, and the rest of the clip after it");
     assert!(app.ui.status.contains("new playlist `Lead.02`"), "{}", app.ui.status);
-    // Recover Last MIDI Take places it again, on a new playlist.
+    // Recover MIDI Take places it again, on a new playlist.
     app.run("midi.recover_take", json!({})).unwrap();
     let tr = app.engine.session().track(t).unwrap();
     assert_eq!((tr.playlists.len(), tr.active_playlist), (3, 2));
@@ -208,7 +208,7 @@ fn a_slot_take_with_no_empty_slot_left_is_kept_for_recovery() {
         app.engine.execute("live.slot_from_take", &p).unwrap();
     }
     until(&ctx, &mut app, "the recording ends", |a| a.slot_recording.is_none());
-    assert!(app.ui.status.contains("Recover Last MIDI Take"), "{}", app.ui.status);
+    assert!(app.ui.status.contains("Recover MIDI Take"), "{}", app.ui.status);
     let column_track = app.engine.session().live.column_track(4, &app.engine.session().tracks).unwrap();
     assert_ne!(column_track, t);
     let r = app.run("midi.recover_take", json!({})).unwrap();
@@ -237,4 +237,110 @@ fn an_empty_first_write_does_not_claim_the_slot() {
     let s = app.engine.session();
     assert_eq!(s.live.slot(4, 2).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(40), "not replaced");
     assert_eq!(s.live.slot(4, 0).and_then(|x| x.midi()).map(|m| m.sequence.notes[0].pitch), Some(38), "{}", app.ui.status);
+}
+
+/// A take far beyond one command's limit (the engine takes 1 000 000 events per
+/// `midi.record_take`): never refused, placed whole as one undo step, a flood of repeated
+/// controller values thinned to one. And it waits in the recovery list.
+#[test]
+fn a_very_large_take_is_placed_whole_in_one_undo_step() {
+    use soundcraft_playback::{CaptureEvent, Captured};
+    use soundcraft_ui_egui::midi_record::{MidiTake, finish_take};
+    let (mut app, t) = app();
+    let steps = app.engine.undo_history().len();
+    let notes = 520_000i64;
+    let mut take = MidiTake::new(t, 0, 0);
+    let s = app.engine.session().clone();
+    let f = soundcraft_engine::cmd::InputFilter::default();
+    for i in 0..notes {
+        let at = i * 20;
+        for msg in [MidiMessage::NoteOn { ch: 0, note: 60 + (i % 12) as u8, vel: 100 }, MidiMessage::ControlChange { ch: 0, cc: 7, value: 64 }] {
+            take.thin.push(&mut take.events, Captured { at, pass: 0, event: CaptureEvent::Midi(msg) }, &s, f);
+        }
+        take.thin.push(
+            &mut take.events,
+            Captured { at: at + 10, pass: 0, event: CaptureEvent::Midi(MidiMessage::NoteOff { ch: 0, note: 60 + (i % 12) as u8, vel: 0 }) },
+            &s,
+            f,
+        );
+    }
+    assert_eq!(take.events.len() as i64, notes * 2 + 1, "the repeated CC 7 kept once");
+    app.midi_take = Some(take);
+    let status = finish_take(&mut app, notes * 20 + 100, None).unwrap();
+    assert!(status.contains(&format!("Recorded {notes} MIDI note(s)")), "{status}");
+    assert_eq!(app.engine.undo_history().len(), steps + 1, "one undo step");
+    assert_eq!(app.engine.undo_label(), Some("Record MIDI"));
+    let placed: usize = app
+        .engine
+        .session()
+        .track(t)
+        .unwrap()
+        .clips()
+        .iter()
+        .map(|c| match &c.content {
+            ClipContent::Midi { sequence } => sequence.notes.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(placed as i64, notes, "every note placed");
+    assert!(app.midi_takes[0].placed && app.midi_takes[0].notes as i64 == notes);
+    assert!(app.engine.undo());
+    assert!(app.engine.session().track(t).unwrap().clips().is_empty(), "undone as one");
+}
+
+/// The recovery list keeps several takes, newest first; an older one is placed by index, and
+/// one from another session finds its track by name, else goes on a new MIDI track.
+#[test]
+fn the_recovery_list_places_any_kept_take_by_index_and_by_track_name() {
+    use soundcraft_ui_egui::midi_record::{KeptPass, KeptTake};
+    let (mut app, t) = app();
+    let take = |track: u64, name: &str, pitch: u8| KeptTake {
+        at_s: 1,
+        track,
+        track_name: name.into(),
+        notes: 1,
+        placed: false,
+        passes: vec![KeptPass { start: 0, end: 48_000, events: vec![(100, [0x90, pitch, 100]), (2_000, [0x80, pitch, 0])] }],
+    };
+    app.midi_takes = vec![take(t.0, "Lead", 62), take(999, "Lead", 61), take(t.0, "Gone", 60)];
+    app.midi_takes_loaded = true;
+    let list = app.run("midi.recover_take", json!({"list": true})).unwrap();
+    assert_eq!(list["takes"].as_array().unwrap().len(), 3);
+    assert!(list["takes"][0]["label"].as_str().unwrap().contains("Lead · 1 note (not placed)"));
+    // Another session's id: found by name.
+    let r = app.run("midi.recover_take", json!({"index": 1})).unwrap();
+    assert_eq!(r["notes"], 1);
+    let clip = app.engine.session().track(t).unwrap().clips()[0].clone();
+    let ClipContent::Midi { sequence } = &clip.content else { panic!("not MIDI") };
+    assert_eq!(sequence.notes[0].pitch, 61, "the older take, on Lead");
+    assert!(app.midi_takes[1].placed);
+    // No track of its name (the id names another track): a new MIDI track.
+    let before = app.engine.session().tracks.len();
+    let r = app.run("midi.recover_take", json!({"index": 2})).unwrap();
+    assert!(r["message"].as_str().unwrap().contains("new MIDI track `Gone`"), "{r}");
+    assert_eq!(app.engine.session().tracks.len(), before + 1);
+    assert_eq!(app.engine.undo_label(), Some("Record MIDI"));
+    assert!(app.engine.undo());
+    assert_eq!(app.engine.session().tracks.len(), before, "the new track and its take are one undo step");
+    assert!(app.run("midi.recover_take", json!({"index": 7})).unwrap_err().contains("3 kept"));
+}
+
+#[test]
+fn a_slot_recording_on_an_inactive_column_track_is_refused() {
+    let (mut app, _) = app();
+    let column = app.engine.session().live.column_track(4, &app.engine.session().tracks).unwrap();
+    app.engine.session_mut().track_mut(column).unwrap().inactive = true;
+    assert!(!soundcraft_ui_egui::midi_record::arm_slot(&mut app, 4, 0, 1, false, 0, None));
+    assert!(app.ui.status.contains("inactive"), "{}", app.ui.status);
+    assert!(app.slot_recording.is_none());
+}
+
+#[test]
+fn a_new_session_clears_the_live_target_override() {
+    let (mut app, t) = app();
+    app.run("midi.target", json!({"track": t.0})).unwrap();
+    assert_eq!(app.midi_target, Some(t));
+    app.run("session.new", json!({})).unwrap();
+    app.handle_transport(0.0);
+    assert_eq!(app.midi_target, None);
 }
