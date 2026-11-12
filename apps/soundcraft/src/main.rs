@@ -138,13 +138,28 @@ fn migrate_settings() -> Option<String> {
     let (new, old) = (config::config_dir()?, config::legacy_config_dir()?);
     match config::migrate(&new, &old) {
         Ok(config::Migration::None) => None,
-        Ok(config::Migration::Copied { files, skipped, links, finished }) => {
+        Ok(config::Migration::Copied { files, skipped, links, finished, abandoned }) => {
             log::info!("copied {files} files of the SoundCraft settings {} to {}", old.display(), new.display());
             for file in &skipped {
                 log::warn!("not copied from the SoundCraft settings (couldn't be read): {}", file.display());
             }
             for link in &links {
                 log::warn!("not copied from the SoundCraft settings (a link, not followed): {}", link.display());
+            }
+            for file in &abandoned {
+                log::warn!(
+                    "gave up copying from the SoundCraft settings after {} starts (couldn't be read): {}",
+                    config::MIGRATION_TRIES,
+                    file.display()
+                );
+            }
+            if !abandoned.is_empty() {
+                return Some(format!(
+                    "{} SoundCraft settings files still couldn't be read after {} tries and were left out (see the log). The rest are in {}.",
+                    abandoned.len(),
+                    config::MIGRATION_TRIES,
+                    new.display()
+                ));
             }
             let again = if finished { "" } else { "; they will be tried again next start" };
             let left_out =

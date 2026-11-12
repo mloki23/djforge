@@ -17,10 +17,15 @@ follows changes behaviour you may rely on.
   copies SoundCraft's settings files, `Presets/` and autosaves with unsaved work across once,
   with their modification times, and leaves the SoundCraft folder untouched; logs and autosave
   history are not copied. The copy never replaces a file in the djforge folder. It is done when
-  `migrated-from-soundcraft.txt` is there; if a top-level settings file couldn't be read (another
-  program held it), that marker isn't written and the next start tries again. On a volume
-  without hard links (a network share, FAT) the copy falls back to writing each new file
-  directly.
+  `migrated-from-soundcraft.txt` is there. If a top-level settings file couldn't be read
+  (another program held it), the marker isn't written and the next starts copy just those files
+  again (listed in `migration-pending.json`), up to five starts; then djforge gives up on them,
+  says so in the status line and marks the migration done. Files that couldn't be read inside
+  `Presets/` or `Autosave/` are logged but not retried. A copy interrupted partway (djforge
+  killed, the machine off) is removed and made again on the next start; every copy is on disk
+  before the marker is written. A second djforge starting during the migration leaves it to the
+  first (`.migrating.lock`). On a volume without hard links (a network share, FAT) the copy
+  falls back to writing each new file directly.
 - **App id** `io.github.mloki23.djforge` everywhere: the window's app id, Flatpak, `.desktop`,
   AppStream metadata, MIME and icon names, and the macOS bundle id. djforge has its own
   installer identity (a new MSI UpgradeCode and ProgIds), so it installs beside SoundCraft and

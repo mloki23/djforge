@@ -52,7 +52,9 @@
               Icon="DjforgeIcon.ico" IconIndex="0" />
         </File>
 
-        <!-- .djforge: djforge's own session format; djforge is its default app. -->
+        <!-- .djforge: djforge's own session format; djforge is its default app. The content type
+             stays application/x-soundcraft-session: the format is SoundCraft's, unchanged, and the
+             Linux MIME database (packaging/linux) uses the same type for both extensions. -->
         <ProgId Id="djforge.Session" Description="djforge Session" Icon="DjforgeExe" IconIndex="0">
           <Extension Id="djforge" ContentType="application/x-soundcraft-session">
             <Verb Id="open" Command="Open" TargetFile="DjforgeExe" Argument="&quot;%1&quot;" />
