@@ -126,20 +126,14 @@ pub fn text_toggle(ui: &mut Ui, size: egui::Vec2, text: &str, on: bool, on_color
 /// Record-enable button (red dot); the caller owns track arming and command dispatch.
 pub fn rec_toggle(ui: &mut Ui, size: egui::Vec2, on: bool, tip: &str) -> Response {
     let t = Tokens::current();
-    let style = button_style(t.rec, Color32::WHITE, Color32::from_rgb(218, 112, 106), 2);
+    let style = button_style(t.rec, Color32::WHITE, t.rec_idle[0], 2);
     let resp = IconButton::new(tip, size, &style).selected(on).single_shape_frame().show(ui, |ui, r, tint| {
         key_light(ui.painter(), r.shrink(1.0));
         let rad = size.y * 0.24;
         if on {
             ui.painter().circle_filled(r.center(), rad, tint);
         } else {
-            rounded_vgradient(
-                ui.painter(),
-                Rect::from_center_size(r.center(), Vec2::splat(2.0 * rad)),
-                2.0 * rad,
-                tint,
-                Color32::from_rgb(176, 76, 72),
-            );
+            rounded_vgradient(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(2.0 * rad)), 2.0 * rad, tint, t.rec_idle[1]);
         }
         ui.painter().circle_stroke(r.center(), rad, Stroke::new(1.0, Color32::from_black_alpha(90)));
     });
@@ -453,7 +447,8 @@ pub fn surround_panner(ui: &mut Ui, size: f32, speakers: &[PannerSpeaker], puck:
         _ => divergence,
     };
     if div > 0.01 {
-        painter.circle(pp, 5.0 + div * half, Color32::from_rgba_unmultiplied(80, 160, 230, 28), Stroke::new(1.0, Color32::from_rgb(70, 130, 190)));
+        let [fill, outline] = t.panner_spread;
+        painter.circle(pp, 5.0 + div * half, Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 28), Stroke::new(1.0, outline));
     }
     painter.circle(pp, 5.0, t.counter_text, Stroke::new(1.0, Color32::BLACK));
     let tip = "Surround pan: drag the puck · double-click: front centre · Alt-drag: divergence";

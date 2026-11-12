@@ -44,4 +44,5 @@ follows changes behaviour you may rely on.
 - The theme menu (Setup › Appearance, or Window › UI Customization: Theme) lists djforge Dark, Light, System and
   SoundCraft Classic. System follows the OS: Light, or djforge Dark when the OS is dark.
 - Light changes slightly: the edit-mode buttons are a darker green so their text is readable
-  (4.5:1), and default buttons (Export, Recover, a dialog's OK) have white labels.
+  (4.5:1), default buttons (Export, Recover, a dialog's OK) have white labels, and the
+  clip-gain fader popup is light, so its green readout is readable.

@@ -74,7 +74,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         ui.set_width(320.0);
         let name = job.path().file_name().unwrap_or_default().to_string_lossy();
         ui.label(egui::RichText::new(format!("Bouncing {name}")).font(bold(13.0)));
-        ui.add(egui::ProgressBar::new(job.progress()));
+        ui.add(egui::ProgressBar::new(job.progress()).fill(Tokens::current().accent));
         ui.horizontal(|ui| {
             cancel |= ui.button("Cancel").clicked();
             ui.label(egui::RichText::new(format!("{:.0}%", job.progress() * 100.0)).color(Tokens::current().text_dim));

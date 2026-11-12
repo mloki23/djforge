@@ -316,7 +316,7 @@ fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
         let held: Option<u8> = ui.ctx().data(|d| d.get_temp(keyboard_held_id()));
         for (p, kr) in &keys {
             let fill = match (black(*p), held == Some(*p)) {
-                (_, true) => Color32::from_rgb(90, 160, 240),
+                (_, true) => crate::theme::Tokens::current().key_held,
                 (true, false) => Color32::from_rgb(20, 20, 20),
                 (false, false) => Color32::from_rgb(235, 235, 235),
             };

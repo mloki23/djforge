@@ -65,7 +65,11 @@ fn the_theme_menu_offers_every_palette_and_classic_applies() {
     for label in ["Light", "System", "SoundCraft Classic"] {
         assert!(h.query_by_label(label).is_some(), "the theme menu lacks {label}");
     }
-    h.get_by_label("SoundCraft Classic").click_accesskit();
+    // A real pointer click: move, press and release in separate frames, as a mouse does.
+    let option = h.get_by_label("SoundCraft Classic").rect().center();
+    frame(&mut h, option, None);
+    frame(&mut h, option, Some(true));
+    frame(&mut h, option, Some(false));
     h.run_steps(3);
     assert_eq!(h.state().ui.theme, soundcraft_ui_egui::theme::ThemeMode::Classic);
     assert_eq!(h.ctx.global_style().visuals.panel_fill, soundcraft_ui_egui::theme::Tokens::CLASSIC.panel_bg);

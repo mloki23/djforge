@@ -239,6 +239,32 @@ pub struct Tokens {
     pub roll_lane: Color32,
     /// Empty step-sequencer cells, alternating by beat.
     pub step_cells: [Color32; 2],
+    /// Selected text and the label of a selected menu row (on [`Tokens::accent_dark`]).
+    pub selected_text: Color32,
+    /// The tempo editor graph: background, line and points, scale labels.
+    pub tempo_graph: [Color32; 3],
+    /// The key-signature ruler: background, default-key text, change line, change text.
+    pub key_ruler: [Color32; 4],
+    /// The chords ruler's background.
+    pub chords_ruler: Color32,
+    /// A marker without a colour of its own.
+    pub marker_default: Color32,
+    /// The "FX" badge on clips with clip effects.
+    pub fx_badge: Color32,
+    /// Floating popups painted by hand (the clip-gain fader): face and outline.
+    pub popup_bg: Color32,
+    pub popup_border: Color32,
+    /// A track's timebase button: ticks (bars and beats) and samples.
+    pub timebase_ticks: Color32,
+    pub timebase_samples: Color32,
+    /// The surround panner's divergence circle: fill (drawn faint) and outline.
+    pub panner_spread: [Color32; 2],
+    /// A held key on the on-screen MIDI keyboard.
+    pub key_held: Color32,
+    /// A send's level box in a Mix slot: empty and filled.
+    pub level_well: [Color32; 2],
+    /// The record-enable button while off: its dot, top and bottom.
+    pub rec_idle: [Color32; 2],
 }
 
 /// SoundCraft's piano-roll rows, lines and step cells: dark in Light and Classic.
@@ -269,6 +295,9 @@ pub mod studio {
     pub const IN: Color32 = Color32::from_rgb(0x32, 0xbe, 0x44);
     /// Red: record arm, recording, clipping.
     pub const OUT: Color32 = Color32::from_rgb(0xe0, 0x34, 0x2c);
+    /// djforge Dark's one selection colour, a dark yellow-brown: behind selected rows, headers,
+    /// strips and text. Text, dim text and the accent all read on it.
+    pub const SELECTED: Color32 = Color32::from_rgb(72, 62, 6);
 }
 
 impl Tokens {
@@ -293,7 +322,7 @@ impl Tokens {
             counter_label: Color32::from_rgb(200, 204, 212),
             accent: ACCENT,
             // Behind selected text and selected list rows, which are drawn in the accent.
-            accent_dark: Color32::from_rgb(96, 80, 0),
+            accent_dark: SELECTED,
             mode_on: ACCENT,
             mode_on_text: BG,
             mode_off_text: Color32::from_rgb(214, 182, 20),
@@ -342,11 +371,11 @@ impl Tokens {
             counter_border: LINE,
             counter_rule: PANEL2,
             tool_bracket_off: Color32::from_rgb(56, 62, 74),
-            row_selected: Color32::from_rgb(64, 56, 12),
+            row_selected: SELECTED,
             visible_dot: Color32::from_rgb(200, 204, 212),
             big_counter_bg: Color32::from_rgb(8, 9, 11),
-            header_selected: Color32::from_rgb(50, 46, 24),
-            strip_selected: Color32::from_rgb(54, 50, 28),
+            header_selected: SELECTED,
+            strip_selected: SELECTED,
             marker_text: Color32::from_rgb(236, 238, 242),
             playlist_lane: Color32::from_rgb(19, 21, 26),
             universe_bg: Color32::from_rgb(13, 15, 18),
@@ -377,6 +406,26 @@ impl Tokens {
             roll_lines: [Color32::from_rgb(40, 45, 54), Color32::from_rgb(66, 73, 88), Color32::from_rgb(56, 62, 74)],
             roll_lane: Color32::from_rgb(19, 21, 26),
             step_cells: [Color32::from_rgb(40, 45, 54), Color32::from_rgb(32, 36, 44)],
+            selected_text: ACCENT,
+            tempo_graph: [Color32::from_rgb(20, 40, 28), MID, Color32::from_rgb(126, 170, 138)],
+            // A muted violet that sits on the near-black.
+            key_ruler: [
+                Color32::from_rgb(46, 38, 66),
+                Color32::from_rgb(214, 208, 232),
+                Color32::from_rgb(168, 148, 220),
+                Color32::from_rgb(232, 226, 248),
+            ],
+            chords_ruler: Color32::from_rgb(34, 44, 58),
+            marker_default: ACCENT,
+            fx_badge: ACCENT,
+            popup_bg: PANEL2,
+            popup_border: LINE,
+            timebase_ticks: ACCENT,
+            timebase_samples: HIGH,
+            panner_spread: [HIGH, HIGH],
+            key_held: ACCENT,
+            level_well: [PANEL, LINE],
+            rec_idle: [Color32::from_rgb(236, 112, 104), Color32::from_rgb(180, 44, 38)],
         }
     };
 
@@ -475,6 +524,25 @@ impl Tokens {
         roll_lines: ROLL_LINES,
         roll_lane: Color32::from_rgb(28, 28, 30),
         step_cells: STEP_CELLS,
+        selected_text: Color32::WHITE,
+        tempo_graph: [Color32::from_rgb(24, 40, 32), Color32::from_rgb(140, 230, 160), Color32::from_rgb(120, 160, 130)],
+        key_ruler: [
+            Color32::from_rgb(64, 52, 88),
+            Color32::from_rgb(220, 214, 236),
+            Color32::from_rgb(200, 180, 240),
+            Color32::from_rgb(236, 230, 250),
+        ],
+        chords_ruler: Color32::from_rgb(40, 56, 60),
+        marker_default: Color32::from_rgb(232, 200, 64),
+        fx_badge: Color32::from_rgb(250, 230, 120),
+        popup_bg: Color32::from_rgb(38, 38, 40),
+        popup_border: Color32::from_rgb(10, 10, 10),
+        timebase_ticks: Color32::from_rgb(86, 172, 103),
+        timebase_samples: Color32::from_rgb(100, 184, 249),
+        panner_spread: [Color32::from_rgb(80, 160, 230), Color32::from_rgb(70, 130, 190)],
+        key_held: Color32::from_rgb(90, 160, 240),
+        level_well: [Color32::from_rgb(36, 38, 8), Color32::from_rgb(51, 49, 11)],
+        rec_idle: [Color32::from_rgb(218, 112, 106), Color32::from_rgb(176, 76, 72)],
     };
 
     pub const LIGHT: Tokens = Tokens {
@@ -574,6 +642,26 @@ impl Tokens {
         roll_lines: ROLL_LINES,
         roll_lane: Color32::from_rgb(28, 28, 30),
         step_cells: STEP_CELLS,
+        selected_text: Color32::WHITE,
+        tempo_graph: [Color32::from_rgb(24, 40, 32), Color32::from_rgb(140, 230, 160), Color32::from_rgb(120, 160, 130)],
+        key_ruler: [
+            Color32::from_rgb(64, 52, 88),
+            Color32::from_rgb(220, 214, 236),
+            Color32::from_rgb(200, 180, 240),
+            Color32::from_rgb(236, 230, 250),
+        ],
+        chords_ruler: Color32::from_rgb(40, 56, 60),
+        marker_default: Color32::from_rgb(232, 200, 64),
+        fx_badge: Color32::from_rgb(250, 230, 120),
+        // Light, so the counter-green readout on it is readable (it was the dark grey).
+        popup_bg: Color32::from_rgb(216, 218, 222),
+        popup_border: Color32::from_rgb(100, 103, 109),
+        timebase_ticks: Color32::from_rgb(86, 172, 103),
+        timebase_samples: Color32::from_rgb(100, 184, 249),
+        panner_spread: [Color32::from_rgb(80, 160, 230), Color32::from_rgb(70, 130, 190)],
+        key_held: Color32::from_rgb(90, 160, 240),
+        level_well: [Color32::from_rgb(36, 38, 8), Color32::from_rgb(51, 49, 11)],
+        rec_idle: [Color32::from_rgb(218, 112, 106), Color32::from_rgb(176, 76, 72)],
     };
 
     pub const fn of(palette: Palette) -> Tokens {
@@ -710,10 +798,22 @@ pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
         // Selected text and rows: the accent on a dark yellow, readable either way round. The
         // same accent outlines a focused text field.
         v.selection.bg_fill = t.accent_dark;
-        v.selection.stroke = egui::Stroke::new(1.0, t.accent);
+        v.selection.stroke = egui::Stroke::new(1.0, t.selected_text);
         // A focused button is drawn in the active state: outline it in the accent.
         v.widgets.active.bg_stroke = egui::Stroke::new(1.0, t.accent);
         v.hyperlink_color = t.accent;
+        // egui's neutral greys, in the palette's blue-greys.
+        v.window_stroke = egui::Stroke::new(1.0, t.border_light);
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.border_light);
+        v.widgets.noninteractive.bg_fill = t.panel_bg2;
+        v.widgets.noninteractive.weak_bg_fill = t.panel_bg2;
+        v.widgets.hovered.bg_fill = t.button_hi;
+        v.widgets.active.bg_fill = t.button_hi;
+        v.widgets.active.weak_bg_fill = t.button_hi;
+        v.widgets.open.bg_fill = t.button_hi;
+        v.widgets.open.weak_bg_fill = t.button_hi;
+        v.widgets.open.bg_stroke = egui::Stroke::new(1.0, t.border_light);
+        v.code_bg_color = t.slot_bg;
     }
     v.window_corner_radius = egui::CornerRadius::same(6);
     v.menu_corner_radius = egui::CornerRadius::same(4);
@@ -912,8 +1012,13 @@ mod tests {
         assert_eq!(c.readout_ink, c.counter_text);
         assert_eq!(c.marquee, Color32::from_rgb(120, 170, 255));
         assert_eq!((c.roll_rows, c.roll_lines, c.roll_lane, c.step_cells), (ROLL_ROWS, ROLL_LINES, Color32::from_rgb(28, 28, 30), STEP_CELLS));
+        assert_eq!(
+            (c.selected_text, c.marker_default, c.level_well),
+            (Color32::WHITE, Color32::from_rgb(232, 200, 64), [Color32::from_rgb(36, 38, 8), Color32::from_rgb(51, 49, 11)])
+        );
         // Its visuals are SoundCraft's too: egui's dark ones with the accent as selection.
         let _palette = lock_test_palette();
+        let _restore = RestorePalette(palette());
         let ctx = egui::Context::default();
         apply_palette(&ctx, Palette::Classic);
         assert_eq!(palette(), Palette::Classic);
@@ -925,7 +1030,20 @@ mod tests {
             (v.selection, v.widgets.active.bg_stroke, v.hyperlink_color),
             (want.selection, want.widgets.active.bg_stroke, want.hyperlink_color)
         );
-        apply_palette(&ctx, Palette::Dark);
+        assert_eq!((v.window_stroke, v.code_bg_color), (want.window_stroke, want.code_bg_color));
+        assert_eq!(
+            (v.widgets.noninteractive.bg_stroke, v.widgets.open, v.widgets.active.bg_fill),
+            (want.widgets.noninteractive.bg_stroke, want.widgets.open, want.widgets.active.bg_fill)
+        );
+    }
+
+    /// Puts the process-wide palette back when a test that changed it ends, even by panicking.
+    struct RestorePalette(Palette);
+
+    impl Drop for RestorePalette {
+        fn drop(&mut self) {
+            ACTIVE_PALETTE.store(self.0.index(), Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -944,6 +1062,7 @@ mod tests {
     #[test]
     fn djforge_dark_focus_and_selection_are_visible() {
         let _palette = lock_test_palette();
+        let _restore = RestorePalette(palette());
         let ctx = egui::Context::default();
         apply_palette(&ctx, Palette::Dark);
         let t = Tokens::DARK;
@@ -958,6 +1077,13 @@ mod tests {
         // Selected text and selected rows are drawn in selection.stroke on selection.bg_fill.
         assert!(contrast(v.selection.stroke.color, v.selection.bg_fill) >= 4.5);
         assert!(contrast(t.text, v.selection.bg_fill) >= 4.5);
+        // One selection colour, everywhere something is selected.
+        assert_eq!([t.accent_dark, t.row_selected, t.header_selected, t.strip_selected], [studio::SELECTED; 4]);
+        // egui's own greys are the palette's.
+        assert_eq!(
+            (v.window_stroke.color, v.widgets.noninteractive.bg_stroke.color, v.widgets.open.bg_fill),
+            (t.border_light, t.border_light, t.button_hi)
+        );
     }
 
     #[test]
@@ -1002,6 +1128,26 @@ mod tests {
             ]);
             // A bold label on an accent button. SoundCraft Classic keeps its 3.95:1 white on blue
             // (bold, so WCAG's large-text 3:1), as its look is preserved byte for byte.
+            // Rulers with text on them.
+            let [graph_bg, graph_line, graph_label] = t.tempo_graph;
+            let [key_bg, key_default, key_line, key_text] = t.key_ruler;
+            pairs.extend([
+                ("tempo graph line".into(), graph_line, graph_bg, 3.0),
+                ("tempo graph labels".into(), graph_label, graph_bg, 4.5),
+                ("key ruler default".into(), key_default, key_bg, 4.5),
+                ("key ruler change line".into(), key_line, key_bg, 3.0),
+                ("key ruler change".into(), key_text, key_bg, 4.5),
+                ("marker on the chords ruler".into(), t.marker_default, t.chords_ruler, 3.0),
+                ("marker text on the marker ruler".into(), t.marker_text, t.marker_ruler, 4.5),
+                ("clip-gain readout".into(), t.counter_text, t.popup_bg, 4.5),
+            ]);
+            // Selected rows (menus, lists, egui's selection): selected text, body and dim text.
+            pairs.push(("dim text on selected row".into(), t.text_dim, t.row_selected, 3.0));
+            if palette == Palette::Dark {
+                // Only djforge Dark selects on accent_dark; the others select on the accent.
+                pairs.push(("dim text on menu selection".into(), t.text_dim, t.accent_dark, 3.0));
+                pairs.push(("selected text".into(), t.selected_text, t.accent_dark, 4.5));
+            }
             pairs.push(("accent button label".into(), t.accent_text, t.accent, if palette == Palette::Classic { 3.0 } else { 4.5 }));
             for (what, fg, bg, min) in pairs {
                 let ratio = contrast(fg, bg);

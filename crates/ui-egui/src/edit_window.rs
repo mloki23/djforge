@@ -441,7 +441,9 @@ pub fn ruler_height(id: &str) -> f32 {
 /// The tempo editor: a graph of tempo over time. Click adds a change, Alt-click removes the nearest.
 fn tempo_editor(app: &mut SoundApp, ui: &mut Ui, painter: &egui::Painter, s: &Session, tl: Rect, row: Rect) {
     let sr = s.sample_rate;
-    painter.rect_filled(row, 0.0, Color32::from_rgb(24, 40, 32));
+    let t = Tokens::current();
+    let [graph_bg, graph_line, graph_label] = t.tempo_graph;
+    painter.rect_filled(row, 0.0, graph_bg);
     let (lo, hi) = s.tempo.tempos().iter().fold((f64::MAX, f64::MIN), |(a, b), e| (a.min(e.bpm), b.max(e.bpm)));
     let (lo, hi) = ((lo - 20.0).max(20.0), (hi + 20.0).min(400.0));
     let y_of = |bpm: f64| row.max.y - 4.0 - ((bpm - lo) / (hi - lo).max(1.0)) as f32 * (row.height() - 8.0);
@@ -452,11 +454,11 @@ fn tempo_editor(app: &mut SoundApp, ui: &mut Ui, painter: &egui::Painter, s: &Se
         let x_next = evs.get(k + 1).map_or(tl.max.x, |n| x_of(s, tl, s.tempo.tick_to_samples(n.tick, sr)));
         pts.push(pos2(x, y_of(e.bpm)));
         pts.push(pos2(x_next.min(tl.max.x), y_of(e.bpm)));
-        painter.circle_filled(pos2(x, y_of(e.bpm)), 3.0, Color32::from_rgb(140, 230, 160));
+        painter.circle_filled(pos2(x, y_of(e.bpm)), 3.0, graph_line);
     }
-    painter.add(Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(140, 230, 160))));
-    painter.text(pos2(tl.min.x + 4.0, row.min.y + 8.0), Align2::LEFT_CENTER, format!("{hi:.0}"), regular(9.0), Color32::from_rgb(120, 160, 130));
-    painter.text(pos2(tl.min.x + 4.0, row.max.y - 8.0), Align2::LEFT_CENTER, format!("{lo:.0}"), regular(9.0), Color32::from_rgb(120, 160, 130));
+    painter.add(Shape::line(pts, Stroke::new(1.5, graph_line)));
+    painter.text(pos2(tl.min.x + 4.0, row.min.y + 8.0), Align2::LEFT_CENTER, format!("{hi:.0}"), regular(9.0), graph_label);
+    painter.text(pos2(tl.min.x + 4.0, row.max.y - 8.0), Align2::LEFT_CENTER, format!("{lo:.0}"), regular(9.0), graph_label);
     let resp = ui.interact(row, ui.id().with("tempo_editor"), Sense::click());
     if resp.clicked()
         && let Some(p) = resp.interact_pointer_pos()
@@ -553,14 +555,15 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                 tempo_editor(app, ui, &painter, &s, tl, row);
             }
             "key" => {
-                painter.rect_filled(row, 0.0, Color32::from_rgb(64, 52, 88));
+                let [key_bg, key_default, key_line, key_text] = t.key_ruler;
+                painter.rect_filled(row, 0.0, key_bg);
                 if s.key_signatures.is_empty() {
-                    painter.text(pos2(tl.min.x + 6.0, row.center().y), Align2::LEFT_CENTER, "C major", bold(11.0), Color32::from_rgb(220, 214, 236));
+                    painter.text(pos2(tl.min.x + 6.0, row.center().y), Align2::LEFT_CENTER, "C major", bold(11.0), key_default);
                 }
                 for (at, k) in &s.key_signatures {
                     let x = x_of(&s, tl, *at);
-                    painter.line_segment([pos2(x, row.min.y + 2.0), pos2(x, row.max.y - 2.0)], Stroke::new(2.0, Color32::from_rgb(200, 180, 240)));
-                    painter.text(pos2(x + 5.0, row.center().y), Align2::LEFT_CENTER, k, bold(11.0), Color32::from_rgb(236, 230, 250));
+                    painter.line_segment([pos2(x, row.min.y + 2.0), pos2(x, row.max.y - 2.0)], Stroke::new(2.0, key_line));
+                    painter.text(pos2(x + 5.0, row.center().y), Align2::LEFT_CENTER, k, bold(11.0), key_text);
                 }
                 let resp = ui.interact(row, ui.id().with("key_ruler"), Sense::click());
                 if resp.double_clicked()
@@ -587,10 +590,10 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                     "markers5" => 5,
                     _ => 1,
                 };
-                painter.rect_filled(row, 0.0, if id == "chords" { Color32::from_rgb(40, 56, 60) } else { t.marker_ruler });
+                painter.rect_filled(row, 0.0, if id == "chords" { t.chords_ruler } else { t.marker_ruler });
                 for m in s.markers.iter().filter(|m| m.ruler == lane || (lane == 1 && m.ruler == 0)) {
                     let x = x_of(&s, tl, m.start);
-                    let col = m.color.map_or(Color32::from_rgb(232, 200, 64), rgb);
+                    let col = m.color.map_or(t.marker_default, rgb);
                     if m.kind == soundcraft_model::MarkerKind::Selection {
                         let x1 = x_of(&s, tl, m.end);
                         painter.rect_filled(Rect::from_min_max(pos2(x, row.min.y + 3.0), pos2(x1, row.max.y - 3.0)), 2.0, col.gamma_multiply(0.5));
@@ -1122,7 +1125,7 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
             raised_key(ui.painter(), r, t.slot_face, resp.hovered());
             let c = r.center();
             if track.ticks_timebase {
-                let green = Color32::from_rgb(86, 172, 103);
+                let green = t.timebase_ticks;
                 ui.painter().add(Shape::convex_polygon(
                     vec![c + vec2(-3.0, 3.25), c + vec2(3.0, 3.25), c + vec2(1.0, -3.25), c + vec2(-1.0, -3.25)],
                     green,
@@ -1130,7 +1133,7 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
                 ));
                 ui.painter().line_segment([c + vec2(0.0, 2.0), c + vec2(2.0, -3.0)], Stroke::new(1.0, t.text));
             } else {
-                ui.painter().circle_filled(c, 3.25, Color32::from_rgb(100, 184, 249));
+                ui.painter().circle_filled(c, 3.25, t.timebase_samples);
                 ui.painter().line_segment([c, c + vec2(0.0, -3.25)], Stroke::new(1.0, t.slot_face[1]));
                 ui.painter().line_segment([c, c + vec2(3.25, 0.0)], Stroke::new(1.0, t.slot_face[1]));
             }
@@ -1788,7 +1791,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.with_clip_rect(r.intersect(lane)).text(pos2(r.min.x.max(lane.min.x) + 4.0, r.max.y - 7.0), Align2::LEFT_CENTER, tt, regular(9.0), ov);
     }
     if s.edit.flag("view.clip.effects_status") && s.edit.values.keys().any(|k| k.starts_with(&format!("clip_fx.{}.", clip.id.0))) {
-        painter.text(pos2(r.max.x - 6.0, r.max.y - 7.0), Align2::RIGHT_CENTER, "FX", bold(9.0), Color32::from_rgb(250, 230, 120));
+        painter.text(pos2(r.max.x - 6.0, r.max.y - 7.0), Align2::RIGHT_CENTER, "FX", bold(9.0), Tokens::current().fx_badge);
     }
     if s.edit.flag("view.clip.overlap_shadows") {
         // Shade where a later clip covers this one (crossfades and layered edits).
@@ -1949,7 +1952,7 @@ fn clip_gain_popup(ctx: &egui::Context, fader_bottom: Pos2, pos: f32) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("clip_gain_fader")));
     let track = Rect::from_min_max(pos2(fader_bottom.x - 2.0, fader_bottom.y - CLIP_FADER_TRAVEL), pos2(fader_bottom.x + 2.0, fader_bottom.y));
     let panel = Rect::from_min_max(pos2(track.min.x - 22.0, track.min.y - 26.0), pos2(track.max.x + 22.0, track.max.y + 8.0));
-    p.rect(panel, 3.0, Color32::from_rgb(38, 38, 40), Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
+    p.rect(panel, 3.0, t.popup_bg, Stroke::new(1.0, t.popup_border), StrokeKind::Inside);
     p.rect_filled(track, 2.0, t.fader_track);
     let zero = track.max.y - CLIP_FADER_TRAVEL * crate::widgets::clip_gain_to_pos(0.0);
     p.line_segment([pos2(track.min.x - 8.0, zero), pos2(track.min.x - 2.0, zero)], Stroke::new(1.0, Color32::from_rgb(150, 150, 150)));
@@ -2638,7 +2641,16 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
             if x > tl.min.x && x < tl.max.x {
                 painter.line_segment(
                     [pos2(x, tl.min.y), pos2(x, tl.max.y)],
-                    Stroke::new(1.0, m.color.map_or(Color32::from_rgba_unmultiplied(232, 200, 64, 70), |c| rgb(c).gamma_multiply(0.4))),
+                    Stroke::new(
+                        1.0,
+                        m.color.map_or_else(
+                            || {
+                                let d = Tokens::current().marker_default;
+                                Color32::from_rgba_unmultiplied(d.r(), d.g(), d.b(), 70)
+                            },
+                            |c| rgb(c).gamma_multiply(0.4),
+                        ),
+                    ),
                 );
             }
         }

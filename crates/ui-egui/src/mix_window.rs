@@ -585,8 +585,8 @@ fn used_slot(p: &egui::Painter, r: Rect, faces: [Color32; 2], mark: Mark, name: 
         let well = level_icon(r);
         p.rect_filled(well, 1.0, Color32::BLACK);
         let inner = well.shrink(1.0);
-        p.rect_filled(inner, 0.0, Color32::from_rgb(36, 38, 8));
-        p.rect_filled(inner.with_min_y(inner.max.y - inner.height() * k.clamp(0.0, 1.0)), 0.0, Color32::from_rgb(51, 49, 11));
+        p.rect_filled(inner, 0.0, t.level_well[0]);
+        p.rect_filled(inner.with_min_y(inner.max.y - inner.height() * k.clamp(0.0, 1.0)), 0.0, t.level_well[1]);
         text.max.x = well.min.x - 1.0;
     }
     let g = p.layout_no_wrap(name.to_string(), bold(NAME_SIZE), color);
@@ -847,7 +847,7 @@ impl MenuSearch {
 }
 
 fn menu_row(ui: &mut Ui, selected: bool, text: &str) -> bool {
-    let text = if selected { egui::RichText::new(text).color(Color32::WHITE) } else { egui::RichText::new(text) };
+    let text = if selected { egui::RichText::new(text).color(Tokens::current().selected_text) } else { egui::RichText::new(text) };
     ui.add(egui::Button::selectable(selected, text).min_size(vec2(0.0, ui.spacing().interact_size.y))).clicked()
 }
 
