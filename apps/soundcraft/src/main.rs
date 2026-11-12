@@ -138,7 +138,7 @@ fn migrate_settings() -> Option<String> {
     let (new, old) = (config::config_dir()?, config::legacy_config_dir()?);
     match config::migrate(&new, &old) {
         Ok(config::Migration::None) => None,
-        Ok(config::Migration::Copied { files, skipped, links, finished, abandoned }) => {
+        Ok(config::Migration::Copied { files, skipped, links, finished, abandoned, kept }) => {
             log::info!("copied {files} files of the SoundCraft settings {} to {}", old.display(), new.display());
             for file in &skipped {
                 log::warn!("not copied from the SoundCraft settings (couldn't be read): {}", file.display());
@@ -146,12 +146,19 @@ fn migrate_settings() -> Option<String> {
             for link in &links {
                 log::warn!("not copied from the SoundCraft settings (a link, not followed): {}", link.display());
             }
-            for file in &abandoned {
+            for file in &kept {
+                log::warn!("not copied from the SoundCraft settings ({APP_NAME} has saved its own since): {}", file.display());
+            }
+            for file in abandoned.iter().filter(|f| !kept.contains(f)) {
                 log::warn!(
                     "gave up copying from the SoundCraft settings after {} starts (couldn't be read): {}",
                     config::MIGRATION_TRIES,
                     file.display()
                 );
+            }
+            if !kept.is_empty() {
+                let names: Vec<_> = kept.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+                return Some(format!("SoundCraft's {} couldn't be read earlier; {APP_NAME} kept its own settings.", names.join(", ")));
             }
             if !abandoned.is_empty() {
                 return Some(format!(

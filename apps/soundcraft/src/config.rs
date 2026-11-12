@@ -69,8 +69,10 @@ pub enum Migration {
     /// which are never followed. `finished` is false when a settings file at the top level was
     /// left out: no [`MIGRATED_MARKER`] is written, and the next start copies just those files
     /// again. After [`MIGRATION_TRIES`] starts it gives up on them: `abandoned` lists them, and
-    /// the migration is marked done.
-    Copied { files: usize, skipped: Vec<PathBuf>, links: Vec<PathBuf>, finished: bool, abandoned: Vec<PathBuf> },
+    /// the migration is marked done. A file still to copy that djforge has meanwhile saved its
+    /// own of (it saves `ui.json` on exit) is never replaced: it is abandoned at once and listed
+    /// in `kept` too.
+    Copied { files: usize, skipped: Vec<PathBuf>, links: Vec<PathBuf>, finished: bool, abandoned: Vec<PathBuf>, kept: Vec<PathBuf> },
 }
 
 /// Marks a settings folder whose SoundCraft settings were copied (or found nothing to copy).
@@ -126,7 +128,8 @@ fn migrate_with(new: &Path, old: &Path, hard_links: bool) -> Result<Migration, S
         Ok(()) => {}
         // Another djforge is migrating: it finishes the job.
         Err(std::fs::TryLockError::WouldBlock) => return Ok(Migration::None),
-        // A volume without locks: carry on, as the copy never replaces a file anyway.
+        // A volume that can't take the lock: the migration goes ahead unlocked. A racing
+        // instance is then possible, which is safe, as the copy never replaces a file.
         Err(std::fs::TryLockError::Error(_)) => {}
     }
     // The instance that held the lock may have finished meanwhile.
@@ -138,10 +141,17 @@ fn migrate_with(new: &Path, old: &Path, hard_links: bool) -> Result<Migration, S
     let mut copy = Copy { files: 0, skipped: Vec::new(), links: Vec::new(), hard_links };
     // Top-level settings files left out this time, by name.
     let mut unread: Vec<String> = Vec::new();
+    // Pending files djforge has saved its own of since: kept, never replaced.
+    let mut kept: Vec<PathBuf> = Vec::new();
     match &pending {
         Some(pending) => {
             for name in &pending.files {
                 let (source, target) = (old.join(name), new.join(name));
+                // It wasn't there when this file was listed, so djforge wrote it since.
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    kept.push(source);
+                    continue;
+                }
                 // A file gone from the SoundCraft folder (or now a link) has nothing to copy.
                 if std::fs::symlink_metadata(&source).is_ok_and(|m| m.is_file()) && !copy.file(&source, &target) {
                     unread.push(name.clone());
@@ -176,9 +186,9 @@ fn migrate_with(new: &Path, old: &Path, hard_links: bool) -> Result<Migration, S
     let Copy { files, skipped, links, .. } = copy;
     if !unread.is_empty() && tries < MIGRATION_TRIES {
         write_pending(new, &Pending { tries, files: unread }).map_err(failed)?;
-        return Ok(Migration::Copied { files, skipped, links, finished: false, abandoned: Vec::new() });
+        return Ok(Migration::Copied { files, skipped, links, finished: false, abandoned: kept.clone(), kept });
     }
-    let abandoned = unread.iter().map(|name| old.join(name)).collect();
+    let abandoned = kept.iter().cloned().chain(unread.iter().map(|name| old.join(name))).collect();
     let note = format!("SoundCraft settings copied from {}\n", old.display());
     // `create_new`: a racing instance's marker counts as done too.
     match std::fs::OpenOptions::new().write(true).create_new(true).open(new.join(MIGRATED_MARKER)) {
@@ -190,7 +200,7 @@ fn migrate_with(new: &Path, old: &Path, hard_links: bool) -> Result<Migration, S
         Err(error) => return Err(failed(error)),
     }
     let _ = std::fs::remove_file(new.join(PENDING));
-    Ok(Migration::Copied { files, skipped, links, finished: true, abandoned })
+    Ok(Migration::Copied { files, skipped, links, finished: true, abandoned, kept })
 }
 
 /// The [`PENDING`] list an unfinished migration left in `new`, if any. An unreadable list starts
@@ -723,7 +733,10 @@ mod config_tests {
         // An earlier version's interrupted staging copy is cleared away.
         std::fs::create_dir_all(base.join(".djforge.migrating-123/Presets")).unwrap();
 
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 5, skipped: vec![], links: vec![], finished: true, abandoned: vec![] }));
+        assert_eq!(
+            migrate(&new, &old),
+            Ok(Migration::Copied { files: 5, skipped: vec![], links: vec![], finished: true, abandoned: vec![], kept: vec![] })
+        );
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), r#"{"ui_scale": 1.5}"#);
         assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
         assert_eq!(std::fs::read_to_string(new.join("Autosave/Song 1/Audio Files/Take.wav")).unwrap(), "wav");
@@ -754,7 +767,10 @@ mod config_tests {
         write(&old.join("Presets/EQ/Lead.json"), "preset");
         // Another instance (or an interrupted run) already wrote ui.json, but no marker.
         write(&new.join("ui.json"), "newer settings");
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true, abandoned: vec![] }));
+        assert_eq!(
+            migrate(&new, &old),
+            Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true, abandoned: vec![], kept: vec![] })
+        );
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "newer settings");
         assert_eq!(std::fs::read_to_string(new.join("Presets/EQ/Lead.json")).unwrap(), "preset");
         let _ = std::fs::remove_dir_all(&base);
@@ -772,7 +788,7 @@ mod config_tests {
         std::fs::File::options().write(true).open(old.join("midi.json")).unwrap().set_modified(stamp).unwrap();
         assert_eq!(
             migrate_with(&new, &old, false),
-            Ok(Migration::Copied { files: 2, skipped: vec![], links: vec![], finished: true, abandoned: vec![] })
+            Ok(Migration::Copied { files: 2, skipped: vec![], links: vec![], finished: true, abandoned: vec![], kept: vec![] })
         );
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "newer settings", "never replaced");
         assert_eq!(std::fs::read_to_string(new.join("midi.json")).unwrap(), "mappings");
@@ -812,7 +828,10 @@ mod config_tests {
         assert!(!new.join(MIGRATED_MARKER).exists(), "no marker: the next start tries again");
         assert!(!new.join("ui.json").exists());
         drop(held);
-        assert_eq!(migrate(&new, &old), Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true, abandoned: vec![] }));
+        assert_eq!(
+            migrate(&new, &old),
+            Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true, abandoned: vec![], kept: vec![] })
+        );
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "settings");
         assert!(new.join(MIGRATED_MARKER).is_file());
         assert!(!new.join(PENDING).exists());
@@ -837,6 +856,34 @@ mod config_tests {
         assert!(matches!(migrate(&new, &old), Ok(Migration::Copied { files: 1, finished: true, .. })));
         assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "settings");
         assert!(!new.join("Presets").exists() && !new.join("Autosave").exists(), "deleted files don't come back");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_settings_file_djforge_saved_itself_is_kept_and_not_reported_as_copied() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let base = migration_dir("saved-own");
+        let (old, new) = (base.join("SoundCraft"), base.join("djforge"));
+        write(&old.join("ui.json"), "soundcraft settings");
+        write(&old.join("midi.json"), "soundcraft mappings");
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(old.join("ui.json")).unwrap();
+        let held_midi = std::fs::OpenOptions::new().read(true).share_mode(0).open(old.join("midi.json")).unwrap();
+        assert!(matches!(migrate(&new, &old), Ok(Migration::Copied { files: 0, finished: false, .. })));
+        // djforge ran and saved its own ui.json on exit; midi.json is still held.
+        std::fs::write(new.join("ui.json"), "djforge settings").unwrap();
+        drop(held);
+        let Ok(Migration::Copied { files: 0, finished: false, abandoned, kept, .. }) = migrate(&new, &old) else { panic!("kept") };
+        assert_eq!((abandoned, kept), (vec![old.join("ui.json")], vec![old.join("ui.json")]));
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "djforge settings", "never replaced");
+        drop(held_midi);
+        // Only midi.json was still pending.
+        assert_eq!(
+            migrate(&new, &old),
+            Ok(Migration::Copied { files: 1, skipped: vec![], links: vec![], finished: true, abandoned: vec![], kept: vec![] })
+        );
+        assert_eq!(std::fs::read_to_string(new.join("ui.json")).unwrap(), "djforge settings");
+        assert_eq!(std::fs::read_to_string(new.join("midi.json")).unwrap(), "soundcraft mappings");
         let _ = std::fs::remove_dir_all(&base);
     }
 
