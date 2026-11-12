@@ -45,3 +45,28 @@ fn interface_scale_slider_follows_the_pointer() {
     assert_eq!(h.state().extra.ui_scale, 1.5);
     assert_eq!(h.ctx.zoom_factor(), 1.5);
 }
+
+#[test]
+fn the_theme_menu_offers_every_palette_and_classic_applies() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.extra.show_ui_customization = true;
+    let mut h = Harness::builder().with_size(WINDOW_PX).with_pixels_per_point(1.0).build_ui_state(
+        |ui, app: &mut SoundApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(4);
+    let combo = h.get_all_by_role(Role::ComboBox).find(|n| n.value().as_deref() == Some("djforge Dark")).expect("the theme menu");
+    combo.click();
+    h.run_steps(3);
+    for label in ["Light", "System", "SoundCraft Classic"] {
+        assert!(h.query_by_label(label).is_some(), "the theme menu lacks {label}");
+    }
+    h.get_by_label("SoundCraft Classic").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.theme, soundcraft_ui_egui::theme::ThemeMode::Classic);
+    assert_eq!(h.ctx.global_style().visuals.panel_fill, soundcraft_ui_egui::theme::Tokens::CLASSIC.panel_bg);
+}

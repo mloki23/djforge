@@ -1,10 +1,11 @@
-//! Design tokens. Colours were chosen by eye to give a dark, studio-style look; they are ours.
+//! Design tokens. djforge Dark is built from mixforge's studio palette; Light and SoundCraft
+//! Classic (SoundCraft's grey dark look) were chosen by eye. They are ours.
 
 use egui::{Color32, FontFamily, FontId};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Whether the Light palette is active. Dark is the default (the incumbent is dark-only).
-static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+/// The active [`Palette`] (its [`Palette::index`]). djforge Dark is the default.
+static ACTIVE_PALETTE: AtomicU8 = AtomicU8::new(0);
 
 /// Unit tests that change or read the process-wide palette must own it until their assertions
 /// finish. The lock is re-entrant per thread, so a test may hold it and still build apps
@@ -66,24 +67,30 @@ mod palette_lock {
     }
 }
 
-/// The Appearance setting (`ui.theme {mode}`). Dark by default; System and Light are opt-in.
+/// The Appearance setting (`ui.theme {mode}`). djforge Dark by default; Light, System (Light or
+/// djforge Dark, as the OS is) and SoundCraft Classic are opt-in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
     System,
     Light,
+    /// djforge Dark. Prefs saved as `dark` before it existed get it too.
     #[default]
     Dark,
+    /// SoundCraft's grey dark look.
+    Classic,
 }
 
 impl ThemeMode {
-    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+    /// In the order the theme menu lists them.
+    pub const ALL: [Self; 4] = [Self::Dark, Self::Light, Self::System, Self::Classic];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
-            Self::Dark => "Dark",
+            Self::Dark => "djforge Dark",
+            Self::Classic => "SoundCraft Classic",
         }
     }
 
@@ -93,6 +100,7 @@ impl ThemeMode {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Classic => "classic",
         }
     }
 
@@ -210,10 +218,170 @@ pub struct Tokens {
     pub slot_face: [Color32; 2],
     pub slot_bypassed: [Color32; 2],
     pub slot_mark: Color32,
+    /// Text and icons on an accent fill (a default dialog button, a selected icon button).
+    pub accent_text: Color32,
+    /// The open tab in the Edit window's dock tab strip (its label is [`Tokens::accent_text`]).
+    pub tab_on: Color32,
+    /// The transport's Play key while playing, and its icon.
+    pub transport_play: Color32,
+    pub transport_play_icon: Color32,
+    /// The transport's Record key while recording.
+    pub transport_rec: Color32,
+    /// Ink on the black volume/pan readouts in Edit-window track headers.
+    pub readout_ink: Color32,
+    /// The MIDI editor's rubber-band selection (outline; its fill is a faint wash of it).
+    pub marquee: Color32,
+    /// Piano-roll rows, `[white key, black key]`: outside the key, in its scale, on its tonic.
+    pub roll_rows: [[Color32; 2]; 3],
+    /// Piano-roll lines: beat, bar, octave.
+    pub roll_lines: [Color32; 3],
+    /// The MIDI editor's velocity lane.
+    pub roll_lane: Color32,
+    /// Empty step-sequencer cells, alternating by beat.
+    pub step_cells: [Color32; 2],
+}
+
+/// SoundCraft's piano-roll rows, lines and step cells: dark in Light and Classic.
+const ROLL_ROWS: [[Color32; 2]; 3] = [
+    [Color32::from_rgb(40, 40, 42), Color32::from_rgb(30, 30, 32)],
+    [Color32::from_rgb(44, 50, 60), Color32::from_rgb(34, 40, 50)],
+    [Color32::from_rgb(50, 60, 76), Color32::from_rgb(40, 50, 66)],
+];
+const ROLL_LINES: [Color32; 3] = [Color32::from_rgb(50, 50, 54), Color32::from_rgb(80, 80, 86), Color32::from_rgb(64, 64, 68)];
+const STEP_CELLS: [Color32; 2] = [Color32::from_rgb(46, 46, 50), Color32::from_rgb(36, 36, 40)];
+
+/// mixforge's studio palette, which djforge Dark is built from.
+pub mod studio {
+    use egui::Color32;
+    pub const BG: Color32 = Color32::from_rgb(0x11, 0x13, 0x17);
+    pub const PANEL: Color32 = Color32::from_rgb(0x19, 0x1c, 0x22);
+    pub const PANEL2: Color32 = Color32::from_rgb(0x20, 0x24, 0x2c);
+    pub const LINE: Color32 = Color32::from_rgb(0x2c, 0x31, 0x3b);
+    pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe8, 0xec);
+    pub const DIM: Color32 = Color32::from_rgb(0x8b, 0x93, 0xa3);
+    /// Yellow: selection, the playhead, the counters, active buttons.
+    pub const ACCENT: Color32 = Color32::from_rgb(0xf8, 0xd2, 0x00);
+    /// EQ band colours: low, mid and high.
+    pub const LOW: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
+    pub const MID: Color32 = Color32::from_rgb(0x46, 0xc4, 0x6a);
+    pub const HIGH: Color32 = Color32::from_rgb(0x4f, 0x8f, 0xf7);
+    /// Green: input, playing, meters below the warning level.
+    pub const IN: Color32 = Color32::from_rgb(0x32, 0xbe, 0x44);
+    /// Red: record arm, recording, clipping.
+    pub const OUT: Color32 = Color32::from_rgb(0xe0, 0x34, 0x2c);
 }
 
 impl Tokens {
-    pub const DARK: Tokens = Tokens {
+    /// djforge Dark, the default: mixforge's studio palette ([`studio`]).
+    pub const DARK: Tokens = {
+        use studio::*;
+        Tokens {
+            window_bg: BG,
+            panel_bg: PANEL,
+            panel_bg2: PANEL2,
+            toolbar_bg: BG,
+            toolbar_group: Color32::from_rgb(13, 15, 18),
+            border: Color32::from_rgb(8, 9, 11),
+            border_light: LINE,
+            edge_light: Color32::from_rgba_premultiplied(22, 24, 28, 22),
+            text: TEXT,
+            text_dim: DIM,
+            text_dark: BG,
+            header_text: Color32::from_rgb(210, 214, 222),
+            counter_bg: Color32::from_rgb(8, 9, 11),
+            counter_text: ACCENT,
+            counter_label: Color32::from_rgb(200, 204, 212),
+            accent: ACCENT,
+            // Behind selected text and selected list rows, which are drawn in the accent.
+            accent_dark: Color32::from_rgb(96, 80, 0),
+            mode_on: ACCENT,
+            mode_on_text: BG,
+            mode_off_text: Color32::from_rgb(214, 182, 20),
+            button: Color32::from_rgb(40, 45, 54),
+            button_hi: Color32::from_rgb(54, 60, 72),
+            button_border: Color32::from_rgb(8, 9, 11),
+            name_field: Color32::from_rgb(220, 223, 229),
+            name_field_sel: Color32::from_rgb(236, 238, 242),
+            ruler_bg: Color32::from_rgb(28, 31, 38),
+            ruler_label_bg: Color32::from_rgb(28, 31, 38),
+            ruler_text: Color32::from_rgb(178, 184, 196),
+            ruler_tick: Color32::from_rgb(80, 88, 102),
+            tempo_ruler: Color32::from_rgb(30, 96, 50),
+            meter_ruler: Color32::from_rgb(36, 76, 140),
+            marker_ruler: Color32::from_rgb(34, 38, 46),
+            playlist_bg: Color32::from_rgb(22, 25, 30),
+            playlist_alt: Color32::from_rgb(26, 29, 35),
+            // The lane with a white veil (6 % and 13 %): grid lines are drawn as one, over clips too.
+            grid_line: Color32::from_rgb(36, 39, 44),
+            bar_line: Color32::from_rgb(52, 55, 59),
+            // The accent at 30 %, premultiplied.
+            selection: Color32::from_rgba_premultiplied(74, 63, 0, 77),
+            playhead: ACCENT,
+            // Brighter than text, so the blinking insertion point is told apart from it.
+            insertion: Color32::from_rgb(244, 246, 248),
+            solo: Color32::from_rgb(222, 196, 52),
+            mute: Color32::from_rgb(232, 148, 40),
+            rec: OUT,
+            input: IN,
+            auto_read: MID,
+            auto_write: OUT,
+            auto_touch: Color32::from_rgb(230, 170, 50),
+            auto_latch: Color32::from_rgb(160, 120, 220),
+            meter_green: IN,
+            meter_yellow: ACCENT,
+            meter_red: OUT,
+            fader_track: Color32::from_rgb(8, 9, 11),
+            strip_bg: PANEL2,
+            strip_section: PANEL,
+            slot_bg: Color32::from_rgb(19, 21, 26),
+            automation_line: Color32::from_rgb(240, 240, 240),
+            menu_bar: Color32::from_rgb(13, 15, 18),
+            group_border: Color32::from_rgb(6, 7, 9),
+            mode_off: Color32::from_rgb(34, 32, 20),
+            counter_off: Color32::from_rgb(34, 32, 20),
+            counter_border: LINE,
+            counter_rule: PANEL2,
+            tool_bracket_off: Color32::from_rgb(56, 62, 74),
+            row_selected: Color32::from_rgb(64, 56, 12),
+            visible_dot: Color32::from_rgb(200, 204, 212),
+            big_counter_bg: Color32::from_rgb(8, 9, 11),
+            header_selected: Color32::from_rgb(50, 46, 24),
+            strip_selected: Color32::from_rgb(54, 50, 28),
+            marker_text: Color32::from_rgb(236, 238, 242),
+            playlist_lane: Color32::from_rgb(19, 21, 26),
+            universe_bg: Color32::from_rgb(13, 15, 18),
+            universe_view: TEXT,
+            meter_bg: Color32::from_rgb(6, 7, 9),
+            meter_clip_off: Color32::from_rgb(60, 20, 20),
+            knob_bg: Color32::from_rgb(19, 21, 26),
+            knob_ring: DIM,
+            knob_pointer: TEXT,
+            section_label: Color32::from_rgb(200, 204, 212),
+            slot_well: PANEL2,
+            slot_empty: Color32::from_rgb(28, 31, 38),
+            slot_face: [Color32::from_rgb(76, 84, 98), Color32::from_rgb(62, 69, 81)],
+            slot_bypassed: [Color32::from_rgb(60, 100, 170), Color32::from_rgb(46, 80, 140)],
+            slot_mark: Color32::from_rgb(159, 166, 180),
+            accent_text: BG,
+            tab_on: ACCENT,
+            transport_play: Color32::from_rgb(22, 70, 32),
+            transport_play_icon: IN,
+            transport_rec: Color32::from_rgb(96, 24, 20),
+            readout_ink: ACCENT,
+            marquee: ACCENT,
+            roll_rows: [
+                [PANEL2, PANEL],
+                [Color32::from_rgb(40, 46, 58), Color32::from_rgb(31, 36, 46)],
+                [Color32::from_rgb(50, 58, 76), Color32::from_rgb(41, 48, 64)],
+            ],
+            roll_lines: [Color32::from_rgb(40, 45, 54), Color32::from_rgb(66, 73, 88), Color32::from_rgb(56, 62, 74)],
+            roll_lane: Color32::from_rgb(19, 21, 26),
+            step_cells: [Color32::from_rgb(40, 45, 54), Color32::from_rgb(32, 36, 44)],
+        }
+    };
+
+    /// SoundCraft Classic: SoundCraft's grey dark palette, unchanged.
+    pub const CLASSIC: Tokens = Tokens {
         window_bg: Color32::from_rgb(30, 30, 30),
         panel_bg: Color32::from_rgb(37, 37, 38),
         panel_bg2: Color32::from_rgb(44, 44, 45),
@@ -296,6 +464,17 @@ impl Tokens {
         slot_face: [Color32::from_rgb(92, 92, 92), Color32::from_rgb(75, 75, 75)],
         slot_bypassed: [Color32::from_rgb(66, 96, 146), Color32::from_rgb(50, 76, 120)],
         slot_mark: Color32::from_rgb(159, 159, 159),
+        accent_text: Color32::WHITE,
+        tab_on: Color32::from_rgb(40, 92, 146),
+        transport_play: Color32::from_rgb(40, 90, 50),
+        transport_play_icon: Color32::from_rgb(120, 255, 140),
+        transport_rec: Color32::from_rgb(110, 30, 30),
+        readout_ink: Color32::from_rgb(104, 220, 120),
+        marquee: Color32::from_rgb(120, 170, 255),
+        roll_rows: ROLL_ROWS,
+        roll_lines: ROLL_LINES,
+        roll_lane: Color32::from_rgb(28, 28, 30),
+        step_cells: STEP_CELLS,
     };
 
     pub const LIGHT: Tokens = Tokens {
@@ -316,9 +495,10 @@ impl Tokens {
         counter_label: Color32::from_rgb(54, 57, 63),
         accent: Color32::from_rgb(62, 116, 180),
         accent_dark: Color32::from_rgb(43, 88, 145),
-        mode_on: Color32::from_rgb(75, 158, 88),
+        // Dark enough for white text (4.5:1).
+        mode_on: Color32::from_rgb(52, 128, 66),
         mode_on_text: Color32::from_rgb(255, 255, 255),
-        mode_off_text: Color32::from_rgb(38, 106, 52),
+        mode_off_text: Color32::from_rgb(30, 96, 44),
         button: Color32::from_rgb(214, 216, 220),
         button_hi: Color32::from_rgb(200, 203, 208),
         button_border: Color32::from_rgb(108, 111, 117),
@@ -381,24 +561,81 @@ impl Tokens {
         slot_face: [Color32::from_rgb(244, 245, 247), Color32::from_rgb(214, 216, 220)],
         slot_bypassed: [Color32::from_rgb(190, 210, 240), Color32::from_rgb(160, 186, 228)],
         slot_mark: Color32::from_rgb(92, 95, 102),
+        accent_text: Color32::WHITE,
+        tab_on: Color32::from_rgb(43, 88, 145),
+        transport_play: Color32::from_rgb(40, 90, 50),
+        transport_play_icon: Color32::from_rgb(120, 255, 140),
+        transport_rec: Color32::from_rgb(110, 30, 30),
+        // The readout is black in every palette.
+        readout_ink: Color32::from_rgb(104, 220, 120),
+        marquee: Color32::from_rgb(120, 170, 255),
+        // The MIDI editor stays dark in Light, as it always has.
+        roll_rows: ROLL_ROWS,
+        roll_lines: ROLL_LINES,
+        roll_lane: Color32::from_rgb(28, 28, 30),
+        step_cells: STEP_CELLS,
     };
 
-    pub fn current() -> Tokens {
-        if is_light() { Self::LIGHT } else { Self::DARK }
+    pub const fn of(palette: Palette) -> Tokens {
+        match palette {
+            Palette::Dark => Self::DARK,
+            Palette::Light => Self::LIGHT,
+            Palette::Classic => Self::CLASSIC,
+        }
     }
+
+    pub fn current() -> Tokens {
+        Self::of(palette())
+    }
+}
+
+/// A palette the UI is drawn in; [`ThemeMode::System`] resolves to Dark or Light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Palette {
+    Dark,
+    Light,
+    Classic,
+}
+
+impl Palette {
+    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::Classic];
+
+    const fn index(self) -> u8 {
+        match self {
+            Self::Dark => 0,
+            Self::Light => 1,
+            Self::Classic => 2,
+        }
+    }
+
+    const fn from_index(index: u8) -> Self {
+        match index {
+            1 => Self::Light,
+            2 => Self::Classic,
+            _ => Self::Dark,
+        }
+    }
+}
+
+/// The active palette.
+pub fn palette() -> Palette {
+    Palette::from_index(ACTIVE_PALETTE.load(Ordering::Relaxed))
 }
 
 /// Whether the Light palette is the active one.
 pub fn is_light() -> bool {
-    LIGHT_THEME.load(Ordering::Relaxed)
+    palette() == Palette::Light
 }
 
-/// Resolve each frame from the integration's current OS appearance. Unknown uses Dark.
-pub fn wants_light(ctx: &egui::Context, mode: ThemeMode) -> bool {
+/// The palette `mode` asks for, resolved each frame from the integration's current OS
+/// appearance: System with a dark or unknown appearance is djforge Dark.
+pub fn resolve(ctx: &egui::Context, mode: ThemeMode) -> Palette {
     match mode {
-        ThemeMode::Light => true,
-        ThemeMode::Dark => false,
-        ThemeMode::System => ctx.system_theme() == Some(egui::Theme::Light),
+        ThemeMode::Light => Palette::Light,
+        ThemeMode::Dark => Palette::Dark,
+        ThemeMode::Classic => Palette::Classic,
+        ThemeMode::System if ctx.system_theme() == Some(egui::Theme::Light) => Palette::Light,
+        ThemeMode::System => Palette::Dark,
     }
 }
 
@@ -449,11 +686,16 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
-/// Make `light` (or dark) the active palette and apply its visuals. Call only when it changes.
+/// Make Light (or djforge Dark) the active palette and apply its visuals ([`apply_palette`]).
 pub fn apply(ctx: &egui::Context, light: bool) {
-    LIGHT_THEME.store(light, Ordering::Relaxed);
-    let t = Tokens::current();
-    let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    apply_palette(ctx, if light { Palette::Light } else { Palette::Dark });
+}
+
+/// Make `palette` the active one and apply its visuals. Call only when it changes.
+pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
+    ACTIVE_PALETTE.store(palette.index(), Ordering::Relaxed);
+    let t = Tokens::of(palette);
+    let mut v = if palette == Palette::Light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = t.panel_bg;
     v.window_fill = t.panel_bg2;
     v.extreme_bg_color = t.slot_bg;
@@ -464,6 +706,15 @@ pub fn apply(ctx: &egui::Context, light: bool) {
     v.widgets.hovered.weak_bg_fill = t.button_hi;
     v.widgets.noninteractive.fg_stroke.color = t.text;
     v.widgets.inactive.fg_stroke.color = t.text;
+    if palette == Palette::Dark {
+        // Selected text and rows: the accent on a dark yellow, readable either way round. The
+        // same accent outlines a focused text field.
+        v.selection.bg_fill = t.accent_dark;
+        v.selection.stroke = egui::Stroke::new(1.0, t.accent);
+        // A focused button is drawn in the active state: outline it in the accent.
+        v.widgets.active.bg_stroke = egui::Stroke::new(1.0, t.accent);
+        v.hyperlink_color = t.accent;
+    }
     v.window_corner_radius = egui::CornerRadius::same(6);
     v.menu_corner_radius = egui::CornerRadius::same(4);
     // Keep receiving native OS appearance changes even when our palette is manual. On macOS,
@@ -485,6 +736,95 @@ mod tests {
     use crate::{Services, SoundApp, UiState};
     use serde_json::json;
 
+    /// Every colour SoundCraft's dark palette had, in declaration order, folded into an FNV-1a hash.
+    fn soundcraft_fingerprint(t: &Tokens) -> u64 {
+        let mut colors = vec![
+            t.window_bg,
+            t.panel_bg,
+            t.panel_bg2,
+            t.toolbar_bg,
+            t.toolbar_group,
+            t.border,
+            t.border_light,
+            t.edge_light,
+            t.text,
+            t.text_dim,
+            t.text_dark,
+            t.header_text,
+            t.counter_bg,
+            t.counter_text,
+            t.counter_label,
+            t.accent,
+            t.accent_dark,
+            t.mode_on,
+            t.mode_on_text,
+            t.mode_off_text,
+            t.button,
+            t.button_hi,
+            t.button_border,
+            t.name_field,
+            t.name_field_sel,
+            t.ruler_bg,
+            t.ruler_label_bg,
+            t.ruler_text,
+            t.ruler_tick,
+            t.tempo_ruler,
+            t.meter_ruler,
+            t.marker_ruler,
+            t.playlist_bg,
+            t.playlist_alt,
+            t.grid_line,
+            t.bar_line,
+            t.selection,
+            t.playhead,
+            t.insertion,
+            t.solo,
+            t.mute,
+            t.rec,
+            t.input,
+            t.auto_read,
+            t.auto_write,
+            t.auto_touch,
+            t.auto_latch,
+            t.meter_green,
+            t.meter_yellow,
+            t.meter_red,
+            t.fader_track,
+            t.strip_bg,
+            t.strip_section,
+            t.slot_bg,
+            t.automation_line,
+            t.menu_bar,
+            t.group_border,
+            t.mode_off,
+            t.counter_off,
+            t.counter_border,
+            t.counter_rule,
+            t.tool_bracket_off,
+            t.row_selected,
+            t.visible_dot,
+            t.big_counter_bg,
+            t.header_selected,
+            t.strip_selected,
+            t.marker_text,
+            t.playlist_lane,
+            t.universe_bg,
+            t.universe_view,
+            t.meter_bg,
+            t.meter_clip_off,
+            t.knob_bg,
+            t.knob_ring,
+            t.knob_pointer,
+            t.section_label,
+            t.slot_well,
+            t.slot_empty,
+            t.slot_mark,
+        ];
+        colors.extend(t.slot_face);
+        colors.extend(t.slot_bypassed);
+        colors.iter().flat_map(|c| c.to_array()).fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
     #[test]
     fn test_palette_lock_is_reentrant_and_excludes_other_threads() {
         // Regression for the parallel-run flakes: the process-wide palette must be owned for a
@@ -504,6 +844,179 @@ mod tests {
         drop(app);
         // Other tests compete for the lock too, and some hold it for seconds: allow for a queue.
         assert!(rx.recv_timeout(std::time::Duration::from_secs(120)).is_ok(), "the palette lock must be released when every holder drops it");
+    }
+
+    /// WCAG 2 contrast ratio of two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let luminance = |c: Color32| {
+            let linear = |channel: u8| {
+                let s = f64::from(channel) / 255.0;
+                if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn djforge_dark_is_mixforges_studio_palette() {
+        let t = Tokens::DARK;
+        let hex = |c: Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+        for (name, color, want) in [
+            ("bg", t.window_bg, "#111317"),
+            ("panel", t.panel_bg, "#191c22"),
+            ("panel2", t.panel_bg2, "#20242c"),
+            ("line", t.border_light, "#2c313b"),
+            ("text", t.text, "#e6e8ec"),
+            ("dim", t.text_dim, "#8b93a3"),
+            ("accent", t.accent, "#f8d200"),
+            ("selection outline", t.marquee, "#f8d200"),
+            ("playhead", t.playhead, "#f8d200"),
+            ("counter", t.counter_text, "#f8d200"),
+            ("mode on", t.mode_on, "#f8d200"),
+            ("mode on text", t.mode_on_text, "#111317"),
+            ("open tab", t.tab_on, "#f8d200"),
+            ("record", t.rec, "#e0342c"),
+            ("input", t.input, "#32be44"),
+            ("meter green", t.meter_green, "#32be44"),
+            ("meter yellow", t.meter_yellow, "#f8d200"),
+            ("meter red", t.meter_red, "#e0342c"),
+        ] {
+            assert_eq!(hex(color), want, "{name}");
+        }
+        assert_eq!([studio::LOW, studio::MID, studio::HIGH].map(hex), ["#e5484d", "#46c46a", "#4f8ff7"]);
+        // The selection wash is the accent, translucent.
+        let wash = t.selection.to_srgba_unmultiplied();
+        assert!(wash[0] > wash[2] && wash[1] > wash[2] && wash[3] < 128, "{wash:?}");
+    }
+
+    #[test]
+    fn soundcraft_classic_is_soundcraft_s_dark_look_unchanged() {
+        assert_eq!(ThemeMode::parse("classic"), Some(ThemeMode::Classic));
+        assert_eq!(ThemeMode::parse("Classic"), Some(ThemeMode::Classic));
+        assert_eq!(ThemeMode::Classic.label(), "SoundCraft Classic");
+        let ui: UiState = serde_json::from_value(json!({"theme": "classic"})).unwrap_or_default();
+        assert_eq!(ui.theme, ThemeMode::Classic);
+        // Every colour of SoundCraft's dark palette, byte for byte, as of the rebrand.
+        assert_eq!(soundcraft_fingerprint(&Tokens::CLASSIC), 0xddcb_58b6_7158_84c5);
+        assert_ne!(soundcraft_fingerprint(&Tokens::DARK), soundcraft_fingerprint(&Tokens::CLASSIC));
+        // The colours routed through new tokens keep the values SoundCraft drew them in.
+        let c = Tokens::CLASSIC;
+        assert_eq!(c.accent_text, Color32::WHITE);
+        assert_eq!(c.tab_on, c.accent_dark);
+        assert_eq!(
+            (c.transport_play, c.transport_play_icon, c.transport_rec),
+            (Color32::from_rgb(40, 90, 50), Color32::from_rgb(120, 255, 140), Color32::from_rgb(110, 30, 30))
+        );
+        assert_eq!(c.readout_ink, c.counter_text);
+        assert_eq!(c.marquee, Color32::from_rgb(120, 170, 255));
+        assert_eq!((c.roll_rows, c.roll_lines, c.roll_lane, c.step_cells), (ROLL_ROWS, ROLL_LINES, Color32::from_rgb(28, 28, 30), STEP_CELLS));
+        // Its visuals are SoundCraft's too: egui's dark ones with the accent as selection.
+        let _palette = lock_test_palette();
+        let ctx = egui::Context::default();
+        apply_palette(&ctx, Palette::Classic);
+        assert_eq!(palette(), Palette::Classic);
+        assert_eq!(Tokens::current().panel_bg, c.panel_bg);
+        let v = ctx.global_style().visuals.clone();
+        let mut want = egui::Visuals::dark();
+        want.selection.bg_fill = c.accent;
+        assert_eq!(
+            (v.selection, v.widgets.active.bg_stroke, v.hyperlink_color),
+            (want.selection, want.widgets.active.bg_stroke, want.hyperlink_color)
+        );
+        apply_palette(&ctx, Palette::Dark);
+    }
+
+    #[test]
+    fn prefs_saved_as_dark_get_djforge_dark() {
+        let ui: UiState = serde_json::from_value(json!({"theme": "dark"})).unwrap_or_default();
+        assert_eq!(ui.theme, ThemeMode::Dark);
+        assert_eq!(ThemeMode::Dark.label(), "djforge Dark");
+        let ctx = egui::Context::default();
+        assert_eq!(resolve(&ctx, ThemeMode::Dark), Palette::Dark);
+        assert_eq!(resolve(&ctx, ThemeMode::Classic), Palette::Classic);
+        // System with a dark (or unknown) OS appearance is djforge Dark, never Classic.
+        assert_eq!(resolve(&ctx, ThemeMode::System), Palette::Dark);
+        assert_eq!(Tokens::of(resolve(&ctx, ThemeMode::Dark)).panel_bg, Tokens::DARK.panel_bg);
+    }
+
+    #[test]
+    fn djforge_dark_focus_and_selection_are_visible() {
+        let _palette = lock_test_palette();
+        let ctx = egui::Context::default();
+        apply_palette(&ctx, Palette::Dark);
+        let t = Tokens::DARK;
+        let v = ctx.global_style().visuals.clone();
+        // A focused text field is outlined in selection.stroke; a focused button in the active state.
+        for (what, stroke) in [("focused text field", v.selection.stroke), ("focused button", v.widgets.active.bg_stroke)] {
+            assert!(stroke.width >= 1.0, "{what}");
+            for bg in [t.window_bg, t.panel_bg, t.panel_bg2, t.slot_bg, t.button] {
+                assert!(contrast(stroke.color, bg) >= 3.0, "{what} outline on {bg:?}: {:.2}", contrast(stroke.color, bg));
+            }
+        }
+        // Selected text and selected rows are drawn in selection.stroke on selection.bg_fill.
+        assert!(contrast(v.selection.stroke.color, v.selection.bg_fill) >= 4.5);
+        assert!(contrast(t.text, v.selection.bg_fill) >= 4.5);
+    }
+
+    #[test]
+    fn text_is_readable_in_every_palette() {
+        let mut failures = Vec::new();
+        for palette in Palette::ALL {
+            let t = Tokens::of(palette);
+            let surfaces = [
+                ("window", t.window_bg),
+                ("panel", t.panel_bg),
+                ("panel2", t.panel_bg2),
+                ("toolbar", t.toolbar_bg),
+                ("strip", t.strip_bg),
+                ("menu bar", t.menu_bar),
+                ("lane", t.playlist_bg),
+                ("button", t.button),
+            ];
+            let mut pairs = vec![];
+            for (name, bg) in surfaces {
+                pairs.push((format!("text on {name}"), t.text, bg, 4.5));
+                pairs.push((format!("dim text on {name}"), t.text_dim, bg, 3.0));
+            }
+            for (name, bg) in [
+                ("hovered button", t.button_hi),
+                ("selected row", t.row_selected),
+                ("selected header", t.header_selected),
+                ("selected strip", t.strip_selected),
+            ] {
+                pairs.push((format!("text on {name}"), t.text, bg, 4.5));
+            }
+            pairs.extend([
+                ("header text".into(), t.header_text, t.panel_bg2, 4.5),
+                ("header text, selected".into(), t.header_text, t.header_selected, 4.5),
+                ("ruler text".into(), t.ruler_text, t.ruler_bg, 4.5),
+                ("counter".into(), t.counter_text, t.counter_bg, 4.5),
+                ("counter label".into(), t.counter_label, t.counter_bg, 4.5),
+                ("mode on".into(), t.mode_on_text, t.mode_on, 4.5),
+                ("mode off".into(), t.mode_off_text, t.mode_off, 4.5),
+                ("dark text on the accent".into(), t.text_dark, t.mode_on, 3.0),
+                ("open tab".into(), t.accent_text, t.tab_on, 4.5),
+                ("section label".into(), t.section_label, t.strip_bg, 4.5),
+            ]);
+            // A bold label on an accent button. SoundCraft Classic keeps its 3.95:1 white on blue
+            // (bold, so WCAG's large-text 3:1), as its look is preserved byte for byte.
+            pairs.push(("accent button label".into(), t.accent_text, t.accent, if palette == Palette::Classic { 3.0 } else { 4.5 }));
+            for (what, fg, bg, min) in pairs {
+                let ratio = contrast(fg, bg);
+                if ratio < min {
+                    failures.push(format!("{palette:?}: {what} is {ratio:.2}:1, below {min}:1"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn the_theme_menu_lists_every_mode() {
+        assert_eq!(ThemeMode::ALL.map(ThemeMode::label), ["djforge Dark", "Light", "System", "SoundCraft Classic"]);
+        assert_eq!(ThemeMode::ALL.map(ThemeMode::id), ["dark", "light", "system", "classic"]);
     }
 
     #[test]
@@ -542,6 +1055,8 @@ mod tests {
         assert!(app.run("ui.theme", json!({"mode": "sepia"})).is_err());
         assert_eq!(app.ui.theme, ThemeMode::Light);
         assert_eq!(app.run("ui.theme", json!({"mode": "system"})), Ok(json!({"mode": "system"})));
+        assert_eq!(app.run("ui.theme", json!({"mode": "classic"})), Ok(json!({"mode": "classic"})));
+        assert_eq!(app.ui.theme, ThemeMode::Classic);
         assert!(crate::menus::UI_COMMANDS.iter().any(|c| c.0 == "ui.theme"));
     }
 

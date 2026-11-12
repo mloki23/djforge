@@ -244,7 +244,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let pitch = top - r;
         let y = y_of(pitch);
         let row = Rect::from_min_size(pos2(roll.min.x, y), vec2(roll.width(), ROW_H));
-        painter.rect_filled(row, 0.0, row_color(pitch, key));
+        painter.rect_filled(row, 0.0, row_color(&t, pitch, key));
         let key = Rect::from_min_size(pos2(keys.min.x, y), vec2(KEY_W - 2.0, ROW_H - 1.0));
         painter.rect_filled(key, 1.0, if is_black(pitch) { Color32::from_rgb(20, 20, 20) } else { Color32::from_rgb(225, 225, 225) });
         if pitch.rem_euclid(12) == 0 && (0..=127).contains(&pitch) {
@@ -255,7 +255,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 regular(8.0),
                 Color32::from_rgb(40, 40, 40),
             );
-            painter.line_segment([pos2(roll.min.x, y + ROW_H), pos2(roll.max.x, y + ROW_H)], Stroke::new(1.0, Color32::from_rgb(64, 64, 68)));
+            painter.line_segment([pos2(roll.min.x, y + ROW_H), pos2(roll.max.x, y + ROW_H)], Stroke::new(1.0, t.roll_lines[2]));
         }
     }
     // Grid.
@@ -264,10 +264,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let bar = tick % (TICKS_PER_QUARTER * 4) == 0;
         let x = x_of(tick);
         if grid_ticks as f32 * px_per_tick > 4.0 || bar {
-            painter.line_segment(
-                [pos2(x, roll.min.y), pos2(x, roll.max.y)],
-                Stroke::new(1.0, if bar { Color32::from_rgb(80, 80, 86) } else { Color32::from_rgb(50, 50, 54) }),
-            );
+            painter.line_segment([pos2(x, roll.min.y), pos2(x, roll.max.y)], Stroke::new(1.0, if bar { t.roll_lines[1] } else { t.roll_lines[0] }));
         }
         tick += grid_ticks;
     }
@@ -327,8 +324,8 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         ui.painter().rect(
             band,
             0.0,
-            Color32::from_rgba_unmultiplied(120, 170, 255, 40),
-            Stroke::new(1.0, Color32::from_rgb(120, 170, 255)),
+            Color32::from_rgba_unmultiplied(t.marquee.r(), t.marquee.g(), t.marquee.b(), 40),
+            Stroke::new(1.0, t.marquee),
             StrokeKind::Inside,
         );
         if resp.drag_stopped() {
@@ -435,7 +432,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         app.midi.selected.clear();
     }
     // Velocity lane.
-    ui.painter().rect_filled(vel, 0.0, Color32::from_rgb(28, 28, 30));
+    ui.painter().rect_filled(vel, 0.0, t.roll_lane);
     ui.painter().text(pos2(full.min.x + 6.0, vel.center().y), Align2::LEFT_CENTER, "Velocity", regular(10.0), t.text_dim);
     let vresp = ui.interact(vel, ui.id().with(("vel", cid.0)), Sense::click_and_drag());
     for (i, n) in sequence.notes.iter().enumerate() {
@@ -456,16 +453,14 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 }
 
 /// A piano roll row's colour: shaded when the pitch is in the key's scale, more so on the tonic.
-fn row_color(pitch: i32, key: Option<Key>) -> Color32 {
+fn row_color(t: &Tokens, pitch: i32, key: Option<Key>) -> Color32 {
     let degree = key.filter(|k| (0..=127).contains(&pitch) && k.contains(pitch as u8)).map(|k| i32::from(k.tonic) == pitch.rem_euclid(12));
-    match (is_black(pitch), degree) {
-        (false, None) => Color32::from_rgb(40, 40, 42),
-        (true, None) => Color32::from_rgb(30, 30, 32),
-        (false, Some(false)) => Color32::from_rgb(44, 50, 60),
-        (true, Some(false)) => Color32::from_rgb(34, 40, 50),
-        (false, Some(true)) => Color32::from_rgb(50, 60, 76),
-        (true, Some(true)) => Color32::from_rgb(40, 50, 66),
-    }
+    let [white, black] = match degree {
+        None => t.roll_rows[0],
+        Some(false) => t.roll_rows[1],
+        Some(true) => t.roll_rows[2],
+    };
+    if is_black(pitch) { black } else { white }
 }
 
 /// The header's key menu: the set's key, or any other for the view only (the session is
@@ -600,8 +595,8 @@ fn drum_grid(app: &mut SoundApp, ui: &mut Ui, cid: ClipId, sequence: &Sequence, 
                 Some(v) if v >= ACCENTED => color,
                 Some(v) => color.gamma_multiply(0.35 + 0.4 * f32::from(v) / 127.0),
                 // Beats alternate, so the bar reads in fours.
-                None if (s / 4) % 2 == 0 => Color32::from_rgb(46, 46, 50),
-                None => Color32::from_rgb(36, 36, 40),
+                None if (s / 4) % 2 == 0 => t.step_cells[0],
+                None => t.step_cells[1],
             };
             painter.rect_filled(cell, 2.0, fill);
             if velocity.is_some_and(|v| v >= ACCENTED) {

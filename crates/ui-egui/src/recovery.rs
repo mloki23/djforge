@@ -23,7 +23,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 if ui.button("Discard").clicked() {
                     recover = Some(false);
                 }
-                let recover_button = egui::Button::new(egui::RichText::new("Recover").strong()).fill(Tokens::current().accent);
+                let t = Tokens::current();
+                let recover_button = egui::Button::new(egui::RichText::new("Recover").strong().color(t.accent_text)).fill(t.accent);
                 if ui.add_enabled(!app.engine.transport.recording, recover_button).on_disabled_hover_text("Stop recording first").clicked() {
                     recover = Some(true);
                 }

@@ -688,7 +688,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         if ui.button("Cancel").clicked() {
                             ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dlg_cancel"), true));
                         }
-                        let ok = egui::Button::new(egui::RichText::new("Export").strong()).fill(Tokens::current().accent);
+                        let t = Tokens::current();
+                        let ok = egui::Button::new(egui::RichText::new("Export").strong().color(t.accent_text)).fill(t.accent);
                         let why = if refused.is_some() { "The session can't be exported" } else { "Tick Rekordbox or Mixxx" };
                         export |= ui.add_enabled(any, ok).on_disabled_hover_text(why).clicked();
                     });
@@ -786,7 +787,8 @@ fn buttons(ui: &mut egui::Ui, ok: &str, enter: bool) -> bool {
         if ui.button("Cancel").clicked() {
             ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dlg_cancel"), true));
         }
-        if ui.add(egui::Button::new(egui::RichText::new(ok).strong()).fill(Tokens::current().accent)).clicked() {
+        let t = Tokens::current();
+        if ui.add(egui::Button::new(egui::RichText::new(ok).strong().color(t.accent_text)).fill(t.accent)).clicked() {
             pressed = true;
         }
     });

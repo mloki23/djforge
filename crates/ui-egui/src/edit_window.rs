@@ -163,10 +163,10 @@ fn dock_tabs(app: &mut SoundApp, ui: &mut Ui) {
         ("MEMORY LOCATIONS", app.ui.show_memory_locations, "window.memory_locations"),
         ("UNDO HISTORY", app.ui.show_undo_history, "window.undo_history"),
     ] {
-        let g = ui.painter().layout_no_wrap(label.to_string(), bold(10.5), if on { Color32::WHITE } else { t.text_dim });
+        let g = ui.painter().layout_no_wrap(label.to_string(), bold(10.5), if on { t.accent_text } else { t.text_dim });
         let tr = Rect::from_min_size(pos2(x, r.min.y + 2.0), vec2(g.size().x + 16.0, r.height() - 4.0));
         if on {
-            ui.painter().rect_filled(tr, 3.0, t.accent_dark);
+            ui.painter().rect_filled(tr, 3.0, t.tab_on);
         }
         ui.painter().galley(pos2(tr.min.x + 8.0, tr.center().y - g.size().y * 0.5), g, Color32::WHITE);
         if ui.interact(tr, ui.id().with(("dock", label)), Sense::click()).clicked() {
@@ -1331,8 +1331,8 @@ fn io_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
         ui.painter().rect_filled(vr.shrink(1.5), 1.5, Color32::BLACK);
         let m = &track.mixer;
         let pan = m.pan.first().map_or("-".into(), |p| crate::widgets::pan_text(*p));
-        // The readout is black in both themes, so it takes the dark palette's green.
-        let ink = Tokens::DARK.counter_text;
+        // The readout is black in every palette, so its ink is a dark-palette colour in Light too.
+        let ink = t.readout_ink;
         for (y, label, value) in [(7.5, "vol", crate::widgets::db_text(m.volume_db)), (22.0, "pan", pan)] {
             ui.painter().text(pos2(vr.min.x + 7.0, vr.min.y + y), Align2::LEFT_CENTER, label, bold(10.0), ink);
             ui.painter().text(pos2(vr.max.x - 6.5, vr.min.y + y), Align2::RIGHT_CENTER, value, bold(10.0), ink);
