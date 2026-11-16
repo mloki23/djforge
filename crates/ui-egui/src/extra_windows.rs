@@ -173,6 +173,12 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
                     let _ = app.run("ui.theme", json!({"mode": mode.id()}));
                 }
                 ui.end_row();
+                ui.label("Colour waveforms by frequency");
+                let mut bands = app.waveform_bands();
+                if crate::widgets::checkbox(ui, &mut bands, "").changed() {
+                    app.ui.waveform_bands = Some(bands);
+                }
+                ui.end_row();
                 ui.label("Auto-update configuration");
                 crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "");
                 ui.end_row();
@@ -180,6 +186,7 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
             if ui.button("Reset").clicked() {
                 app.extra.ui_scale = 1.0;
                 app.extra.reduce_motion = false;
+                app.ui.waveform_bands = None;
                 let _ = app.run("ui.theme", json!({"mode": crate::theme::ThemeMode::default().id()}));
             }
         },

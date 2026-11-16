@@ -46,3 +46,17 @@ follows changes behaviour you may rely on.
 - Light changes slightly: the edit-mode buttons are a darker green so their text is readable
   (4.5:1), default buttons (Export, Recover, a dialog's OK) have white labels, and the
   clip-gain fader popup is light, so its green readout is readable.
+
+## Waveforms coloured by frequency
+
+- **Audio clip waveforms are coloured by frequency in djforge Dark**, as in Rekordbox's 3-band
+  view: lows (below 200 Hz) red, mids (200 Hz to 2.5 kHz) green, highs (above 2.5 kHz) blue,
+  mixed per pixel column, so kicks and bass read red, vocals green and hats blue. The clip body
+  turns a dark tint of the clip's colour and the colour stays in the name bar (or a 3-point strip
+  along the clip's top when names are hidden). Light and SoundCraft Classic keep one-colour
+  waveforms. Setup › Appearance › "Colour waveforms by frequency" (`ui.waveform_bands {"value":
+  true|false|null}`, null following the theme) overrides the theme, saved with the UI prefs.
+  Split clips, muted clips, the outgoing half of an overlapped crossfade and recording takes
+  stay one colour. Loading audio takes a little longer: the bands are filtered once, with the
+  waveform overview (about 0.2 s per channel for 10 minutes), and keep about 43 MB per hour of
+  stereo in memory.

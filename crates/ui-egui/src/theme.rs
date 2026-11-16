@@ -688,6 +688,12 @@ pub enum Palette {
 impl Palette {
     pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::Classic];
 
+    /// Whether waveforms are coloured by frequency unless the UI prefs say otherwise: in
+    /// djforge Dark only.
+    pub const fn colours_waveforms(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
     const fn index(self) -> u8 {
         match self {
             Self::Dark => 0,
@@ -756,6 +762,12 @@ pub fn clip_colors(rgb: [u8; 3], selected: bool) -> (Color32, Color32, Color32) 
     }
     // A dark body and a light waveform in the clip's own colour; selection inverts them.
     if selected { (shade(0.7), bar, Color32::from_rgb(16, 16, 18)) } else { (shade(0.34), bar, tint(0.35)) }
+}
+
+/// The body of a clip whose waveform is coloured by frequency: a dark tint of its colour, under
+/// the band colours, lighter when selected.
+pub fn band_clip_body(rgb: [u8; 3], selected: bool) -> Color32 {
+    studio::BG.lerp_to_gamma(self::rgb(rgb), if selected { 0.42 } else { 0.2 })
 }
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
@@ -1044,6 +1056,33 @@ mod tests {
         fn drop(&mut self) {
             ACTIVE_PALETTE.store(self.0.index(), Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn waveforms_are_coloured_by_frequency_in_djforge_dark_unless_the_prefs_say_otherwise() {
+        let _palette = lock_test_palette();
+        let _restore = RestorePalette(palette());
+        assert_eq!(Palette::ALL.map(Palette::colours_waveforms), [true, false, false]);
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        assert_eq!(app.ui.waveform_bands, None);
+        let ctx = egui::Context::default();
+        for (p, on) in [(Palette::Dark, true), (Palette::Light, false), (Palette::Classic, false)] {
+            apply_palette(&ctx, p);
+            assert_eq!(app.waveform_bands(), on, "{p:?}");
+        }
+        assert_eq!(app.run("ui.waveform_bands", json!({"value": true})), Ok(json!({"value": true, "follows_theme": false})));
+        assert!(app.waveform_bands(), "the choice beats Classic's default");
+        assert!(app.run("ui.waveform_bands", json!({"value": "yes"})).is_err());
+        // Saved with the UI prefs, and an old prefs file follows the theme.
+        let back: UiState = serde_json::from_value(serde_json::to_value(&app.ui).unwrap_or_default()).unwrap_or_default();
+        assert_eq!(back.waveform_bands, Some(true));
+        let old: UiState = serde_json::from_value(json!({"theme": "classic"})).unwrap_or_default();
+        assert_eq!(old.waveform_bands, None);
+        apply_palette(&ctx, Palette::Dark);
+        assert_eq!(app.run("ui.waveform_bands", json!({"value": false})), Ok(json!({"value": false, "follows_theme": false})));
+        assert!(!app.waveform_bands());
+        assert_eq!(app.run("ui.waveform_bands", json!({"value": null})), Ok(json!({"value": true, "follows_theme": true})));
+        assert_eq!(app.run("ui.waveform_bands", json!({})), Ok(json!({"value": true, "follows_theme": true})));
     }
 
     #[test]

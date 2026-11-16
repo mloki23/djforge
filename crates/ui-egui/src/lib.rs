@@ -200,6 +200,9 @@ pub struct UiState {
     pub configurations: Vec<(String, Value)>,
     /// Appearance (`ui.theme`): djforge Dark by default; Light, System or SoundCraft Classic on request.
     pub theme: theme::ThemeMode,
+    /// Colour waveforms by frequency (`ui.waveform_bands`); `None` follows the palette: on in
+    /// djforge Dark, off in Light and SoundCraft Classic ([`theme::Palette::colours_waveforms`]).
+    pub waveform_bands: Option<bool>,
     /// The main window's size (logical points) and maximized state, and the interface scale, as
     /// the desktop app last saw them; it restores them at launch.
     pub window_size: [f32; 2],
@@ -289,6 +292,7 @@ impl Default for UiState {
             midi_mappings: Vec::new(),
             midi_mappings_backup: Vec::new(),
             show_midi_mappings: false,
+            waveform_bands: None,
         }
     }
 }
@@ -585,6 +589,12 @@ impl SoundApp {
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
         self
+    }
+
+    /// Whether clip waveforms are coloured by frequency: the UI prefs' choice, or the active
+    /// palette's default ([`theme::Palette::colours_waveforms`]).
+    pub fn waveform_bands(&self) -> bool {
+        self.ui.waveform_bands.unwrap_or_else(|| theme::palette().colours_waveforms())
     }
 
     /// Run a command; errors go to the status line. Returns the result.

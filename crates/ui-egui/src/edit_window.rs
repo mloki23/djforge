@@ -1604,6 +1604,10 @@ fn grid_veil(line: Color32, bg: Color32) -> Color32 {
     }
 }
 
+/// How tall the clip-coloured strip over the top of a clip coloured by frequency is, when its
+/// name is hidden.
+const BAND_CLIP_STRIP: f32 = 3.0;
+
 fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, clip: &Clip, tl: Rect, lane: Rect, dim: bool) {
     let x0 = x_of(s, tl, clip.start);
     let x1 = x_of(s, tl, clip.end()).max(x0 + 1.0);
@@ -1618,6 +1622,16 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     if clip.muted || dim {
         body = body.gamma_multiply(0.45);
         wave = Color32::from_rgb(70, 70, 70);
+    }
+    // Coloured by frequency over a dark body; the clip's colour stays in its name bar, or a strip
+    // along its top. Split clips keep the clip colour, as their stems are what they play.
+    let by_frequency = app.waveform_bands()
+        && clip.stems.is_none()
+        && !(clip.muted || dim)
+        && track.view != "blocks"
+        && matches!(clip.content, ClipContent::Audio { .. });
+    if by_frequency {
+        body = crate::theme::band_clip_body(color, selected);
     }
     let body = if s.edit.flag("view.clip.transparency") { body.gamma_multiply(0.55) } else { body };
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
@@ -1651,7 +1665,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                         preview = Clip { fade_in, fade_out, ..clip.clone() };
                         &preview
                     };
-                    crate::waveform::draw(&painter.with_clip_rect(vis), s, tl, shown, audio, track.channels(), body_r, wave);
+                    crate::waveform::draw(&painter.with_clip_rect(vis), s, tl, shown, audio, track.channels(), body_r, wave, by_frequency);
                     let n = track.channels().min(audio.peaks.len()).max(1);
                     for k in 1..n {
                         let y = body_r.min.y + body_r.height() / n as f32 * k as f32;
@@ -1692,6 +1706,11 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             }
         }
     }
+    if by_frequency && name_h <= 0.0 {
+        // Over the waveform's top edge, which leaves the body (and the fades drawn on it) as it is.
+        let strip = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + BAND_CLIP_STRIP.min(r.height() * 0.25)));
+        painter.rect_filled(strip, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, bar);
+    }
     let prev = crossfade_partner(track, clip);
     if s.edit.flag("waveform.overlapped_crossfades")
         && track.view != "blocks"
@@ -1705,7 +1724,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         } else {
             clip_colors(prev.color.unwrap_or(track.color), false).2.gamma_multiply(0.6)
         };
-        crate::waveform::draw(&painter.with_clip_rect(xf), s, tl, prev, audio, track.channels(), body_r, tail);
+        crate::waveform::draw(&painter.with_clip_rect(xf), s, tl, prev, audio, track.channels(), body_r, tail, false);
     }
     // Clip gain line.
     let show_gain = s.edit.flag("view.clip.gain_line") && (!clip.gain_env.is_empty() || clip.gain_db.abs() > 0.01 || track.view == "clip_gain");

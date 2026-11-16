@@ -448,6 +448,7 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
                     } else {
                         st.configurations = app.ui.configurations.clone();
                         st.theme = app.ui.theme;
+                        st.waveform_bands = app.ui.waveform_bands;
                         st.show_configurations = true;
                         crate::docking::cancel_replaced_state(app, &st);
                         app.ui = st;

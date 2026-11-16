@@ -102,7 +102,7 @@ impl VideoSource {
     }
 }
 
-/// Decoded audio plus waveform overviews (not serialised).
+/// Decoded audio plus waveform overviews, with their frequency bands (not serialised).
 #[derive(Debug)]
 pub struct SourceAudio {
     pub buffer: AudioBuffer,
@@ -111,7 +111,7 @@ pub struct SourceAudio {
 
 impl SourceAudio {
     pub fn new(buffer: AudioBuffer) -> Self {
-        let peaks = buffer.channels.iter().map(|c| Peaks::build(c)).collect();
+        let peaks = buffer.channels.iter().map(|c| Peaks::build_with_bands(c, buffer.sample_rate)).collect();
         SourceAudio { buffer, peaks }
     }
     pub fn frames(&self) -> usize {
