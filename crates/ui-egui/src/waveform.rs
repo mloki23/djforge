@@ -30,6 +30,8 @@ pub fn draw(
 
 /// How much each band counts in [`band_colour`], by RMS: music has less energy the higher it
 /// goes, so mids and highs are lifted a little (about +2 and +6 dB) to show up beside the bass.
+/// More lift for the highs mostly pales full-spectrum music (hats rarely play alone) rather than
+/// turning more of it blue.
 const BAND_WEIGHT: [f32; 3] = [1.0, 1.3, 2.0];
 /// The power of each band's weighted RMS that [`band_colour`] mixes by. Above 2 (energy) the
 /// loudest band leads the mix, so full-spectrum music keeps a colour, as in Rekordbox, rather
@@ -59,6 +61,42 @@ pub fn band_colour(rms: [f32; 3]) -> Option<Color32> {
     let k = if top > 0.0 { bright / top } else { 1.0 };
     let [r, g, b] = mix.map(|v| (v * k).round().clamp(0.0, 255.0) as u8);
     Some(Color32::from_rgb(r, g, b))
+}
+
+/// How many columns either side [`smooth_bands`] mixes in, for columns `step` samples apart at
+/// `sample_rate`: none while a column is under ~30 ms, so beats keep their colours; zoomed out,
+/// where one column spans a beat or more, one to three, so neighbouring columns that happen to
+/// catch a kick or a hat don't alternate red and blue in stripes.
+pub fn smoothing_radius(step: f64, sample_rate: f64) -> usize {
+    match step / sample_rate {
+        s if s >= 1.0 => 3,
+        s if s >= 1.0 / 8.0 => 2,
+        s if s >= 1.0 / 32.0 => 1,
+        _ => 0,
+    }
+}
+
+/// Each column's band RMS mixed (by energy) with its neighbours' up to `radius` away, weighted
+/// down with distance. Silent and out-of-range columns (`None`) stay so and add nothing.
+pub fn smooth_bands(spans: &[Option<[f32; 3]>], radius: usize) -> Vec<Option<[f32; 3]>> {
+    if radius == 0 {
+        return spans.to_vec();
+    }
+    (0..spans.len())
+        .map(|c| {
+            spans.get(c).copied().flatten()?;
+            let (mut sum, mut weight) = ([0.0f32; 3], 0.0f32);
+            for n in c.saturating_sub(radius)..=c.saturating_add(radius) {
+                let Some(rms) = spans.get(n).copied().flatten() else { continue };
+                let w = (radius + 1 - n.abs_diff(c)) as f32;
+                for (s, v) in sum.iter_mut().zip(rms) {
+                    *s += v * v * w;
+                }
+                weight += w;
+            }
+            Some(sum.map(|e| (e / weight).sqrt()))
+        })
+        .collect()
 }
 
 fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
@@ -106,8 +144,10 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
             })
         })
         .collect();
-    let colours: Vec<Color32> = bands
-        .map_or_else(Vec::new, |b| b.spans(start, g.step, overlap, g.cols).into_iter().map(|b| b.and_then(band_colour).unwrap_or(wave)).collect());
+    let radius = smoothing_radius(g.step, s.sample_rate.as_f64());
+    let colours: Vec<Color32> = bands.map_or_else(Vec::new, |b| {
+        smooth_bands(&b.spans(start, g.step, overlap, g.cols), radius).into_iter().map(|b| b.and_then(band_colour).unwrap_or(wave)).collect()
+    });
     g.paint(painter, &ys, Colours { wave, each: &colours }, outlines, rectified);
 }
 

@@ -391,3 +391,29 @@ fn open_time_of_a_long_track() {
     println!("bands, built after in the background: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn zoomed_out_band_colours_blend_across_neighbouring_columns() {
+    use soundcraft_ui_egui::theme::studio::{HIGH, LOW};
+    // Columns that alternately catch a kick and a hat.
+    let spans: Vec<Option<[f32; 3]>> = (0..12).map(|c| Some(if c % 2 == 0 { [0.5, 0.0, 0.0] } else { [0.0, 0.0, 0.25] })).chain([None]).collect();
+    // Close in (a few ms a column) nothing is mixed, so beats keep their colours.
+    assert_eq!(waveform::smoothing_radius(240.0, 48_000.0), 0);
+    assert_eq!(waveform::smooth_bands(&spans, 0), spans);
+    // Zoomed out to a beat a column, neighbours mix: no column is a pure band any more, and
+    // adjacent ones are close in colour rather than flipping from red to blue.
+    let radius = waveform::smoothing_radius(24_000.0, 48_000.0);
+    assert!(radius >= 1);
+    let smooth = waveform::smooth_bands(&spans, radius);
+    assert_eq!(smooth.len(), spans.len());
+    assert_eq!(smooth.last(), Some(&None), "silence stays silent");
+    let colours: Vec<Color32> = smooth.iter().take(12).map(|b| b.and_then(waveform::band_colour).unwrap_or_default()).collect();
+    for c in &colours[1..11] {
+        assert!(*c != LOW && *c != HIGH, "{c:?}");
+    }
+    let step = |a: Color32, b: Color32| a.to_array().iter().zip(b.to_array()).map(|(x, y)| x.abs_diff(y)).max().unwrap_or(0);
+    let raw_step = step(LOW, HIGH);
+    for pair in colours[1..11].windows(2) {
+        assert!(step(pair[0], pair[1]) < raw_step / 2, "{pair:?}");
+    }
+}
