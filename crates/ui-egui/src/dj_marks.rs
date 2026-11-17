@@ -1,56 +1,37 @@
 //! The DJ set in the Edit window: deck tints on the decks' clips, and each transition's mix-in,
 //! bass-hit and mix-out markers.
 //!
-//! **Decks.** The deck tracks are those `prod.*` treats as decks: the tracks the transitions mix
-//! between and the audio tracks holding beat-locked clips, or failing both, the audio tracks named
-//! "Deck A" / "Deck B". A deck track named "Deck A" or "Deck B" (as `dj.import_set` names them)
-//! is that deck, so reordering them keeps their colours; any other deck track takes A or B by its
-//! place among the deck tracks in track order (first A, second B, third A…), so a set of two
-//! unnamed decks is A then B. A clip is tinted when it is an audio clip on a deck track that is
-//! beat-locked or mixed by a transition.
+//! **Decks.** The deck tracks and their letters follow [`soundcraft_model::deck_tracks`] and
+//! [`soundcraft_model::deck_letters`], the rule `prod.*` places parts by: the tracks the
+//! transitions mix (with no transitions, the tracks holding beat-locked clips, failing that the
+//! tracks named "Deck A" / "Deck B"); a track named "Deck A" or "Deck B" is that deck, the others
+//! take the free letter or alternate among themselves. A clip is tinted when it is an audio clip
+//! on a deck track that is beat-locked or mixed by a transition.
 //!
 //! **Markers.** Each transition shows where the incoming track enters (mix-in, `entry_bar`),
 //! where its bass hits in full (`hit_bar`) and where the outgoing bass is gone (mix-out,
 //! `gone_bar` = hit + `out_bars`: the end of the recipe's bass swap, after which the outgoing
 //! track no longer carries the mix). Positions are bar starts on the tempo map, as the recipe
-//! places its automation; the nudge moves the audio, not the bars.
+//! places its automation; the nudge moves the audio, not the bars. A mix-out on the bar the next
+//! mix-in enters is picked by which side of the flag the pointer is on (the mix-in pennant points
+//! right, the mix-out's left), and the tooltip names both.
 
 use crate::SoundApp;
 use crate::edit_window::{sample_at, x_of};
-use crate::theme::studio;
+use crate::theme::{Tokens, studio};
 use egui::{Color32, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
 use serde_json::json;
-use soundcraft_model::{Clip, ClipId, Session, TrackId, TrackKind, Transition, TransitionStyle};
+pub use soundcraft_model::Deck;
+use soundcraft_model::{Clip, ClipId, Session, TrackId, Transition, TransitionStyle};
 use soundcraft_time::Samples;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// A DJ deck.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Deck {
-    A,
-    B,
-}
-
-impl Deck {
-    /// The deck's tint ([`studio::DECK_A`], [`studio::DECK_B`]).
-    pub const fn colour(self) -> Color32 {
-        match self {
-            Deck::A => studio::DECK_A,
-            Deck::B => studio::DECK_B,
-        }
-    }
-
-    /// The deck a track named "Deck A" / "Deck B" is, ignoring case and outer spaces.
-    fn named(name: &str) -> Option<Deck> {
-        let n = name.trim();
-        if n.eq_ignore_ascii_case("deck a") {
-            Some(Deck::A)
-        } else if n.eq_ignore_ascii_case("deck b") {
-            Some(Deck::B)
-        } else {
-            None
-        }
+/// A deck's tint ([`studio::DECK_A`], [`studio::DECK_B`]).
+pub const fn deck_colour(deck: Deck) -> Color32 {
+    match deck {
+        Deck::A => studio::DECK_A,
+        Deck::B => studio::DECK_B,
     }
 }
 
@@ -64,19 +45,7 @@ pub struct Decks {
 impl Decks {
     /// The decks of session `s` (see the module docs).
     pub fn of(s: &Session) -> Decks {
-        let mixed_tracks: HashSet<TrackId> = s.dj.transitions.iter().flat_map(|t| [t.out_track, t.in_track]).collect();
-        let mut decks: Vec<(TrackId, &str)> = s
-            .tracks
-            .iter()
-            .filter(|t| mixed_tracks.contains(&t.id) || (t.kind == TrackKind::Audio && t.clips().iter().any(|c| c.warp.is_some())))
-            .map(|t| (t.id, t.name.as_str()))
-            .collect();
-        if decks.is_empty() {
-            decks =
-                s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && Deck::named(&t.name).is_some()).map(|t| (t.id, t.name.as_str())).collect();
-        }
-        let by_place = |i: usize| if i.is_multiple_of(2) { Deck::A } else { Deck::B };
-        let tracks = decks.iter().enumerate().map(|(i, (id, name))| (*id, Deck::named(name).unwrap_or_else(|| by_place(i)))).collect();
+        let tracks = soundcraft_model::deck_letters(s).into_iter().collect();
         let mixed = s.dj.transitions.iter().flat_map(|t| [t.out_clip, t.in_clip]).collect();
         Decks { tracks, mixed }
     }
@@ -106,11 +75,13 @@ pub enum MarkKind {
 }
 
 impl MarkKind {
-    pub const fn colour(self) -> Color32 {
+    /// The marker's colour in the palette of `t` ([`Tokens::dj_marks`]).
+    pub const fn colour(self, t: &Tokens) -> Color32 {
+        let [mix_in, hit, mix_out] = t.dj_marks;
         match self {
-            MarkKind::MixIn => studio::IN,
-            MarkKind::Hit => studio::ACCENT,
-            MarkKind::MixOut => studio::OUT,
+            MarkKind::MixIn => mix_in,
+            MarkKind::Hit => hit,
+            MarkKind::MixOut => mix_out,
         }
     }
 
@@ -122,13 +93,13 @@ impl MarkKind {
         }
     }
 
-    /// Which of several markers on the same spot a click takes: a mix-in (the next transition)
-    /// over a hit over a mix-out (the previous one ending there).
-    const fn rank(self) -> u8 {
-        match self {
-            MarkKind::MixIn => 0,
-            MarkKind::Hit => 1,
-            MarkKind::MixOut => 2,
+    /// Which of several markers on the same spot a click takes, lowest first: right of the flag
+    /// the mix-in (its pennant points right), left of it the mix-out.
+    const fn rank(self, right: bool) -> u8 {
+        match (self, right) {
+            (MarkKind::Hit, _) => 1,
+            (MarkKind::MixIn, true) | (MarkKind::MixOut, false) => 0,
+            (MarkKind::MixIn, false) | (MarkKind::MixOut, true) => 2,
         }
     }
 }
@@ -166,7 +137,7 @@ pub fn marks(s: &Session) -> Vec<Mark> {
                 })
             })
             .collect();
-    v.sort_by_key(|m| (m.at, m.kind.rank(), m.transition));
+    v.sort_by_key(|m| (m.at, m.kind.rank(true), m.transition));
     v
 }
 
@@ -194,19 +165,29 @@ pub fn mark_text(s: &Session, m: &Mark) -> String {
     format!("{} · bar {}\n{what}", m.kind.label(), m.bar)
 }
 
+/// The tooltip over `picked`: its text, then that of every other marker on the same sample
+/// among `marks` (a mix-out on the bar the next mix-in enters).
+pub fn tooltip(s: &Session, marks: &[Mark], picked: &Mark) -> String {
+    let others = marks.iter().filter(|m| m.at == picked.at && *m != picked);
+    std::iter::once(picked).chain(others).map(|m| mark_text(s, m)).collect::<Vec<_>>().join("\n\n")
+}
+
 /// How near (points) the pointer must be to a marker to pick it.
 pub const PICK_PX: f32 = 6.0;
 /// Height of the marker strip at the foot of the rulers.
 pub const FLAG_H: f32 = 9.0;
 
-/// The marker under `x` among `marks` drawn at `xs` (the same order): the nearest within
-/// [`PICK_PX`], a mix-in winning a tie.
+/// The marker under `x` among `marks` drawn at `xs`: the nearest within [`PICK_PX`]; of
+/// markers on the same spot, the mix-in right of the flag and the mix-out left of it.
 pub fn mark_at(marks: &[Mark], xs: impl Fn(&Mark) -> f32, x: f32) -> Option<&Mark> {
     marks
         .iter()
-        .map(|m| ((xs(m) - x).abs(), m))
-        .filter(|(d, _)| *d <= PICK_PX)
-        .min_by(|(da, a), (db, b)| da.round().total_cmp(&db.round()).then(a.kind.rank().cmp(&b.kind.rank())))
+        .map(|m| (xs(m), m))
+        .filter(|(mx, _)| (mx - x).abs() <= PICK_PX)
+        .min_by(|(xa, a), (xb, b)| {
+            let rank = |mx: f32, m: &Mark| m.kind.rank(x >= mx);
+            (xa - x).abs().round().total_cmp(&(xb - x).abs().round()).then(rank(*xa, a).cmp(&rank(*xb, b)))
+        })
         .map(|(_, m)| m)
 }
 
@@ -262,21 +243,23 @@ pub fn draw(app: &mut SoundApp, ui: &mut Ui, tl: Rect) {
     if shown.is_empty() {
         return;
     }
-    let rows: HashMap<u64, [f32; 4]> = app.edit_layout.rows.iter().copied().collect();
+    let t = Tokens::current();
+    let rows = &app.edit_layout.rows;
     let flags = ui.painter().with_clip_rect(strip.expand2(vec2(0.0, 1.0)));
     let lines = ui.painter().with_clip_rect(tl);
-    let halo = Stroke::new(3.0, Color32::from_black_alpha(110));
+    // A halo in the palette's edge colour keeps the thin line readable over any waveform.
+    let halo = Stroke::new(3.0, t.dj_mark_edge.gamma_multiply(0.45));
     for m in shown {
         let x = x_of(&s, tl, m.at).round() + 0.5;
-        let col = m.kind.colour();
+        let col = m.kind.colour(&t);
         for track in [m.out_track, m.in_track] {
-            if let Some(r) = rows.get(&track.0) {
+            if let Some((_, r)) = rows.iter().find(|(id, _)| *id == track.0) {
                 let seg = [pos2(x, r[1].max(tl.min.y)), pos2(x, r[3])];
                 lines.line_segment(seg, halo);
                 lines.line_segment(seg, Stroke::new(1.0, col.gamma_multiply(0.7)));
             }
         }
-        flags.add(flag(m.kind, x, strip));
+        flags.add(flag(m.kind, x, strip, &t));
     }
     // One hover target at a time: the marker under the pointer.
     let Some(p) = ui.input(|i| i.pointer.hover_pos()) else { return };
@@ -287,7 +270,7 @@ pub fn draw(app: &mut SoundApp, ui: &mut Ui, tl: Rect) {
     let x = x_of(&s, tl, m.at);
     let target = Rect::from_min_max(pos2(x - PICK_PX, strip.min.y - 2.0), pos2(x + PICK_PX, strip.max.y + 2.0));
     let resp = ui.interact(target, ui.id().with(("dj_mark", m.transition, m.kind)), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(mark_text(&s, &m));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tooltip(&s, shown, &m));
     if resp.clicked() {
         pick(app, &m);
     }
@@ -295,16 +278,16 @@ pub fn draw(app: &mut SoundApp, ui: &mut Ui, tl: Rect) {
 
 /// A marker's flag at `x`: a pennant pointing into the mix (right) for a mix-in, out of it
 /// (left) for a mix-out, a diamond for the hit; outlined so it reads on any ruler.
-fn flag(kind: MarkKind, x: f32, strip: Rect) -> Shape {
+fn flag(kind: MarkKind, x: f32, strip: Rect, t: &Tokens) -> Shape {
     let (top, bottom) = (strip.min.y + 0.5, strip.max.y - 0.5);
     let mid = (top + bottom) / 2.0;
-    let outline = Stroke::new(1.0, studio::BG);
+    let outline = Stroke::new(1.0, t.dj_mark_edge);
     let pts = match kind {
         MarkKind::MixIn => vec![pos2(x - 1.0, top), pos2(x + 6.0, mid), pos2(x - 1.0, bottom)],
         MarkKind::MixOut => vec![pos2(x + 1.0, top), pos2(x + 1.0, bottom), pos2(x - 6.0, mid)],
         MarkKind::Hit => vec![pos2(x, top), pos2(x + 4.5, mid), pos2(x, bottom), pos2(x - 4.5, mid)],
     };
-    Shape::convex_polygon(pts, kind.colour(), outline)
+    Shape::convex_polygon(pts, kind.colour(t), outline)
 }
 
 #[cfg(test)]
@@ -312,11 +295,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_marker_is_picked_by_the_nearest_flag_and_a_mix_in_wins_a_tie() {
+    fn a_marker_is_picked_by_the_nearest_flag_and_a_tie_by_the_side_of_it() {
         let m = |transition, kind, at| Mark { transition, kind, bar: 0, at, out_track: TrackId(1), in_track: TrackId(2) };
         let marks = [m(1, MarkKind::MixOut, 100), m(2, MarkKind::MixIn, 100), m(2, MarkKind::Hit, 130)];
         let xs = |m: &Mark| m.at as f32;
         assert_eq!(mark_at(&marks, xs, 101.0).map(|m| (m.transition, m.kind)), Some((2, MarkKind::MixIn)));
+        assert_eq!(mark_at(&marks, xs, 100.0).map(|m| m.kind), Some(MarkKind::MixIn), "on the line: the mix-in");
+        assert_eq!(mark_at(&marks, xs, 98.5).map(|m| (m.transition, m.kind)), Some((1, MarkKind::MixOut)));
         assert_eq!(mark_at(&marks, xs, 127.0).map(|m| m.kind), Some(MarkKind::Hit));
         assert_eq!(mark_at(&marks, xs, 115.0), None);
         assert_eq!(mark_at(&[], xs, 0.0), None);

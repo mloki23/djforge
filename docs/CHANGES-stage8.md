@@ -73,17 +73,23 @@ follows changes behaviour you may rely on.
 
 - **The DJ decks' clips carry their deck's colour in djforge Dark**: a 3-point band along the
   clip's top, Deck A cyan (`#26c6da`), Deck B magenta (`#c64fd6`), over the top of the name bar
-  so the clip's own colour stays below it. Tinted are audio clips on a deck track (one a
-  transition mixes, or holding beat-locked clips; failing both, tracks named "Deck A"/"Deck B")
-  that are beat-locked or mixed. A track named "Deck A" or "Deck B" is that deck; other deck
-  tracks take A, B, A… by their place among the decks. Off in Light and SoundCraft Classic;
+  so the clip's own colour stays below it. Tinted are audio clips on a deck track that are
+  beat-locked or mixed. The deck tracks are the tracks the transitions mix; with no transitions,
+  the tracks holding beat-locked clips; failing both, tracks named "Deck A"/"Deck B" (ignoring
+  case and outer spaces). So in an imported set a beat-locked vocal no transition mixes is no
+  deck and isn't tinted. A track named "Deck A" or "Deck B" is that deck; the other decks take
+  the letter no named deck has, or alternate A, B… among themselves when neither or both are
+  named. `prod.new_part` places parts after the same deck tracks: with transitions, a
+  beat-locked track they don't mix no longer counts. Off in Light and SoundCraft Classic;
   Setup › Appearance › "Deck colours" (`ui.deck_colours {"value": true|false|null}`) overrides
   the theme, saved with the UI prefs.
 - **Each transition is marked in the Edit window**: flags at the foot of the rulers and faint
   lines through its two decks' lanes, green at the mix-in (`entry_bar`), yellow at the bass hit
   (`hit_bar`) and red at the mix-out, the bar the outgoing bass is gone by (`gone_bar`: the hit
-  plus `out_bars`). Hovering a flag names the mix ("Out → In · blend · 16-bar build · hit bar
-  33"); clicking it selects the transition (its incoming clip, which the DJ commands act on) and
-  locates there. Where a mix-out and the next mix-in share a bar, a click takes the mix-in.
+  plus `out_bars`). In Light they are a darker green, amber and red, to read on its pale rulers
+  and lanes. Hovering a flag names the mix ("Out → In · blend · 16-bar build · hit bar 33");
+  clicking it selects the transition (its incoming clip, which the DJ commands act on) and
+  locates there. Where a mix-out and the next mix-in share a bar, the side of the flag clicked
+  decides (the mix-in pennant points right, the mix-out's left), and the tooltip names both.
 - **`edit.select` with `clips` and `start`** now keeps the given start (and end) instead of
   selecting the clips' range; clips alone still select their range.

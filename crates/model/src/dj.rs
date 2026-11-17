@@ -1,6 +1,6 @@
 //! DJ arrangement data: the transitions between beat-locked tracks of an imported set.
 
-use crate::{ClipId, Track, TrackId};
+use crate::{ClipId, Session, Track, TrackId, TrackKind};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer};
 use soundcraft_time::Samples;
@@ -209,6 +209,76 @@ impl DjState {
     }
 }
 
+/// A DJ deck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Deck {
+    A,
+    B,
+}
+
+impl Deck {
+    /// The deck a track named "Deck A" / "Deck B" is (as `dj.import_set` names them), ignoring
+    /// case and outer spaces.
+    pub fn named(name: &str) -> Option<Deck> {
+        let n = name.trim();
+        if n.eq_ignore_ascii_case("deck a") {
+            Some(Deck::A)
+        } else if n.eq_ignore_ascii_case("deck b") {
+            Some(Deck::B)
+        } else {
+            None
+        }
+    }
+
+    const fn other(self) -> Deck {
+        match self {
+            Deck::A => Deck::B,
+            Deck::B => Deck::A,
+        }
+    }
+}
+
+/// The DJ deck tracks, in track order: the tracks the transitions mix between; with no
+/// transitions, the audio tracks holding beat-locked clips; failing both, the audio tracks named
+/// "Deck A" / "Deck B" ([`Deck::named`]).
+pub fn deck_tracks(s: &Session) -> Vec<TrackId> {
+    if !s.dj.is_empty() {
+        let mixed: std::collections::HashSet<TrackId> = s.dj.transitions.iter().flat_map(|t| [t.out_track, t.in_track]).collect();
+        return s.tracks.iter().filter(|t| mixed.contains(&t.id)).map(|t| t.id).collect();
+    }
+    let locked: Vec<TrackId> =
+        s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.clips().iter().any(|c| c.warp.is_some())).map(|t| t.id).collect();
+    if !locked.is_empty() {
+        return locked;
+    }
+    s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && Deck::named(&t.name).is_some()).map(|t| t.id).collect()
+}
+
+/// Each deck track ([`deck_tracks`]) with its deck: a track named "Deck A" or "Deck B" is that
+/// deck. The others take the letter no named deck has when exactly one is free; otherwise (no
+/// named decks, or both letters named) they alternate A, B, A… among themselves in track order.
+pub fn deck_letters(s: &Session) -> Vec<(TrackId, Deck)> {
+    let decks: Vec<(TrackId, Option<Deck>)> = deck_tracks(s).into_iter().map(|id| (id, s.track(id).and_then(|t| Deck::named(&t.name)))).collect();
+    let (has_a, has_b) = (decks.iter().any(|d| d.1 == Some(Deck::A)), decks.iter().any(|d| d.1 == Some(Deck::B)));
+    let free = match (has_a, has_b) {
+        (true, false) => Some(Deck::B),
+        (false, true) => Some(Deck::A),
+        _ => None,
+    };
+    let mut next = Deck::A;
+    decks
+        .into_iter()
+        .map(|(id, named)| {
+            let deck = named.or(free).unwrap_or_else(|| {
+                let d = next;
+                next = d.other();
+                d
+            });
+            (id, deck)
+        })
+        .collect()
+}
+
 impl Transition {
     /// Bar the incoming bass hits in full.
     pub fn hit_bar(&self) -> i64 {
@@ -289,6 +359,71 @@ mod tests {
             }),
         };
         (s, t)
+    }
+
+    /// Audio track `name` holding a clip, beat-locked when `locked`.
+    fn deck_track(s: &mut Session, name: &str, locked: bool) -> (TrackId, ClipId) {
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(name));
+        let c = s.new_clip_id();
+        let mut clip = Clip::audio(c, name, SourceId(90), 0, 0, 48_000);
+        if locked {
+            clip.warp = crate::WarpMap::new(vec![0.0, 0.5, 1.0], 0.0);
+        }
+        if let Some(p) = s.track_mut(t).and_then(Track::playlist_mut) {
+            p.clips.push(clip);
+        }
+        (t, c)
+    }
+
+    #[test]
+    fn deck_tracks_are_the_mixed_ones_else_the_beat_locked_else_the_named() {
+        let mut s = Session::default();
+        let (named, _) = deck_track(&mut s, " deck B ", false);
+        assert_eq!(deck_tracks(&s), [named], "the names, failing all else");
+        let (vocal, _) = deck_track(&mut s, "Vocal", true);
+        assert_eq!(deck_tracks(&s), [vocal], "beat-locked clips beat the names");
+        let (left, lc) = deck_track(&mut s, "Left", true);
+        let (right, rc) = deck_track(&mut s, "Right", false);
+        s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Deck A"));
+        let (build_bars, out_bars) = TransitionStyle::Blend.default_bars();
+        s.dj.transitions.push(Transition {
+            id: 1,
+            out_clip: lc,
+            in_clip: rc,
+            out_track: left,
+            in_track: right,
+            entry_bar: 17,
+            style: TransitionStyle::Blend,
+            build_bars,
+            out_bars,
+            nudge_beats: 0.0,
+            nudge_source: NudgeSource::None,
+            suggestion: None,
+            edited: false,
+            stale: false,
+            applied: None,
+        });
+        assert_eq!(deck_tracks(&s), [left, right], "with transitions, only the tracks they mix");
+        assert_eq!(deck_letters(&s), [(left, Deck::A), (right, Deck::B)]);
+        assert!(deck_tracks(&Session::default()).is_empty());
+    }
+
+    #[test]
+    fn named_decks_keep_their_letters_and_the_others_never_take_a_named_one() {
+        let letters = |names: &[&str]| {
+            let mut s = Session::default();
+            for n in names {
+                deck_track(&mut s, n, true);
+            }
+            deck_letters(&s).into_iter().map(|(_, d)| d).collect::<Vec<_>>()
+        };
+        use Deck::{A, B};
+        assert_eq!(letters(&["Deck B", "Deck A"]), [B, A]);
+        assert_eq!(letters(&["One", "Two", "Three"]), [A, B, A]);
+        assert_eq!(letters(&["DECK A", "Vocal", "Pad"]), [A, B, B], "the free letter");
+        assert_eq!(letters(&["Vocal", "Deck B"]), [A, B]);
+        assert_eq!(letters(&["Deck A", "X", "Deck B", "Y"]), [A, A, B, B], "both named: the rest alternate");
+        assert_eq!((Deck::named("Deck C"), Deck::named("Deck A2"), Deck::named("  deck a")), (None, None, Some(A)));
     }
 
     #[test]

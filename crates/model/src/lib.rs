@@ -21,8 +21,8 @@ mod warp;
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint, INSTRUMENT_SLOT};
 pub use clip::{Clip, ClipContent, Fade, FadeShape, STEMS, StemSet};
 pub use dj::{
-    Applied, AppliedFade, AppliedPoint, DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource,
-    NudgeSuggestion, OwnedSpan, Transition, TransitionStyle,
+    Applied, AppliedFade, AppliedPoint, Deck, DjState, MAX_NUDGE_BEATS, MAX_TRANSITION_BAR, MAX_TRANSITION_BARS, MIN_TRANSITION_BARS, NudgeSource,
+    NudgeSuggestion, OwnedSpan, Transition, TransitionStyle, deck_letters, deck_tracks,
 };
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use live::{

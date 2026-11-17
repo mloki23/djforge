@@ -55,7 +55,8 @@ fn transition(
 
 /// A small set laid out as `dj.import_set` lays one out: "Sunrise" on Deck A into "Orbit" on
 /// Deck B (a blend entering on bar 17) into "Lift" back on Deck A (a quick mix on bar 49), the
-/// tempo stepping from 120 to 128 bpm on bar 33; a vocal track and a loose clip besides.
+/// tempo stepping from 120 to 128 bpm on bar 33; a beat-locked vocal no transition mixes and a
+/// loose clip besides.
 struct Set {
     engine: Engine,
     decks: [TrackId; 2],
@@ -132,16 +133,22 @@ fn deck_tints_follow_the_deck_names_else_the_track_order() {
     assert_eq!(tints, [Some(Deck::A), Some(Deck::B), Some(Deck::A)]);
     // A loose (not beat-locked, not mixed) clip on a deck gets none.
     assert_eq!(d.clip(a, find(set.loose).1), None);
-    // The vocal track holds a beat-locked clip, so it counts as a deck: the third, so A.
-    assert_eq!((d.track(set.vocal), d.clip(set.vocal, find(set.vocal_clip).1)), (Some(Deck::A), Some(Deck::A)));
+    // The vocal holds a beat-locked clip, but with transitions only the tracks they mix are decks.
+    assert_eq!((d.track(set.vocal), d.clip(set.vocal, find(set.vocal_clip).1)), (None, None));
 
-    // Named decks keep their letters when reordered; the unnamed one goes by its place.
+    // Named decks keep their letters when reordered.
     let mut s2 = s.clone();
-    s2.tracks.swap(0, 2);
-    let d2 = Decks::of(&s2);
-    assert_eq!((d2.track(a), d2.track(b), d2.track(set.vocal)), (Some(Deck::A), Some(Deck::B), Some(Deck::A)));
     s2.tracks.swap(0, 1);
-    assert_eq!(Decks::of(&s2).track(set.vocal), Some(Deck::B), "second among the decks");
+    let d2 = Decks::of(&s2);
+    assert_eq!((d2.track(a), d2.track(b), d2.track(set.vocal)), (Some(Deck::A), Some(Deck::B), None));
+
+    // Without transitions the beat-locked tracks are the decks: an unnamed one beside a named
+    // Deck A takes B, never A.
+    let mut s5 = s.clone();
+    s5.dj.transitions.clear();
+    s5.tracks.retain(|t| t.id != b);
+    let d5 = Decks::of(&s5);
+    assert_eq!((d5.track(a), d5.track(set.vocal)), (Some(Deck::A), Some(Deck::B)));
 
     // Unnamed decks alternate A, B, A by track order.
     let mut s3 = Session::default();
@@ -233,9 +240,9 @@ impl Rig {
 fn the_edit_window_draws_one_flag_per_marker_and_tints_the_deck_clips() {
     let mut rig = Rig::new(set().engine);
     assert_eq!((rig.flags(studio::IN), rig.flags(studio::ACCENT), rig.flags(studio::OUT)), (2, 2, 2));
-    // Sunrise, Lift and the beat-locked vocal hook are Deck A, Orbit Deck B; the loose clip
-    // (off screen anyway) is not tinted.
-    assert_eq!((rig.rects(studio::DECK_A), rig.rects(studio::DECK_B)), (3, 1));
+    // Sunrise and Lift are Deck A, Orbit Deck B; the beat-locked vocal hook (on no deck) and the
+    // loose clip (off screen anyway) are not tinted.
+    assert_eq!((rig.rects(studio::DECK_A), rig.rects(studio::DECK_B)), (2, 1));
     rig.app.run("ui.deck_colours", json!({"value": false})).unwrap();
     rig.frames(2);
     assert_eq!((rig.rects(studio::DECK_A), rig.rects(studio::DECK_B)), (0, 0), "the toggle turns them off");
@@ -262,4 +269,51 @@ fn clicking_a_marker_selects_its_transition_and_locates_there() {
     rig.click(rig.flag(&out));
     assert_eq!(rig.app.engine.session().edit.selected_clips, [set.clips[1]]);
     assert_eq!(rig.app.position(), out.at);
+}
+
+#[test]
+fn a_mix_out_on_the_next_mix_in_is_picked_by_the_side_of_the_flag() {
+    let mut set = set();
+    // The second mix enters on bar 41, as the first one's bass is gone.
+    if let Some(t) = set.engine.session_mut().dj.transition_mut(2) {
+        t.entry_bar = 41;
+    }
+    let (orbit, lift) = (set.clips[1], set.clips[2]);
+    let s = set.engine.session().clone();
+    let marks = dj_marks::marks(&s);
+    let tie: Vec<&Mark> = marks.iter().filter(|m| m.bar == 41).collect();
+    assert_eq!(tie.iter().map(|m| (m.transition, m.kind)).collect::<Vec<_>>(), [(2, MarkKind::MixIn), (1, MarkKind::MixOut)]);
+    let (mix_in, mix_out) = (*tie[0], *tie[1]);
+    let text = dj_marks::tooltip(&s, &marks, &mix_out);
+    assert!(text.starts_with("Mix-out · bar 41\nSunrise → Orbit"), "{text}");
+    assert!(text.contains("\n\nMix-in · bar 41\nOrbit → Lift"), "the tooltip names both: {text}");
+
+    let mut rig = Rig::new(set.engine);
+    let at = rig.flag(&mix_out);
+    rig.click(pos2(at.x - 3.0, at.y));
+    assert_eq!(rig.app.engine.session().edit.selected_clips, [orbit], "left of the flag: the mix-out of the mix into Orbit");
+    assert_eq!(rig.app.position(), mix_out.at);
+    rig.click(pos2(at.x + 3.0, at.y));
+    assert_eq!(rig.app.engine.session().edit.selected_clips, [lift], "right of it: the mix-in of Lift");
+    assert_eq!(rig.app.position(), mix_in.at);
+}
+
+#[test]
+fn only_the_markers_in_view_of_a_long_set_are_drawn() {
+    let mut engine = Engine::default();
+    let s = engine.session_mut();
+    let decks =
+        [s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Deck A")), s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Deck B"))];
+    let clips: Vec<(ClipId, TrackId)> =
+        (0..26).map(|i| (clip(s, decks[i % 2], &format!("Track {i}"), i as i64 * 16 * BAR, 48 * BAR, true), decks[i % 2])).collect();
+    s.dj.transitions = clips.windows(2).zip(0u64..).map(|(w, i)| transition(i + 1, w[0], w[1], 17 + 16 * i as i64, TransitionStyle::Blend)).collect();
+    assert_eq!(s.dj.transitions.len(), 25);
+    s.edit.zoom.samples_per_px = 2_000.0;
+    let rig = Rig::new(engine);
+    let tl = rect(rig.app.edit_layout.timeline);
+    let s = rig.app.engine.session();
+    let in_view = dj_marks::marks(s).iter().filter(|m| (tl.min.x - 12.0..=tl.max.x + 12.0).contains(&x_of(s, tl, m.at))).count();
+    let drawn = rig.flags(studio::IN) + rig.flags(studio::ACCENT) + rig.flags(studio::OUT);
+    assert!(in_view > 0 && in_view < 75, "{in_view} of 75 in view");
+    assert_eq!(drawn, in_view);
 }

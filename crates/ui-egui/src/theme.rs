@@ -265,6 +265,11 @@ pub struct Tokens {
     pub level_well: [Color32; 2],
     /// The record-enable button while off: its dot, top and bottom.
     pub rec_idle: [Color32; 2],
+    /// DJ transition markers: mix-in, bass hit and mix-out (each 3:1 or more on the rulers and
+    /// the lanes).
+    pub dj_marks: [Color32; 3],
+    /// The outline of a transition marker's flag, and (translucent) the halo along its line.
+    pub dj_mark_edge: Color32,
 }
 
 /// SoundCraft's piano-roll rows, lines and step cells: dark in Light and Classic.
@@ -299,8 +304,8 @@ pub mod studio {
     /// strips and text. Text, dim text and the accent all read on it.
     pub const SELECTED: Color32 = Color32::from_rgb(72, 62, 6);
     /// DJ deck tints: Deck A cyan, Deck B magenta. Both read on [`BG`] (9:1 and 4.9:1) and stay
-    /// clear of the band colours and of in, out and the accent (CIE76 ΔE ≥ 54 from each), so a
-    /// tint never reads as a frequency or a state.
+    /// clear of the band colours and of in, out and the accent (CIE76 ΔE 54 or more from each;
+    /// the tests ask for 50), so a tint never reads as a frequency or a state.
     pub const DECK_A: Color32 = Color32::from_rgb(0x26, 0xc6, 0xda);
     pub const DECK_B: Color32 = Color32::from_rgb(0xc6, 0x4f, 0xd6);
 }
@@ -431,6 +436,8 @@ impl Tokens {
             key_held: ACCENT,
             level_well: [PANEL, LINE],
             rec_idle: [Color32::from_rgb(236, 112, 104), Color32::from_rgb(180, 44, 38)],
+            dj_marks: [IN, ACCENT, OUT],
+            dj_mark_edge: BG,
         }
     };
 
@@ -548,6 +555,9 @@ impl Tokens {
         key_held: Color32::from_rgb(90, 160, 240),
         level_well: [Color32::from_rgb(36, 38, 8), Color32::from_rgb(51, 49, 11)],
         rec_idle: [Color32::from_rgb(218, 112, 106), Color32::from_rgb(176, 76, 72)],
+        // New with djforge (SoundCraft had no DJ markers): djforge Dark's, which read on its greys.
+        dj_marks: [studio::IN, studio::ACCENT, studio::OUT],
+        dj_mark_edge: Color32::from_rgb(10, 10, 10),
     };
 
     pub const LIGHT: Tokens = Tokens {
@@ -667,6 +677,9 @@ impl Tokens {
         key_held: Color32::from_rgb(90, 160, 240),
         level_well: [Color32::from_rgb(36, 38, 8), Color32::from_rgb(51, 49, 11)],
         rec_idle: [Color32::from_rgb(218, 112, 106), Color32::from_rgb(176, 76, 72)],
+        // Darker than djforge Dark's, to read on the pale rulers and lanes: green, amber, red.
+        dj_marks: [Color32::from_rgb(0x1e, 0x7a, 0x2e), Color32::from_rgb(0x7a, 0x5c, 0x00), Color32::from_rgb(0xb3, 0x26, 0x1e)],
+        dj_mark_edge: Color32::WHITE,
     };
 
     pub const fn of(palette: Palette) -> Tokens {
@@ -1161,13 +1174,27 @@ mod tests {
             assert!(contrast(deck, BG) >= 4.5, "{deck:?} on the background: {:.2}", contrast(deck, BG));
             assert!(contrast(deck, Tokens::DARK.panel_bg2) >= 3.0, "{deck:?}");
             for (name, other) in [("low", LOW), ("mid", MID), ("high", HIGH), ("in", IN), ("out", OUT), ("accent", ACCENT)] {
-                assert!(delta_e(deck, other) >= 40.0, "{deck:?} too near {name}: ΔE {:.1}", delta_e(deck, other));
+                assert!(delta_e(deck, other) >= 50.0, "{deck:?} too near {name}: ΔE {:.1}", delta_e(deck, other));
             }
         }
         assert!(delta_e(DECK_A, DECK_B) >= 60.0, "the decks tell apart");
         // An orange Deck B would read as the low band or record red.
         let orange = Color32::from_rgb(0xe0, 0x66, 0x3a);
         assert!(delta_e(orange, LOW) < 40.0 && delta_e(orange, OUT) < 40.0);
+    }
+
+    #[test]
+    fn transition_markers_read_on_every_palettes_rulers_and_lanes() {
+        for p in Palette::ALL {
+            let t = Tokens::of(p);
+            for (kind, c) in ["mix-in", "hit", "mix-out"].into_iter().zip(t.dj_marks) {
+                for (on, bg) in [("ruler", t.ruler_bg), ("lane", t.playlist_bg), ("flag edge", t.dj_mark_edge)] {
+                    assert!(contrast(c, bg) >= 3.0, "{p:?} {kind} on the {on}: {:.2}", contrast(c, bg));
+                }
+            }
+        }
+        assert_eq!(Tokens::DARK.dj_marks, [studio::IN, studio::ACCENT, studio::OUT], "djforge Dark keeps the studio colours");
+        assert_ne!(Tokens::LIGHT.dj_marks, Tokens::DARK.dj_marks);
     }
 
     #[test]

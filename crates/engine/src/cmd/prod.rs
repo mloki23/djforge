@@ -14,7 +14,6 @@ use soundcraft_midi::Key;
 use soundcraft_midi::patterns::{self, AutoParam as Sweep, MAX_BARS, PatternKind, PatternSpec, PatternStyle};
 use soundcraft_model::{AutoParam, ChannelFormat, Clip, Session, TrackKind};
 use soundcraft_time::{Range, Samples};
-use std::collections::HashSet;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -60,23 +59,6 @@ fn numbered_name(s: &Session, base: &str) -> String {
     (1u64..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
-/// The DJ deck tracks: those the set's transitions mix between and audio tracks holding
-/// beat-locked clips; failing both, tracks named "Deck A" / "Deck B" (as `dj.import_set` names
-/// them).
-fn deck_tracks(s: &Session) -> Vec<TrackId> {
-    let mixed: HashSet<TrackId> = s.dj.transitions.iter().flat_map(|t| [t.out_track, t.in_track]).collect();
-    let decks: Vec<TrackId> = s
-        .tracks
-        .iter()
-        .filter(|t| mixed.contains(&t.id) || (t.kind == TrackKind::Audio && t.clips().iter().any(|c| c.warp.is_some())))
-        .map(|t| t.id)
-        .collect();
-    if !decks.is_empty() {
-        return decks;
-    }
-    s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && matches!(t.name.as_str(), "Deck A" | "Deck B")).map(|t| t.id).collect()
-}
-
 /// The outermost folder holding `t` that the session has, or `t` itself when it is in none.
 fn outermost(s: &Session, t: TrackId) -> TrackId {
     let mut root = t;
@@ -96,7 +78,7 @@ fn outermost(s: &Session, t: TrackId) -> TrackId {
 /// tracks outside folders right after that (earlier parts), so parts stack in the order they were
 /// made. With no decks, `None`: the end, before any master.
 fn part_position(s: &Session) -> Option<usize> {
-    let decks = deck_tracks(s);
+    let decks = soundcraft_model::deck_tracks(s);
     let last = s.tracks.iter().rposition(|t| decks.contains(&t.id))?;
     let root = outermost(s, s.tracks.get(last)?.id);
     let at = s.track_index(root)?;

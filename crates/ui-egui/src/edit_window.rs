@@ -847,7 +847,7 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
         if !clip.range().overlaps(&view) {
             continue;
         }
-        draw_clip(app, &painter, &s, track, clip, tl, lane, auto_view.is_some(), dj.decks.clip(track.id, clip));
+        draw_clip(app, &painter, &s, track, clip, ClipPlace { tl, lane, dim: auto_view.is_some(), deck: dj.decks.clip(track.id, clip) });
     }
     draw_live_take(app, &painter, &s, track, tl, lane);
     crate::video_track::draw_lane(app, &painter, &s, track, tl, lane);
@@ -892,7 +892,7 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
         ui.painter().text(pos2(head.min.x + 4.0, head.center().y), Align2::LEFT_CENTER, &pl.name, regular(10.5), t.text_dim);
         let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
         for c in &pl.clips {
-            draw_clip(app, &painter, &s, track, c, tl, lane, false, dj.decks.clip(track.id, c));
+            draw_clip(app, &painter, &s, track, c, ClipPlace { tl, lane, dim: false, deck: dj.decks.clip(track.id, c) });
         }
         let resp = ui.interact(lane, ui.id().with(("pl_lane", track.id.0, i)), Sense::click());
         if resp.clicked()
@@ -1613,19 +1613,19 @@ const BAND_CLIP_STRIP: f32 = 3.0;
 /// How tall the deck-coloured band along the top of a DJ deck's clip is.
 const DECK_BAND: f32 = 3.0;
 
-/// Draws `clip`; `deck` is its DJ deck ([`crate::dj_marks::Decks::clip`]), tinting a band along
-/// its top when deck colours are on.
-fn draw_clip(
-    app: &SoundApp,
-    painter: &egui::Painter,
-    s: &Session,
-    track: &Track,
-    clip: &Clip,
+/// Where and how a clip is drawn: the timeline and lane rectangles, whether it is dimmed (under
+/// an automation view), and its DJ deck ([`crate::dj_marks::Decks::clip`]), which tints a band
+/// along its top when deck colours are on.
+#[derive(Clone, Copy)]
+struct ClipPlace {
     tl: Rect,
     lane: Rect,
     dim: bool,
     deck: Option<crate::dj_marks::Deck>,
-) {
+}
+
+fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, clip: &Clip, place: ClipPlace) {
+    let ClipPlace { tl, lane, dim, deck } = place;
     let x0 = x_of(s, tl, clip.start);
     let x1 = x_of(s, tl, clip.end()).max(x0 + 1.0);
     let r = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
@@ -1742,7 +1742,8 @@ fn draw_clip(
     if let Some(d) = deck
         && deck_h > 0.0
     {
-        let tint = if clip.muted || dim { d.colour().gamma_multiply(0.45) } else { d.colour() };
+        let tint = crate::dj_marks::deck_colour(d);
+        let tint = if clip.muted || dim { tint.gamma_multiply(0.45) } else { tint };
         painter.rect_filled(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + deck_h)), CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, tint);
     }
     // Selection: the body stays dark under the band colours, so an accent outline shows it.
