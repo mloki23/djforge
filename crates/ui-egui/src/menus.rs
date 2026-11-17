@@ -91,6 +91,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("ui.set", "Set UI State", "", None),
     ("ui.theme", "Appearance", "", None),
     ("ui.waveform_bands", "Colour Waveforms by Frequency", "", None),
+    ("ui.deck_colours", "Deck Colours", "", None),
 ];
 
 /// Extra catalog mappings handled by the UI layer.
@@ -746,6 +747,15 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
                 Some(_) => return Some(Err("value: true, false, or null to follow the theme".into())),
             }
             json!({"value": app.waveform_bands(), "follows_theme": app.ui.waveform_bands.is_none()})
+        }
+        "ui.deck_colours" => {
+            match p.get("value") {
+                None => {}
+                Some(Value::Null) => app.ui.deck_colours = None,
+                Some(Value::Bool(on)) => app.ui.deck_colours = Some(*on),
+                Some(_) => return Some(Err("value: true, false, or null to follow the theme".into())),
+            }
+            json!({"value": app.deck_colours(), "follows_theme": app.ui.deck_colours.is_none()})
         }
         "ui.set" => match serde_json::to_value(&app.ui) {
             Ok(mut cur) => {

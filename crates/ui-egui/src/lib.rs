@@ -9,6 +9,7 @@ pub mod bounce;
 pub mod control;
 pub mod credits;
 pub mod dialogs;
+pub mod dj_marks;
 pub mod docking;
 pub mod edit_window;
 pub mod export;
@@ -204,6 +205,9 @@ pub struct UiState {
     /// Colour waveforms by frequency (`ui.waveform_bands`); `None` follows the palette: on in
     /// djforge Dark, off in Light and SoundCraft Classic ([`theme::Palette::colours_waveforms`]).
     pub waveform_bands: Option<bool>,
+    /// Tint the DJ decks' clips with their deck's colour (`ui.deck_colours`); `None` follows the
+    /// palette: on in djforge Dark only ([`theme::Palette::tints_decks`]).
+    pub deck_colours: Option<bool>,
     /// The main window's size (logical points) and maximized state, and the interface scale, as
     /// the desktop app last saw them; it restores them at launch.
     pub window_size: [f32; 2],
@@ -294,6 +298,7 @@ impl Default for UiState {
             midi_mappings_backup: Vec::new(),
             show_midi_mappings: false,
             waveform_bands: None,
+            deck_colours: None,
         }
     }
 }
@@ -611,6 +616,12 @@ impl SoundApp {
     /// palette's default ([`theme::Palette::colours_waveforms`]).
     pub fn waveform_bands(&self) -> bool {
         self.ui.waveform_bands.unwrap_or_else(|| theme::palette().colours_waveforms())
+    }
+
+    /// Whether the DJ decks' clips are tinted: the UI prefs' choice, or the active palette's
+    /// default ([`theme::Palette::tints_decks`]).
+    pub fn deck_colours(&self) -> bool {
+        self.ui.deck_colours.unwrap_or_else(|| theme::palette().tints_decks())
     }
 
     /// Run a command; errors go to the status line. Returns the result.

@@ -68,3 +68,22 @@ follows changes behaviour you may rely on.
   way. They keep about 43 MB per hour of stereo in memory.
 - **In the browser (the wasm build) waveforms stay one colour**: there are no threads to build
   the bands on, and building them on the UI thread would stall it.
+
+## Deck colours and transition markers
+
+- **The DJ decks' clips carry their deck's colour in djforge Dark**: a 3-point band along the
+  clip's top, Deck A cyan (`#26c6da`), Deck B magenta (`#c64fd6`), over the top of the name bar
+  so the clip's own colour stays below it. Tinted are audio clips on a deck track (one a
+  transition mixes, or holding beat-locked clips; failing both, tracks named "Deck A"/"Deck B")
+  that are beat-locked or mixed. A track named "Deck A" or "Deck B" is that deck; other deck
+  tracks take A, B, A… by their place among the decks. Off in Light and SoundCraft Classic;
+  Setup › Appearance › "Deck colours" (`ui.deck_colours {"value": true|false|null}`) overrides
+  the theme, saved with the UI prefs.
+- **Each transition is marked in the Edit window**: flags at the foot of the rulers and faint
+  lines through its two decks' lanes, green at the mix-in (`entry_bar`), yellow at the bass hit
+  (`hit_bar`) and red at the mix-out, the bar the outgoing bass is gone by (`gone_bar`: the hit
+  plus `out_bars`). Hovering a flag names the mix ("Out → In · blend · 16-bar build · hit bar
+  33"); clicking it selects the transition (its incoming clip, which the DJ commands act on) and
+  locates there. Where a mix-out and the next mix-in share a bar, a click takes the mix-in.
+- **`edit.select` with `clips` and `start`** now keeps the given start (and end) instead of
+  selecting the clips' range; clips alone still select their range.

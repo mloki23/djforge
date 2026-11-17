@@ -179,6 +179,12 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
                     app.ui.waveform_bands = Some(bands);
                 }
                 ui.end_row();
+                ui.label("Deck colours");
+                let mut decks = app.deck_colours();
+                if crate::widgets::checkbox(ui, &mut decks, "").changed() {
+                    app.ui.deck_colours = Some(decks);
+                }
+                ui.end_row();
                 ui.label("Auto-update configuration");
                 crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "");
                 ui.end_row();
@@ -187,6 +193,7 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
                 app.extra.ui_scale = 1.0;
                 app.extra.reduce_motion = false;
                 app.ui.waveform_bands = None;
+                app.ui.deck_colours = None;
                 let _ = app.run("ui.theme", json!({"mode": crate::theme::ThemeMode::default().id()}));
             }
         },

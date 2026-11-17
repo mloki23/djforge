@@ -298,6 +298,11 @@ pub mod studio {
     /// djforge Dark's one selection colour, a dark yellow-brown: behind selected rows, headers,
     /// strips and text. Text, dim text and the accent all read on it.
     pub const SELECTED: Color32 = Color32::from_rgb(72, 62, 6);
+    /// DJ deck tints: Deck A cyan, Deck B magenta. Both read on [`BG`] (9:1 and 4.9:1) and stay
+    /// clear of the band colours and of in, out and the accent (CIE76 ΔE ≥ 54 from each), so a
+    /// tint never reads as a frequency or a state.
+    pub const DECK_A: Color32 = Color32::from_rgb(0x26, 0xc6, 0xda);
+    pub const DECK_B: Color32 = Color32::from_rgb(0xc6, 0x4f, 0xd6);
 }
 
 impl Tokens {
@@ -691,6 +696,12 @@ impl Palette {
     /// Whether waveforms are coloured by frequency unless the UI prefs say otherwise: in
     /// djforge Dark only.
     pub const fn colours_waveforms(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    /// Whether the DJ decks' clips are tinted with their deck's colour unless the UI prefs say
+    /// otherwise: in djforge Dark only (Light's clip bodies are pale and Classic is unchanged).
+    pub const fn tints_decks(self) -> bool {
         matches!(self, Self::Dark)
     }
 
@@ -1123,6 +1134,67 @@ mod tests {
         assert!(!app.waveform_bands());
         assert_eq!(app.run("ui.waveform_bands", json!({"value": null})), Ok(json!({"value": true, "follows_theme": true})));
         assert_eq!(app.run("ui.waveform_bands", json!({})), Ok(json!({"value": true, "follows_theme": true})));
+    }
+
+    /// CIE76 colour difference (ΔE*ab, D65) of two opaque colours.
+    fn delta_e(a: Color32, b: Color32) -> f64 {
+        let lab = |c: Color32| {
+            let linear = |channel: u8| {
+                let s = f64::from(channel) / 255.0;
+                if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+            };
+            let (r, g, b) = (linear(c.r()), linear(c.g()), linear(c.b()));
+            let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+            let f = |t: f64| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+            [116.0 * f(y) - 16.0, 500.0 * (f(x) - f(y)), 200.0 * (f(y) - f(z))]
+        };
+        let (a, b) = (lab(a), lab(b));
+        a.iter().zip(&b).map(|(p, q)| (p - q).powi(2)).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn deck_tints_read_on_the_background_and_stay_clear_of_the_band_and_state_colours() {
+        use studio::*;
+        for deck in [DECK_A, DECK_B] {
+            assert!(contrast(deck, BG) >= 4.5, "{deck:?} on the background: {:.2}", contrast(deck, BG));
+            assert!(contrast(deck, Tokens::DARK.panel_bg2) >= 3.0, "{deck:?}");
+            for (name, other) in [("low", LOW), ("mid", MID), ("high", HIGH), ("in", IN), ("out", OUT), ("accent", ACCENT)] {
+                assert!(delta_e(deck, other) >= 40.0, "{deck:?} too near {name}: ΔE {:.1}", delta_e(deck, other));
+            }
+        }
+        assert!(delta_e(DECK_A, DECK_B) >= 60.0, "the decks tell apart");
+        // An orange Deck B would read as the low band or record red.
+        let orange = Color32::from_rgb(0xe0, 0x66, 0x3a);
+        assert!(delta_e(orange, LOW) < 40.0 && delta_e(orange, OUT) < 40.0);
+    }
+
+    #[test]
+    fn deck_colours_are_on_in_djforge_dark_unless_the_prefs_say_otherwise() {
+        let _palette = lock_test_palette();
+        let _restore = RestorePalette(palette());
+        assert_eq!(Palette::ALL.map(Palette::tints_decks), [true, false, false]);
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        assert_eq!(app.ui.deck_colours, None);
+        let ctx = egui::Context::default();
+        for (p, on) in [(Palette::Dark, true), (Palette::Light, false), (Palette::Classic, false)] {
+            apply_palette(&ctx, p);
+            assert_eq!(app.deck_colours(), on, "{p:?}");
+        }
+        assert_eq!(app.run("ui.deck_colours", json!({"value": true})), Ok(json!({"value": true, "follows_theme": false})));
+        assert!(app.deck_colours(), "the choice beats Classic's default");
+        assert!(app.run("ui.deck_colours", json!({"value": 1})).is_err());
+        // Saved with the UI prefs; an old prefs file follows the theme.
+        let back: UiState = serde_json::from_value(serde_json::to_value(&app.ui).unwrap_or_default()).unwrap_or_default();
+        assert_eq!(back.deck_colours, Some(true));
+        let old: UiState = serde_json::from_value(json!({"theme": "classic", "waveform_bands": true})).unwrap_or_default();
+        assert_eq!(old.deck_colours, None);
+        apply_palette(&ctx, Palette::Dark);
+        assert_eq!(app.run("ui.deck_colours", json!({"value": false})), Ok(json!({"value": false, "follows_theme": false})));
+        assert!(!app.deck_colours());
+        assert_eq!(app.run("ui.deck_colours", json!({"value": null})), Ok(json!({"value": true, "follows_theme": true})));
+        assert_eq!(app.run("ui.deck_colours", json!({})), Ok(json!({"value": true, "follows_theme": true})));
     }
 
     #[test]

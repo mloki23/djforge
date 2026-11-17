@@ -622,6 +622,9 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         "ui.waveform_bands" => {
             "{value?: bool | null} — colour audio waveforms by frequency (lows red, mids green, highs blue); null follows the theme (on in djforge Dark only); saved with the UI prefs; reports {value, follows_theme}"
         }
+        "ui.deck_colours" => {
+            "{value?: bool | null} — tint the DJ decks' beat-locked clips with their deck's colour (Deck A cyan, Deck B magenta, a strip along the clip's top); null follows the theme (on in djforge Dark only); saved with the UI prefs; reports {value, follows_theme}"
+        }
         "midi.move_settings" => {
             "{raw_name, backend_id (an enabled input's, not listed), to (a listed port's name)} — the enabled input and its mappings move to that port (a device on another USB port, when several ports have its name)"
         }

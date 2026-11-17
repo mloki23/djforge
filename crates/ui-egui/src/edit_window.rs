@@ -269,6 +269,7 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
             let _ = app.run("edit.select_none", json!({}));
         }
     }
+    crate::dj_marks::draw(app, ui, tl);
     overlay(app, ui, tl, Rect::from_min_max(pos2(tl.min.x, rulers_rect.min.y), tl.max));
     let _ = header;
     // Horizontal scrollbar.
@@ -841,11 +842,12 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
     }
     let view = Range::new(sample_at(&s, tl, tl.min.x), sample_at(&s, tl, tl.max.x));
     let auto_view = AutoParam::parse(&track.view);
+    let dj = crate::dj_marks::view(ui.ctx(), &s, app.engine.revision);
     for clip in track.clips() {
         if !clip.range().overlaps(&view) {
             continue;
         }
-        draw_clip(app, &painter, &s, track, clip, tl, lane, auto_view.is_some());
+        draw_clip(app, &painter, &s, track, clip, tl, lane, auto_view.is_some(), dj.decks.clip(track.id, clip));
     }
     draw_live_take(app, &painter, &s, track, tl, lane);
     crate::video_track::draw_lane(app, &painter, &s, track, tl, lane);
@@ -878,6 +880,7 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
 fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, main_h: f32, tl: Rect) {
     let t = Tokens::current();
     let s = app.engine.session_arc();
+    let dj = crate::dj_marks::view(ui.ctx(), &s, app.engine.revision);
     let mut y = row.min.y + main_h;
     for (i, pl) in track.playlists.iter().enumerate() {
         if i == track.active_playlist {
@@ -889,7 +892,7 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
         ui.painter().text(pos2(head.min.x + 4.0, head.center().y), Align2::LEFT_CENTER, &pl.name, regular(10.5), t.text_dim);
         let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
         for c in &pl.clips {
-            draw_clip(app, &painter, &s, track, c, tl, lane, false);
+            draw_clip(app, &painter, &s, track, c, tl, lane, false, dj.decks.clip(track.id, c));
         }
         let resp = ui.interact(lane, ui.id().with(("pl_lane", track.id.0, i)), Sense::click());
         if resp.clicked()
@@ -1607,8 +1610,22 @@ fn grid_veil(line: Color32, bg: Color32) -> Color32 {
 /// How tall the clip-coloured strip over the top of a clip coloured by frequency is, when its
 /// name is hidden.
 const BAND_CLIP_STRIP: f32 = 3.0;
+/// How tall the deck-coloured band along the top of a DJ deck's clip is.
+const DECK_BAND: f32 = 3.0;
 
-fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, clip: &Clip, tl: Rect, lane: Rect, dim: bool) {
+/// Draws `clip`; `deck` is its DJ deck ([`crate::dj_marks::Decks::clip`]), tinting a band along
+/// its top when deck colours are on.
+fn draw_clip(
+    app: &SoundApp,
+    painter: &egui::Painter,
+    s: &Session,
+    track: &Track,
+    clip: &Clip,
+    tl: Rect,
+    lane: Rect,
+    dim: bool,
+    deck: Option<crate::dj_marks::Deck>,
+) {
     let x0 = x_of(s, tl, clip.start);
     let x1 = x_of(s, tl, clip.end()).max(x0 + 1.0);
     let r = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
@@ -1710,10 +1727,23 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             }
         }
     }
+    // The deck tint: a band along the clip's very top, over the name bar's top edge (or above
+    // the clip-coloured strip), so the clip's own colour stays below it.
+    let deck_h = match deck {
+        Some(_) if app.deck_colours() => DECK_BAND.min(r.height() * 0.2),
+        _ => 0.0,
+    };
     if by_frequency && name_h <= 0.0 {
         // Over the waveform's top edge, which leaves the body (and the fades drawn on it) as it is.
-        let strip = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + BAND_CLIP_STRIP.min(r.height() * 0.25)));
+        let top = r.min.y + deck_h;
+        let strip = Rect::from_min_max(pos2(r.min.x, top), pos2(r.max.x, top + BAND_CLIP_STRIP.min(r.height() * 0.25)));
         painter.rect_filled(strip, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, bar);
+    }
+    if let Some(d) = deck
+        && deck_h > 0.0
+    {
+        let tint = if clip.muted || dim { d.colour().gamma_multiply(0.45) } else { d.colour() };
+        painter.rect_filled(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + deck_h)), CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, tint);
     }
     // Selection: the body stays dark under the band colours, so an accent outline shows it.
     if let Some(outline) = banded.and_then(|b| b.outline) {

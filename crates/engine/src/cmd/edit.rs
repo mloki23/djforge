@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             repeat_to_fill
         ),
         cmd!(noundo "edit.select_all", "Select All", ["Edit"], Some("Cmd+A"), "{}", always, select_all),
-        cmd!(noundo "edit.select", "Set Edit Selection", [], None, "{tracks?: [id|name], start?, end?, clips?: [id], sources?: [id] (Clip List files), exact?: bool (ignore edit groups)}", always, select),
+        cmd!(noundo "edit.select", "Set Edit Selection", [], None, "{tracks?: [id|name], start?, end?, clips?: [id] (with their tracks, and their range unless start is given), sources?: [id] (Clip List files), exact?: bool (ignore edit groups)}", always, select),
         cmd!(noundo "edit.select_none", "Deselect All", [], None, "{}", always, |e, _| {
             let s = e.session_mut();
             s.edit.selected_tracks.clear();
@@ -481,7 +481,8 @@ fn select(e: &mut Engine, p: &Value) -> Result<Value> {
         _ => {}
     }
     if let Some(c) = clips {
-        // Selecting clips also selects their range and tracks (Grabber click).
+        // Selecting clips also selects their tracks and, unless `start` is given, their range
+        // (Grabber click).
         let mut range: Option<soundcraft_time::Range> = None;
         let mut trs = Vec::new();
         for id in &c {
@@ -493,7 +494,9 @@ fn select(e: &mut Engine, p: &Value) -> Result<Value> {
             }
         }
         if let Some(r) = range {
-            ed.selection = r;
+            if st.is_none() {
+                ed.selection = r;
+            }
             ed.selected_tracks = trs;
         }
         ed.selected_clips = c;
@@ -1093,6 +1096,26 @@ mod tests {
         assert_eq!(e.revision, rev);
         e.execute("edit.select", &json!({"tracks": [ids[0]], "start": 100, "end": 300})).unwrap();
         assert_ne!(e.revision, rev);
+    }
+
+    #[test]
+    fn selecting_clips_selects_their_range_unless_a_start_is_given() {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("A"));
+        let c = e.session_mut().new_clip_id();
+        if let Some(p) = e.session_mut().track_mut(t).and_then(soundcraft_model::Track::playlist_mut) {
+            p.clips.push(Clip::audio(c, "c", soundcraft_model::SourceId(1), 0, 1000, 5000));
+        }
+        e.execute("edit.select", &json!({"clips": [c.0]})).unwrap();
+        let ed = &e.session().edit;
+        assert_eq!((ed.selection, ed.selected_tracks.as_slice()), (soundcraft_time::Range::new(1000, 6000), &[t][..]));
+        // A clip picked with a point to work from (a transition marker) keeps the point.
+        e.execute("edit.select", &json!({"clips": [c.0], "start": 2500})).unwrap();
+        let ed = &e.session().edit;
+        assert_eq!(
+            (ed.selection, ed.selected_clips.as_slice(), ed.selected_tracks.as_slice()),
+            (soundcraft_time::Range::point(2500), &[c][..], &[t][..])
+        );
     }
 
     fn keys() -> (Engine, TrackId, impl Fn(i64) -> i64) {
