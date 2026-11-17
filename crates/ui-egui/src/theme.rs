@@ -273,6 +273,12 @@ pub struct Tokens {
     pub dj_marks: [Color32; 3],
     /// The outline of a transition marker's flag, and (translucent) the halo along its line.
     pub dj_mark_edge: Color32,
+    /// The triangle marking a tempo change on the tempo ruler.
+    pub tempo_mark: Color32,
+    /// A tempo change's label on the tempo ruler (drawn on [`Tokens::tempo_ruler`]).
+    pub tempo_label: Color32,
+    /// A clip's name in its name bar, drawn on the clip's (or its DJ deck's) colour.
+    pub clip_name_text: Color32,
 }
 
 /// SoundCraft's piano-roll rows, lines and step cells: dark in Light and Classic.
@@ -442,6 +448,9 @@ impl Tokens {
             rec_idle: [Color32::from_rgb(236, 112, 104), Color32::from_rgb(180, 44, 38)],
             dj_marks: [IN, ACCENT, OUT],
             dj_mark_edge: BG,
+            tempo_mark: Color32::from_rgb(220, 60, 50),
+            tempo_label: Color32::from_rgb(230, 240, 230),
+            clip_name_text: Color32::from_rgb(12, 12, 12),
         }
     };
 
@@ -563,6 +572,10 @@ impl Tokens {
         // New with djforge (SoundCraft had no DJ markers): djforge Dark's, which read on its greys.
         dj_marks: [studio::IN, studio::ACCENT, studio::OUT],
         dj_mark_edge: Color32::from_rgb(10, 10, 10),
+        // SoundCraft's, unchanged.
+        tempo_mark: Color32::from_rgb(220, 60, 50),
+        tempo_label: Color32::from_rgb(230, 240, 230),
+        clip_name_text: Color32::from_rgb(12, 12, 12),
     };
 
     pub const LIGHT: Tokens = Tokens {
@@ -686,6 +699,11 @@ impl Tokens {
         // Darker than djforge Dark's, to read on the pale rulers and lanes: green, amber, red.
         dj_marks: [Color32::from_rgb(0x1e, 0x7a, 0x2e), Color32::from_rgb(0x7a, 0x5c, 0x00), Color32::from_rgb(0xb3, 0x26, 0x1e)],
         dj_mark_edge: Color32::WHITE,
+        tempo_mark: Color32::from_rgb(220, 60, 50),
+        // Dark on Light's pale green tempo ruler (4.5:1 or more), where the near-white label
+        // read at under 3:1.
+        tempo_label: Color32::from_rgb(10, 30, 16),
+        clip_name_text: Color32::from_rgb(12, 12, 12),
     };
 
     pub const fn of(palette: Palette) -> Tokens {
@@ -1296,6 +1314,14 @@ mod tests {
     }
 
     #[test]
+    fn classic_keeps_soundcrafts_ruler_and_clip_name_colours() {
+        let t = Tokens::CLASSIC;
+        assert_eq!(t.tempo_mark, Color32::from_rgb(220, 60, 50));
+        assert_eq!(t.tempo_label, Color32::from_rgb(230, 240, 230));
+        assert_eq!(t.clip_name_text, Color32::from_rgb(12, 12, 12));
+    }
+
+    #[test]
     fn text_is_readable_in_every_palette() {
         let mut failures = Vec::new();
         for palette in Palette::ALL {
@@ -1350,6 +1376,13 @@ mod tests {
                 ("marker text on the marker ruler".into(), t.marker_text, t.marker_ruler, 4.5),
                 ("clip-gain readout".into(), t.counter_text, t.popup_bg, 4.5),
             ]);
+            // Tempo labels on the tempo ruler. SoundCraft Classic keeps its 4.1:1 near-white on
+            // green (bold), as its look is preserved byte for byte.
+            pairs.push(("tempo label".into(), t.tempo_label, t.tempo_ruler, if palette == Palette::Classic { 3.0 } else { 4.5 }));
+            // A clip's name on its DJ deck's colour (the name bar takes it with deck colours on).
+            for deck in [crate::dj_marks::Deck::A, crate::dj_marks::Deck::B] {
+                pairs.push((format!("clip name on deck {deck:?}"), t.clip_name_text, crate::dj_marks::deck_colour(deck), 4.5));
+            }
             // Selected rows (menus, lists, egui's selection): selected text, body and dim text.
             pairs.push(("dim text on selected row".into(), t.text_dim, t.row_selected, 3.0));
             if palette == Palette::Dark {

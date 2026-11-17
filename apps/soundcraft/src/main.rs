@@ -157,8 +157,7 @@ fn migrate_settings() -> Option<String> {
                 );
             }
             if !kept.is_empty() {
-                let names: Vec<_> = kept.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
-                return Some(format!("SoundCraft's {} couldn't be read earlier; {APP_NAME} kept its own settings.", names.join(", ")));
+                return Some(kept_note(&kept, &old, &new));
             }
             if !abandoned.is_empty() {
                 return Some(format!(
@@ -180,11 +179,30 @@ fn migrate_settings() -> Option<String> {
     }
 }
 
+/// The status note for SoundCraft settings files that couldn't be read at first and that djforge
+/// has since saved its own of, so it kept its own. It names the SoundCraft files in full and says
+/// how to bring them over by hand; SoundCraft's `ui.json` holds the MIDI mappings and devices.
+fn kept_note(kept: &[std::path::PathBuf], old: &std::path::Path, new: &std::path::Path) -> String {
+    let names: Vec<String> = kept.iter().map(|f| f.display().to_string()).collect();
+    let ui = old.join("ui.json");
+    let how = if kept.contains(&ui) {
+        format!(
+            "To bring back your SoundCraft MIDI mappings and devices, close {APP_NAME} and copy {} over {} by hand.",
+            ui.display(),
+            new.join("ui.json").display()
+        )
+    } else {
+        format!("To use SoundCraft's instead, close {APP_NAME} and copy them into {} by hand.", new.display())
+    };
+    format!("SoundCraft's {} couldn't be read earlier, and {APP_NAME} has saved its own since, so it kept its own settings. {how}", names.join(", "))
+}
+
 fn prefs_path() -> Option<std::path::PathBuf> {
     config_dir().map(|b| b.join("ui.json"))
 }
 
-/// Runs without preferences (`SOUNDCRAFT_NO_PREFS`, agents' test runs) neither read nor write them.
+/// Runs without preferences (`SOUNDCRAFT_NO_PREFS`, agents' test runs) neither read nor write them,
+/// and keep out of the settings folder entirely: no migration, autosave, Presets or log file.
 fn prefs_enabled() -> bool {
     std::env::var_os("SOUNDCRAFT_NO_PREFS").is_none()
 }
@@ -389,7 +407,20 @@ fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::{set_title, window_title};
+    use super::{kept_note, set_title, window_title};
+    use std::path::Path;
+
+    #[test]
+    fn the_kept_settings_note_says_how_to_copy_soundcrafts_by_hand() {
+        let (old, new) = (Path::new("C:/Users/a/AppData/Roaming/SoundCraft"), Path::new("C:/Users/a/AppData/Roaming/djforge"));
+        let note = kept_note(&[old.join("ui.json")], old, new);
+        assert!(note.contains(&old.join("ui.json").display().to_string()), "{note}");
+        assert!(note.contains(&new.join("ui.json").display().to_string()), "{note}");
+        assert!(note.contains("close djforge") && note.contains("MIDI mappings and devices"), "{note}");
+        let other = kept_note(&[old.join("keys.json")], old, new);
+        assert!(other.contains(&old.join("keys.json").display().to_string()) && other.contains("close djforge"), "{other}");
+        assert!(!other.contains("MIDI"), "{other}");
+    }
 
     #[test]
     fn the_title_names_the_session_then_djforge() {

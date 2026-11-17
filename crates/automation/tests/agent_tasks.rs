@@ -37,6 +37,22 @@ fn handshake_and_tool_list() {
 }
 
 #[test]
+fn resources_answer_to_djforge_and_soundcraft_uris() {
+    let mut s = Server::new(Headless::new(Engine::default()));
+    let r = rpc(&mut s, 1, "resources/list", json!({}));
+    let uris: Vec<&str> = r["result"]["resources"].as_array().unwrap().iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert_eq!(uris, ["djforge://session", "djforge://commands"]);
+    for (id, uri) in (2..).zip(["djforge://session", "soundcraft://session", "djforge://commands", "soundcraft://commands"]) {
+        let r = rpc(&mut s, id, "resources/read", json!({"uri": uri}));
+        let content = &r["result"]["contents"][0];
+        assert_eq!(content["uri"], uri, "{r}");
+        assert!(serde_json::from_str::<Value>(content["text"].as_str().unwrap()).is_ok(), "{uri}: {r}");
+    }
+    let r = rpc(&mut s, 9, "resources/read", json!({"uri": "djforge://nope"}));
+    assert_eq!(r["error"]["code"], -32002);
+}
+
+#[test]
 fn agent_builds_and_mixes_a_session() {
     let mut s = Server::new(Headless::new(Engine::default()));
     // 1. New demo session.

@@ -221,16 +221,18 @@ impl<B: Backend> Server<B> {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(self.call_tool(name, &args))
             }
+            // djforge's own URIs; `soundcraft://` ones still read the same, for clients written
+            // against SoundCraft.
             "resources/list" => Ok(json!({"resources": [
-                {"uri": "soundcraft://session", "name": "Session", "mimeType": "application/json", "description": "The open session as JSON"},
-                {"uri": "soundcraft://commands", "name": "Commands", "mimeType": "application/json", "description": "All commands"},
+                {"uri": "djforge://session", "name": "Session", "mimeType": "application/json", "description": "The open session as JSON"},
+                {"uri": "djforge://commands", "name": "Commands", "mimeType": "application/json", "description": "All commands"},
             ]})),
             "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
                 let r = match uri {
-                    "soundcraft://session" => self.backend.call("session.inspect", json!({"detail": "full"})),
-                    "soundcraft://commands" => self.backend.call("engine.commands", json!({})),
+                    "djforge://session" | "soundcraft://session" => self.backend.call("session.inspect", json!({"detail": "full"})),
+                    "djforge://commands" | "soundcraft://commands" => self.backend.call("engine.commands", json!({})),
                     _ => Err(format!("unknown resource {uri}")),
                 };
                 match r {

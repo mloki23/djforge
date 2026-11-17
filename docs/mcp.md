@@ -98,7 +98,10 @@ files it was given rather than guarding against other software on the computer.
 | `parity` | Feature-parity report. |
 | `screenshot`, `ui_inspect`, `ui_set`, `menu_invoke`, `click`, `drag`, `key` | App only (with `--connect`). |
 
-Resources: `soundcraft://session` (full session JSON), `soundcraft://commands`.
+Resources: `djforge://session` (full session JSON), `djforge://commands`. SoundCraft's
+`soundcraft://session` and `soundcraft://commands` still read the same resources, so clients
+written against SoundCraft keep working; `resources/list` names only the `djforge://` ones, and a
+read answers with the URI it was asked for.
 
 ## Conventions
 

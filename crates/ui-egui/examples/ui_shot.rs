@@ -25,7 +25,7 @@ fn system_theme(value: &str) -> Option<Option<egui::Theme>> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let out = args.first().cloned().unwrap_or_else(|| "soundcraft.png".into());
+    let out = args.first().cloned().unwrap_or_else(|| "djforge.png".into());
     let script = args.get(1).filter(|a| !a.starts_with("--")).cloned();
     let blank = args.iter().any(|a| a == "--blank");
     let appearance = if let Some(i) = args.iter().position(|a| a == "--system-theme") {

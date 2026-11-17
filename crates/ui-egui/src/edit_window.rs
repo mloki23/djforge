@@ -544,13 +544,13 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                 for &x in &xs {
                     painter.add(Shape::convex_polygon(
                         vec![pos2(x, row.min.y + 3.0), pos2(x + 7.0, row.center().y), pos2(x, row.max.y - 3.0)],
-                        Color32::from_rgb(220, 60, 50),
+                        t.tempo_mark,
                         Stroke::NONE,
                     ));
                 }
                 // Labels go after their triangle, on the ruler's colour so a later triangle never
                 // cuts into one, and only where they clear the previous label.
-                let label_color = Color32::from_rgb(230, 240, 230);
+                let label_color = t.tempo_label;
                 let galleys: Vec<_> = s
                     .tempo
                     .tempos()
@@ -1702,7 +1702,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             Align2::LEFT_CENTER,
             &clip.name,
             bold(10.5),
-            Color32::from_rgb(12, 12, 12),
+            Tokens::current().clip_name_text,
             name_clip.max.x - left - 2.0,
         );
     }
@@ -1767,8 +1767,10 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             }
         }
     }
-    // The deck tint: a band along the clip's very top, over the name bar's top edge (or above
-    // the clip-coloured strip), so the clip's own colour stays below it.
+    // The deck tint where the name bar didn't take it (names hidden, or a muted or dimmed clip,
+    // whose band is faded): a band along the clip's very top, over the name bar's top edge or
+    // above the clip-coloured strip. With the name bar tinted, the clip's own colour shows only
+    // in the body's tint.
     let deck_h = match deck_tint {
         Some(_) if tinted_bar.is_none() => DECK_BAND.min(r.height() * 0.2),
         _ => 0.0,

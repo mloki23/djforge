@@ -336,14 +336,25 @@ fn take_sources(v: &mut serde_json::Value, base: &Path) -> Option<Vec<(PathBuf, 
         .collect()
 }
 
-/// `a` and `b` name the same file, or files of the same bytes.
+/// The largest audio file [`same_audio`] reads through to compare with another. A larger copy
+/// (a long take) counts as different, which keeps its autosave folder (the safe direction)
+/// instead of stalling the start reading gigabytes.
+const SAME_AUDIO_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// `a` and `b` name the same file, or files of the same bytes (copies of at most
+/// [`SAME_AUDIO_MAX_BYTES`]).
 fn same_audio(a: &Path, b: &Path) -> bool {
+    same_audio_within(a, b, SAME_AUDIO_MAX_BYTES)
+}
+
+/// [`same_audio`], reading through copies of at most `max_bytes` only.
+fn same_audio_within(a: &Path, b: &Path, max_bytes: u64) -> bool {
     if a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b)) {
         return true;
     }
     let open = |p: &Path| std::fs::File::open(p).and_then(|f| Ok((f.metadata()?.len(), f)));
     let (Ok((a_len, a)), Ok((b_len, b))) = (open(a), open(b)) else { return false };
-    if a_len != b_len {
+    if a_len != b_len || a_len > max_bytes {
         return false;
     }
     let (mut a, mut b) = (std::io::BufReader::new(a), std::io::BufReader::new(b));
@@ -539,6 +550,23 @@ mod tests {
     use serde_json::json;
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{ChannelFormat, Clip, TrackKind};
+
+    #[test]
+    fn copies_over_the_size_cap_count_as_different_audio() {
+        let dir = folder("same-audio-cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        std::fs::write(&a, [7u8; 4096]).unwrap();
+        std::fs::write(&b, [7u8; 4096]).unwrap();
+        assert!(same_audio_within(&a, &b, 4096), "equal copies within the cap");
+        assert!(!same_audio_within(&a, &b, 4095), "a copy over the cap is never read through");
+        // One file is the same file whatever its size: no bytes are read.
+        assert!(same_audio_within(&a, &a, 0));
+        std::fs::write(&b, [8u8; 4096]).unwrap();
+        assert!(!same_audio_within(&a, &b, 4096));
+        const { assert!(SAME_AUDIO_MAX_BYTES >= 100 * 1024 * 1024) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("soundcraft-{name}-{}", std::process::id()));
