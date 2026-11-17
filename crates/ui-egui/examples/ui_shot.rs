@@ -1,9 +1,11 @@
 //! Render the real UI offscreen (no window, no focus stealing) and save PNGs.
 //!
-//! `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl] [--blank] [--size WxH] [--system-theme light|dark|none]`
+//! `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl] [--blank] [--size WxH] [--system-theme light|dark|none] [--fake-midi NAME,NAME]`
 //!
-//! Script lines are control requests (`{"method": "...", "params": {...}}`), `{"shot": "path.png"}`
-//! or `{"steps": n}`. `{"system_theme": "light"}` (also `"dark"` or `"none"`) changes the
+//! Script lines are control requests (`{"method": "...", "params": {...}}`), `{"shot": "path.png"}`,
+//! `{"steps": n}` or `{"wait_bands": seconds}` (steps frames until every source's frequency bands
+//! are built, so waveforms are coloured, or the time runs out; at once when the colours are off). `--fake-midi` plugs simulated MIDI
+//! input devices with those names in (a `FakeSource`; no real MIDI ports are opened). `{"system_theme": "light"}` (also `"dark"` or `"none"`) changes the
 //! simulated OS appearance for subsequent frames. The demo session is loaded unless `--blank`.
 
 use soundcraft_ui_egui::{ControlRequest, Services, SoundApp};
@@ -44,7 +46,18 @@ fn main() {
         .unwrap_or((1600.0, 1000.0));
     let engine = if blank { soundcraft_engine::Engine::default() } else { soundcraft_engine::demo::demo_engine() };
     let (tx, rx) = mpsc::channel::<ControlRequest>();
-    let app = SoundApp::new(engine, None, Services::default()).with_control(rx);
+    let mut app = SoundApp::new(engine, None, Services::default()).with_control(rx);
+    if let Some(names) = args.iter().position(|a| a == "--fake-midi").and_then(|i| args.get(i + 1)) {
+        match soundcraft_midi_io::FakeSource::new(soundcraft_midi_io::MidiClock::new()) {
+            Ok(mut src) => {
+                for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                    src.plug(name);
+                }
+                app.midi_host = Some(soundcraft_ui_egui::midi_input::MidiHost::new(Box::new(src)));
+            }
+            Err(e) => eprintln!("--fake-midi: {e}"),
+        }
+    }
     let mut harness =
         egui_kittest::Harness::builder().with_size(egui::vec2(w, h)).with_pixels_per_point(2.0).with_max_steps(1_000_000).wgpu().build_ui_state(
             |ui, app: &mut SoundApp| {
@@ -97,6 +110,22 @@ fn main() {
                     step(&mut harness);
                 }
                 shoot(&mut harness, p);
+                continue;
+            }
+            if let Some(secs) = v.get("wait_bands").and_then(|x| x.as_f64()) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs.max(0.0));
+                let ready = |h: &egui_kittest::Harness<SoundApp>| {
+                    !h.state().waveform_bands() || h.state().engine.session().pool.audio().all(|a| a.bands_ready())
+                };
+                while !ready(&harness) && std::time::Instant::now() < deadline {
+                    step(&mut harness);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let (done, all) = {
+                    let pool = &harness.state().engine.session().pool;
+                    (pool.audio().filter(|a| a.bands_ready()).count(), pool.audio().count())
+                };
+                println!("bands ready: {done}/{all} (colours {})", if harness.state().waveform_bands() { "on" } else { "off" });
                 continue;
             }
             if let Some(n) = v.get("steps").and_then(|x| x.as_u64()) {
