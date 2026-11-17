@@ -32,9 +32,9 @@
 > `djforge-cli`.
 
 <p align="center">
-  <img alt="The Edit window with a nine-track session: drums, bass, pad, keys and lead, a reverb aux and a master fader" src="docs/images/edit.png" width="100%">
+  <img alt="The Edit window in djforge Dark: Deck A and Deck B with frequency-coloured waveforms, deck-coloured name bars, the tempo ruler and a transition's bass-hit flag with its tooltip" src="docs/images/edit.png" width="100%">
   <br>
-  <sub>The Edit window: tracks, waveforms, MIDI, rulers, markers and the transport, playing the built-in demo song (every sound in it is synthesised by the app itself).</sub>
+  <sub>The Edit window in djforge Dark: two decks mid-transition, waveforms coloured by frequency, and the transition's flags on the rulers.</sub>
 </p>
 
 <p align="center">
@@ -57,32 +57,20 @@ where things are.
 
 <table>
   <tr>
-    <td width="50%"><img alt="The Mix window with channel strips, inserts, sends, I/O, pan knobs, faders and meters, and an EQ plugin window" src="docs/images/mix.png"></td>
-    <td width="50%"><img alt="The MIDI editor showing a lead melody as a piano roll with a velocity lane" src="docs/images/midi.png"></td>
+    <td width="35%"><img alt="The Mix window in djforge Dark: Deck A, Deck B and Master 1 strips with inserts, sends, I/O, pan knobs, faders and meters" src="docs/images/mix.png"></td>
+    <td width="65%"><img alt="The Session view window over the Edit window: four Live columns of clip slots with scene and stop buttons" src="docs/images/session-view.png"></td>
   </tr>
   <tr>
     <td><b>Mix window.</b> Ten inserts and ten sends per track, busses and aux inputs, master faders, VCAs, routing folders, solo-in-place with implicit solo, and meters with peak hold.</td>
+    <td><b>Session view.</b> Clip slots to jam with beside the arrangement: launch clips and scenes on a quantised beat, stop a column or everything, from the mouse or the keyboard.</td>
+  </tr>
+  <tr>
     <td><b>MIDI editor.</b> Instrument tracks with built-in synths, a piano roll with a velocity lane, step input, quantize, transpose, and Standard MIDI File import and export.</td>
-  </tr>
-  <tr>
-    <td width="50%"><img alt="Volume automation drawn on the Pad track, with the Memory Locations and Big Counter windows open" src="docs/images/automation.png"></td>
-    <td width="50%"><img alt="The djforge app icon: four yellow waveform bars on a dark rounded square" src="assets/app-icon/djforge-1024.png" width="70%"></td>
-  </tr>
-  <tr>
     <td><b>Automation and markers.</b> Breakpoint automation for volume, pan, mute, sends and every plugin parameter, written live in Write, Touch and Latch, plus memory locations and a big counter.</td>
-    <td><b>Everywhere.</b> Signed builds for macOS (universal), Windows (x64, x86, Arm), Linux (AppImage, deb, rpm, Flatpak), FreeBSD, and a WebAssembly build that runs in the browser.</td>
-  </tr>
-  <tr>
-    <td width="50%"><img alt="The Video window showing a colour-bar test movie with a timecode burn-in, above a Video track with thumbnails in the Edit window" src="docs/images/video.png"></td>
-    <td width="50%"><img alt="The Renderer window showing a 7.1.4 speaker layout with two object tracks, beside the Mix window with surround panners and Object/Bed buttons" src="docs/images/surround.png"></td>
   </tr>
   <tr>
     <td><b>Video.</b> A picture track with thumbnails and a Video window that follows the playhead, decoding H.264, ProRes and Motion JPEG in pure Rust, with timecode burn-in and sync offset.</td>
     <td><b>Surround and immersive.</b> Main and bus formats from stereo to 9.1.6 and Ambisonics, a surround panner with divergence and height, object/bed routing and a Renderer window with live speaker levels.</td>
-  </tr>
-  <tr>
-    <td width="50%"><img alt="The Score Editor showing the lead melody in standard notation on a treble and bass staff" src="docs/images/score.png"></td>
-    <td></td>
   </tr>
   <tr>
     <td><b>Notation.</b> A Score Editor for MIDI tracks, MusicXML export for Sibelius and other notation programs, and printable engraved scores.</td>
@@ -127,13 +115,13 @@ where things are.
 
 ## Getting started
 
-Download a build from the [releases page](https://github.com/storytold/soundcraft/releases), or build
-from source with Rust 1.95 or later for the desktop/web UI (the core workspace's declared
+Download a build from the [releases page](https://github.com/mloki23/djforge/releases) once there
+are any, or build from source with Rust 1.95 or later for the desktop/web UI (the core workspace's declared
 minimum remains Rust 1.90):
 
 ```sh
-git clone https://github.com/storytold/soundcraft
-cd soundcraft
+git clone https://github.com/mloki23/djforge
+cd djforge
 cargo run --release -p soundcraft -- --demo     # opens the demo song (the binary is djforge)
 ```
 
@@ -167,7 +155,7 @@ error only.
 | Variable | Effect |
 |---|---|
 | `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for the app's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,soundcraft_mix=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`soundcraft*=debug`). |
-| `SOUNDCRAFT_NO_PREFS` | No preferences read or written and no log file (agents' test runs). |
+| `SOUNDCRAFT_NO_PREFS` | Keeps out of the settings folder entirely (agents' test runs): no preferences read or written, no copy of SoundCraft's settings, no autosave (so no crash recovery, earlier autosaves aren't offered, and an unsaved session records into the temporary folder), no Presets folder (user presets can't be saved or loaded) and no log file. |
 
 The realtime audio thread never writes a record itself: the logger keeps the first one it logs
 (without waiting or allocating), counts the rest, and the UI thread writes them. The logger is
@@ -245,16 +233,20 @@ very welcome, in the issues.
 
 ## Downloads
 
-djforge has no release builds yet: build it from source (above). The builds below are
-**SoundCraft's**, from GitHub: the [latest release](https://github.com/storytold/soundcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/soundcraft/releases) have earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+djforge has no release builds yet: build it from source (above). When there are, the
+[latest release](https://github.com/mloki23/djforge/releases/latest) will have the builds listed
+below and [all releases](https://github.com/mloki23/djforge/releases) earlier versions and their
+notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for
+every file. Until then, SoundCraft's own builds are on
+[its releases page](https://github.com/storytold/soundcraft/releases).
 
 ### Windows
 
 | Build | Installer | Portable |
 |---|---|---|
-| x64 (64-bit Intel/AMD) | `soundcraft-<ver>-windows-x64.msi` | `soundcraft-<ver>-windows-x64-portable.zip` |
-| arm64 (Snapdragon and other ARM PCs) | `soundcraft-<ver>-windows-arm64.msi` | `soundcraft-<ver>-windows-arm64-portable.zip` |
-| x86 (32-bit) | `soundcraft-<ver>-windows-x86.msi` | `soundcraft-<ver>-windows-x86-portable.zip` |
+| x64 (64-bit Intel/AMD) | `djforge-<ver>-windows-x64.msi` | `djforge-<ver>-windows-x64-portable.zip` |
+| arm64 (Snapdragon and other ARM PCs) | `djforge-<ver>-windows-arm64.msi` | `djforge-<ver>-windows-arm64-portable.zip` |
+| x86 (32-bit) | `djforge-<ver>-windows-x86.msi` | `djforge-<ver>-windows-x86-portable.zip` |
 
 Installers and executables are code-signed.
 
@@ -281,32 +273,32 @@ DirectX 12 shaders are compiled with FXC, which is part of Windows, so no `dxcom
 
 | Build | File | Notes |
 |---|---|---|
-| App, universal (Apple silicon + Intel) | `soundcraft-<ver>-macos-universal.dmg` | Signed and notarized |
-| Command-line tool, universal | `soundcraft-cli-<ver>-macos-universal.zip` | Signed and notarized |
+| App, universal (Apple silicon + Intel) | `djforge-<ver>-macos-universal.dmg` | Signed and notarized |
+| Command-line tool, universal | `djforge-cli-<ver>-macos-universal.zip` | Signed and notarized |
 
 ### Linux
 
 | Format | x86_64 | aarch64 (ARM64) | Notes |
 |---|---|---|---|
-| AppImage | `soundcraft-<ver>-linux-x86_64.AppImage` | `soundcraft-<ver>-linux-aarch64.AppImage` | Runs anywhere; updates itself with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`.zsync` files) |
-| Flatpak | `soundcraft-<ver>-linux-x86_64.flatpak` | `soundcraft-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
-| Debian/Ubuntu | `soundcraft-<ver>-linux-x86_64.deb` | `soundcraft-<ver>-linux-aarch64.deb` | |
-| Fedora/RHEL/openSUSE | `soundcraft-<ver>-linux-x86_64.rpm` | `soundcraft-<ver>-linux-aarch64.rpm` | |
-| Tarball | `soundcraft-<ver>-linux-x86_64.tar.gz` | `soundcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
+| AppImage | `djforge-<ver>-linux-x86_64.AppImage` | `djforge-<ver>-linux-aarch64.AppImage` | Runs anywhere; updates itself with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`.zsync` files) |
+| Flatpak | `djforge-<ver>-linux-x86_64.flatpak` | `djforge-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
+| Debian/Ubuntu | `djforge-<ver>-linux-x86_64.deb` | `djforge-<ver>-linux-aarch64.deb` | |
+| Fedora/RHEL/openSUSE | `djforge-<ver>-linux-x86_64.rpm` | `djforge-<ver>-linux-aarch64.rpm` | |
+| Tarball | `djforge-<ver>-linux-x86_64.tar.gz` | `djforge-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
 
-RISC-V (riscv64): `soundcraft-<ver>-linux-riscv64.tar.gz`, a tarball only (glibc 2.39+, e.g. Ubuntu 24.04).
+RISC-V (riscv64): `djforge-<ver>-linux-riscv64.tar.gz`, a tarball only (glibc 2.39+, e.g. Ubuntu 24.04).
 
 ### FreeBSD
 
 | Build | File |
 |---|---|
-| x86_64 | `soundcraft-<ver>-freebsd-x86_64.tar.gz` |
+| x86_64 | `djforge-<ver>-freebsd-x86_64.tar.gz` |
 
 ### Web (WebAssembly)
 
 | Build | File | Notes |
 |---|---|---|
-| Static site | `soundcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
+| Static site | `djforge-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
 
 ## Based on SoundCraft
 

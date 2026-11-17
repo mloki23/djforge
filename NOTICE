@@ -10,7 +10,9 @@ Licensed under the MIT License or the Apache License, Version 2.0, at your optio
 
 Modifications: djforge renames the app (djforge, djforge-cli), saves sessions as .djforge,
 moves its settings folder, replaces the app icon, and adds DJ features (set import, transitions,
-track prep, stems, Session view, Rekordbox and Mixxx export), among other changes; the Git
+track prep, stems, Session view, Rekordbox and Mixxx export), adds its own djforge Dark theme
+(SoundCraft's look is kept as SoundCraft Classic) and audio waveforms coloured by frequency,
+among other changes; the Git
 history has the details. djforge's changes are licensed under the same terms (MIT OR
 Apache-2.0, at your option).
 
