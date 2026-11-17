@@ -4,6 +4,7 @@
 //! executing commands. It can be replaced without touching anything below it.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod band_jobs;
 pub mod bounce;
 pub mod control;
 pub mod credits;
@@ -354,6 +355,8 @@ pub enum Gesture {
 
 pub struct SoundApp {
     pub engine: Engine,
+    /// Builds the sources' frequency bands in the background, for waveforms coloured by frequency.
+    band_jobs: band_jobs::BandJobs,
     /// The session path as of the last frame, and whether the recent list changed since the host
     /// last saved it (see `recent`).
     recent_seen: Option<String>,
@@ -581,6 +584,7 @@ impl SoundApp {
             stem_unmute: HashMap::new(),
             session_generation: 0,
             split_generation: 0,
+            band_jobs: band_jobs::BandJobs::default(),
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -1454,6 +1458,9 @@ impl SoundApp {
         if self.theme_applied != Some(palette) || theme::palette() != palette {
             theme::apply_palette(ctx, palette);
             self.theme_applied = Some(palette);
+        }
+        if self.waveform_bands() {
+            self.band_jobs.queue(ctx, &self.engine.session().pool);
         }
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);

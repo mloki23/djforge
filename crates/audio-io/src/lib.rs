@@ -9,12 +9,14 @@
 //! * [`encode`] writes WAV/BWF (RF64 above 4 GiB), AIFF / AIFF-C `fl32`, and FLAC (built-in
 //!   encoder), with optional TPDF dither.
 //! * [`wav_float_header`] heads a float WAV written while it grows (recording).
-//! * [`peaks`] builds multi-resolution min/max overviews for waveform drawing.
+//! * [`peaks`] builds multi-resolution min/max overviews for waveform drawing, and [`bands`] their
+//!   low, mid and high frequency bands, for waveforms coloured by frequency.
 //! * [`FileEncoder`] writes the same formats block by block into any `Write + Seek`, so a file
 //!   of any length never has to fit in memory.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod aiff;
+pub mod bands;
 mod buffer;
 mod caf;
 mod flac;

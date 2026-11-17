@@ -219,8 +219,8 @@ pub(crate) fn decodes_unchanged(audio: &Arc<SourceAudio>, p: &Path) -> bool {
 /// read or decoded.
 fn decodes_to(audio: &Arc<SourceAudio>, p: &Path) -> Option<bool> {
     let ext = p.extension().and_then(|x| x.to_str());
-    let again = decode_source(&read_file(p).ok()?, ext, audio.buffer.sample_rate).ok()?;
-    let (x, y) = (&again.buffer.channels, &audio.buffer.channels);
+    let again = decode_buffer(&read_file(p).ok()?, ext, audio.buffer.sample_rate).ok()?;
+    let (x, y) = (&again.channels, &audio.buffer.channels);
     Some(x.len() == y.len() && x.iter().zip(y).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.to_bits() == b.to_bits())))
 }
 
@@ -432,9 +432,22 @@ fn unique_audio_rel(s: &Session, stem: &str) -> String {
 }
 
 /// Register decoded audio as a new source. Resamples to the session rate if needed.
-pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
+pub fn add_source(s: &mut Session, name: &str, buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
+    add_source_audio(s, name, buf, path, format, None)
+}
+
+/// [`add_source`], playing `shared` (audio already decoded from the same file, at the session's
+/// rate) instead of `buf` when there is one, so no overview is built for audio thrown away.
+fn add_source_audio(
+    s: &mut Session,
+    name: &str,
+    mut buf: AudioBuffer,
+    path: Option<&str>,
+    format: FileFormat,
+    shared: Option<Arc<SourceAudio>>,
+) -> SourceId {
     let sr = s.sample_rate.hz();
-    if buf.sample_rate != sr && buf.sample_rate > 0 {
+    if shared.is_none() && buf.sample_rate != sr && buf.sample_rate > 0 {
         buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
     }
@@ -461,7 +474,7 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         origin_modified_ms: 0,
         key: None,
     });
-    s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
+    s.pool.insert(id, shared.unwrap_or_else(|| Arc::new(SourceAudio::new(buf))));
     id
 }
 
@@ -536,28 +549,26 @@ pub(crate) fn add_import(e: &mut Engine, name: &str, decoded: DecodedImport, pat
     let file_rate = info.sample_rate;
     let s = e.session_mut();
     let session_rate = s.sample_rate.hz();
-    let src = add_source(s, name, buf, path, info.format);
     // A file that plays as decoded (no resampling), from an absolute path whose extension is the
     // one it was decoded as, is referenced where it is: saving the session does not copy it.
     let ext_of = |p: &str| Path::new(p).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let in_place = file_rate == session_rate && path.is_some_and(|p| Path::new(p).is_absolute() && ext_of(p) == ext);
-    if let (true, Some(p)) = (in_place, path.map(Path::new)) {
-        // The same file imported again shares the audio already decoded from it, so the two
-        // sources stay one reference instead of differing audio under one path.
+    let in_place_path = path.map(Path::new).filter(|_| in_place);
+    // The same file imported again shares the audio already decoded from it, so the two sources
+    // stay one reference instead of differing audio under one path.
+    let earlier = in_place_path.and_then(|p| {
         let key = file_key(p);
-        let earlier = s
-            .sources
+        s.sources
             .iter()
-            .filter(|x| x.id != src && !x.unsaved && file_key(Path::new(&x.path)) == key)
-            .find_map(|x| s.pool.get(x.id).filter(|a| decoded_unchanged(a, p)).cloned());
-        match earlier {
-            Some(audio) => s.pool.insert(src, audio),
-            None => {
-                if let Some(audio) = s.pool.get(src) {
-                    remember_decoded(audio, p);
-                }
-            }
-        }
+            .filter(|x| !x.unsaved && file_key(Path::new(&x.path)) == key)
+            .find_map(|x| s.pool.get(x.id).filter(|a| decoded_unchanged(a, p)).cloned())
+    });
+    let shared = earlier.is_some();
+    let src = add_source_audio(s, name, buf, path, info.format, earlier);
+    if let (false, Some(p)) = (shared, in_place_path)
+        && let Some(audio) = s.pool.get(src)
+    {
+        remember_decoded(audio, p);
     }
     if let Some(sx) = s.sources.last_mut() {
         sx.unsaved = !in_place;
@@ -1641,9 +1652,13 @@ fn open_session_report(e: &mut Engine, path: &str, links: &Path) -> Result<OpenR
 
 /// Decode one source's audio file at the session rate.
 fn decode_source(bytes: &[u8], ext: Option<&str>, rate: u32) -> std::result::Result<Arc<SourceAudio>, String> {
+    Ok(Arc::new(SourceAudio::new(decode_buffer(bytes, ext, rate)?)))
+}
+
+/// [`decode_source`]'s audio, without the overviews: for comparing.
+fn decode_buffer(bytes: &[u8], ext: Option<&str>, rate: u32) -> std::result::Result<AudioBuffer, String> {
     let (_, buf) = soundcraft_audio_io::decode(bytes, ext).map_err(|err| err.to_string())?;
-    let buf = at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or("too large to load")?;
-    Ok(Arc::new(SourceAudio::new(buf)))
+    at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or_else(|| "too large to load".to_string())
 }
 
 /// Audio files decoded so far, by path: a session may name one file thousands of times.

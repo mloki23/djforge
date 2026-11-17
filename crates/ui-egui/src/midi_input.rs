@@ -618,6 +618,10 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
         }
         "midi.target" => "{track?: id | name | null}",
         "window.midi_devices" => "{value?: bool}",
+        "ui.theme" => "{mode?: dark | light | system | classic} — dark is djforge Dark, classic SoundCraft Classic; without mode, reports {mode}",
+        "ui.waveform_bands" => {
+            "{value?: bool | null} — colour audio waveforms by frequency (lows red, mids green, highs blue); null follows the theme (on in djforge Dark only); saved with the UI prefs; reports {value, follows_theme}"
+        }
         "midi.move_settings" => {
             "{raw_name, backend_id (an enabled input's, not listed), to (a listed port's name)} — the enabled input and its mappings move to that port (a device on another USB port, when several ports have its name)"
         }

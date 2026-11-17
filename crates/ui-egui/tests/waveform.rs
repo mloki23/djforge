@@ -25,8 +25,21 @@ fn draw(samples: Vec<f32>, samples_per_px: f64) -> Vec<Shape> {
 
 fn draw_coloured(samples: Vec<f32>, samples_per_px: f64, by_frequency: bool) -> Vec<Shape> {
     let clip = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, samples.len() as i64);
-    let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![samples] });
+    let audio = banded(vec![samples]);
     paint(samples_per_px, |p, s, band| waveform::draw(p, s, band, &clip, &audio, 1, band, WAVE, by_frequency))
+}
+
+/// 48 kHz audio with its frequency bands built, as the background job leaves it.
+fn banded(channels: Vec<Vec<f32>>) -> SourceAudio {
+    let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels });
+    assert!(audio.build_bands_while(|| true));
+    audio
+}
+
+/// HSV saturation.
+fn saturation(c: Color32) -> f32 {
+    let (hi, lo) = (c.r().max(c.g()).max(c.b()), c.r().min(c.g()).min(c.b()));
+    if hi == 0 { 0.0 } else { f32::from(hi - lo) / f32::from(hi) }
 }
 
 fn sine(hz: f32, n: usize) -> Vec<f32> {
@@ -48,12 +61,30 @@ fn pure_bands_take_the_band_colours() {
     assert_eq!(waveform::band_colour([0.0; 3]), None);
     assert_eq!(waveform::band_colour([f32::NAN, f32::INFINITY, 0.0]), None);
     // A mix sits between its bands and keeps their brightness: bass and hats make a violet.
-    let mix = waveform::band_colour([0.3, 0.0, 0.3 / 3.2]).unwrap_or_default();
+    let mix = waveform::band_colour([0.3, 0.0, 0.3 / 2.0]).unwrap_or_default();
     assert!(mix.r() > 0xa0 && mix.b() > 0xa0 && mix.g() < mix.r().min(mix.b()), "{mix:?}");
-    let dull = waveform::band_colour([0.3, 0.3 / 1.6, 0.3 / 3.2]).unwrap_or_default();
-    // All three: a pale blue-grey as bright as the band colours (their brightest channels are
-    // 0xc4 to 0xf7), not a dull grey.
-    assert!(dull.r().max(dull.g()).max(dull.b()) >= 0xc4, "{dull:?}");
+    // Full-spectrum music keeps a colour, as bright as the band colours (whose brightest
+    // channels are 0xc4 to 0xf7), rather than washing out: a trance mix's bands (-12, -16 and
+    // -24 dB) lean to the bass, equal bands (pink noise, roughly) to the highs.
+    for rms in [[0.25, 0.158, 0.063], [0.2, 0.2, 0.2], [0.1, 0.077, 0.025]] {
+        let c = waveform::band_colour(rms).unwrap_or_default();
+        assert!(saturation(c) >= 0.3 && c.r().max(c.g()).max(c.b()) >= 0xc4, "{rms:?}: {c:?}");
+    }
+}
+
+#[test]
+fn full_spectrum_music_keeps_its_colour_when_drawn() {
+    // A kick-and-bass, lead and hats mix at trance-like levels.
+    let n = 96_000;
+    let (a, b, c) = (sine(60.0, n), sine(1000.0, n), sine(8000.0, n));
+    let x: Vec<f32> = a.iter().zip(&b).zip(&c).map(|((a, b), c)| a * 0.5 + b * 0.316 + c * 0.126).collect();
+    let shapes = draw_coloured(x, 240.0, true);
+    let [Shape::Mesh(mesh)] = shapes.as_slice() else { panic!("{shapes:?}") };
+    let (cols, _) = colours_outside(mesh, 8.0, 390.0, f32::INFINITY);
+    assert!(!cols.is_empty());
+    for c in cols {
+        assert!(saturation(c) >= 0.3, "washed out: {c:?}");
+    }
 }
 
 #[test]
@@ -68,7 +99,7 @@ fn coloured_by_frequency_kicks_are_red_and_hats_blue() {
         s.edit.set_flag("waveform.power", power);
         s.edit.set_flag("waveform.outlines", outlines);
         let clip = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, x.len() as i64);
-        let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![x.clone()] });
+        let audio = banded(vec![x.clone()]);
         let band = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 100.0));
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(2.0);
@@ -91,7 +122,7 @@ fn coloured_by_frequency_kicks_are_red_and_hats_blue() {
     // Off, or zoomed to the samples where the line takes the colour of what's in view.
     let x = sine(60.0, 48_000);
     let clip = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, x.len() as i64);
-    let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![x] });
+    let audio = banded(vec![x]);
     let shapes = paint(0.25, |p, s, band| {
         let mut s = s.clone();
         s.edit.zoom.scroll = 24_000;
@@ -108,11 +139,20 @@ fn coloured_by_frequency_kicks_are_red_and_hats_blue() {
 #[test]
 fn audio_without_bands_and_live_takes_stay_one_colour() {
     let clip = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, 48_000);
-    // A rate too low for bands: the overview has none, so the waveform keeps its colour.
+    let one_colour = |audio: &SourceAudio| {
+        let shapes = paint(240.0, |p, s, band| waveform::draw(p, s, band, &clip, audio, 1, band, WAVE, true));
+        let [Shape::Mesh(mesh)] = shapes.as_slice() else { panic!("{shapes:?}") };
+        mesh.vertices.iter().all(|v| v.color == WAVE || v.color == Color32::TRANSPARENT)
+    };
+    // Until the bands are built the waveform keeps its colour; then it is coloured.
+    let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![sine(60.0, 48_000)] });
+    assert!(one_colour(&audio));
+    assert!(audio.build_bands_while(|| true));
+    assert!(!one_colour(&audio));
+    // A rate too low for bands: there are none, so the waveform keeps its colour.
     let audio = SourceAudio::new(AudioBuffer { sample_rate: 4_000, channels: vec![sine(60.0, 48_000)] });
-    let shapes = paint(240.0, |p, s, band| waveform::draw(p, s, band, &clip, &audio, 1, band, WAVE, true));
-    let [Shape::Mesh(mesh)] = shapes.as_slice() else { panic!("{shapes:?}") };
-    assert!(mesh.vertices.iter().all(|v| v.color == WAVE || v.color == Color32::TRANSPARENT));
+    assert!(audio.build_bands_while(|| true));
+    assert!(one_colour(&audio));
     let blocks = vec![vec![(-0.5, 0.5); 100]];
     let shapes = paint(128.0, |p, s, band| waveform::draw_live(p, s, band, 1280.0, 128.0, &blocks, band, WAVE));
     let [Shape::Mesh(mesh)] = shapes.as_slice() else { panic!("{shapes:?}") };
@@ -198,15 +238,17 @@ fn overlapped_crossfades_show_the_outgoing_clip_too() {
     assert_eq!(waveforms(&ctx, &mut app, "Bass", 0.0), plain + 1);
 }
 
-/// Draw time for a 10-minute stereo clip, zoomed out to fit and zoomed in, in the dev profile:
-/// `cargo test -p soundcraft-ui-egui --test waveform -- --ignored --nocapture draw_time`.
+/// Draw time for a 10-minute stereo clip, zoomed out to fit and zoomed in, with and without
+/// colours: `cargo test -p soundcraft-ui-egui --test waveform -- --ignored --nocapture draw_time`
+/// (add `--release` for figures that stand for the app; the test profile builds this
+/// workspace's crates at opt-level 1).
 #[test]
 #[ignore = "timing harness"]
 fn draw_time_of_a_long_clip() {
     let n = 48_000 * 600;
     let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.0079).sin() * 0.5 + (i as f32 * 0.37).sin() * 0.2) * ((i / 24_000) % 2) as f32).collect();
     let clip = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, n as i64);
-    let audio = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![x.clone(), x] });
+    let audio = banded(vec![x.clone(), x]);
     let t = std::time::Instant::now();
     for _ in 0..20 {
         std::hint::black_box(paint(64.0, |_, _, _| {}));
@@ -256,7 +298,11 @@ fn split_clips_keep_one_colour_when_waveforms_are_coloured_by_frequency() {
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
     app.ui.waveform_bands = Some(true);
     let ctx = egui::Context::default();
-    assert!(lane_colours(&ctx, &mut app, "Bass").len() > 1, "coloured by frequency");
+    // Once the background job has built the bands.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lane_colours(&ctx, &mut app, "Bass").len() < 2 {
+        assert!(std::time::Instant::now() < until, "never coloured by frequency");
+    }
     let tid = app.engine.session().track_by_name("Bass").unwrap().id;
     let ids: Vec<ClipId> = app.engine.session().track(tid).unwrap().clips().iter().map(|c| c.id).collect();
     for id in ids {
@@ -267,4 +313,81 @@ fn split_clips_keep_one_colour_when_waveforms_are_coloured_by_frequency() {
     assert_eq!(lane_colours(&ctx, &mut app, "Bass").len(), 1, "split clips keep the clip's colour");
     app.ui.waveform_bands = Some(false);
     assert_eq!(lane_colours(&ctx, &mut app, "Kick").len(), 1, "off: one colour");
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("djforge-ui-waveform-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn an_opened_session_gets_its_frequency_colours_after_loading() {
+    let dir = scratch("bands-open");
+    let path = dir.join("set.djforge").to_string_lossy().into_owned();
+    soundcraft_engine::io::save_session(&mut soundcraft_engine::demo::demo_engine(), &path).unwrap();
+    let mut e = soundcraft_engine::Engine::default();
+    soundcraft_engine::io::open_session(&mut e, &path).unwrap();
+    // Opening returns with the audio loaded and no bands built.
+    let pool = e.session().pool.clone();
+    assert!(!pool.is_empty() && pool.audio().all(|a| !a.bands_ready()));
+    let mut app = SoundApp::new(e, None, Services::default());
+    app.ui.waveform_bands = Some(true);
+    let ctx = egui::Context::default();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lane_colours(&ctx, &mut app, "Bass").len() < 2 {
+        assert!(std::time::Instant::now() < until, "the bands never came");
+    }
+    while !pool.audio().all(|a| a.bands_ready()) {
+        assert!(std::time::Instant::now() < until, "not every source got its bands");
+        lane_colours(&ctx, &mut app, "Bass");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_colours_off_no_bands_are_built() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.ui.waveform_bands = Some(false);
+    // Audio of its own: the demo's is shared with the other tests.
+    let audio = std::sync::Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![sine(60.0, 4800)] }));
+    app.engine.session_mut().pool.insert(SourceId(999_999), std::sync::Arc::clone(&audio));
+    let ctx = egui::Context::default();
+    lane_colours(&ctx, &mut app, "Bass");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    lane_colours(&ctx, &mut app, "Bass");
+    assert!(!audio.bands_ready());
+}
+
+/// Opening a session holding a 10-minute stereo file, and building its bands after:
+/// `cargo test -p soundcraft-ui-egui --test waveform -- --ignored --nocapture open_time` (add
+/// `--release` for figures that stand for the app).
+#[test]
+#[ignore = "timing harness"]
+fn open_time_of_a_long_track() {
+    let dir = scratch("open-time");
+    let path = dir.join("long.djforge").to_string_lossy().into_owned();
+    let mut e = soundcraft_engine::Engine::default();
+    let n = 48_000 * 600;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.0079).sin() * 0.5 + (i as f32 * 0.37).sin() * 0.2).collect();
+    let s = e.session_mut();
+    soundcraft_engine::io::add_source(
+        s,
+        "long",
+        AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![x.clone(), x] },
+        None,
+        soundcraft_audio_io::FileFormat::Wav,
+    );
+    soundcraft_engine::io::save_session(&mut e, &path).unwrap();
+    let mut e = soundcraft_engine::Engine::default();
+    let t = std::time::Instant::now();
+    soundcraft_engine::io::open_session(&mut e, &path).unwrap();
+    println!("open: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let t = std::time::Instant::now();
+    for a in e.session().pool.audio() {
+        assert!(a.build_bands_while(|| true));
+    }
+    println!("bands, built after in the background: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let _ = std::fs::remove_dir_all(&dir);
 }

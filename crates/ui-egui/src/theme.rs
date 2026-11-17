@@ -764,10 +764,33 @@ pub fn clip_colors(rgb: [u8; 3], selected: bool) -> (Color32, Color32, Color32) 
     if selected { (shade(0.7), bar, Color32::from_rgb(16, 16, 18)) } else { (shade(0.34), bar, tint(0.35)) }
 }
 
-/// The body of a clip whose waveform is coloured by frequency: a dark tint of its colour, under
-/// the band colours, lighter when selected.
-pub fn band_clip_body(rgb: [u8; 3], selected: bool) -> Color32 {
-    studio::BG.lerp_to_gamma(self::rgb(rgb), if selected { 0.42 } else { 0.2 })
+/// How a clip whose waveform is coloured by frequency is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandClip {
+    /// A dark tint of the clip's colour under the band colours, in every palette: the band colours
+    /// need a dark ground, so a clip coloured by frequency in Light or SoundCraft Classic (where
+    /// it is off unless asked for) is dark there too.
+    pub body: Color32,
+    /// The name bar (or the strip along the top when names are hidden): the clip's colour, pale
+    /// when selected.
+    pub bar: Color32,
+    /// The selected clip's outline, in the palette's accent.
+    pub outline: Option<Color32>,
+    /// The line between a stereo clip's channels.
+    pub divider: Color32,
+}
+
+/// [`BandClip`] for a clip of colour `rgb`.
+pub fn band_clip(rgb: [u8; 3], selected: bool) -> BandClip {
+    let c = self::rgb(rgb);
+    let body = studio::BG.lerp_to_gamma(c, if selected { 0.24 } else { 0.15 });
+    let (_, bar, _) = clip_colors(rgb, false);
+    BandClip {
+        body,
+        bar: if selected { c.lerp_to_gamma(Color32::WHITE, 0.55) } else { bar },
+        outline: selected.then(|| Tokens::current().accent),
+        divider: body.lerp_to_gamma(Color32::WHITE, 0.3),
+    }
 }
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
@@ -959,6 +982,23 @@ mod tests {
     }
 
     /// WCAG 2 contrast ratio of two opaque colours.
+    #[test]
+    fn a_selected_clip_coloured_by_frequency_stands_out() {
+        let _palette = lock_test_palette();
+        for rgb in [[230, 72, 77], [70, 196, 106], [79, 143, 247], [248, 210, 0], [128, 128, 128], [40, 40, 44], [255, 255, 255]] {
+            let (on, off) = (band_clip(rgb, true), band_clip(rgb, false));
+            let outline = on.outline.unwrap_or(off.body);
+            assert!(off.outline.is_none(), "{rgb:?}");
+            assert!(contrast(outline, off.body) >= 3.0 && contrast(outline, on.body) >= 3.0, "{rgb:?}: outline {outline:?}");
+            assert!(contrast(on.bar, off.bar) >= 1.4 || contrast(on.bar, on.body) >= 3.0, "{rgb:?}: bars {:?} {:?}", on.bar, off.bar);
+            assert!(contrast(on.divider, on.body) >= 1.5 && contrast(off.divider, off.body) >= 1.5, "{rgb:?}: divider");
+            // The band colours read on the body.
+            for band in [studio::LOW, studio::MID, studio::HIGH] {
+                assert!(contrast(band, on.body) >= 2.0 && contrast(band, off.body) >= 3.0, "{rgb:?}: {band:?}");
+            }
+        }
+    }
+
     fn contrast(a: Color32, b: Color32) -> f64 {
         let luminance = |c: Color32| {
             let linear = |channel: u8| {

@@ -51,12 +51,16 @@ follows changes behaviour you may rely on.
 
 - **Audio clip waveforms are coloured by frequency in djforge Dark**, as in Rekordbox's 3-band
   view: lows (below 200 Hz) red, mids (200 Hz to 2.5 kHz) green, highs (above 2.5 kHz) blue,
-  mixed per pixel column, so kicks and bass read red, vocals green and hats blue. The clip body
-  turns a dark tint of the clip's colour and the colour stays in the name bar (or a 3-point strip
-  along the clip's top when names are hidden). Light and SoundCraft Classic keep one-colour
-  waveforms. Setup › Appearance › "Colour waveforms by frequency" (`ui.waveform_bands {"value":
-  true|false|null}`, null following the theme) overrides the theme, saved with the UI prefs.
-  Split clips, muted clips, the outgoing half of an overlapped crossfade and recording takes
-  stay one colour. Loading audio takes a little longer: the bands are filtered once, with the
-  waveform overview (about 0.2 s per channel for 10 minutes), and keep about 43 MB per hour of
-  stereo in memory.
+  mixed per pixel column with the loudest band leading, so kicks and bass read red, vocals green,
+  hats blue, and a full mix keeps a colour. The clip body turns a dark tint of the clip's colour
+  and the colour stays in the name bar (or a 3-point strip along the clip's top when names are
+  hidden); a selected clip has a pale name bar and an outline in the accent colour. Light and
+  SoundCraft Classic keep one-colour waveforms. Setup › Appearance › "Colour waveforms by
+  frequency" (`ui.waveform_bands {"value": true|false|null}`, null following the theme)
+  overrides the theme, saved with the UI prefs; turned on in Light or Classic, the clips it
+  colours get the same dark bodies, as the band colours need a dark ground. Split clips, muted
+  clips, the outgoing half of an overlapped crossfade and recording takes stay one colour.
+- **The bands are built in the background** after audio loads, one source at a time, so opening
+  a session or importing takes no longer; a waveform shows one colour until its bands are ready
+  (about 0.2 s per channel for 10 minutes of audio). With the colours off they aren't built. They
+  keep about 43 MB per hour of stereo in memory.

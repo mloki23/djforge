@@ -1,16 +1,17 @@
 //! Clip waveforms, drawn per physical pixel, or as a line through the samples at the sample level.
 //!
-//! Coloured by frequency ([`band_colour`]), each column mixes the low, mid and high bands the
-//! overview kept for its span (`Peaks::build_with_bands`): red for kicks and bass, green for
-//! vocals and leads, blue for hats. Drawing only reads those bands; nothing is filtered per frame.
+//! Coloured by frequency ([`band_colour`]), each column mixes the low, mid and high bands kept for
+//! its span (`SourceAudio::bands`): red for kicks and bass, green for vocals and leads, blue for
+//! hats. Drawing only reads those bands, nothing is filtered per frame; until a background job has
+//! built them ([`crate::band_jobs`]) the waveform keeps one colour.
 
 use egui::{Color32, Mesh, Painter, Rect, Shape, Stroke, pos2, vec2};
 use soundcraft_model::{Clip, Session, SourceAudio};
 use soundcraft_time::Samples;
 
 /// Draw a clip's audio across `body`, one band per channel, `channels` of them at most: in
-/// `wave`, or with `by_frequency` coloured by frequency ([`band_colour`]) where the overview has
-/// bands, `wave` elsewhere.
+/// `wave`, or with `by_frequency` coloured by frequency ([`band_colour`]) once the audio's bands
+/// are built, `wave` until then.
 pub fn draw(
     painter: &Painter,
     s: &Session,
@@ -28,18 +29,22 @@ pub fn draw(
 }
 
 /// How much each band counts in [`band_colour`], by RMS: music has less energy the higher it
-/// goes, so mids and highs are lifted (about +4 and +10 dB) to show up beside the bass.
-const BAND_WEIGHT: [f32; 3] = [1.0, 1.6, 3.2];
+/// goes, so mids and highs are lifted a little (about +2 and +6 dB) to show up beside the bass.
+const BAND_WEIGHT: [f32; 3] = [1.0, 1.3, 2.0];
+/// The power of each band's weighted RMS that [`band_colour`] mixes by. Above 2 (energy) the
+/// loudest band leads the mix, so full-spectrum music keeps a colour, as in Rekordbox, rather
+/// than washing out to a pale grey.
+const BAND_POWER: i32 = 4;
 
 /// The colour of a span whose low, mid and high bands have these RMS levels: the band colours
-/// ([`crate::theme::studio`]'s LOW, MID and HIGH) mixed by the bands' weighted energy, then
-/// brought back to the brightness of the colours mixed, so a mix never dulls to grey. `None`
-/// for silence.
+/// ([`crate::theme::studio`]'s LOW, MID and HIGH) mixed by the bands' weighted RMS to the power
+/// [`BAND_POWER`], then brought back to the brightness of the colours mixed, so a mix never dulls.
+/// A pure band is its band colour. `None` for silence.
 pub fn band_colour(rms: [f32; 3]) -> Option<Color32> {
     use crate::theme::studio::{HIGH, LOW, MID};
     let w = std::array::from_fn::<f32, 3, _>(|k| {
         let v = rms.get(k).copied().unwrap_or(0.0) * BAND_WEIGHT.get(k).copied().unwrap_or(1.0);
-        if v.is_finite() { v * v } else { 0.0 }
+        if v.is_finite() { v.max(0.0).powi(BAND_POWER) } else { 0.0 }
     });
     let total: f32 = w.iter().sum();
     if !(total > 0.0 && total.is_finite()) {
@@ -63,7 +68,7 @@ fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
 
 fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, ch: usize, band: Rect, wave: Color32, by_frequency: bool) {
     let (Some(samples), Some(peaks)) = (audio.channel(ch), audio.peaks.get(ch)) else { return };
-    let by_frequency = by_frequency && peaks.has_bands();
+    let bands = audio.bands(ch).filter(|b| by_frequency && !b.is_empty());
     let Some(g) = Grid::new(painter, s, tl, band) else { return };
     let (rectified, power, outlines) = (s.edit.flag("waveform.rectified"), s.edit.flag("waveform.power"), s.edit.flag("waveform.outlines"));
     let origin = clip.start.saturating_sub(clip.source_offset()) as f64;
@@ -77,7 +82,7 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
             pos2(g.x_at(pos), g.cy - level(v * gain(pos)) * g.half)
         });
         // One colour along the line: the bands of what is in view.
-        let colour = if by_frequency { peaks.bands(first, last.saturating_add(1)).and_then(band_colour).unwrap_or(wave) } else { wave };
+        let colour = bands.and_then(|b| b.rms(first, last.saturating_add(1))).and_then(band_colour).unwrap_or(wave);
         painter.add(Shape::line(points.collect(), Stroke::new(g.weight, colour)));
         return;
     }
@@ -101,11 +106,8 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
             })
         })
         .collect();
-    let colours: Vec<Color32> = if by_frequency {
-        peaks.band_spans(start, g.step, overlap, g.cols).into_iter().map(|b| b.and_then(band_colour).unwrap_or(wave)).collect()
-    } else {
-        Vec::new()
-    };
+    let colours: Vec<Color32> = bands
+        .map_or_else(Vec::new, |b| b.spans(start, g.step, overlap, g.cols).into_iter().map(|b| b.and_then(band_colour).unwrap_or(wave)).collect());
     g.paint(painter, &ys, Colours { wave, each: &colours }, outlines, rectified);
 }
 

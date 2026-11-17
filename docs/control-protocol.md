@@ -114,6 +114,12 @@ When the integration cannot report an appearance, System uses Dark. Manual Light
 fixed when the OS appearance changes. An offscreen render without `--system-theme` supplies no
 OS appearance and therefore resolves System to Dark.
 
+`ui.waveform_bands {"value": true|false|null}` colours audio clip waveforms by frequency (lows
+red, mids green, highs blue). `null` (the default) follows the theme: on in djforge Dark, off in
+Light and SoundCraft Classic. The choice is saved with the UI prefs; the reply is `{value,
+follows_theme}`. The bands are built in the background after audio loads, so a waveform keeps
+one colour for a moment first.
+
 ## Panel docking
 
 Tracks and Groups, Clips, MIDI Editor, Memory Locations, and Undo History use movable panels. Commands target the active Edit or Mix view; floating panels stay inside the current viewport. Edit and Mix retain separate arrangements; Clips and MIDI Editor belong to Edit. Transport, plug-in, and specialist utility windows retain their existing hosts. The document/session view is protected. Layouts, active tabs, panel visibility, and floating rectangles are saved with the app's existing UI preferences. These operations do not edit document contents.

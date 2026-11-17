@@ -2,9 +2,10 @@
 //! movies video clips reference.
 
 use crate::SourceId;
-use soundcraft_audio_io::{AudioBuffer, FileFormat, peaks::Peaks};
+use soundcraft_audio_io::{AudioBuffer, FileFormat, bands::Bands, peaks::Peaks};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Metadata for an audio file used by the session (serialised).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -102,17 +103,53 @@ impl VideoSource {
     }
 }
 
-/// Decoded audio plus waveform overviews, with their frequency bands (not serialised).
+/// Decoded audio plus waveform overviews (not serialised). Each channel's frequency bands, for
+/// waveforms coloured by frequency, are filled in later by whoever claims the job
+/// ([`SourceAudio::claim_bands`], [`SourceAudio::build_bands_while`]), so loading never waits
+/// for them.
 #[derive(Debug)]
 pub struct SourceAudio {
     pub buffer: AudioBuffer,
     pub peaks: Vec<Peaks>,
+    bands: Vec<OnceLock<Bands>>,
+    bands_claimed: AtomicBool,
 }
 
 impl SourceAudio {
+    /// The audio and its min/max overviews; no bands yet.
     pub fn new(buffer: AudioBuffer) -> Self {
-        let peaks = buffer.channels.iter().map(|c| Peaks::build_with_bands(c, buffer.sample_rate)).collect();
-        SourceAudio { buffer, peaks }
+        let peaks = buffer.channels.iter().map(|c| Peaks::build(c)).collect();
+        let bands = buffer.channels.iter().map(|_| OnceLock::new()).collect();
+        SourceAudio { buffer, peaks, bands, bands_claimed: AtomicBool::new(false) }
+    }
+
+    /// Channel `ch`'s frequency bands, once built.
+    pub fn bands(&self, ch: usize) -> Option<&Bands> {
+        self.bands.get(ch).and_then(OnceLock::get)
+    }
+
+    /// Whether every channel's bands are built.
+    pub fn bands_ready(&self) -> bool {
+        self.bands.iter().all(|b| b.get().is_some())
+    }
+
+    /// Claim the job of building the bands: true for the first caller only, so a source is
+    /// queued for building once.
+    pub fn claim_bands(&self) -> bool {
+        !self.bands_ready() && !self.bands_claimed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Build the channels' missing bands, giving up when `wanted` says they are no longer needed
+    /// (it is asked now and then). Returns whether every channel's bands are built.
+    pub fn build_bands_while(&self, wanted: impl Fn() -> bool) -> bool {
+        for (slot, samples) in self.bands.iter().zip(&self.buffer.channels) {
+            if slot.get().is_some() {
+                continue;
+            }
+            let Some(bands) = Bands::build_while(samples, self.buffer.sample_rate, &wanted) else { return false };
+            let _ = slot.set(bands);
+        }
+        self.bands_ready()
     }
     pub fn frames(&self) -> usize {
         self.buffer.frames()
@@ -150,6 +187,10 @@ impl SourcePool {
     pub fn ids(&self) -> impl Iterator<Item = SourceId> + '_ {
         self.map.keys().copied()
     }
+    /// The decoded audio of every source.
+    pub fn audio(&self) -> impl Iterator<Item = &Arc<SourceAudio>> + '_ {
+        self.map.values()
+    }
 }
 
 impl PartialEq for SourcePool {
@@ -162,6 +203,27 @@ impl PartialEq for SourcePool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn tone(channels: usize, n: usize) -> SourceAudio {
+        let c: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+        SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![c; channels] })
+    }
+
+    #[test]
+    fn bands_come_later_and_are_built_once() {
+        let a = tone(2, 4800);
+        assert!(a.bands(0).is_none() && !a.bands_ready(), "new audio has no bands yet");
+        assert!(a.claim_bands());
+        assert!(!a.claim_bands(), "claimed once");
+        assert!(!a.build_bands_while(|| false), "given up");
+        assert!(a.bands(0).is_none());
+        assert!(a.build_bands_while(|| true));
+        assert!(a.bands(0).is_some_and(|b| !b.is_empty()) && a.bands(1).is_some() && a.bands(2).is_none());
+        assert!(!a.claim_bands(), "nothing left to build");
+        // No channels: ready at once.
+        let none = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![] });
+        assert!(none.bands_ready() && !none.claim_bands());
+    }
 
     fn old_source() -> serde_json::Value {
         serde_json::json!({"id": 3, "name": "a", "path": "a.wav", "channels": 2, "frames": 10, "sample_rate": 48000, "format": "Wav"})
