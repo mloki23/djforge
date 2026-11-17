@@ -101,3 +101,13 @@ follows changes behaviour you may rely on.
   for the default output device. The first device call waits for it at most 5 seconds (a
   hanging driver is logged, not waited on), and a panic while making it is logged; the thread is
   kept either way.
+
+## Crash recovery
+
+- **Unsaved changes made right after a save are no longer deleted at the next launch.** An
+  autosave was thrown away unless it was strictly newer than its session file, so a change
+  autosaved within the file system's time resolution of a save (the same clock tick on NTFS, 2 s
+  on FAT) was lost after a crash. An autosave folder now records what its session file held
+  (`origin-state`: length and FNV-1a hash), and is dropped only once that file was saved with
+  different contents since. Folders from SoundCraft or earlier builds are kept unless their
+  session file is strictly newer.

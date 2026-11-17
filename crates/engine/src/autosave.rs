@@ -16,6 +16,9 @@ const SESSION: &str = "session.djforge";
 /// The session file of folders SoundCraft wrote (a settings folder copied across keeps them).
 const LEGACY_SESSION: &str = "session.scraft";
 const ORIGIN: &str = "origin";
+/// What the session file the folder came from held when the folder was written (see
+/// [`file_state`]). Folders SoundCraft and earlier djforge builds wrote don't have it.
+const ORIGIN_STATE: &str = "origin-state";
 const LOCK: &str = "lock";
 /// The plan of a recording still running when the folder was written.
 const RECORDING: &str = "recording.json";
@@ -232,6 +235,8 @@ impl Autosave {
         }
         let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
         write_atomically(&self.dir.join(ORIGIN), origin.unwrap_or_default().as_bytes())?;
+        // Read now, after the session handed over was taken: a save after this one changes it.
+        write_atomically(&self.dir.join(ORIGIN_STATE), origin.map_or_else(|| NO_FILE.into(), file_state).as_bytes())?;
         write_atomically(&self.dir.join(SESSION), text.as_bytes())?;
         for (_, name) in std::mem::replace(&mut self.copies, copies).into_values() {
             let _ = std::fs::remove_file(audio_dir.join(name));
@@ -277,8 +282,33 @@ pub struct Leftover {
 const LOCK_TRIES: usize = 3;
 const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
-/// session file they came from or holding a recording. Empty and outdated ones are deleted.
+/// [`ORIGIN_STATE`] when there was no session file, or it couldn't be read.
+const NO_FILE: &str = "none";
+
+/// What the file at `path` holds: its length and FNV-1a hash, or [`NO_FILE`].
+fn file_state(path: &str) -> String {
+    std::fs::read(path).map_or_else(|_| NO_FILE.into(), |b| format!("{} {:016x}", b.len(), crate::cmd::prep::fnv1a64(&b)))
+}
+
+/// The session file `origin` the autosave in `dir`, written at `saved`, came from was saved since,
+/// with what the autosave holds. Only a sure sign counts; when in doubt the autosave is kept.
+/// Modification times alone can't tell: a save and the next change's autosave can land within
+/// the file system's time resolution.
+fn superseded(dir: &Path, origin: Option<&str>, saved: SystemTime) -> bool {
+    let Some(origin) = origin else { return false };
+    let Ok(modified) = std::fs::metadata(origin).and_then(|m| m.modified()) else { return false };
+    match std::fs::read_to_string(dir.join(ORIGIN_STATE)) {
+        // Rewritten since the autosave was written (not with older contents put back).
+        Ok(then) => then != NO_FILE && then != file_state(origin) && modified >= saved,
+        // A folder SoundCraft or an earlier djforge build wrote: only a session file saved
+        // strictly later says so.
+        Err(_) => modified > saved,
+    }
+}
+
+/// Leftover autosaves under `root`, newest first: folders no open session holds, unless the
+/// session file they came from was saved with their changes since (see [`superseded`]). Empty
+/// and outdated ones are deleted; a folder still locked is left alone.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten().map(|d| d.path()) {
@@ -295,13 +325,12 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
             continue;
         }
         let origin = std::fs::read_to_string(dir.join(ORIGIN)).ok().filter(|o| !o.is_empty());
-        let origin_saved = origin.as_ref().and_then(|o| std::fs::metadata(o).and_then(|m| m.modified()).ok());
         let file = session_in(&dir);
         let saved = std::fs::metadata(&file).and_then(|m| m.modified());
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
+            Ok(saved) if recording || !superseded(&dir, origin.as_deref(), saved) => {
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -721,6 +750,68 @@ mod tests {
         assert_eq!(levels(&reopened), [0.5]);
         Autosave::create(&root, "Song").unwrap().discard();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session saved, then changed within the file system's time resolution: the autosave of
+    /// the change, left by a crash, and the session file have the same modification time.
+    /// Returns the test's folder, the session file, the autosave root and the engine with the change.
+    fn saved_then_changed(name: &str) -> (PathBuf, PathBuf, PathBuf, Engine) {
+        let dir = folder(name);
+        let path = dir.join("Song.djforge");
+        let root = dir.join("Autosave");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Engine::default();
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        record(&mut e, 0.5);
+        let mut a = Autosave::create(&root, "Song").unwrap();
+        a.write(e.session(), e.path.as_deref(), None).unwrap();
+        drop(a);
+        (dir, path, root, e)
+    }
+
+    /// Give the file at `p` the modification time of the autosave under `root`.
+    fn same_time_as_the_autosave(p: &Path, root: &Path) {
+        let autosave = std::fs::read_dir(root).unwrap().flatten().map(|d| d.path().join(SESSION)).next().unwrap();
+        let t = std::fs::metadata(autosave).unwrap().modified().unwrap();
+        std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(t)).unwrap();
+        assert_eq!(std::fs::metadata(p).unwrap().modified().unwrap(), t);
+    }
+
+    #[test]
+    fn an_autosave_as_old_as_its_session_file_is_still_offered() {
+        let (dir, path, root, _) = saved_then_changed("autosave-same-time");
+        same_time_as_the_autosave(&path, &root);
+        let left = leftovers(&root);
+        assert_eq!(left.len(), 1, "the unsaved change is offered, not deleted");
+        let mut r = Engine::default();
+        recover(&mut r, &left[0]).unwrap();
+        assert_eq!(levels(&r), [0.5]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_autosave_is_dropped_once_its_session_is_saved_with_its_changes() {
+        let (dir, path, root, mut e) = saved_then_changed("autosave-superseded");
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        // Even at the very same time as the autosave: the session file changed since.
+        same_time_as_the_autosave(&path, &root);
+        assert!(leftovers(&root).is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_autosave_from_an_earlier_build_is_kept_unless_its_session_was_saved_later() {
+        let (dir, path, root, _) = saved_then_changed("autosave-earlier-build");
+        // Folders SoundCraft and earlier djforge builds wrote don't say what the session file held.
+        let folder = std::fs::read_dir(&root).unwrap().flatten().map(|d| d.path()).next().unwrap();
+        let _ = std::fs::remove_file(folder.join(ORIGIN_STATE));
+        same_time_as_the_autosave(&path, &root);
+        assert_eq!(leftovers(&root).len(), 1, "the same time is no sign the session was saved since");
+        crate::io::touch_later(&path);
+        assert!(leftovers(&root).is_empty());
+        assert!(!folder.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
