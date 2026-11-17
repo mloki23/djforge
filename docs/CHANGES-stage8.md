@@ -93,3 +93,11 @@ follows changes behaviour you may rely on.
   decides (the mix-in pennant points right, the mix-out's left), and the tooltip names both.
 - **`edit.select` with `clips` and `start`** now keeps the given start (and end) instead of
   selecting the clips' range; clips alone still select their range.
+
+## Audio devices
+
+- **Audio devices no longer crash djforge when opened from a thread after an ended one**
+  (Windows). cpal's one WASAPI device enumerator is now made on a thread kept for it, asking only
+  for the default output device. The first device call waits for it at most 5 seconds (a
+  hanging driver is logged, not waited on), and a panic while making it is logged; the thread is
+  kept either way.

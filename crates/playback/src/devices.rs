@@ -96,17 +96,31 @@ fn describe(d: &cpal::Device, default_name: Option<&str>, output: bool) -> Optio
 /// thread. Once that thread has gone, the next device call on any thread can crash the process
 /// (an access violation). So the enumerator is made here, on a thread that never ends. Every cpal
 /// host in this crate comes from [`host`] or [`audio_systems`], which call this first.
+///
+/// The thread joins a single-threaded apartment (cpal initialises COM that way) and never pumps
+/// messages. That is safe only because nothing is marshalled to it: cpal marks the enumerator
+/// `Send + Sync` and calls it directly from whichever thread asks, which holds because the
+/// MMDevice enumerator is a free-threaded object. All this thread has to do is keep the
+/// apartment it was made in alive. Should cpal start marshalling calls to the creating thread,
+/// they would block here.
+///
+/// The caller waits at most [`ENUMERATOR_WAIT`] for the enumerator (a driver can hang in
+/// enumeration); a panic while making it is caught and logged, and the thread parks either way.
 #[cfg(windows)]
 fn keep_device_enumerator() {
     static KEPT: std::sync::Once = std::sync::Once::new();
     KEPT.call_once(|| {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("audio devices".into()).spawn(move || {
-            // Listing the devices makes cpal's enumerator, on this thread.
-            if let Err(e) = cpal::default_host().devices().map(Iterator::count) {
-                log::warn!("listing the audio devices: {e}");
+            // Asking for the default output makes cpal's enumerator, on this thread, with the
+            // least work (no device is opened or probed).
+            let made = std::panic::catch_unwind(|| {
+                let _ = cpal::default_host().default_output_device();
+            });
+            if made.is_err() {
+                log::error!("making the audio device enumerator panicked; audio devices may be unavailable");
             }
-            // The caller waits for this; should it be gone, nothing is lost.
+            // The caller waits for this; should it be gone (timed out), nothing is lost.
             let _ = tx.send(());
             loop {
                 std::thread::park();
@@ -115,12 +129,21 @@ fn keep_device_enumerator() {
         match spawned {
             // Wait until the enumerator is made there, so no caller makes it first.
             Ok(_) => {
-                let _ = rx.recv();
+                if rx.recv_timeout(ENUMERATOR_WAIT).is_err() {
+                    log::warn!(
+                        "the audio device enumerator took over {} s to make (or its thread ended); carrying on without waiting",
+                        ENUMERATOR_WAIT.as_secs()
+                    );
+                }
             }
             Err(e) => log::warn!("no thread to keep the audio devices on: {e}"),
         }
     });
 }
+
+/// How long the first device call waits for the enumerator's thread.
+#[cfg(windows)]
+const ENUMERATOR_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(not(windows))]
 fn keep_device_enumerator() {}

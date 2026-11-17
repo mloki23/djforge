@@ -5,6 +5,9 @@
 //! thread to ask under that thread's COM initialisation, which ends with the thread. The next
 //! thread to open a device then crashed the process (an access violation). This is its own test
 //! binary so that no other thread keeps COM alive and hides the crash.
+//!
+//! Elsewhere there is no such enumerator and this is only a smoke test: the input opens (or
+//! fails cleanly) from ended threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_playback::AudioConfig;
