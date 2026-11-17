@@ -139,6 +139,17 @@ impl SourceAudio {
         !self.bands_ready() && !self.bands_claimed.swap(true, Ordering::AcqRel)
     }
 
+    /// Whether the bands still need building and nobody has claimed the job.
+    pub fn bands_pending(&self) -> bool {
+        !self.bands_ready() && !self.bands_claimed.load(Ordering::Acquire)
+    }
+
+    /// Give the job back unfinished (the build was stopped, or never reached a worker), so the
+    /// source is claimed and queued again later.
+    pub fn unclaim_bands(&self) {
+        self.bands_claimed.store(false, Ordering::Release);
+    }
+
     /// Build the channels' missing bands, giving up when `wanted` says they are no longer needed
     /// (it is asked now and then). Returns whether every channel's bands are built.
     pub fn build_bands_while(&self, wanted: impl Fn() -> bool) -> bool {
@@ -219,7 +230,11 @@ mod tests {
         assert!(a.bands(0).is_none());
         assert!(a.build_bands_while(|| true));
         assert!(a.bands(0).is_some_and(|b| !b.is_empty()) && a.bands(1).is_some() && a.bands(2).is_none());
-        assert!(!a.claim_bands(), "nothing left to build");
+        assert!(!a.claim_bands() && !a.bands_pending(), "nothing left to build");
+        let b = tone(1, 4800);
+        assert!(b.bands_pending() && b.claim_bands() && !b.bands_pending());
+        b.unclaim_bands();
+        assert!(b.bands_pending() && b.claim_bands(), "claimed again once given back");
         // No channels: ready at once.
         let none = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![] });
         assert!(none.bands_ready() && !none.claim_bands());

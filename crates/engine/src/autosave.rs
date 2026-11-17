@@ -273,13 +273,25 @@ pub struct Leftover {
     pub recording: bool,
 }
 
+/// How many times [`leftovers`] tries a folder's lock, and how long apart.
+const LOCK_TRIES: usize = 3;
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
 /// session file they came from or holding a recording. Empty and outdated ones are deleted.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten().map(|d| d.path()) {
         let Ok(lock) = std::fs::OpenOptions::new().write(true).open(dir.join(LOCK)) else { continue };
-        if lock.try_lock().is_err() {
+        // A lock just released can still look taken for a moment (a child process another part of
+        // the app started may hold a copy of its handle until it execs): ask a few times.
+        let free = (0..LOCK_TRIES).any(|k| {
+            if k > 0 {
+                std::thread::sleep(LOCK_RETRY);
+            }
+            lock.try_lock().is_ok()
+        });
+        if !free {
             continue;
         }
         let origin = std::fs::read_to_string(dir.join(ORIGIN)).ok().filter(|o| !o.is_empty());

@@ -56,14 +56,22 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     first.close_autosave();
     drop(first);
 
+    let next = launch(&root);
+    assert!(!next.leftovers.is_empty(), "the autosave is offered at the next launch");
     let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
         |ui, app: &mut SoundApp| {
             app.logic(&ui.ctx().clone());
             app.ui(ui);
         },
-        launch(&root),
+        next,
     );
-    h.run_steps(3);
+    // The offer appears once the fonts are in, a few frames after launch.
+    for _ in 0..30 {
+        if h.query_by_label("Recover").is_some() {
+            break;
+        }
+        h.step();
+    }
     h.get_by_label("Recover").click();
     h.run_steps(3);
     let e = &h.state().engine;

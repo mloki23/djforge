@@ -16,6 +16,9 @@ fn pass(ctx: &egui::Context, app: &mut SoundApp, shown: bool) -> Duration {
 fn only_a_shown_window_animates_and_a_hidden_one_wakes_once_a_second() {
     let ctx = egui::Context::default();
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    // The demo has audio: with frequency colours on, the background band builder wakes the UI
+    // when a source finishes, which would race the once-a-second idle wake measured below.
+    app.run("ui.waveform_bands", serde_json::json!({"value": false})).unwrap();
     for _ in 0..3 {
         pass(&ctx, &mut app, true);
     }

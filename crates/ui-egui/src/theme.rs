@@ -981,7 +981,6 @@ mod tests {
         assert!(rx.recv_timeout(std::time::Duration::from_secs(120)).is_ok(), "the palette lock must be released when every holder drops it");
     }
 
-    /// WCAG 2 contrast ratio of two opaque colours.
     #[test]
     fn a_selected_clip_coloured_by_frequency_stands_out() {
         let _palette = lock_test_palette();
@@ -999,6 +998,7 @@ mod tests {
         }
     }
 
+    /// WCAG 2 contrast ratio of two opaque colours.
     fn contrast(a: Color32, b: Color32) -> f64 {
         let luminance = |c: Color32| {
             let linear = |channel: u8| {

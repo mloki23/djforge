@@ -298,6 +298,18 @@ impl Default for UiState {
     }
 }
 
+/// The sources of the audio clips the Edit window's timeline (`[x0, y0, x1, y1]`) shows at the
+/// session's zoom and scroll.
+fn visible_sources(s: &soundcraft_model::Session, timeline: [f32; 4]) -> Vec<soundcraft_model::SourceId> {
+    let z = &s.edit.zoom;
+    let width = f64::from((timeline[2] - timeline[0]).max(0.0));
+    let (from, to) = (z.scroll, z.scroll.saturating_add((width * z.samples_per_px.max(0.0)) as Samples));
+    let mut ids: Vec<_> = s.tracks.iter().flat_map(|t| t.clips()).filter(|c| c.start < to && c.end() > from).filter_map(|c| c.source()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Host services (file dialogs) injected by the app; absent in tests and on the web.
 #[derive(Default)]
 pub struct Services {
@@ -1459,9 +1471,11 @@ impl SoundApp {
             theme::apply_palette(ctx, palette);
             self.theme_applied = Some(palette);
         }
-        if self.waveform_bands() {
-            self.band_jobs.queue(ctx, &self.engine.session().pool);
-        }
+        let on = self.waveform_bands();
+        let s = self.engine.session();
+        // The sources of the clips in view go first; only looked for while some wait.
+        let first = if on && s.pool.audio().any(|a| a.bands_pending()) { visible_sources(s, self.edit_layout.timeline) } else { Vec::new() };
+        self.band_jobs.queue(ctx, &s.pool, on, &first);
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;

@@ -60,7 +60,11 @@ follows changes behaviour you may rely on.
   overrides the theme, saved with the UI prefs; turned on in Light or Classic, the clips it
   colours get the same dark bodies, as the band colours need a dark ground. Split clips, muted
   clips, the outgoing half of an overlapped crossfade and recording takes stay one colour.
-- **The bands are built in the background** after audio loads, one source at a time, so opening
-  a session or importing takes no longer; a waveform shows one colour until its bands are ready
-  (about 0.2 s per channel for 10 minutes of audio). With the colours off they aren't built. They
-  keep about 43 MB per hour of stereo in memory.
+- **The bands are built in the background** after audio loads, one source at a time and those of
+  the clips in view first, so opening a session or importing takes no longer; a waveform shows
+  one colour until its bands are ready (about 0.2 s per channel for 10 minutes of audio), so a
+  screenshot (`ui_shot`, `ui.screenshot`) taken straight after a load may show one-colour
+  waveforms. With the colours off they aren't built, and turning them off stops the builds under
+  way. They keep about 43 MB per hour of stereo in memory.
+- **In the browser (the wasm build) waveforms stay one colour**: there are no threads to build
+  the bands on, and building them on the UI thread would stall it.
