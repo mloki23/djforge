@@ -89,9 +89,46 @@ fn describe(d: &cpal::Device, default_name: Option<&str>, output: bool) -> Optio
     Some(DeviceInfo { is_default: default_name == Some(name.as_str()), name, max_channels, sample_rates, buffer_min, buffer_max })
 }
 
+/// Makes sure cpal's device enumerator outlives the thread that first asks for a device.
+///
+/// On Windows cpal keeps one WASAPI device enumerator for the whole process, made on the first
+/// thread to list or open a device under that thread's COM initialisation, which ends with the
+/// thread. Once that thread has gone, the next device call on any thread can crash the process
+/// (an access violation). So the enumerator is made here, on a thread that never ends. Every cpal
+/// host in this crate comes from [`host`] or [`audio_systems`], which call this first.
+#[cfg(windows)]
+fn keep_device_enumerator() {
+    static KEPT: std::sync::Once = std::sync::Once::new();
+    KEPT.call_once(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("audio devices".into()).spawn(move || {
+            // Listing the devices makes cpal's enumerator, on this thread.
+            if let Err(e) = cpal::default_host().devices().map(Iterator::count) {
+                log::warn!("listing the audio devices: {e}");
+            }
+            // The caller waits for this; should it be gone, nothing is lost.
+            let _ = tx.send(());
+            loop {
+                std::thread::park();
+            }
+        });
+        match spawned {
+            // Wait until the enumerator is made there, so no caller makes it first.
+            Ok(_) => {
+                let _ = rx.recv();
+            }
+            Err(e) => log::warn!("no thread to keep the audio devices on: {e}"),
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn keep_device_enumerator() {}
+
 /// Every audio system on this machine with its devices. Enumerating can take a moment (some
 /// systems probe each device): call it when the settings window opens, not every frame.
 pub fn audio_systems() -> Vec<AudioSystem> {
+    keep_device_enumerator();
     let default_id = cpal::default_host().id();
     cpal::available_hosts()
         .into_iter()
@@ -108,6 +145,7 @@ pub fn audio_systems() -> Vec<AudioSystem> {
 
 /// The chosen audio system, else the default one.
 pub(crate) fn host(cfg: &AudioConfig) -> cpal::Host {
+    keep_device_enumerator();
     cfg.system
         .as_deref()
         .and_then(|want| cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case(want)))
