@@ -2554,9 +2554,11 @@ mod save_tests {
         open_session(&mut missing, &path("A/A.djforge")).unwrap();
         save_session(&mut missing, &path("B/Moved.djforge")).unwrap();
         let mut r = Engine::default();
+        // Opening resolves stored paths to the platform's separators (`\` on Windows), so the
+        // expected path is joined component by component.
         assert_eq!(
             open_session(&mut r, &path("B/Moved.djforge")).unwrap(),
-            vec![dir.join("A").join("Audio Files/Audio 1_02.wav").display().to_string()]
+            vec![dir.join("A").join("Audio Files").join("Audio 1_02.wav").display().to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
