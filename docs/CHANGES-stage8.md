@@ -107,7 +107,9 @@ follows changes behaviour you may rely on.
 - **Unsaved changes made right after a save are no longer deleted at the next launch.** An
   autosave was thrown away unless it was strictly newer than its session file, so a change
   autosaved within the file system's time resolution of a save (the same clock tick on NTFS, 2 s
-  on FAT) was lost after a crash. An autosave folder now records what its session file held
-  (`origin-state`: length and FNV-1a hash), and is dropped only once that file was saved with
-  different contents since. Folders from SoundCraft or earlier builds are kept unless their
-  session file is strictly newer.
+  on FAT) was lost after a crash. An autosave is now dropped only once its session file holds
+  exactly its session: the same session apart from where audio is stored, each source's audio
+  the same file or one of the same bytes. Anything else, such as another program, a sync tool or
+  a second instance rewriting the session file, keeps the autosave and offers it. Folders from
+  SoundCraft or earlier builds, which don't record the session file's state (`origin-state`),
+  are kept unless their session file is strictly newer.

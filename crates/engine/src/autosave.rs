@@ -290,24 +290,79 @@ fn file_state(path: &str) -> String {
     std::fs::read(path).map_or_else(|_| NO_FILE.into(), |b| format!("{} {:016x}", b.len(), crate::cmd::prep::fnv1a64(&b)))
 }
 
-/// The session file `origin` the autosave in `dir`, written at `saved`, came from was saved since,
-/// with what the autosave holds. Only a sure sign counts; when in doubt the autosave is kept.
-/// Modification times alone can't tell: a save and the next change's autosave can land within
-/// the file system's time resolution.
-fn superseded(dir: &Path, origin: Option<&str>, saved: SystemTime) -> bool {
+/// The session file `origin` the autosave in `dir` (its session file `file`, written at `saved`)
+/// came from was saved since with exactly what the autosave holds. Only a sure sign counts;
+/// anything else (a rewrite by another program, a sync tool or a second instance) keeps the
+/// autosave. Modification times can't tell: a save and the next change's autosave can land
+/// within the file system's time resolution.
+fn superseded(dir: &Path, file: &Path, origin: Option<&str>, saved: SystemTime) -> bool {
     let Some(origin) = origin else { return false };
     let Ok(modified) = std::fs::metadata(origin).and_then(|m| m.modified()) else { return false };
     match std::fs::read_to_string(dir.join(ORIGIN_STATE)) {
-        // Rewritten since the autosave was written (not with older contents put back).
-        Ok(then) => then != NO_FILE && then != file_state(origin) && modified >= saved,
+        // Rewritten since the autosave was written, with the autosave's session in it.
+        Ok(then) => then != file_state(origin) && same_session(file, Path::new(origin)),
         // A folder SoundCraft or an earlier djforge build wrote: only a session file saved
         // strictly later says so.
         Err(_) => modified > saved,
     }
 }
 
+/// The session file `origin` holds the session the autosave session file `autosave` holds. Only
+/// what saving rewrites may differ: where each source's audio is stored (the same file, or a
+/// file of the same bytes) and the stamps of that file. Anything unreadable is not the same.
+fn same_session(autosave: &Path, origin: &Path) -> bool {
+    let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let (Some(mut a), Some(mut o)) = (read(autosave), read(origin)) else { return false };
+    // Both resolve relative paths against the session file's folder.
+    let base = origin.parent().unwrap_or(Path::new(""));
+    let (Some(a_sources), Some(o_sources)) = (take_sources(&mut a, base), take_sources(&mut o, base)) else { return false };
+    a == o && a_sources.len() == o_sources.len() && a_sources.iter().zip(&o_sources).all(|((af, a), (of, o))| a == o && same_audio(af, of))
+}
+
+/// Take the sources out of the session `v`: each without what saving rewrites, beside the file
+/// its audio is in, relative paths resolved against `base`.
+fn take_sources(v: &mut serde_json::Value, base: &Path) -> Option<Vec<(PathBuf, serde_json::Value)>> {
+    let serde_json::Value::Array(sources) = v.as_object_mut()?.remove("sources")? else { return None };
+    sources
+        .into_iter()
+        .map(|mut src| {
+            let fields = src.as_object_mut()?;
+            let path = PathBuf::from(fields.remove("path")?.as_str()?);
+            for rewritten in ["unsaved", "file_len", "file_modified_ms"] {
+                fields.remove(rewritten);
+            }
+            Some((if path.is_absolute() { path } else { base.join(path) }, src))
+        })
+        .collect()
+}
+
+/// `a` and `b` name the same file, or files of the same bytes.
+fn same_audio(a: &Path, b: &Path) -> bool {
+    if a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b)) {
+        return true;
+    }
+    let open = |p: &Path| std::fs::File::open(p).and_then(|f| Ok((f.metadata()?.len(), f)));
+    let (Ok((a_len, a)), Ok((b_len, b))) = (open(a), open(b)) else { return false };
+    if a_len != b_len {
+        return false;
+    }
+    let (mut a, mut b) = (std::io::BufReader::new(a), std::io::BufReader::new(b));
+    loop {
+        let (Ok(x), Ok(y)) = (std::io::BufRead::fill_buf(&mut a), std::io::BufRead::fill_buf(&mut b)) else { return false };
+        let n = x.len().min(y.len());
+        if n == 0 {
+            return x.is_empty() && y.is_empty();
+        }
+        if x[..n] != y[..n] {
+            return false;
+        }
+        std::io::BufRead::consume(&mut a, n);
+        std::io::BufRead::consume(&mut b, n);
+    }
+}
+
 /// Leftover autosaves under `root`, newest first: folders no open session holds, unless the
-/// session file they came from was saved with their changes since (see [`superseded`]). Empty
+/// session file they came from was saved with exactly their changes since (see [`superseded`]). Empty
 /// and outdated ones are deleted; a folder still locked is left alone.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
@@ -330,7 +385,7 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || !superseded(&dir, origin.as_deref(), saved) => {
+            Ok(saved) if recording || !superseded(&dir, &file, origin.as_deref(), saved) => {
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -762,12 +817,25 @@ mod tests {
         let root = dir.join("Autosave");
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = Engine::default();
-        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        // Every kind of source: a saved take, a file referenced in place and a new take.
         record(&mut e, 0.5);
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        let wav = dir.join("Elsewhere/track.wav");
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Float32, dither: false, bwf: None };
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.75; 4_800]] };
+        std::fs::write(&wav, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        record(&mut e, -0.25);
         let mut a = Autosave::create(&root, "Song").unwrap();
         a.write(e.session(), e.path.as_deref(), None).unwrap();
         drop(a);
         (dir, path, root, e)
+    }
+
+    /// The autosave folders under `root`.
+    fn autosaves(root: &Path) -> usize {
+        std::fs::read_dir(root).map_or(0, Iterator::count)
     }
 
     /// Give the file at `p` the modification time of the autosave under `root`.
@@ -786,7 +854,7 @@ mod tests {
         assert_eq!(left.len(), 1, "the unsaved change is offered, not deleted");
         let mut r = Engine::default();
         recover(&mut r, &left[0]).unwrap();
-        assert_eq!(levels(&r), [0.5]);
+        assert_eq!(levels(&r), [0.5, 0.75, -0.25]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -794,10 +862,42 @@ mod tests {
     fn an_autosave_is_dropped_once_its_session_is_saved_with_its_changes() {
         let (dir, path, root, mut e) = saved_then_changed("autosave-superseded");
         crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
-        // Even at the very same time as the autosave: the session file changed since.
+        // Even at the very same time as the autosave: the session file holds its changes.
         same_time_as_the_autosave(&path, &root);
         assert!(leftovers(&root).is_empty());
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(autosaves(&root), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_autosave_is_kept_when_something_else_rewrites_its_session_file() {
+        let (dir, path, root, _) = saved_then_changed("autosave-rewritten");
+        // Another program, a sync tool or a second instance writes other contents there.
+        let mut other = Engine::default();
+        other.execute("track.new", &json!({"name": "Other"})).unwrap();
+        crate::io::save_session(&mut other, &path.to_string_lossy()).unwrap();
+        same_time_as_the_autosave(&path, &root);
+        assert_eq!(leftovers(&root).len(), 1, "at the same time");
+        crate::io::touch_later(&path);
+        let left = leftovers(&root);
+        assert_eq!(left.len(), 1, "later");
+        let mut r = Engine::default();
+        recover(&mut r, &left[0]).unwrap();
+        assert_eq!(levels(&r), [0.5, 0.75, -0.25]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_autosave_is_kept_when_its_session_is_saved_with_other_audio() {
+        let (dir, path, root, mut e) = saved_then_changed("autosave-other-audio");
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        // The take saved with it is not the one autosaved: same length, other samples.
+        for take in std::fs::read_dir(dir.join("Audio Files")).unwrap().flatten().map(|d| d.path()) {
+            let mut bytes = std::fs::read(&take).unwrap();
+            *bytes.last_mut().unwrap() ^= 0x40;
+            std::fs::write(&take, bytes).unwrap();
+        }
+        assert_eq!(leftovers(&root).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
