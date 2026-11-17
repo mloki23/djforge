@@ -1322,76 +1322,80 @@ fn mappings_window(app: &mut SoundApp, ctx: &egui::Context) {
     let t = crate::theme::Tokens::current();
     let mut delete = None;
     let mut changed = false;
-    egui::Window::new("MIDI Mappings").id(egui::Id::new("midi_mappings")).open(&mut open).default_size(egui::vec2(640.0, 300.0)).show(ctx, |ui| {
-        if app.ui.midi_mappings.is_empty() {
-            ui.label("No MIDI mappings. Right-click a slot, fader, knob or parameter and choose Learn MIDI.");
-        }
-        let rows: Vec<(Mapping, Option<(f64, String)>, bool)> =
-            app.ui.midi_mappings.iter().map(|m| (m.clone(), activity(app, m), m.target.is_trigger() || travel(app, &m.target).is_ok())).collect();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("midi_mappings_grid").num_columns(7).striped(true).show(ui, |ui| {
-                for h in ["", "Device", "Message", "Target", "Mode", "Settings", ""] {
-                    ui.label(egui::RichText::new(h).strong());
-                }
-                ui.end_row();
-                for (i, (m, act, resolved)) in rows.iter().enumerate() {
-                    let lit = act.as_ref().is_some_and(|(age, _)| *age < ACTIVITY_S);
-                    let dot = egui::RichText::new("●").color(if lit { t.accent } else { t.text_dim.gamma_multiply(0.4) });
-                    ui.label(dot)
-                        .on_hover_text(act.as_ref().map_or_else(|| "No activity yet".to_string(), |(age, what)| format!("{what}, {age:.1} s ago")));
-                    ui.label(&m.device.name).on_hover_text(&m.device.raw_name);
-                    ui.label(m.matcher.label());
-                    let label = if *resolved {
-                        egui::RichText::new(m.target.label())
-                    } else {
-                        egui::RichText::new(format!("{} (missing)", m.target.label())).color(t.text_dim)
-                    };
-                    ui.label(label);
-                    let mut mode = m.mode;
-                    egui::ComboBox::from_id_salt(("midi_map_mode", i)).selected_text(mode.label()).show_ui(ui, |ui| {
-                        for x in Mode::ALL.into_iter().filter(|x| x.fits(&m.matcher)) {
-                            ui.selectable_value(&mut mode, x, x.label());
-                        }
-                    });
-                    let mut sens = m.sensitivity;
-                    let mut pickup = m.pickup;
-                    ui.horizontal(|ui| {
-                        if mode.relative() {
-                            ui.add(egui::DragValue::new(&mut sens).range(MIN_SENSITIVITY..=MAX_SENSITIVITY).speed(0.0005).prefix("step "));
-                        }
-                        if !m.target.is_trigger() && !m.matcher.is_note() && mode == Mode::Absolute {
-                            ui.checkbox(&mut pickup, "Pickup");
-                        }
-                    });
-                    if ui.button("Delete").clicked() {
-                        delete = Some(i);
+    crate::windows::floating(ctx, "MIDI Mappings").id(egui::Id::new("midi_mappings")).open(&mut open).default_size(egui::vec2(640.0, 300.0)).show(
+        ctx,
+        |ui| {
+            if app.ui.midi_mappings.is_empty() {
+                ui.label("No MIDI mappings. Right-click a slot, fader, knob or parameter and choose Learn MIDI.");
+            }
+            let rows: Vec<(Mapping, Option<(f64, String)>, bool)> =
+                app.ui.midi_mappings.iter().map(|m| (m.clone(), activity(app, m), m.target.is_trigger() || travel(app, &m.target).is_ok())).collect();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("midi_mappings_grid").num_columns(7).striped(true).show(ui, |ui| {
+                    for h in ["", "Device", "Message", "Target", "Mode", "Settings", ""] {
+                        ui.label(egui::RichText::new(h).strong());
                     }
                     ui.end_row();
-                    if let Some(x) = app.ui.midi_mappings.get_mut(i)
-                        && (x.mode != mode || x.sensitivity != sens || x.pickup != pickup)
-                    {
-                        x.mode = mode;
-                        x.sensitivity = sens;
-                        x.pickup = pickup;
-                        changed = true;
+                    for (i, (m, act, resolved)) in rows.iter().enumerate() {
+                        let lit = act.as_ref().is_some_and(|(age, _)| *age < ACTIVITY_S);
+                        let dot = egui::RichText::new("●").color(if lit { t.accent } else { t.text_dim.gamma_multiply(0.4) });
+                        ui.label(dot).on_hover_text(
+                            act.as_ref().map_or_else(|| "No activity yet".to_string(), |(age, what)| format!("{what}, {age:.1} s ago")),
+                        );
+                        ui.label(&m.device.name).on_hover_text(&m.device.raw_name);
+                        ui.label(m.matcher.label());
+                        let label = if *resolved {
+                            egui::RichText::new(m.target.label())
+                        } else {
+                            egui::RichText::new(format!("{} (missing)", m.target.label())).color(t.text_dim)
+                        };
+                        ui.label(label);
+                        let mut mode = m.mode;
+                        egui::ComboBox::from_id_salt(("midi_map_mode", i)).selected_text(mode.label()).show_ui(ui, |ui| {
+                            for x in Mode::ALL.into_iter().filter(|x| x.fits(&m.matcher)) {
+                                ui.selectable_value(&mut mode, x, x.label());
+                            }
+                        });
+                        let mut sens = m.sensitivity;
+                        let mut pickup = m.pickup;
+                        ui.horizontal(|ui| {
+                            if mode.relative() {
+                                ui.add(egui::DragValue::new(&mut sens).range(MIN_SENSITIVITY..=MAX_SENSITIVITY).speed(0.0005).prefix("step "));
+                            }
+                            if !m.target.is_trigger() && !m.matcher.is_note() && mode == Mode::Absolute {
+                                ui.checkbox(&mut pickup, "Pickup");
+                            }
+                        });
+                        if ui.button("Delete").clicked() {
+                            delete = Some(i);
+                        }
+                        ui.end_row();
+                        if let Some(x) = app.ui.midi_mappings.get_mut(i)
+                            && (x.mode != mode || x.sensitivity != sens || x.pickup != pickup)
+                        {
+                            x.mode = mode;
+                            x.sensitivity = sens;
+                            x.pickup = pickup;
+                            changed = true;
+                        }
                     }
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Learn MIDI for Command...").clicked() {
+                    let _ = app.run("midi.learn_command", json!({}));
+                }
+                if !app.ui.midi_mappings.is_empty() && ui.button("Remove All").clicked() {
+                    app.midi_learn.confirm_remove_all = true;
+                }
+                let back = app.ui.midi_mappings_backup.len();
+                if back > 0 && ui.button(format!("Undo Remove ({back})")).on_hover_text("Put back the mapping(s) removed last").clicked() {
+                    let _ = app.run("midi.restore_mappings", json!({}));
                 }
             });
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("Learn MIDI for Command...").clicked() {
-                let _ = app.run("midi.learn_command", json!({}));
-            }
-            if !app.ui.midi_mappings.is_empty() && ui.button("Remove All").clicked() {
-                app.midi_learn.confirm_remove_all = true;
-            }
-            let back = app.ui.midi_mappings_backup.len();
-            if back > 0 && ui.button(format!("Undo Remove ({back})")).on_hover_text("Put back the mapping(s) removed last").clicked() {
-                let _ = app.run("midi.restore_mappings", json!({}));
-            }
-        });
-    });
+        },
+    );
     if app.midi_learn.confirm_remove_all {
         let n = app.ui.midi_mappings.len();
         let mut answer = None;
@@ -1896,6 +1900,8 @@ mod tests {
         map(&mut app, json!({"type": "cc", "ch": 0, "cc": 7}), json!({"kind": "stop_all"}), json!({}));
         app.ui.show_midi_mappings = true;
         let ctx = egui::Context::default();
+        // Window titles are set in the app's bold face.
+        crate::fonts::install(&ctx);
         let frame = |app: &mut SoundApp, events: Vec<egui::Event>| {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),

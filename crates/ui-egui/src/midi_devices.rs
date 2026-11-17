@@ -46,7 +46,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let now = ctx.input(|i| i.time);
     let flash = crate::midi_input::flash_s(ctx);
     let t = Tokens::current();
-    egui::Window::new("MIDI Devices").id(egui::Id::new("midi_devices")).open(&mut open).default_size(vec2(560.0, 440.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "MIDI Devices").id(egui::Id::new("midi_devices")).open(&mut open).default_size(vec2(560.0, 440.0)).show(ctx, |ui| {
         let generation = app.midi_host.as_ref().map(MidiHost::generation);
         let cached: Option<(Option<u64>, Vec<Value>)> = ui.ctx().data(|d| d.get_temp(cache));
         let refresh = ui
@@ -71,7 +71,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             ui.label("No MIDI input devices.");
         }
         let mut stale = false;
-        egui::Grid::new("midi_devices_ports").num_columns(4).striped(true).show(ui, |ui| {
+        egui::Grid::new("midi_devices_ports").num_columns(4).spacing(vec2(18.0, 6.0)).striped(true).show(ui, |ui| {
             for h in ["", "Enable", "State", ""] {
                 ui.label(egui::RichText::new(h).strong());
             }

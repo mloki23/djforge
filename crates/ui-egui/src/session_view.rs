@@ -282,7 +282,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = true;
     let t = Tokens::current();
     let now = ctx.input(|i| i.time);
-    let shown = egui::Window::new(egui::RichText::new("Session").font(bold(13.0)))
+    let shown = crate::windows::floating(ctx, "Session")
         .id(egui::Id::new("session_view"))
         .open(&mut open)
         .default_size(vec2(5.0 * CELL.x + 80.0, 11.0 * CELL.y + 80.0))
@@ -484,7 +484,16 @@ fn slot(app: &mut SoundApp, ui: &mut egui::Ui, column: usize, row: usize, state:
         filled.as_ref().map(|(name, _)| name.clone())
     };
     if let Some(text) = text {
-        p.text(egui::pos2(rect.min.x + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, text, regular(11.0), t.text);
+        let left = rect.min.x + 24.0;
+        crate::widgets::elided_text(
+            &p,
+            egui::pos2(left, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &text,
+            regular(11.0),
+            t.text,
+            rect.max.x - left - 4.0,
+        );
     }
     if loading {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
@@ -741,7 +750,7 @@ fn notes_window(app: &mut SoundApp, ctx: &egui::Context) {
     let t = Tokens::current();
     let mut open = true;
     let (mut copy, mut replace) = (false, false);
-    egui::Window::new(egui::RichText::new(format!("Live {} Slot {}: {}", column + 1, row + 1, x.name)).font(bold(13.0)))
+    crate::windows::floating(ctx, format!("Live {} Slot {}: {}", column + 1, row + 1, x.name))
         .id(egui::Id::new("session_slot_notes"))
         .open(&mut open)
         .default_size(vec2(520.0, 260.0))

@@ -1593,8 +1593,12 @@ impl SoundApp {
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
         }
+        // Floating windows stay below the menu bar and first open below the toolbar.
+        let top = ui.available_rect_before_wrap().top();
         // With the Mix window in its own native window, the main window keeps Edit.
-        match if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window } {
+        let main = if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window };
+        windows::set_work_area(&ctx, top, if main == MainWindow::Edit { top + toolbar::HEIGHT } else { top });
+        match main {
             MainWindow::Edit => edit_window::show(self, ui),
             MainWindow::Mix => mix_window::show(self, ui),
         }

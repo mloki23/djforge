@@ -118,6 +118,9 @@ pub struct Tokens {
     pub toolbar_group: Color32,
     pub border: Color32,
     pub border_light: Color32,
+    /// The outline of an idle control's box: an unticked checkbox or radio button, a text field,
+    /// a button. At least 3:1 on the panel and on a window's fill, so an empty box reads.
+    pub widget_edge: Color32,
     /// The lit top/left edge of raised panels: track headers and Mix strips.
     pub edge_light: Color32,
     pub text: Color32,
@@ -322,6 +325,7 @@ impl Tokens {
             toolbar_group: Color32::from_rgb(13, 15, 18),
             border: Color32::from_rgb(8, 9, 11),
             border_light: LINE,
+            widget_edge: Color32::from_rgb(0x6e, 0x76, 0x86),
             edge_light: Color32::from_rgba_premultiplied(22, 24, 28, 22),
             text: TEXT,
             text_dim: DIM,
@@ -450,6 +454,7 @@ impl Tokens {
         toolbar_group: Color32::from_rgb(24, 24, 25),
         border: Color32::from_rgb(14, 14, 14),
         border_light: Color32::from_rgb(64, 64, 66),
+        widget_edge: Color32::from_rgb(120, 120, 123),
         edge_light: Color32::from_rgba_premultiplied(20, 20, 20, 20),
         text: Color32::from_rgb(214, 214, 214),
         text_dim: Color32::from_rgb(150, 150, 152),
@@ -568,6 +573,7 @@ impl Tokens {
         toolbar_group: Color32::from_rgb(208, 210, 214),
         border: Color32::from_rgb(100, 103, 109),
         border_light: Color32::from_rgb(150, 153, 159),
+        widget_edge: Color32::from_rgb(100, 103, 109),
         edge_light: Color32::from_rgba_premultiplied(150, 150, 150, 150),
         text: Color32::from_rgb(24, 25, 28),
         text_dim: Color32::from_rgb(68, 70, 76),
@@ -853,6 +859,9 @@ pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
     v.widgets.hovered.weak_bg_fill = t.button_hi;
     v.widgets.noninteractive.fg_stroke.color = t.text;
     v.widgets.inactive.fg_stroke.color = t.text;
+    // egui draws an idle control's box without an outline, so an unticked checkbox, a radio
+    // button or an empty text field vanished into the panel.
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t.widget_edge);
     if palette == Palette::Dark {
         // Selected text and rows: the accent on a dark yellow, readable either way round. The
         // same accent outlines a focused text field.
@@ -1262,6 +1271,28 @@ mod tests {
             (v.window_stroke.color, v.widgets.noninteractive.bg_stroke.color, v.widgets.open.bg_fill),
             (t.border_light, t.border_light, t.button_hi)
         );
+    }
+
+    #[test]
+    fn an_unticked_checkbox_reads_on_every_palettes_panels() {
+        use egui::widget_style::{Classes, WidgetState};
+        let _palette = lock_test_palette();
+        let _restore = RestorePalette(palette());
+        let ctx = egui::Context::default();
+        for p in Palette::ALL {
+            apply_palette(&ctx, p);
+            let t = Tokens::of(p);
+            let style = ctx.global_style();
+            // The box egui draws for an idle checkbox (a radio button and a text field use the same stroke).
+            let frame = style.checkbox_style(&Classes::default(), WidgetState::Inactive).checkbox_frame;
+            assert!(frame.stroke.width >= 1.0, "{p:?} checkbox outline width");
+            assert_eq!(style.visuals.widgets.inactive.bg_stroke, frame.stroke, "{p:?}");
+            // On a docked panel, and inside a floating window.
+            for (what, bg) in [("panel", t.panel_bg), ("window", style.visuals.window_fill)] {
+                let c = contrast(frame.stroke.color, bg);
+                assert!(c >= 3.0, "{p:?} checkbox outline on the {what}: {c:.2}");
+            }
+        }
     }
 
     #[test]

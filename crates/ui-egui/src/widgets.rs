@@ -261,12 +261,15 @@ pub fn meter(ui: &Ui, r: Rect, level: f32, hold: f32, clip: bool) {
     }
 }
 
+/// The size of the numbers on fader and meter scales: small, but readable in the dim text colour.
+pub const SCALE_TEXT: f32 = 9.5;
+
 /// The dB scale of a [`meter`] drawn in `r`, its numbers ending at `x`.
 pub fn meter_scale(p: &Painter, r: Rect, x: f32) {
     let t = Tokens::current();
     for (db, y) in meter_marks(meter_bar(r)) {
-        p.text(pos2(x - 3.0, y), Align2::RIGHT_CENTER, format!("{}", db.abs()), regular(8.0), t.text_dim);
-        p.hline(x - 2.0..=x, y, Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)));
+        p.text(pos2(x - 3.0, y), Align2::RIGHT_CENTER, format!("{}", db.abs()), regular(SCALE_TEXT), t.text_dim);
+        p.hline(x - 2.0..=x, y, Stroke::new(1.0, t.text_dim));
     }
 }
 
@@ -336,9 +339,9 @@ fn fader_drawn(ui: &mut Ui, r: Rect, db: f32, resp: &Response) -> Option<f32> {
     let mut last = f32::NEG_INFINITY;
     for mark in [12.0f32, 6.0, 0.0, -5.0, -10.0, -15.0, -20.0, -30.0, -40.0, -60.0] {
         let y = slot.max.y - slot.height() * soundcraft_model::fader_db_to_pos(mark);
-        p.hline(slot.min.x - 6.0..=slot.min.x - 2.0, y, Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)));
-        if numbers_x - r.min.x >= 10.0 && y - last >= 9.0 {
-            p.text(pos2(numbers_x, y), Align2::RIGHT_CENTER, format!("{}", mark.abs()), regular(8.0), t.text_dim);
+        p.hline(slot.min.x - 6.0..=slot.min.x - 2.0, y, Stroke::new(1.0, t.text_dim));
+        if numbers_x - r.min.x >= 12.0 && y - last >= SCALE_TEXT + 1.5 {
+            p.text(pos2(numbers_x, y), Align2::RIGHT_CENTER, format!("{}", mark.abs()), regular(SCALE_TEXT), t.text_dim);
             last = y;
         }
     }
@@ -540,6 +543,21 @@ fn drag_toggle(ui: &Ui, resp: &Response, on: &mut bool) -> bool {
         return true;
     }
     false
+}
+
+/// `text` laid out on one line no wider than `max_width`, ending in "…" when it is cut short.
+pub fn elided_galley(painter: &Painter, text: &str, font: egui::FontId, color: Color32, max_width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: max_width.max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    painter.layout_job(job)
+}
+
+/// Paint `text` anchored at `pos` like [`Painter::text`], elided with "…" to `max_width`.
+pub fn elided_text(painter: &Painter, pos: egui::Pos2, anchor: Align2, text: &str, font: egui::FontId, color: Color32, max_width: f32) -> Rect {
+    let galley = elided_galley(painter, text, font, color, max_width);
+    let rect = anchor.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
+    rect
 }
 
 #[cfg(test)]

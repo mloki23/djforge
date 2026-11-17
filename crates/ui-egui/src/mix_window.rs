@@ -1020,11 +1020,12 @@ fn send_window_contents(app: &mut SoundApp, ctx: &egui::Context) {
     };
     let t = Tokens::current();
     let mut open = true;
-    egui::Window::new(format!("{name} · Send {}", (b'A' + slot as u8) as char))
+    crate::windows::floating(ctx, format!("{name} · Send {}", (b'A' + slot as u8) as char))
         .id(egui::Id::new("send_window"))
         .open(&mut open)
         .auto_sized()
         .collapsible(false)
+        .pivot(egui::Align2::LEFT_TOP)
         .default_pos(ctx.pointer_latest_pos().map_or(pos2(200.0, 200.0), |p| p + vec2(24.0, -160.0)))
         .show(ctx, |ui| {
             ui.set_width(150.0);

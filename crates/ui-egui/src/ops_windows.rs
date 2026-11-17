@@ -87,7 +87,7 @@ fn beat_detective(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Beat Detective").open(&mut open).default_size(vec2(360.0, 220.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "Beat Detective").open(&mut open).default_size(vec2(360.0, 220.0)).show(ctx, |ui| {
         ui.label("Analyses the edit selection on the selected tracks.");
         ui.add(egui::Slider::new(&mut app.ops.beat_sensitivity, 0.0..=1.0).text("Sensitivity"));
         crate::widgets::checkbox(ui, &mut app.ops.beat_separate, "Separate clips at detected beats");
@@ -143,7 +143,7 @@ fn tempo_ops(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Tempo Operations").open(&mut open).default_size(vec2(360.0, 200.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "Tempo Operations").open(&mut open).default_size(vec2(360.0, 200.0)).show(ctx, |ui| {
         egui::ComboBox::from_label("Curve").selected_text(app.ops.tempo_curve.clone()).show_ui(ui, |ui| {
             for c in ["constant", "linear", "parabolic", "s-curve", "scale", "stretch"] {
                 ui.selectable_value(&mut app.ops.tempo_curve, c.to_string(), c);
@@ -171,7 +171,7 @@ fn time_ops(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Time Operations").open(&mut open).default_size(vec2(360.0, 200.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "Time Operations").open(&mut open).default_size(vec2(360.0, 200.0)).show(ctx, |ui| {
         egui::ComboBox::from_label("Operation").selected_text(app.ops.time_op.clone()).show_ui(ui, |ui| {
             for c in ["insert", "cut", "change meter", "move song start"] {
                 ui.selectable_value(&mut app.ops.time_op, c.to_string(), c);
@@ -215,7 +215,7 @@ fn midi_ops(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("MIDI Operations").open(&mut open).default_size(vec2(360.0, 220.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "MIDI Operations").open(&mut open).default_size(vec2(360.0, 220.0)).show(ctx, |ui| {
         egui::ComboBox::from_label("Operation").selected_text(app.ops.midi_op.clone()).show_ui(ui, |ui| {
             for c in ["quantize", "transpose", "change velocity", "flatten performance", "restore performance"] {
                 ui.selectable_value(&mut app.ops.midi_op, c.to_string(), c);
@@ -261,7 +261,7 @@ fn rtp(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("MIDI Real-Time Properties").open(&mut open).default_size(vec2(340.0, 200.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "MIDI Real-Time Properties").open(&mut open).default_size(vec2(340.0, 200.0)).show(ctx, |ui| {
         ui.label("Non-destructive, applied at playback to the selected MIDI tracks.");
         let mut changed = false;
         changed |= ui.add(egui::Slider::new(&mut app.ops.rtp_velocity, -127..=127).text("Velocity +")).changed();

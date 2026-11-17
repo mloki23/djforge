@@ -439,6 +439,27 @@ pub fn ruler_height(id: &str) -> f32 {
     if id == "tempo_editor" { 56.0 } else { RULER_H }
 }
 
+/// How far a tempo label starts after its change's x: the 7-pt triangle plus a 3-pt gap.
+const TEMPO_LABEL_OFFSET: f32 = 10.0;
+/// The least space between one tempo label's end and the next one's start.
+const TEMPO_LABEL_GAP: f32 = 8.0;
+
+/// Which tempo changes get a label, given each change's x and its label's width, in x order:
+/// each label starts [`TEMPO_LABEL_OFFSET`] after its triangle, and one that would run into the
+/// previous label is left out, so the labels thin out as changes crowd together.
+fn tempo_label_slots(spans: &[(f32, f32)]) -> Vec<usize> {
+    let mut shown = Vec::new();
+    let mut end = f32::MIN;
+    for (i, &(x, width)) in spans.iter().enumerate() {
+        let left = x + TEMPO_LABEL_OFFSET;
+        if left >= end + TEMPO_LABEL_GAP {
+            shown.push(i);
+            end = left + width;
+        }
+    }
+    shown
+}
+
 /// The tempo editor: a graph of tempo over time. Click adds a change, Alt-click removes the nearest.
 fn tempo_editor(app: &mut SoundApp, ui: &mut Ui, painter: &egui::Painter, s: &Session, tl: Rect, row: Rect) {
     let sr = s.sample_rate;
@@ -519,24 +540,34 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                     let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(at, sr));
                     app.dialogs.open = Some(crate::dialogs::Dialog::TempoChange { at, bpm });
                 }
-                let mut last_label = f32::MIN;
-                for ev in s.tempo.tempos() {
-                    let x = x_of(&s, tl, s.tempo.tick_to_samples(ev.tick, sr));
+                let xs: Vec<f32> = s.tempo.tempos().iter().map(|ev| x_of(&s, tl, s.tempo.tick_to_samples(ev.tick, sr))).collect();
+                for &x in &xs {
                     painter.add(Shape::convex_polygon(
                         vec![pos2(x, row.min.y + 3.0), pos2(x + 7.0, row.center().y), pos2(x, row.max.y - 3.0)],
                         Color32::from_rgb(220, 60, 50),
                         Stroke::NONE,
                     ));
-                    if x - last_label > 46.0 {
-                        last_label = x;
-                        painter.text(
-                            pos2(x + 10.0, row.center().y),
-                            Align2::LEFT_CENTER,
-                            format!("{}", (ev.bpm * 100.0).round() / 100.0),
-                            bold(11.0),
-                            Color32::from_rgb(230, 240, 230),
-                        );
-                    }
+                }
+                // Labels go after their triangle, on the ruler's colour so a later triangle never
+                // cuts into one, and only where they clear the previous label.
+                let label_color = Color32::from_rgb(230, 240, 230);
+                let galleys: Vec<_> = s
+                    .tempo
+                    .tempos()
+                    .iter()
+                    .zip(&xs)
+                    .filter(|&(_, &x)| x > tl.min.x - 120.0 && x < tl.max.x)
+                    .map(|(ev, &x)| {
+                        let text = format!("{}", (ev.bpm * 100.0).round() / 100.0);
+                        (x, painter.layout_no_wrap(text, bold(11.0), label_color))
+                    })
+                    .collect();
+                let spans: Vec<(f32, f32)> = galleys.iter().map(|(x, g)| (*x, g.size().x)).collect();
+                for i in tempo_label_slots(&spans) {
+                    let Some((x, galley)) = galleys.get(i) else { continue };
+                    let at = pos2(x + TEMPO_LABEL_OFFSET, row.center().y - galley.size().y / 2.0);
+                    painter.rect_filled(Rect::from_min_size(at, galley.size()).expand2(vec2(2.0, 0.0)), 0.0, t.tempo_ruler);
+                    painter.galley(at, galley.clone(), label_color);
                 }
             }
             "meter" => {
@@ -1610,12 +1641,13 @@ fn grid_veil(line: Color32, bg: Color32) -> Color32 {
 /// How tall the clip-coloured strip over the top of a clip coloured by frequency is, when its
 /// name is hidden.
 const BAND_CLIP_STRIP: f32 = 3.0;
-/// How tall the deck-coloured band along the top of a DJ deck's clip is.
-const DECK_BAND: f32 = 3.0;
+/// How tall the deck-coloured band along the top of a DJ deck's clip is, when its name bar is
+/// hidden (with the name bar shown, the whole bar takes the deck's colour).
+const DECK_BAND: f32 = 5.0;
 
 /// Where and how a clip is drawn: the timeline and lane rectangles, whether it is dimmed (under
-/// an automation view), and its DJ deck ([`crate::dj_marks::Decks::clip`]), which tints a band
-/// along its top when deck colours are on.
+/// an automation view), and its DJ deck ([`crate::dj_marks::Decks::clip`]), which tints it
+/// in its name bar (or a band along its top) when deck colours are on.
 #[derive(Clone, Copy)]
 struct ClipPlace {
     tl: Rect,
@@ -1654,16 +1686,24 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     let body = if s.edit.flag("view.clip.transparency") { body.gamma_multiply(0.55) } else { body };
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     let name_h = clip_name_height(s, lane);
+    // A DJ deck's clip, with deck colours on, takes the deck's colour in its name bar (dark text
+    // reads on both decks' colours), or in a band along its top when the name bar is hidden.
+    let deck_tint = deck.filter(|_| app.deck_colours()).map(crate::dj_marks::deck_colour);
+    let tinted_bar = deck_tint.filter(|_| name_h > 0.0 && !(clip.muted || dim));
     if name_h > 0.0 {
         let nb = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + name_h));
-        painter.rect_filled(nb, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, if clip.muted { Color32::from_rgb(70, 70, 70) } else { bar });
+        let fill = if clip.muted { Color32::from_rgb(70, 70, 70) } else { tinted_bar.unwrap_or(bar) };
+        painter.rect_filled(nb, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, fill);
         let name_clip = nb.intersect(lane);
-        painter.with_clip_rect(name_clip).text(
-            pos2(nb.min.x.max(lane.min.x) + 4.0, nb.center().y),
+        let left = nb.min.x.max(lane.min.x) + 4.0;
+        crate::widgets::elided_text(
+            &painter.with_clip_rect(name_clip),
+            pos2(left, nb.center().y),
             Align2::LEFT_CENTER,
             &clip.name,
             bold(10.5),
             Color32::from_rgb(12, 12, 12),
+            name_clip.max.x - left - 2.0,
         );
     }
     let body_r = Rect::from_min_max(pos2(r.min.x, r.min.y + name_h), r.max);
@@ -1729,8 +1769,8 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     // The deck tint: a band along the clip's very top, over the name bar's top edge (or above
     // the clip-coloured strip), so the clip's own colour stays below it.
-    let deck_h = match deck {
-        Some(_) if app.deck_colours() => DECK_BAND.min(r.height() * 0.2),
+    let deck_h = match deck_tint {
+        Some(_) if tinted_bar.is_none() => DECK_BAND.min(r.height() * 0.2),
         _ => 0.0,
     };
     if by_frequency && name_h <= 0.0 {
@@ -1739,10 +1779,9 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         let strip = Rect::from_min_max(pos2(r.min.x, top), pos2(r.max.x, top + BAND_CLIP_STRIP.min(r.height() * 0.25)));
         painter.rect_filled(strip, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, bar);
     }
-    if let Some(d) = deck
+    if let Some(tint) = deck_tint
         && deck_h > 0.0
     {
-        let tint = crate::dj_marks::deck_colour(d);
         let tint = if clip.muted || dim { tint.gamma_multiply(0.45) } else { tint };
         painter.rect_filled(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + deck_h)), CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, tint);
     }
@@ -2813,6 +2852,22 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
 mod tests {
     use super::*;
     use egui_kittest::Harness;
+
+    #[test]
+    fn tempo_labels_follow_their_triangle_and_thin_out_when_crowded() {
+        // Far apart: every change is labelled.
+        assert_eq!(tempo_label_slots(&[(0.0, 36.0), (100.0, 36.0), (200.0, 36.0)]), [0, 1, 2]);
+        // A change every 33 pt with 36-pt labels: every other label, each clear of the last.
+        let crowded: Vec<(f32, f32)> = (0..8).map(|i| (i as f32 * 33.0, 36.0)).collect();
+        let shown = tempo_label_slots(&crowded);
+        assert_eq!(shown, [0, 2, 4, 6]);
+        for pair in shown.windows(2) {
+            let (a, b) = (crowded[pair[0]], crowded[pair[1]]);
+            assert!(b.0 + TEMPO_LABEL_OFFSET >= a.0 + TEMPO_LABEL_OFFSET + a.1 + TEMPO_LABEL_GAP);
+        }
+        // A label never starts on its own triangle (7 pt wide).
+        const { assert!(TEMPO_LABEL_OFFSET > 7.0) };
+    }
 
     #[test]
     fn follow_jumps_to_offscreen_playhead_while_playing() {

@@ -87,7 +87,54 @@ fn win(ctx: &egui::Context, open: &mut bool, title: &str, size: egui::Vec2, body
     if !*open {
         return;
     }
-    egui::Window::new(title).open(open).default_size(size).show(ctx, body);
+    floating(ctx, title).open(open).default_size(size).show(ctx, body);
+}
+
+/// Where floating windows may go in a viewport: below its menu bar, and first opened below the
+/// toolbar. Recorded each frame by [`set_work_area`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorkArea {
+    /// The menu bar's bottom edge: no window goes above it.
+    top: f32,
+    /// Where a window first opens: below the toolbar, when there is one.
+    open_top: f32,
+}
+
+fn work_area_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("floating_work_area", ctx.viewport_id()))
+}
+
+/// This viewport's work area, if recorded this run. (The id is made outside `ctx.data`, which
+/// holds the context's lock.)
+fn work_area(ctx: &egui::Context) -> Option<WorkArea> {
+    let id = work_area_id(ctx);
+    ctx.data(|d| d.get_temp::<WorkArea>(id))
+}
+
+/// Record this viewport's work area: windows stay below `top` (the menu bar's bottom edge) and
+/// first open at `open_top` (below the toolbar).
+pub(crate) fn set_work_area(ctx: &egui::Context, top: f32, open_top: f32) {
+    let area = WorkArea { top, open_top: open_top.max(top) };
+    let id = work_area_id(ctx);
+    ctx.data_mut(|d| d.insert_temp(id, area));
+}
+
+/// The rectangle floating windows are kept inside: the viewport below its menu bar.
+pub(crate) fn work_rect(ctx: &egui::Context) -> egui::Rect {
+    let content = ctx.content_rect();
+    let top = work_area(ctx).map_or(content.top(), |a| a.top);
+    egui::Rect::from_min_max(egui::pos2(content.left(), top.clamp(content.top(), content.bottom())), content.max)
+}
+
+/// A floating window titled like every other (bold 13 pt), first opened centred below the
+/// toolbar and kept below the menu bar so it never covers the menus or the counter.
+pub(crate) fn floating<'a>(ctx: &egui::Context, title: impl Into<String>) -> egui::Window<'a> {
+    let content = ctx.content_rect();
+    let open_top = work_area(ctx).map_or(content.top(), |a| a.open_top) + 12.0;
+    egui::Window::new(egui::RichText::new(title.into()).font(crate::theme::bold(13.0)))
+        .pivot(egui::Align2::CENTER_TOP)
+        .default_pos(egui::pos2(content.center().x, open_top))
+        .constrain_to(work_rect(ctx))
 }
 
 fn automation(app: &mut SoundApp, ctx: &egui::Context) {
@@ -371,7 +418,7 @@ fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Workspace").open(&mut open).default_size(vec2(460.0, 420.0)).show(ctx, |ui| {
+    crate::windows::floating(ctx, "Workspace").open(&mut open).default_size(vec2(460.0, 420.0)).show(ctx, |ui| {
         let dir = if app.ui.workspace_dir.is_empty() { std::env::var("HOME").unwrap_or_else(|_| ".".into()) } else { app.ui.workspace_dir.clone() };
         ui.horizontal(|ui| {
             if ui.button("⬆").on_hover_text("Parent folder").clicked()
@@ -805,6 +852,8 @@ mod audio_health_tests {
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
         app.run("window.audio_health", json!({"value": true})).unwrap();
         let ctx = egui::Context::default();
+        // Window titles are set in the app's bold face.
+        crate::fonts::install(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| audio_health(&mut app, ui.ctx()));
         output.textures_delta.clear();
         assert_eq!(app.audio_health_report.as_ref().unwrap().as_ref().unwrap()["healthy"], true);

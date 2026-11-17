@@ -58,8 +58,10 @@ fn fader_scale_numbers_are_readable_and_clear_of_their_ticks() {
     for (mode, palette) in [(ThemeMode::Dark, Tokens::DARK), (ThemeMode::Light, Tokens::LIGHT)] {
         let harness = mix(mode);
         let output = harness.output();
-        let numbers: Vec<_> =
-            texts(output, |t| t.galley.job.sections[0].format.font_id.size == 8.0 && SCALE.contains(&t.galley.job.text.as_str())).collect();
+        let numbers: Vec<_> = texts(output, |t| {
+            t.galley.job.sections[0].format.font_id.size == soundcraft_ui_egui::widgets::SCALE_TEXT && SCALE.contains(&t.galley.job.text.as_str())
+        })
+        .collect();
         assert!(numbers.len() >= SCALE.len() * 2, "{mode:?}: found {} scale numbers", numbers.len());
         for number in numbers {
             let color = number.override_text_color.unwrap_or(number.galley.job.sections[0].format.color);
@@ -90,7 +92,7 @@ fn stereo_strips_line_up_with_mono_strips() {
 fn the_meter_starts_level_with_the_top_of_the_faders_travel() {
     let _palette = PALETTE.lock().unwrap_or_else(|e| e.into_inner());
     let harness = mix(ThemeMode::Dark);
-    let numbers: Vec<_> = texts(harness.output(), |t| t.galley.job.sections[0].format.font_id.size == 8.0)
+    let numbers: Vec<_> = texts(harness.output(), |t| t.galley.job.sections[0].format.font_id.size == soundcraft_ui_egui::widgets::SCALE_TEXT)
         .map(|t| (t.galley.job.text.as_str(), t.galley.rect.translate(t.pos.to_vec2())))
         .collect();
     let fader_tops: Vec<_> = numbers.iter().filter(|(text, _)| *text == "12").map(|(_, r)| *r).collect();
@@ -109,6 +111,8 @@ fn narrow_strips_show_ticks_without_numbers() {
     for _ in 0..3 {
         harness.step();
     }
-    let numbers = texts(harness.output(), |t| t.galley.job.sections[0].format.font_id.size == 8.0 && SCALE.contains(&t.galley.job.text.as_str()));
+    let numbers = texts(harness.output(), |t| {
+        t.galley.job.sections[0].format.font_id.size == soundcraft_ui_egui::widgets::SCALE_TEXT && SCALE.contains(&t.galley.job.text.as_str())
+    });
     assert_eq!(numbers.count(), 0);
 }

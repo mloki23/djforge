@@ -215,7 +215,7 @@ pub fn show_result(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = true;
     let mut close = false;
     let mut opened: Option<Result<(), String>> = None;
-    egui::Window::new(egui::RichText::new("Export Finished").font(bold(13.0)))
+    crate::windows::floating(ctx, "Export Finished")
         .collapsible(false)
         .resizable(true)
         .open(&mut open)

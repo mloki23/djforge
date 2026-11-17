@@ -1,7 +1,7 @@
 //! The offer to recover unsaved work an earlier run left in the autosave folder.
 
 use crate::SoundApp;
-use crate::theme::{Tokens, bold};
+use crate::theme::Tokens;
 use egui::{Align2, vec2};
 
 /// Offer the newest leftover autosave, one at a time.
@@ -9,7 +9,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let Some(left) = app.leftovers.first().cloned() else { return };
     let mut open = true;
     let mut recover = None;
-    egui::Window::new(egui::RichText::new("Recover Unsaved Work").font(bold(13.0)))
+    crate::windows::floating(ctx, "Recover Unsaved Work")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
