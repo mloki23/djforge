@@ -243,12 +243,12 @@ mod tests {
         let p = parse_plan(SMALL).unwrap();
         assert_eq!((p.format.as_str(), p.master_bpm, p.tempo_mode.as_str(), p.target_lufs), ("mixforge-plan/2", 140.0, "ramp", Some(-10.0)));
         assert_eq!(p.tracks.len(), 3);
-        assert!(p.warnings.first().unwrap().starts_with("Key clash: Quest - Accelerator"));
+        assert!(p.warnings.first().unwrap().starts_with("Key clash: Northern Lights (Club Mix)"));
         let t = &p.tracks[0];
         assert_eq!((t.bpm, t.play_bpm, t.first_downbeat, t.cue_in, t.start), (132.006, 132.006, 1.5957, 1.5957, 0.0));
         assert_eq!((t.out_start, t.audio_end, t.gain_db, t.nudge_ms), (Some(496.1187), 512.464, 6.0, 0.0));
-        assert_eq!((t.camelot.as_str(), t.key.as_str(), t.artist.as_str(), t.fx_count), ("5B", "D#", "GERMSGEMS", 0));
-        assert!(t.path.ends_with("193 - Quest - Accelerator (Sunnyside Dub) (Acid Trance 2000).mp3"));
+        assert_eq!((t.camelot.as_str(), t.key.as_str(), t.artist.as_str(), t.fx_count), ("5B", "D#", "Demo Artist A", 0));
+        assert!(t.path.ends_with("01 - Northern Lights (Club Mix).mp3"));
         assert_eq!(t.transition, Some(PlanTransition { style: TransitionStyle::Quick, bars: 8, ramp: true }));
         // An integer nudge reads as a number.
         let t = &p.tracks[1];
@@ -270,7 +270,7 @@ mod tests {
         // An unknown style blends, with a warning naming the track.
         assert_eq!(p.tracks[0].transition.map(|t| t.style), Some(TransitionStyle::Blend));
         let w = p.warnings.last().unwrap();
-        assert!(w.contains("track 1") && w.contains("\"drop\"") && w.contains("Quest - Accelerator"), "{w}");
+        assert!(w.contains("track 1") && w.contains("\"drop\"") && w.contains("Northern Lights"), "{w}");
     }
 
     #[test]

@@ -20,7 +20,7 @@ What changes for a set:
 - **Latency.** In True Peak mode the limiter adds 64 more samples (1.3 ms at 48 kHz) on top of
   its lookahead, up from 6 before stage 7a: the detector's span, twice its 32-sample delay. It
   reports this, so playback and bounces stay aligned.
-- **Inter-sample peaks.** On the loki journey gate (bars 896..968), the master reads:
+- **Inter-sample peaks.** On the stage 7a production gate (a 20-track test set, bars 896..968), the master reads:
   - ffmpeg ebur128 per-frame maximum: -1.0005 dBTP (it was -0.954);
   - engine meter: -1.000 dBTP (was -0.935);
   - gate checker's 4x estimate: -0.97 dBTP (was -0.91);

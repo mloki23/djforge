@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn the_collection_and_playlist_parse_back() {
-        let x = rekordbox_xml("loki & friends", &tracks());
+        let x = rekordbox_xml("demo & friends", &tracks());
         assert!(x.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         let root = parse(&x);
         assert_eq!((root.name.as_str(), root.attr("Version")), ("DJ_PLAYLISTS", "1.0.0"));
@@ -343,7 +343,7 @@ mod tests {
         let rootnode = root.kid("PLAYLISTS").kid("NODE");
         assert_eq!((rootnode.attr("Type"), rootnode.attr("Name"), rootnode.attr("Count")), ("0", "ROOT", "1"));
         let list = rootnode.kid("NODE");
-        assert_eq!((list.attr("Name"), list.attr("Type"), list.attr("KeyType"), list.attr("Entries")), ("loki & friends", "1", "0", "2"));
+        assert_eq!((list.attr("Name"), list.attr("Type"), list.attr("KeyType"), list.attr("Entries")), ("demo & friends", "1", "0", "2"));
         assert_eq!(list.kids("TRACK").iter().map(|k| k.attr("Key")).collect::<Vec<_>>(), ["1", "2"]);
     }
 
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn file_urls_percent_encode_utf8_and_keep_the_drive() {
         let url = |p: &str| file_url(Path::new(p));
-        assert_eq!(url(r"C:\Users\marty\Music\a b.mp3").as_deref(), Some("file://localhost/C:/Users/marty/Music/a%20b.mp3"));
+        assert_eq!(url(r"C:\Users\dj\Music\a b.mp3").as_deref(), Some("file://localhost/C:/Users/dj/Music/a%20b.mp3"));
         assert_eq!(url(r"c:\x\#1 100%.mp3").as_deref(), Some("file://localhost/C:/x/%231%20100%25.mp3"));
         // U+FF1F (fullwidth ?) and é as their UTF-8 bytes.
         assert_eq!(url("C:/x/why\u{FF1F} caf\u{e9}.mp3").as_deref(), Some("file://localhost/C:/x/why%EF%BC%9F%20caf%C3%A9.mp3"));

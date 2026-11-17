@@ -317,9 +317,10 @@ including the notice of djforge's modifications, are in [NOTICE](NOTICE).
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-Every icon in the interface is drawn in code, the app icon is original, and the demo song and the
-screenshots' audio are synthesised by the app itself, so there are no samples or artwork from
-anyone else in this repository.
+Every icon in the interface is drawn in code, the app icon is original, the demo song is
+synthesised by the app itself, and the screenshots show an invented set whose audio
+`tools/screens/demo_set.py` synthesises, so there are no samples or artwork from anyone else in
+this repository.
 
 The ArtCraft name and logos are trademarks of the ArtCraft Team. As a fork, djforge doesn't carry
 them; ArtCraft is named only to credit SoundCraft's authors.

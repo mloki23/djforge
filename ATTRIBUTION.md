@@ -36,7 +36,7 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `assets/app-icon/djforge.icns` | djforge contributors | original, drawn by `tools/icon/make_icon.py` | MIT OR Apache-2.0 |
 | `assets/app-icon/djforge.ico` | djforge contributors | original, drawn by `tools/icon/make_icon.py` | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/` | djforge contributors | original, drawn by `tools/icon/make_icon.py` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
-| `docs/images/` | djforge contributors | screenshots of djforge in djforge Dark, rendered by the `ui_shot` example (`tools/screens/stage8.py`), downscaled | MIT OR Apache-2.0 |
+| `docs/images/` | djforge contributors | screenshots of djforge in djforge Dark, rendered by the `ui_shot` example (`tools/screens/stage8.py`) from a generated synthetic demo set (`tools/screens/demo_set.py`: invented titles, synthesised audio), downscaled | MIT OR Apache-2.0 |
 
 ## Vendored source code
 
