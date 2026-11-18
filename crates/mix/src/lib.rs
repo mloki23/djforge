@@ -1380,7 +1380,7 @@ impl MixEngine {
         self.order = order;
         // The live decks play into the main mix, before the master faders.
         if let Some(d) = self.decks.as_mut() {
-            d.render(&mut self.main, frames);
+            d.render_with(&mut self.main, frames, !self.monitor_only);
         }
         // Master faders process the main mix.
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);
@@ -1425,7 +1425,7 @@ impl MixEngine {
         // While the decks sound, the output stage holds them under the ceiling whatever the master
         // faders do (the arrangement is stopped then).
         if let Some(d) = self.decks.as_mut() {
-            d.limit_output(&mut self.main, frames);
+            d.limit_output(&mut self.main, frames, !self.monitor_only);
         }
         // Metronome: summed after the master fader, so it reaches the speakers without passing
         // through any track, send or insert. Only the playback engine sets `metronome`.
