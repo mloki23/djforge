@@ -38,8 +38,8 @@ pub use midi_in::{CONTROL_PORTS, Control as MidiControl, KEYBOARD_SOURCE, MIDI_S
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_midi_io::{MidiClock, MidiMessage, PortId, Subscriber};
 use soundcraft_mix::{
-    ColumnPlay, LiveCmd, LiveEvent, MAX_CHANNELS, MixEngine, PlayerStem, PreparedInstance, PreparedWarp, StripMeter, WarpPlayer, WarpRoom,
-    itu_stereo_fold, main_channels,
+    ColumnPlay, DeckCmd, DeckId, DecksState, LiveCmd, LiveEvent, MAX_CHANNELS, MixEngine, PlayerStem, PreparedDeck, PreparedInstance, PreparedWarp,
+    StripMeter, WarpPlayer, WarpRoom, itu_stereo_fold, main_channels,
 };
 use soundcraft_model::{MAX_LIVE_COLUMNS, Session, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
@@ -109,6 +109,11 @@ enum Cmd {
     MidiCapture(Option<rtrb::Producer<Captured>>),
     /// Capture whenever the transport plays, not only while recording onto an armed target.
     MidiCaptureWhilePlaying(bool),
+    /// A command for the live decks. Starting a deck stops the arrangement.
+    Deck(DeckCmd),
+    /// A track for a deck, prepared off the audio thread; the one it replaces comes back to be
+    /// dropped on the UI thread.
+    DeckLoad(DeckId, Box<PreparedDeck>),
 }
 
 /// Live MIDI figures the audio thread publishes, and what the player last sent it.
@@ -189,6 +194,8 @@ struct LiveShared {
     last: Mutex<[LiveColumnState; MAX_LIVE_COLUMNS]>,
     /// The longest audio callback seen, in session samples.
     max_callback: AtomicI64,
+    /// What the live decks play.
+    decks: DeckShared,
 }
 
 impl Default for LiveShared {
@@ -198,7 +205,57 @@ impl Default for LiveShared {
             words: std::array::from_fn(|_| std::array::from_fn(|i| AtomicI64::new(if i >= 4 { 0 } else { -2 }))),
             last: Mutex::new([LiveColumnState::default(); MAX_LIVE_COLUMNS]),
             max_callback: AtomicI64::new(0),
+            decks: DeckShared::default(),
         }
+    }
+}
+
+/// The live decks' [`DecksState`] shared lock-free by the audio thread, as [`LiveShared`] does
+/// the Live columns': a sequence counter (odd while it writes) around the state's words
+/// ([`DecksState::encode`]).
+struct DeckShared {
+    seq: AtomicU64,
+    words: [AtomicU64; soundcraft_mix::decks::STATE_WORDS],
+    /// The last state read whole, for a read that keeps meeting a write (UI side only).
+    last: Mutex<DecksState>,
+}
+
+impl Default for DeckShared {
+    fn default() -> Self {
+        let words = DecksState::default().encode();
+        DeckShared { seq: AtomicU64::new(0), words: words.map(AtomicU64::new), last: Mutex::new(DecksState::default()) }
+    }
+}
+
+impl DeckShared {
+    /// Publishes `state` (audio thread: no allocation, no lock).
+    fn publish(&self, state: &DecksState) {
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        for (a, v) in self.words.iter().zip(state.encode()) {
+            a.store(v, Ordering::Relaxed);
+        }
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// The last state published (a few retries when a write is under way; then the last state
+    /// read whole).
+    fn read(&self) -> DecksState {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut w = [0u64; soundcraft_mix::decks::STATE_WORDS];
+        for _ in 0..64 {
+            let before = self.seq.load(Ordering::Acquire);
+            for (o, a) in w.iter_mut().zip(&self.words) {
+                *o = a.load(Ordering::Relaxed);
+            }
+            std::sync::atomic::fence(Ordering::Acquire);
+            if before.is_multiple_of(2) && self.seq.load(Ordering::Relaxed) == before {
+                *last = DecksState::decode(&w);
+                return *last;
+            }
+            std::hint::spin_loop();
+        }
+        *last
     }
 }
 
@@ -361,6 +418,8 @@ struct AudioState {
     capture_pass: u32,
     /// A replaced capture queue the full `captures` channel refused, sent again later.
     capture_backlog: Option<rtrb::Producer<Captured>>,
+    /// A replaced deck the full `decks` channel refused, sent again on the next callback.
+    deck_backlog: Option<Box<PreparedDeck>>,
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -376,6 +435,8 @@ struct Bin {
     subs: SyncSender<Subscriber>,
     /// Replaced capture queues (dropping one may free it). Bounded: sending never allocates.
     captures: SyncSender<rtrb::Producer<Captured>>,
+    /// Replaced decks (their tracks, stretchers and buffers). Bounded: sending never allocates.
+    decks: SyncSender<Box<PreparedDeck>>,
 }
 
 /// The UI-thread ends of a [`Bin`].
@@ -386,6 +447,7 @@ struct BinRx {
     rooms: Receiver<WarpRoom>,
     subs: Receiver<Subscriber>,
     captures: Receiver<rtrb::Producer<Captured>>,
+    decks: Receiver<Box<PreparedDeck>>,
 }
 
 /// Replaced MIDI queues in flight back to the UI thread.
@@ -398,9 +460,10 @@ fn bin() -> (Bin, BinRx) {
     let (rtx, rrx) = sync_channel(ROOMS);
     let (stx, srx) = sync_channel(SUBS);
     let (ctx, crx) = sync_channel(SUBS);
+    let (dtx, drx) = sync_channel(SUBS);
     (
-        Bin { plugins: ptx, warps: wtx, batches: btx, rooms: rtx, subs: stx, captures: ctx },
-        BinRx { plugins: prx, warps: wrx, batches: brx, rooms: rrx, subs: srx, captures: crx },
+        Bin { plugins: ptx, warps: wtx, batches: btx, rooms: rtx, subs: stx, captures: ctx, decks: dtx },
+        BinRx { plugins: prx, warps: wrx, batches: brx, rooms: rrx, subs: srx, captures: crx, decks: drx },
     )
 }
 
@@ -445,6 +508,7 @@ fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
     m.set_external_instances(true);
     m.metronome = true;
+    m.enable_decks();
     m
 }
 
@@ -479,6 +543,7 @@ impl AudioState {
             capture_dropped: 0,
             capture_pass: 0,
             capture_backlog: None,
+            deck_backlog: None,
         }
     }
 
@@ -530,6 +595,8 @@ impl AudioState {
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Live(cmd) => self.mix.live(cmd),
                 Cmd::Play { from, end, looped } => {
+                    // The arrangement and the live decks never play together.
+                    self.mix.deck(DeckCmd::StopAll);
                     // Live slots restart across the transport's loop wraps like at their own.
                     self.mix.set_live_loop(looped.filter(|r| r.len() > 64));
                     if self.playing {
@@ -570,6 +637,23 @@ impl AudioState {
                     }
                 }
                 Cmd::MidiCaptureWhilePlaying(on) => self.capture_playing = on,
+                Cmd::Deck(cmd) => {
+                    // A deck that starts stops the arrangement (as `Cmd::Stop` does).
+                    if self.playing && matches!(cmd, DeckCmd::Play(_) | DeckCmd::Cue { down: true, .. }) {
+                        self.mix.live_release_all();
+                        self.mix.live_clear();
+                        self.playing = false;
+                        self.end = None;
+                        self.looped = None;
+                        self.mix.reset();
+                    }
+                    self.mix.deck(cmd);
+                }
+                Cmd::DeckLoad(id, deck) => {
+                    if let Some(old) = self.mix.deck_load(id, deck) {
+                        self.return_deck(old);
+                    }
+                }
                 Cmd::Stop => {
                     // The transport stopped: live keys are released too.
                     self.mix.live_release_all();
@@ -735,10 +819,34 @@ impl AudioState {
         }
     }
 
+    /// Sends a replaced deck back to be dropped on the UI thread, without allocating; one the
+    /// full channel refuses waits for the next callback (only when one already waits is a deck
+    /// dropped here, as a last resort).
+    fn return_deck(&mut self, deck: Box<PreparedDeck>) {
+        self.flush_decks();
+        match self.garbage.decks.try_send(deck) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(deck)) => {
+                if self.deck_backlog.is_none() {
+                    self.deck_backlog = Some(deck);
+                }
+            }
+        }
+    }
+
+    fn flush_decks(&mut self) {
+        if let Some(d) = self.deck_backlog.take()
+            && let Err(TrySendError::Full(d)) = self.garbage.decks.try_send(d)
+        {
+            self.deck_backlog = Some(d);
+        }
+    }
+
     fn send_garbage(&mut self) {
         self.flush_rooms();
         self.flush_subs();
         self.flush_captures();
+        self.flush_decks();
         let g = self.mix.take_retired();
         if !g.is_empty() {
             let _ = self.garbage.plugins.send(g);
@@ -844,6 +952,8 @@ impl AudioState {
             }
             self.shared.live.publish(&self.live_seen);
         }
+        // What the decks play, every callback (their playheads move).
+        self.shared.live.decks.publish(&self.mix.decks_state());
     }
 
     fn fill_block(&mut self, out: &mut [f32], channels: usize) {
@@ -851,7 +961,7 @@ impl AudioState {
         let channels = channels.max(1);
         // Live MIDI keeps the engine rendering while stopped only while there is something to
         // play or ring out, not merely because a target exists.
-        let live = self.mix.live_awake() || (self.mix.live_target().is_some() && self.midi.waiting());
+        let live = self.mix.live_awake() || (self.mix.live_target().is_some() && self.midi.waiting()) || self.mix.decks_awake();
         let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)) || live;
         if !self.playing && !monitoring {
             // With no target nothing plays live MIDI: what arrived is dropped rather than kept for
@@ -1008,6 +1118,7 @@ impl Side {
         self.garbage.rooms.try_iter().for_each(drop);
         self.garbage.subs.try_iter().for_each(drop);
         self.garbage.captures.try_iter().for_each(drop);
+        self.garbage.decks.try_iter().for_each(drop);
         if let Some(rx) = &self.old_sessions {
             rx.try_iter().for_each(drop);
         }
@@ -1346,6 +1457,26 @@ impl Player {
     /// whose player has not arrived plays silence.
     pub fn live(&self, cmd: LiveCmd) {
         let _ = self.tx.send(Cmd::Live(cmd));
+    }
+
+    /// A command for the live decks, applied at the next block. Starting a deck (play, or cue
+    /// pressed on a stopped one) stops the arrangement; arrangement play stops the decks.
+    pub fn deck(&self, cmd: DeckCmd) {
+        if matches!(cmd, DeckCmd::Play(_) | DeckCmd::Cue { down: true, .. }) {
+            self.shared.playing.store(false, Ordering::Relaxed);
+        }
+        let _ = self.tx.send(Cmd::Deck(cmd));
+    }
+
+    /// Loads a track prepared off the audio thread ([`PreparedDeck::new`]) on deck `id`,
+    /// stopped at its first downbeat; the deck it replaces is dropped here, later.
+    pub fn deck_load(&self, id: DeckId, deck: Box<PreparedDeck>) {
+        let _ = self.tx.send(Cmd::DeckLoad(id, deck));
+    }
+
+    /// What the decks play, as the audio thread last published it.
+    pub fn decks_state(&self) -> DecksState {
+        self.shared.live.decks.read()
     }
 
     /// What each Live column plays and has queued, as the audio thread last published it (all
@@ -3416,5 +3547,112 @@ mod midi_tests {
         let _new = r.capture(8);
         r.callback();
         assert!(r.grx.captures.try_recv().is_ok(), "the old queue came back to be dropped");
+    }
+}
+
+#[cfg(test)]
+mod deck_tests {
+    use super::*;
+    use soundcraft_audio_io::AudioBuffer;
+    use soundcraft_mix::{BeatGrid, DeckTrack, HOT_CUES};
+    use soundcraft_model::SourceAudio;
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            live: LiveShared::default(),
+            midi: MidiShared::new(),
+        })
+    }
+
+    /// A deck of a quiet 48 kHz tone at 128 bpm.
+    fn deck() -> Box<PreparedDeck> {
+        let n = 48_000 * 10;
+        let ch: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin() * 0.25).collect();
+        let source = Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![ch.clone(), ch] }));
+        let track = DeckTrack {
+            source,
+            grid: BeatGrid::constant(0.0, 22_500.0, n as f64),
+            bpm: Some(128.0),
+            key: None,
+            cues: [None; HOT_CUES],
+            title: "Tone".into(),
+            artist: String::new(),
+            path: String::new(),
+            grid_from: Some("given"),
+        };
+        Box::new(PreparedDeck::new(Arc::new(track), 48_000.0))
+    }
+
+    #[test]
+    fn decks_play_with_the_transport_stopped_and_are_published() {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, bin().0);
+        let d = deck();
+        let load = d.load();
+        tx.send(Cmd::DeckLoad(DeckId::A, d)).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::A))).unwrap();
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..4 {
+            st.fill(&mut out, 2);
+        }
+        assert!(out.iter().any(|v| v.abs() > 0.05), "the deck is heard");
+        assert!(!shared.playing.load(Ordering::Relaxed), "the arrangement stays stopped");
+        let s = shared.live.decks.read();
+        assert_eq!((s.decks[0].load, s.decks[0].playing), (load, true));
+        assert!(s.decks[0].position >= 4.0 * 512.0);
+        assert!((s.decks[0].bpm - 128.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arrangement_play_stops_the_decks_and_a_deck_stops_the_arrangement() {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, bin().0);
+        tx.send(Cmd::DeckLoad(DeckId::B, deck())).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::B))).unwrap();
+        let mut out = vec![0.0f32; 2 * 512];
+        st.fill(&mut out, 2);
+        assert!(shared.live.decks.read().decks[1].playing);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut out, 2);
+        assert!(!shared.live.decks.read().decks[1].playing, "arrangement play stops the decks");
+        assert!(shared.playing.load(Ordering::Relaxed));
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::B))).unwrap();
+        st.fill(&mut out, 2);
+        assert!(shared.live.decks.read().decks[1].playing);
+        assert!(!shared.playing.load(Ordering::Relaxed), "a deck starting stops the arrangement");
+    }
+
+    #[test]
+    fn a_replaced_deck_is_dropped_off_the_audio_thread_and_storage_never_grows() {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+        let first = deck();
+        let id = first.load();
+        tx.send(Cmd::DeckLoad(DeckId::A, first)).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::A))).unwrap();
+        let mut out = vec![0.0f32; 2 * 512];
+        st.fill(&mut out, 2);
+        let storage = st.mix.decks_storage();
+        for c in
+            [DeckCmd::MasterTempo { deck: DeckId::A, on: true }, DeckCmd::Loop { deck: DeckId::A, action: soundcraft_mix::LoopAction::Beats(1.0) }]
+        {
+            tx.send(Cmd::Deck(c)).unwrap();
+            for _ in 0..50 {
+                st.fill(&mut out, 2);
+            }
+        }
+        assert_eq!(st.mix.decks_storage(), storage);
+        tx.send(Cmd::DeckLoad(DeckId::A, deck())).unwrap();
+        st.fill(&mut out, 2);
+        let back = grx.decks.try_recv().expect("the replaced deck came back");
+        assert_eq!(back.load(), id);
     }
 }
