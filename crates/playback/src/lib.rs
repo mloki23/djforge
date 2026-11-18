@@ -559,6 +559,15 @@ impl AudioState {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
                         let _ = self.garbage.plugins.send(old.drain_plugins());
                         let _ = self.garbage.warps.send(old.drain_warps());
+                        // The decks' tracks go back to be dropped on the UI thread (they were at the
+                        // old rate; the engine forgets them once the decks report empty).
+                        let decks: [Option<Box<PreparedDeck>>; 6] = {
+                            let mut it = old.drain_decks();
+                            std::array::from_fn(|_| it.next())
+                        };
+                        for d in decks.into_iter().flatten() {
+                            self.return_deck(d);
+                        }
                     }
                     // Place the previous batch first, so the engine's inbox is empty to adopt into
                     // (see `MixEngine::adopt_warps`).
@@ -612,7 +621,7 @@ impl AudioState {
                     self.playing = true;
                     self.pending_len = 0;
                     self.read = 0.0;
-                    self.mix.reset();
+                    self.mix.reset_for_transport(&self.session);
                 }
                 Cmd::MidiIn(sub) => {
                     let old = self.midi.replace(sub);
@@ -645,7 +654,7 @@ impl AudioState {
                         self.playing = false;
                         self.end = None;
                         self.looped = None;
-                        self.mix.reset();
+                        self.mix.reset_for_transport(&self.session);
                     }
                     self.mix.deck(cmd);
                 }
@@ -661,7 +670,7 @@ impl AudioState {
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
-                    self.mix.reset();
+                    self.mix.reset_for_transport(&self.session);
                 }
                 Cmd::Locate(at) => {
                     self.mix.live_locate(self.pos, at, false);
@@ -671,7 +680,7 @@ impl AudioState {
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
-                    self.mix.reset();
+                    self.mix.reset_for_transport(&self.session);
                 }
             }
         }
@@ -851,6 +860,11 @@ impl AudioState {
         if !g.is_empty() {
             let _ = self.garbage.plugins.send(g);
         }
+        if self.deck_backlog.is_none()
+            && let Some(d) = self.mix.take_retired_deck()
+        {
+            self.return_deck(d);
+        }
         let w = self.mix.take_retired_warps();
         if !w.is_empty() {
             let _ = self.garbage.warps.send(w);
@@ -876,7 +890,7 @@ impl AudioState {
                 self.end = None;
                 self.mix.live_release_all();
                 self.mix.live_clear();
-                self.mix.reset();
+                self.mix.reset_for_transport(&self.session);
                 self.shared.playing.store(false, Ordering::Relaxed);
                 n = 0;
             } else {
@@ -935,7 +949,8 @@ impl AudioState {
     /// [`AudioState::fill`] for a callback starting at `now_ns` on the MIDI clock.
     fn fill_at(&mut self, out: &mut [f32], channels: usize, now_ns: u64) {
         // The longest callback, in session samples, for the UI's launch margin.
-        let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
+        // Half-speed and the like are the arrangement's: the decks play at their own rates.
+        let speed = if self.playing { f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0 } else { 1.0 };
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let frames = out.len() / channels.max(1);
         let span = (frames as f64 * step - 1e-6).ceil() as i64;
@@ -985,7 +1000,8 @@ impl AudioState {
         }
         // Audio rendered ahead in the last callback plays first in this one.
         self.midi.ahead(self.pending_len as f64 - self.read);
-        let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
+        // Half-speed and the like are the arrangement's: the decks play at their own rates.
+        let speed = if self.playing { f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0 } else { 1.0 };
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
@@ -3651,8 +3667,31 @@ mod deck_tests {
         }
         assert_eq!(st.mix.decks_storage(), storage);
         tx.send(Cmd::DeckLoad(DeckId::A, deck())).unwrap();
+        // Loaded while playing: it fades out first, then comes back.
         st.fill(&mut out, 2);
         let back = grx.decks.try_recv().expect("the replaced deck came back");
         assert_eq!(back.load(), id);
+        assert_eq!(st.mix.decks_storage(), storage);
+    }
+
+    #[test]
+    fn half_speed_is_the_arrangements_and_a_rate_change_returns_the_decks() {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx);
+        shared.speed.store(500, Ordering::Relaxed);
+        tx.send(Cmd::DeckLoad(DeckId::A, deck())).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::A))).unwrap();
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..4 {
+            st.fill(&mut out, 2);
+        }
+        assert_eq!(shared.live.decks.read().decks[0].position, 4.0 * 512.0, "full speed, whatever the transport's");
+        let s96 = Session::new("96k", soundcraft_time::SampleRate::new(96_000).unwrap());
+        tx.send(session_cmd(Arc::new(s96), Vec::new(), Vec::new())).unwrap();
+        st.fill(&mut out, 2);
+        assert!(grx.decks.try_recv().is_ok(), "the deck came back to be dropped off the audio thread");
+        assert_eq!(shared.live.decks.read().decks[0].load, 0, "and the decks report empty");
     }
 }
