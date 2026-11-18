@@ -135,7 +135,9 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
     if let Some((id, params)) = run {
-        if let Some(params) = params.filter(|_| !app.palette.learn) {
+        if !app.palette.learn
+            && let Some(params) = params.clone()
+        {
             if let Err(err) = app.run(&id, params) {
                 app.ui.status = err;
             }
@@ -149,7 +151,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             app.palette = PaletteState { learn: true, ..PaletteState::default() };
         } else if app.palette.learn {
             close = true;
-            let params = crate::menus::params_for(&path, &id);
+            // A deck control learns with its own parameters.
+            let params = params.unwrap_or_else(|| crate::menus::params_for(&path, &id));
             crate::midi_learn::start(app, crate::midi_learn::Target::Command { id, params });
         } else {
             close = true;

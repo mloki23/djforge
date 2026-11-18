@@ -6,6 +6,7 @@
 
 use crate::SoundApp;
 use soundcraft_engine::DeckRequest;
+use soundcraft_mix::{DeckCmd, HotCueAction};
 
 /// Search entries for the decks: (label, command, parameters).
 pub const PALETTE: &[(&str, &str, &str)] = &[
@@ -14,18 +15,22 @@ pub const PALETTE: &[(&str, &str, &str)] = &[
     ("Deck B: Play", "deck.play", r#"{"deck":"b"}"#),
     ("Deck A: Pause", "deck.pause", r#"{"deck":"a"}"#),
     ("Deck B: Pause", "deck.pause", r#"{"deck":"b"}"#),
-    ("Deck A: Cue", "deck.cue", r#"{"deck":"a","down":true}"#),
-    ("Deck B: Cue", "deck.cue", r#"{"deck":"b","down":true}"#),
+    ("Deck A: Cue", "deck.cue", r#"{"deck":"a","tap":true}"#),
+    ("Deck B: Cue", "deck.cue", r#"{"deck":"b","tap":true}"#),
     ("Deck A: Back to Start", "deck.seek", r#"{"deck":"a","at":0}"#),
     ("Deck B: Back to Start", "deck.seek", r#"{"deck":"b","at":0}"#),
-    ("Deck A: Nudge Faster", "deck.jog", r#"{"deck":"a","delta":0.3}"#),
-    ("Deck B: Nudge Faster", "deck.jog", r#"{"deck":"b","delta":0.3}"#),
+    ("Deck A: Search Forward a Beat", "deck.jog", r#"{"deck":"a","delta":1,"mode":"search"}"#),
+    ("Deck B: Search Forward a Beat", "deck.jog", r#"{"deck":"b","delta":1,"mode":"search"}"#),
     ("Deck A: Pitch to 0", "deck.pitch", r#"{"deck":"a","value":0}"#),
     ("Deck B: Pitch to 0", "deck.pitch", r#"{"deck":"b","value":0}"#),
     ("Deck A: Master Tempo On", "deck.master_tempo", r#"{"deck":"a","on":true}"#),
     ("Deck B: Master Tempo On", "deck.master_tempo", r#"{"deck":"b","on":true}"#),
+    ("Deck A: Master Tempo Off", "deck.master_tempo", r#"{"deck":"a","on":false}"#),
+    ("Deck B: Master Tempo Off", "deck.master_tempo", r#"{"deck":"b","on":false}"#),
     ("Deck A: Sync", "deck.sync", r#"{"deck":"a","on":true}"#),
     ("Deck B: Sync", "deck.sync", r#"{"deck":"b","on":true}"#),
+    ("Deck A: Sync Off", "deck.sync", r#"{"deck":"a","on":false}"#),
+    ("Deck B: Sync Off", "deck.sync", r#"{"deck":"b","on":false}"#),
     ("Deck A: Hot Cue A", "deck.hotcue", r#"{"deck":"a","n":1}"#),
     ("Deck B: Hot Cue A", "deck.hotcue", r#"{"deck":"b","n":1}"#),
     ("Deck A: 4-Beat Loop", "deck.loop", r#"{"deck":"a","beats":4}"#),
@@ -50,8 +55,14 @@ pub const PALETTE: &[(&str, &str, &str)] = &[
 ];
 
 impl SoundApp {
-    /// Carries a deck command to the audio engine.
+    /// Carries a deck command to the audio engine. A deck that starts while the arrangement plays
+    /// or records stops it the app's way first: a recording is finalised, half-speed reset and a
+    /// transport loop or slot recording cancelled.
     pub(crate) fn deck_request(&mut self, req: DeckRequest) {
+        let starts = matches!(req.0, DeckCmd::Play(_) | DeckCmd::Cue { down: true, .. } | DeckCmd::HotCue { action: HotCueAction::Jump, .. });
+        if starts && (self.is_playing() || self.engine.transport.recording) {
+            self.stop_play();
+        }
         if let Some(p) = &self.player {
             p.deck(req.0);
         }
@@ -71,7 +82,7 @@ impl SoundApp {
             }
         }
         if let Some(p) = &self.player {
-            self.engine.deck_status = p.decks_state();
+            self.engine.set_deck_status(p.decks_state());
         }
     }
 }
