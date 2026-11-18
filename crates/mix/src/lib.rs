@@ -62,9 +62,15 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
+pub mod decks;
+pub mod dj_strip;
 mod live;
 mod live_in;
 mod warp;
+pub use decks::{
+    BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HOT_CUES, HotCueAction, JogMode, LoopAction, PITCH_RANGES, PreparedDeck,
+};
+pub use dj_strip::{EqBand, FaderCurve, XfadeCurve, XfadeSide};
 pub use live::{
     ColumnPlay, LiveCmd, LivePlaying, LiveQueued, LiveStore, XFADE_S, column_of, pool_needs, pool_player_plays, slot_loops, slot_sources,
 };
@@ -417,6 +423,9 @@ pub struct MixEngine {
     live_target: Option<TrackId>,
     /// Live events refused because the inbox was full.
     live_in_dropped: u64,
+    /// The live decks (see [`decks`]), when the host plays them: realtime playback turns them
+    /// on with [`MixEngine::enable_decks`]; offline renders have none.
+    decks: Option<Box<Decks>>,
 }
 
 /// What `sync` needs to fill a slot.
@@ -516,7 +525,52 @@ impl MixEngine {
             live_in: Vec::with_capacity(LIVE_INBOX),
             live_target: None,
             live_in_dropped: 0,
+            decks: None,
         }
+    }
+
+    /// Gives the engine its live decks (allocates: call it off the audio thread).
+    pub fn enable_decks(&mut self) {
+        if self.decks.is_none() {
+            self.decks = Some(Box::new(Decks::new(self.sample_rate, self.max_block)));
+        }
+    }
+
+    /// A command for the live decks (none: ignored). Neither allocates nor frees.
+    pub fn deck(&mut self, cmd: DeckCmd) {
+        if let Some(d) = self.decks.as_mut() {
+            d.apply(cmd);
+        }
+    }
+
+    /// Puts `deck` on deck `id`; returns what is to be dropped off the audio thread: the deck it
+    /// replaced, or `deck` itself when the engine has no decks.
+    pub fn deck_load(&mut self, id: DeckId, deck: Box<PreparedDeck>) -> Option<Box<PreparedDeck>> {
+        match self.decks.as_mut() {
+            Some(d) => d.load(id, deck),
+            None => Some(deck),
+        }
+    }
+
+    /// What the decks play (all stopped and empty without decks).
+    pub fn decks_state(&self) -> DecksState {
+        self.decks.as_ref().map(|d| d.state()).unwrap_or_default()
+    }
+
+    /// True while a deck plays or rings out, so the host keeps rendering.
+    pub fn decks_awake(&self) -> bool {
+        self.decks.as_ref().is_some_and(|d| d.awake())
+    }
+
+    /// True while a deck plays.
+    pub fn decks_playing(&self) -> bool {
+        self.decks.as_ref().is_some_and(|d| d.playing())
+    }
+
+    /// The decks' buffers (lengths and capacities), for allocation checks.
+    #[doc(hidden)]
+    pub fn decks_storage(&self) -> Vec<(usize, usize)> {
+        self.decks.as_ref().map(|d| d.storage()).unwrap_or_default()
     }
 
     /// Queues a Live launch or stop for its sample (one that is due already takes effect at the
@@ -1298,6 +1352,10 @@ impl MixEngine {
             self.strips.insert(t.id, st);
         }
         self.order = order;
+        // The live decks play into the main mix, before the master faders.
+        if let Some(d) = self.decks.as_mut() {
+            d.render(&mut self.main, frames);
+        }
         // Master faders process the main mix.
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
