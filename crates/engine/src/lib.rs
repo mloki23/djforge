@@ -227,6 +227,12 @@ pub struct Engine {
     pub deck_loads: Vec<(soundcraft_mix::DeckId, Box<soundcraft_mix::PreparedDeck>)>,
     /// `deck.load`s still decoding and analysing on their own threads.
     deck_jobs: Vec<cmd::decks::DeckLoadJob>,
+    /// Per deck, the last `deck.load` issued (the last issued wins).
+    deck_generation: [u64; 2],
+    /// Per deck, the load handed to the host for `deck_tracks`, and whether its audio engine
+    /// has reported it (after which a report without it means the deck lost it).
+    deck_loaded: [u64; 2],
+    deck_seen: [bool; 2],
 }
 
 impl Default for Engine {
@@ -271,6 +277,9 @@ impl Engine {
             deck_tracks: [None, None],
             deck_loads: Vec::new(),
             deck_jobs: Vec::new(),
+            deck_generation: [0; 2],
+            deck_loaded: [0; 2],
+            deck_seen: [false; 2],
         }
     }
 
@@ -286,6 +295,10 @@ impl Engine {
                 continue;
             }
             let job = self.deck_jobs.remove(i);
+            if job.superseded(self) {
+                // A later load for its deck was issued: this one is dropped unheard.
+                continue;
+            }
             let r = job.finish(self);
             match &r {
                 Ok(v) => self.messages.push(format!(
@@ -298,6 +311,37 @@ impl Engine {
             out.push(r);
         }
         out
+    }
+
+    /// The host's audio engine reports what the decks play. A deck that no longer holds the
+    /// track `deck_tracks` names (its engine was replaced) is forgotten, so `decks.state` never
+    /// describes a track the audio thread lacks.
+    pub fn set_deck_status(&mut self, status: soundcraft_mix::DecksState) {
+        for (i, d) in status.decks.iter().enumerate() {
+            let (Some(loaded), Some(seen)) = (self.deck_loaded.get(i).copied(), self.deck_seen.get_mut(i)) else { continue };
+            if loaded == 0 {
+                continue;
+            }
+            if d.load == loaded {
+                *seen = true;
+            } else if *seen {
+                *seen = false;
+                if let Some(t) = self.deck_tracks.get_mut(i) {
+                    *t = None;
+                }
+                if let Some(l) = self.deck_loaded.get_mut(i) {
+                    *l = 0;
+                }
+            }
+        }
+        self.deck_status = status;
+    }
+
+    /// A load was handed on for deck `deck` (see [`Engine::set_deck_status`]).
+    pub(crate) fn note_deck_load(&mut self, deck: soundcraft_mix::DeckId, load: u64) {
+        if let (Some(l), Some(s)) = (self.deck_loaded.get_mut(deck.index()), self.deck_seen.get_mut(deck.index())) {
+            (*l, *s) = (load, false);
+        }
     }
 
     /// True while a `deck.load` is still reading its file.
@@ -532,6 +576,10 @@ impl Engine {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if self.blocked_while_recording(id) {
             return Err(EngineError::Disabled(id.to_string(), "stop recording first".into()));
+        }
+        // Another session may have another sample rate, which takes the decks' tracks away.
+        if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && self.deck_status.decks.iter().any(|d| d.playing) {
+            return Err(EngineError::Disabled(id.to_string(), "pause the decks first: another session may change the sample rate".into()));
         }
         if let Err(reason) = (spec.enabled)(self) {
             // A call that names its targets (tracks, clips, a range) does not need a selection;

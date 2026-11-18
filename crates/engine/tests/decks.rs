@@ -112,24 +112,39 @@ fn deck_load_runs_off_the_ui_thread_and_falls_back_to_the_bpm_tag() {
     assert!(e.messages.iter().any(|m| m.starts_with("Deck A: loaded")));
 }
 
+/// An analysis as mixforge's library holds it (`analysis.py`, sections from `structure.py`):
+/// 128 bpm from 0.5 s, 40 bars.
+fn analysis() -> Value {
+    json!({
+        "bpm": 128.0, "first_downbeat": 0.5, "duration": 75.0, "audio_end": 75.5, "camelot": "5A", "key": "C minor",
+        "constant_tempo": true, "downbeat_confidence": 0.9, "lufs": -8.0,
+        "grid_ok_4bar": vec![true; 10],
+        "bar_change": vec![1.0; 40],
+        "sections": [{"bar": 0, "label": "intro"}, {"bar": 16, "label": "build"}, {"bar": 24, "label": "drop"}]
+    })
+}
+
 #[test]
-fn mixforge_gives_the_grid_key_and_first_hot_cues() {
+fn mixforge_gives_the_grid_key_and_its_mix_points_as_hot_cues() {
     let dir = Scratch::new("mixforge");
-    let path = wav(&dir.0, "track.wav", 12.0);
+    let path = wav(&dir.0, "track.wav", 75.0);
     let mut e = engine();
-    e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| {
-        Ok(json!({"bpm": 128.0, "first_downbeat": 0.25, "camelot": "5A", "cues": [1.0, {"time": 2.5}, -1, "x", 4.0, 5.0, 6.0]}))
-    }));
+    e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
     run(&mut e, "deck.load", json!({"path": path, "deck": "b"}));
     let v = wait(&mut e).remove(0);
     assert_eq!(
-        (v["deck"].as_str(), v["grid"].as_str(), v["key"].as_str(), v["title"].as_str()),
-        (Some("b"), Some("mixforge"), Some("5A"), Some("track"))
+        (v["deck"].as_str(), v["grid"].as_str(), v["key"].as_str(), v["title"].as_str(), v["cues_from"].as_str()),
+        (Some("b"), Some("mixforge"), Some("5A"), Some("track"), Some("mixforge")),
+        "{v}"
     );
+    assert_eq!(v["priming_ms"], 0.0, "not an MP3");
     let t = e.deck_tracks[1].clone().unwrap();
-    assert_eq!(t.grid.as_ref().unwrap().first(), 0.25 * 48_000.0);
-    assert_eq!(t.cues[..5], [Some(48_000.0), Some(120_000.0), Some(192_000.0), Some(240_000.0), None], "four cues, A–D");
-    // Given bpm wins over the analysis.
+    assert_eq!(t.grid.as_ref().unwrap().first(), 0.5 * 48_000.0);
+    // Mix in on the first downbeat, the bass 16 bars on; Mix out on the drop (bar 24), the last
+    // boundary leaving room; Bass gone 24 bars after it falls past the end.
+    let bar = 1.875 * 48_000.0;
+    assert_eq!(t.cues[..5], [Some(24_000.0), Some(24_000.0 + 16.0 * bar), Some(24_000.0 + 24.0 * bar), None, None]);
+    // Given bpm wins over the analysis's grid.
     run(&mut e, "deck.load", json!({"path": path, "deck": "a", "bpm": 140, "first_beat": 0.1}));
     let v = wait(&mut e).remove(0);
     assert_eq!(v["grid"], "given");
@@ -138,6 +153,134 @@ fn mixforge_gives_the_grid_key_and_first_hot_cues() {
     let v = wait(&mut e).remove(0);
     assert!(v["error"].as_str().unwrap().contains("missing.wav"), "{v}");
     assert!((e.deck_tracks[0].as_ref().unwrap().bpm.unwrap() - 140.0).abs() < 1e-6);
+}
+
+#[test]
+fn a_track_in_the_open_set_takes_the_sets_cues() {
+    let dir = Scratch::new("set");
+    let (a, b) = (wav(&dir.0, "a.wav", 40.0), wav(&dir.0, "b.wav", 40.0));
+    let mut e = engine();
+    let ra = run(&mut e, "dj.load_warped", json!({"path": a, "bpm": 120, "first_beat": 0.0, "at_bar": 1}));
+    let rb = run(&mut e, "dj.load_warped", json!({"path": b, "bpm": 120, "first_beat": 0.0, "at_bar": 9}));
+    run(&mut e, "dj.transition", json!({"out_clip": ra["clip"], "in_clip": rb["clip"], "build_bars": 4, "out_bars": 4}));
+    e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
+    run(&mut e, "deck.load", json!({"path": b, "deck": "a"}));
+    let v = wait(&mut e).remove(0);
+    assert_eq!(v["cues_from"], "session", "{v}");
+    let t = e.deck_tracks[0].clone().unwrap();
+    // B comes in on bar 9 (its first beat) and its bass hits 4 bars (8 s at 120 bpm) later; it
+    // goes out nowhere in this set.
+    let [mix_in, hit, out, gone] = [0, 1, 2, 3].map(|i| t.cues[i]);
+    assert!(mix_in.unwrap().abs() < 1.0 && (hit.unwrap() - 8.0 * 48_000.0).abs() < 1.0, "{mix_in:?} {hit:?}");
+    assert_eq!((out, gone), (None, None));
+    // A plays out of it: Mix out on the same bar, 8 bars (16 s) into A; Bass gone 8 bars on.
+    run(&mut e, "deck.load", json!({"path": a, "deck": "b"}));
+    wait(&mut e);
+    let t = e.deck_tracks[1].clone().unwrap();
+    assert!((t.cues[2].unwrap() - 16.0 * 48_000.0).abs() < 1.0 && (t.cues[3].unwrap() - 32.0 * 48_000.0).abs() < 1.0, "{:?}", t.cues);
+}
+
+#[test]
+fn a_playing_deck_refuses_a_load_unless_forced_even_if_it_started_while_decoding() {
+    let dir = Scratch::new("lock");
+    let path = wav(&dir.0, "a.wav", 4.0);
+    let mut e = engine();
+    e.deck_status.decks[0].playing = true;
+    assert!(err(&mut e, "deck.load", json!({"path": path, "deck": "a"})).contains("Deck A is playing: pause it first"));
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a", "force": true, "bpm": 120}));
+    assert!(wait(&mut e)[0]["error"].is_null());
+    assert_eq!(e.deck_loads.len(), 1);
+    // Issued while stopped, started before the file was ready: refused at the finish.
+    run(&mut e, "deck.load", json!({"path": path, "deck": "b"}));
+    e.deck_status.decks[1].playing = true;
+    let v = wait(&mut e).remove(0);
+    assert!(v["error"].as_str().unwrap().contains("Deck B is playing"), "{v}");
+    assert_eq!(e.deck_loads.len(), 1, "nothing handed on");
+}
+
+#[test]
+fn the_last_load_issued_wins_and_the_one_it_replaces_stops_early() {
+    let dir = Scratch::new("gen");
+    let (slow, fast) = (wav(&dir.0, "slow.wav", 4.0), wav(&dir.0, "fast.wav", 4.0));
+    let mut e = engine();
+    let stopped = Arc::new(Mutex::new(false));
+    let s = Arc::clone(&stopped);
+    e.set_analyse(Arc::new(move |_: &str, stop: &dyn Fn() -> bool| {
+        for _ in 0..2000 {
+            if stop() {
+                *s.lock().unwrap() = true;
+                return Err("cancelled".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(json!({"bpm": 128.0, "first_downbeat": 0.0}))
+    }));
+    run(&mut e, "deck.load", json!({"path": slow, "deck": "a"}));
+    run(&mut e, "deck.load", json!({"path": fast, "deck": "a", "bpm": 124}));
+    let done = wait(&mut e);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(done[0]["path"].as_str().unwrap().ends_with("fast.wav"));
+    assert!(*stopped.lock().unwrap(), "the superseded analysis was stopped");
+    assert_eq!(e.deck_loads.len(), 1);
+    assert!(e.deck_tracks[0].as_ref().unwrap().path.ends_with("fast.wav"));
+}
+
+#[test]
+fn a_rate_change_while_loading_refuses_and_a_lost_track_is_forgotten() {
+    let dir = Scratch::new("rate");
+    let path = wav(&dir.0, "a.wav", 4.0);
+    let mut e = engine();
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a", "bpm": 120}));
+    e.session_mut().sample_rate = soundcraft_time::SampleRate::new(96_000).unwrap();
+    assert!(wait(&mut e)[0]["error"].as_str().unwrap().contains("sample rate changed"));
+    e.session_mut().sample_rate = soundcraft_time::SampleRate::new(48_000).unwrap();
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a", "bpm": 120}));
+    wait(&mut e);
+    let load = e.deck_loads[0].1.load();
+    let mut st = e.deck_status;
+    st.decks[0].load = load;
+    e.set_deck_status(st);
+    assert!(e.deck_tracks[0].is_some());
+    // The audio thread's engine was replaced: the deck is empty, and so is decks.state.
+    st.decks[0].load = 0;
+    e.set_deck_status(st);
+    assert!(e.deck_tracks[0].is_none());
+    assert_eq!(run(&mut e, "decks.state", json!({}))["decks"][0]["track"], Value::Null);
+    // Another session (perhaps at another rate) waits for the decks to stop.
+    st.decks[1].playing = true;
+    e.set_deck_status(st);
+    assert!(err(&mut e, "session.new", json!({})).contains("pause the decks first"));
+}
+
+#[test]
+fn an_mp3s_mixforge_grid_and_cues_move_by_its_priming() {
+    let ok = std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success());
+    if !ok {
+        println!("note: ffmpeg is not on the PATH; this test checks nothing");
+        return;
+    }
+    let dir = Scratch::new("priming");
+    let path = dir.0.join("lame.mp3");
+    let o = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=80:sample_rate=48000", "-c:a", "libmp3lame", "-b:a", "128k"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let primed = soundcraft_audio_io::mp3gain::gapless_priming(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(primed, (1105, 48_000), "a LAME gapless tag");
+    let mut e = engine();
+    e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a"}));
+    let v = wait(&mut e).remove(0);
+    assert!((v["priming_ms"].as_f64().unwrap() - 1105.0 / 48.0).abs() < 1e-6, "{v}");
+    let t = e.deck_tracks[0].clone().unwrap();
+    assert!((t.grid.as_ref().unwrap().first() - (24_000.0 - 1105.0)).abs() < 1e-6);
+    assert!((t.cues[0].unwrap() - (24_000.0 - 1105.0)).abs() < 1e-6, "{:?}", t.cues);
+    // A given grid is djforge's own: it stays.
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a", "bpm": 128, "first_beat": 0.5}));
+    wait(&mut e);
+    assert_eq!(e.deck_tracks[0].as_ref().unwrap().grid.as_ref().unwrap().first(), 24_000.0);
 }
 
 #[test]

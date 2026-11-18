@@ -34,7 +34,8 @@ def main(mixforge_dir, path):
     if info is None:
         print(json.dumps({"error": f"not analysed by mixforge: run `mixforge analyze \"{path}\"`"}))
         return 2
-    keys = ("bpm", "first_downbeat", "duration", "key", "camelot", "lufs", "constant_tempo", "downbeat_confidence")
+    keys = ("bpm", "first_downbeat", "duration", "audio_end", "key", "camelot", "lufs", "constant_tempo", "downbeat_confidence",
+            "grid_ok_4bar", "bar_change", "sections")
     out = {k: info.get(k) for k in keys}
     out.update(path=path, stale_cache=stale)
     print(json.dumps(out))

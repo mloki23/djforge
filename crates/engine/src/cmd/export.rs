@@ -68,6 +68,53 @@ const CHANGED: &str = "the original changed since import; exported the session's
 /// Extensions of movies: the audio of a movie has no audio file of its own to export.
 const MOVIES: [&str; 9] = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "mpg", "mpeg"];
 
+/// A transition's four cues, each on the clip it belongs to: (clip, bar, name, hot cue slot). A
+/// "Mix in" on the entry bar and B "Bass hit" on the hit bar of the track coming in; C "Mix out"
+/// on the entry bar and D "Bass gone" on the gone bar of the one going out.
+pub(crate) fn transition_cues(t: &Transition) -> [(soundcraft_model::ClipId, i64, &'static str, u8); 4] {
+    [
+        (t.in_clip, t.entry_bar, "Mix in", 0),
+        (t.in_clip, t.hit_bar(), "Bass hit", 1),
+        (t.out_clip, t.entry_bar, "Mix out", 2),
+        (t.out_clip, t.gone_bar(), "Bass gone", 3),
+    ]
+}
+
+/// The file second (on its clip's warp map, so mixforge's timeline) that clip `c` plays on session
+/// bar `bar`.
+fn cue_secs(s: &Session, c: &Clip, w: &WarpMap, bar: i64) -> f64 {
+    w.source_at_time(&s.tempo, s.sample_rate, c.start, bar_sample(s, bar)) / s.sample_rate.as_f64()
+}
+
+/// The A–D cues (file seconds, mixforge's timeline) the open DJ session gives the audio file at
+/// `path`, as [`collect`] exports them: from the first transitions into and out of a beat-locked
+/// clip playing it. `None` when no transition's clip plays it.
+pub(crate) fn cues_for_file(s: &Session, path: &Path) -> Option<[Option<f64>; 4]> {
+    let key = crate::io::file_key(path);
+    let mut transitions: Vec<&Transition> = s.dj.transitions.iter().collect();
+    transitions.sort_by_key(|t| (t.entry_bar, t.id));
+    let mut out = [None; 4];
+    for t in transitions {
+        for (clip, bar, _, slot) in transition_cues(t) {
+            let slot = usize::from(slot);
+            if out.get(slot).is_none_or(Option::is_some) {
+                continue;
+            }
+            let Some((_, c)) = s.find_clip(clip) else { continue };
+            let Some(w) = c.warp.as_ref().filter(|w| w.is_usable() && c.is_audio()) else { continue };
+            let Some(src) = c.source().and_then(|x| s.source(x)) else { continue };
+            if crate::io::file_key(&file_of(s, src).0) != key {
+                continue;
+            }
+            let at = cue_secs(s, c, w, bar);
+            if let Some(o) = out.get_mut(slot).filter(|_| at.is_finite() && at >= 0.0) {
+                *o = Some(at);
+            }
+        }
+    }
+    out.iter().any(Option::is_some).then_some(out)
+}
+
 /// The set in session `s`, from its DJ transitions: the files their clips play, one track per
 /// file in the order its first clip starts, each with its bar grid and cues in file seconds.
 ///
@@ -175,14 +222,9 @@ pub(crate) fn collect(s: &Session) -> Result<Vec<ExportTrack>, String> {
         let mut cues: Vec<Cue> = Vec::new();
         let mut twice = false;
         for t in &transitions {
-            for (clip, bar, cue, slot) in [
-                (t.in_clip, t.entry_bar, "Mix in", 0),
-                (t.in_clip, t.hit_bar(), "Bass hit", 1),
-                (t.out_clip, t.entry_bar, "Mix out", 2),
-                (t.out_clip, t.gone_bar(), "Bass gone", 3),
-            ] {
+            for (clip, bar, cue, slot) in transition_cues(t) {
                 let Some(&(c, w)) = f.clips.iter().find(|(c, _)| c.id == clip) else { continue };
-                let at = w.source_at_time(&s.tempo, s.sample_rate, c.start, bar_sample(s, bar)) / sr;
+                let at = cue_secs(s, c, w, bar);
                 if !(at.is_finite() && (0.0..duration).contains(&at)) {
                     f.doubts.push(format!("the {cue} cue (bar {bar}) falls outside the file; left out"));
                     continue;

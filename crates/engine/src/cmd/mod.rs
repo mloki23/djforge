@@ -12,6 +12,7 @@ mod clap;
 mod clip;
 mod clip_list;
 mod clip_more;
+mod deck_cues;
 pub(crate) mod decks;
 pub(crate) mod dj;
 mod edit;

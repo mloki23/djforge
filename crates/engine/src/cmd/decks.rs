@@ -17,11 +17,9 @@ use soundcraft_mix::{
 };
 use soundcraft_model::SourceAudio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const LOAD: &str = "deck.load";
-
-/// How many of mixforge's cues become hot cues (A–D).
-const ANALYSED_CUES: usize = 4;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -30,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track to Deck",
             [],
             None,
-            "{path, deck?: a|b (default: a deck that is not playing, A first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat. Its beat grid: the given bpm, else mixforge's analysis (when the app has it), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Its first hot cues (A–D) are mixforge's cues when the analysis has them. Returns {deck, path, loading: true}; the result ({deck, title, grid, bpm, key, analysis_error}) goes to the status line",
+            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its beat grid: the given bpm, else mixforge's analysis (when the app has it), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid, bpm, key, cues_from: session|mixforge|null, priming_ms, analysis_error}) goes to the status line",
             always,
             load
         ),
@@ -41,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Cue",
             [],
             None,
-            "{deck: a|b, down?: bool (default true)} — the CDJ cue button. Stopped: down sets the cue point at the playhead (on the nearest beat with quantise) and plays from it while held; up returns there and pauses. Playing: down returns to the cue point and pauses",
+            "{deck: a|b, down?: bool (default true), tap?: bool (a press and release)} — the CDJ cue button. Stopped: down sets the cue point at the playhead (on the nearest beat with quantise) and plays from it while held; up returns there and pauses. Playing: down returns to the cue point and pauses",
             always,
             |e, p| transport(e, p, "deck.cue")
         ),
@@ -79,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Hot Cue",
             [],
             None,
-            "{deck: a|b, n: 1..=8, action?: set|jump|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (with quantise while playing, on the next beat, so the beat stays on time) or clear it",
+            "{deck: a|b, n: 1..=8, action?: set|jump|release|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (while playing, with quantise on the next beat, so the beat stays on time; while stopped it plays from the cue until `release`) or clear it",
             always,
             |e, p| transport(e, p, "deck.hotcue")
         ),
@@ -177,6 +175,10 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
     let c = match cmd {
         "deck.play" => DeckCmd::Play(deck),
         "deck.pause" => DeckCmd::Pause(deck),
+        "deck.cue" if bool_param(cmd, p, "tap", Some(false))? => {
+            e.transport_requests.push(TransportRequest::Deck(DeckRequest(DeckCmd::Cue { deck, down: true })));
+            DeckCmd::Cue { deck, down: false }
+        }
         "deck.cue" => DeckCmd::Cue { deck, down: bool_param(cmd, p, "down", Some(true))? },
         "deck.seek" => DeckCmd::Seek { deck, at: need_num(cmd, p, "at", 0.0..=86_400.0)? * rate },
         "deck.jog" => {
@@ -219,7 +221,8 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
                 None | Some("jump") => HotCueAction::Jump,
                 Some("set") => HotCueAction::Set,
                 Some("clear") => HotCueAction::Clear,
-                Some(_) => return Err(bad(cmd, "`action` must be set, jump or clear")),
+                Some("release") => HotCueAction::Release,
+                Some(_) => return Err(bad(cmd, "`action` must be set, jump, release or clear")),
             };
             DeckCmd::HotCue { deck, n: n - 1, action }
         }
@@ -329,12 +332,23 @@ struct Loaded {
     track: Arc<DeckTrack>,
     prepared: Box<PreparedDeck>,
     analysis_error: Option<String>,
+    /// Where hot cues A–D came from: `session` (the open DJ set), `mixforge` (its mix points).
+    cues_from: Option<&'static str>,
+    /// How far an MP3's grid and cues moved to its gapless decode (ms).
+    priming_ms: f64,
 }
 
 /// A `deck.load` running on a thread of its own.
 pub struct DeckLoadJob {
     deck: DeckId,
     path: String,
+    /// The deck's load it is (the last issued wins).
+    generation: u64,
+    force: bool,
+    /// The session rate it decodes at.
+    rate: u32,
+    /// Set when a later load for the deck supersedes it: its analysis stops early.
+    cancel: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<Result<Loaded>>,
 }
 
@@ -343,16 +357,30 @@ impl DeckLoadJob {
         self.handle.is_finished()
     }
 
-    /// Hands the loaded track to the engine (for the host) and reports it.
+    /// A later load for its deck was issued: this one is to be dropped.
+    pub(crate) fn superseded(&self, e: &Engine) -> bool {
+        e.deck_generation.get(self.deck.index()).is_some_and(|g| *g != self.generation)
+    }
+
+    /// Hands the loaded track to the engine (for the host) and reports it; refused when the
+    /// session's rate changed meanwhile, or the deck started playing (unless forced).
     pub(crate) fn finish(self, e: &mut Engine) -> Result<Value> {
-        let DeckLoadJob { deck, path, handle } = self;
+        let DeckLoadJob { deck, path, force, rate, handle, .. } = self;
         let l = handle.join().unwrap_or_else(|_| Err(EngineError::Io(format!("{path}: loading the file failed"))))?;
+        if e.session().sample_rate.hz() != rate {
+            return Err(bad(LOAD, format!("{path}: the session's sample rate changed while it loaded; load it again")));
+        }
+        if !force && e.deck_status.decks.get(deck.index()).is_some_and(|s| s.playing) {
+            return Err(bad(LOAD, format!("Deck {} is playing: pause it first (or load with force)", deck.id().to_uppercase())));
+        }
         let t = &l.track;
         let out = json!({"deck": deck.id(), "path": t.path, "title": t.title, "artist": t.artist, "grid": t.grid_from, "bpm": t.bpm,
-            "key": t.key, "analysis_error": l.analysis_error, "can_key_lock": l.prepared.can_key_lock()});
+            "key": t.key, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
+            "can_key_lock": l.prepared.can_key_lock()});
         if let Some(slot) = e.deck_tracks.get_mut(deck.index()) {
             *slot = Some(Arc::clone(&l.track));
         }
+        e.note_deck_load(deck, l.prepared.load());
         e.deck_loads.push((deck, l.prepared));
         Ok(out)
     }
@@ -366,44 +394,53 @@ fn file_stem(path: &str) -> String {
     std::path::Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or("Audio").to_string()
 }
 
-/// Up to [`ANALYSED_CUES`] cue times (seconds) in a mixforge analysis's `cues`: numbers, or
-/// objects with a `time`, `position`, `seconds` or `start`.
-fn analysed_cues(a: &Value) -> Vec<f64> {
-    let Some(list) = a.get("cues").and_then(Value::as_array) else { return Vec::new() };
-    list.iter()
-        .filter_map(|c| c.as_f64().or_else(|| ["time", "position", "seconds", "start"].iter().find_map(|k| c.get(*k).and_then(Value::as_f64))))
-        .filter(|t| t.is_finite() && *t >= 0.0)
-        .take(ANALYSED_CUES)
-        .collect()
+/// What a load reads its track with, worked out on the UI thread.
+struct LoadPlan {
+    given: Option<(f64, f64)>,
+    /// Cues A–D the open DJ session gives the file (seconds, mixforge's timeline).
+    session_cues: Option<[Option<f64>; 4]>,
 }
 
-/// Reads and decodes `path` at `rate`, finds its grid (given, mixforge, the BPM tag) and builds
-/// the deck's heads. Runs on the job's thread.
-fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, given: Option<(f64, f64)>) -> Result<Loaded> {
+/// Reads and decodes `path` at `rate`, finds its grid (given, mixforge, the BPM tag) and hot
+/// cues (the open set's, else mixforge's mix points) and builds the deck's heads. Runs on the
+/// job's thread; `cancel` stops mixforge's sidecar early.
+///
+/// An MP3 decodes gaplessly here while mixforge's times are on its decoder's timeline, which
+/// plays the MP3's priming first: mixforge's grid and the cues (also on its timeline) move that
+/// much earlier.
+fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPlan, cancel: &AtomicBool) -> Result<Loaded> {
     let bytes = crate::io::read_file(path)?;
     let decoded = crate::io::decode_import(&file_name(path), &bytes, rate)?;
     let is_mp3 = std::path::Path::new(path).extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
     let tags = if is_mp3 { soundcraft_audio_io::mp3tags::read_basic(&bytes) } else { Default::default() };
+    let priming = if is_mp3 {
+        match soundcraft_audio_io::mp3gain::gapless_priming(&bytes) {
+            Some((n, r)) if r > 0 => f64::from(n) / f64::from(r),
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
     drop(bytes);
     let (buf, tag_key) = decoded.into_parts();
     let frames = i64::try_from(buf.frames()).unwrap_or(i64::MAX);
     let sr = f64::from(rate);
-    let (mut key, mut cues, mut analysis_error) = (tag_key, Vec::new(), None);
-    let (beats, grid_from) = match given {
+    let (mut key, mut planned, mut analysis_error) = (tag_key, None, None);
+    let (beats, grid_from) = match plan.given {
         Some((bpm, first)) => (Some(Beats::Constant { bpm, first }), Some("given")),
         None => {
             let analysed = match analyse {
-                Some(f) => f(path, &|| false),
+                Some(f) => f(path, &|| cancel.load(Ordering::Relaxed)),
                 None => Err("no mixforge analysis is set up".to_string()),
             };
             match analysed.and_then(|a| {
-                cues = analysed_cues(&a);
+                planned = super::deck_cues::planned(&a);
                 if let Some(k) = analysed_key(&a) {
                     key = Some(k);
                 }
                 grid_of(&a).ok_or_else(|| "mixforge's analysis has no usable bpm/first_downbeat".to_string())
             }) {
-                Ok((bpm, first)) => (Some(Beats::Constant { bpm, first }), Some("mixforge")),
+                Ok((bpm, first)) => (Some(Beats::Constant { bpm, first: first - priming }), Some("mixforge")),
                 Err(why) => {
                     analysis_error = Some(why);
                     match tags.bpm.filter(|b| b.is_finite() && (20.0..=400.0).contains(b)) {
@@ -417,10 +454,17 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, given: Optio
     let grid = beats.and_then(|b| BeatGrid::new(b.secs(frames, sr).iter().map(|s| s * sr).collect()));
     let grid_from = grid_from.filter(|_| grid.is_some());
     let bpm = grid.as_ref().map(|g| 60.0 * sr / g.period_at(g.first()));
+    let (cues, cues_from) = match (plan.session_cues, planned) {
+        (Some(c), _) => (Some(c), Some("session")),
+        (None, Some(c)) => (Some(c), Some("mixforge")),
+        (None, None) => (None, None),
+    };
+    let duration = frames as f64 / sr;
     let mut hot = [None; HOT_CUES];
-    for (h, c) in hot.iter_mut().zip(cues) {
-        *h = Some(c * sr);
+    for (h, c) in hot.iter_mut().zip(cues.into_iter().flatten()) {
+        *h = c.map(|s| s - priming).filter(|s| s.is_finite() && (0.0..duration).contains(s)).map(|s| s * sr);
     }
+    let cues_from = cues_from.filter(|_| hot.iter().any(Option::is_some));
     let key = key.or_else(|| tags.key.as_deref().and_then(soundcraft_model::camelot_of));
     let track = Arc::new(DeckTrack {
         source: Arc::new(SourceAudio::new(buf)),
@@ -434,19 +478,23 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, given: Optio
         grid_from,
     });
     let prepared = Box::new(PreparedDeck::new(Arc::clone(&track), rate as f32));
-    Ok(Loaded { track, prepared, analysis_error })
+    Ok(Loaded { track, prepared, analysis_error, cues_from, priming_ms: priming * 1000.0 })
 }
 
 fn load(e: &mut Engine, p: &Value) -> Result<Value> {
     need_audio(e, LOAD)?;
     let path = str_param(p, "path").filter(|s| !s.is_empty()).ok_or_else(|| bad(LOAD, "`path` required"))?.to_string();
+    let force = bool_param(LOAD, p, "force", Some(false))?;
+    let playing = |d: DeckId| e.deck_status.decks.get(d.index()).is_some_and(|s| s.playing);
     let deck = match p.get("deck") {
         None | Some(Value::Null) => {
-            let idle = |d: DeckId| !e.deck_status.decks.get(d.index()).is_some_and(|s| s.playing);
-            DeckId::ALL.into_iter().find(|d| idle(*d)).ok_or_else(|| bad(LOAD, "both decks are playing: name the `deck` to load"))?
+            DeckId::ALL.into_iter().find(|d| !playing(*d)).ok_or_else(|| bad(LOAD, "both decks are playing: name the `deck` to load"))?
         }
         Some(_) => deck_param(LOAD, p)?,
     };
+    if playing(deck) && !force {
+        return Err(bad(LOAD, format!("Deck {} is playing: pause it first (or load with force)", deck.id().to_uppercase())));
+    }
     let bpm = num(LOAD, p, "bpm", 20.0..=400.0)?;
     let first = num(LOAD, p, "first_beat", 0.0..=600.0)?;
     let given = match (bpm, first) {
@@ -454,12 +502,22 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
         (None, Some(_)) => return Err(bad(LOAD, "`first_beat` needs a `bpm`")),
         (None, None) => None,
     };
+    let plan = LoadPlan { given, session_cues: super::export::cues_for_file(e.session(), std::path::Path::new(&path)) };
+    // The last load issued for a deck wins: earlier ones still running are told to stop.
+    let generation = e.deck_generation.get(deck.index()).copied().unwrap_or(0).wrapping_add(1);
+    if let Some(g) = e.deck_generation.get_mut(deck.index()) {
+        *g = generation;
+    }
+    for j in e.deck_jobs.iter().filter(|j| j.deck == deck) {
+        j.cancel.store(true, Ordering::Relaxed);
+    }
     let rate = e.session().sample_rate.hz();
     let analyse = e.analyse().cloned();
     let roots = crate::file_access::current();
-    let file = path.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (file, stop) = (path.clone(), Arc::clone(&cancel));
     let work = move || {
-        let run = || read_track(&file, rate, analyse.as_ref(), given);
+        let run = || read_track(&file, rate, analyse.as_ref(), plan, &stop);
         match &roots {
             Some(r) => crate::file_access::confine(Some(r), run),
             None => crate::file_access::unconfined(run),
@@ -469,7 +527,7 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
         .name("deck-load".into())
         .spawn(work)
         .map_err(|err| EngineError::Io(format!("could not start loading the file: {err}")))?;
-    e.deck_jobs.push(DeckLoadJob { deck, path: path.clone(), handle });
+    e.deck_jobs.push(DeckLoadJob { deck, path: path.clone(), generation, force, rate, cancel, handle });
     Ok(json!({"deck": deck.id(), "path": path, "loading": true}))
 }
 
