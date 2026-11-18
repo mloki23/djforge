@@ -6,7 +6,9 @@
 //!   through the 2.5 kHz pair's all-pass so the bands sum flat in level. Each band's gain runs
 //!   from a kill (silent) to +6 dB.
 //! - **Filter.** One knob, centre off: left a low-pass sweeping down from 20 kHz to 80 Hz, right a
-//!   high-pass sweeping up from 20 Hz to 10 kHz, 24 dB/oct with a resonant second section.
+//!   high-pass sweeping up from 20 Hz to 10 kHz, 24 dB/oct with a resonant second section, built
+//!   from state-variable sections that stay clean while the knob moves, and faded in and out over
+//!   [`WET_FRAMES`] at the dead zone.
 //! - Gains ramp across each block and the filter is re-designed every [`FILTER_STEP`] frames, so
 //!   moving a control never clicks or zippers. Nothing here allocates once built.
 
@@ -26,7 +28,9 @@ pub const TRIM_DB: (f32, f32) = (-24.0, 12.0);
 /// The filter knob's centre dead zone: within it the filter is off.
 pub const FILTER_DEAD: f32 = 0.02;
 /// Frames between filter re-designs while its knob moves.
-const FILTER_STEP: usize = 64;
+const FILTER_STEP: usize = 16;
+/// Frames the filter takes to fade in or out.
+const WET_FRAMES: usize = 64;
 const BUTTERWORTH_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// The resonant section's Q.
 const RESONANCE_Q: f32 = 1.4;
@@ -244,6 +248,51 @@ impl Crossover {
     }
 }
 
+/// A topology-preserving state-variable filter section (Zavalishin, "The Art of VA Filter
+/// Design"): the same bilinear low- or high-pass as a biquad, but its state stays meaningful
+/// when its cutoff moves every few samples, so a filter sweep never rings or clicks.
+#[derive(Debug, Clone, Copy, Default)]
+struct Svf {
+    ic1: f32,
+    ic2: f32,
+    k: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    high: bool,
+}
+
+impl Svf {
+    fn set(&mut self, kind: FilterType, freq: f32, q: f32, _gain: f32, sr: f32) {
+        let f = if freq.is_finite() { freq.clamp(5.0, sr * 0.49) } else { 1000.0 };
+        let g = (std::f32::consts::PI * f / sr).tan();
+        self.k = 1.0 / q.max(0.05);
+        self.a1 = 1.0 / (1.0 + g * (g + self.k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+        self.high = matches!(kind, FilterType::HighPass | FilterType::HighPass1);
+    }
+
+    fn reset(&mut self) {
+        self.ic1 = 0.0;
+        self.ic2 = 0.0;
+    }
+
+    #[inline]
+    fn process_sample(&mut self, x: f32) -> f32 {
+        let v3 = x - self.ic2;
+        let v1 = self.a1 * self.ic1 + self.a2 * v3;
+        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
+        self.ic1 = 2.0 * v1 - self.ic1;
+        self.ic2 = 2.0 * v2 - self.ic2;
+        if !(self.ic1.is_finite() && self.ic2.is_finite()) {
+            self.reset();
+            return 0.0;
+        }
+        if self.high { x - self.k * v1 - v2 } else { v2 }
+    }
+}
+
 /// The filter's response for knob `v`: none in the dead zone, else (kind, cutoff Hz).
 pub fn filter_response(v: f32) -> Option<(FilterType, f32)> {
     let v = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
@@ -269,11 +318,13 @@ pub struct DjStrip {
     pub curve: FaderCurve,
     pub side: XfadeSide,
     xo: [Crossover; 2],
-    filt: [[Biquad; 2]; 2],
+    filt: [[Svf; 2]; 2],
     /// The filter's kind last designed (a change of kind resets its state).
     filt_kind: Option<FilterType>,
     /// The knob value the filter was last designed for.
     filt_at: f32,
+    /// How much of the filtered signal is heard (fades in and out with the dead zone).
+    wet: f32,
     /// Gains as of the end of the last block (ramped from towards the targets).
     g_trim: f32,
     g_eq: [f32; 3],
@@ -293,9 +344,10 @@ impl DjStrip {
             curve: FaderCurve::Linear,
             side,
             xo: [Crossover::new(sr); 2],
-            filt: [[Biquad::default(); 2]; 2],
+            filt: [[Svf::default(); 2]; 2],
             filt_kind: None,
             filt_at: 0.0,
+            wet: 0.0,
             g_trim: 1.0,
             g_eq: [1.0; 3],
             g_fader: 1.0,
@@ -305,7 +357,7 @@ impl DjStrip {
     /// Clears the filters' state (a deck stopped: its tail must not ring into the next start).
     pub fn reset(&mut self) {
         self.xo.iter_mut().for_each(Crossover::reset);
-        self.filt.iter_mut().flatten().for_each(Biquad::reset);
+        self.filt.iter_mut().flatten().for_each(Svf::reset);
     }
 
     /// The fader's gain now (its curve applied).
@@ -313,14 +365,14 @@ impl DjStrip {
         self.curve.gain(self.fader)
     }
 
+    /// Designs the filter for knob `v` (a response: outside the dead zone). Its state is cleared
+    /// only while it is not heard (`wet` 0), so nothing clicks.
     fn design_filter(&mut self, v: f32) {
         match filter_response(v) {
-            None => {
-                self.filt_kind = None;
-            }
+            None => {}
             Some((kind, f)) => {
-                if self.filt_kind != Some(kind) {
-                    self.filt.iter_mut().flatten().for_each(Biquad::reset);
+                if self.wet <= 0.0 {
+                    self.filt.iter_mut().flatten().for_each(Svf::reset);
                 }
                 for ch in self.filt.iter_mut() {
                     let [a, b] = ch;
@@ -350,9 +402,23 @@ impl DjStrip {
             let len = FILTER_STEP.min(n - i);
             // The knob's value at the end of this step, so a sweep moves smoothly over the block.
             let v = start_filter + (target_filter - start_filter) * (i + len) as f32 / n as f32;
-            if v != self.filt_at || (self.filt_kind.is_none() && filter_response(v).is_some()) {
-                self.design_filter(v);
-            }
+            // The filter fades in and out over a step (and out before it changes kind), so
+            // the knob crossing the dead zone never clicks.
+            let target_wet = match (filter_response(v), self.filt_kind) {
+                (None, _) => {
+                    self.filt_at = v;
+                    0.0
+                }
+                (Some((k, _)), Some(cur)) if k != cur && self.wet > 0.0 => 0.0,
+                (Some(_), _) => {
+                    if v != self.filt_at || self.wet <= 0.0 {
+                        self.design_filter(v);
+                    }
+                    1.0
+                }
+            };
+            let step = 1.0 / WET_FRAMES as f32;
+            let wet0 = self.wet;
             for (ch, b) in buf.iter_mut().enumerate().take(2) {
                 let (Some(xo), Some(fl)) = (self.xo.get_mut(ch), self.filt.get_mut(ch)) else { continue };
                 for k in i..i + len {
@@ -365,13 +431,18 @@ impl DjStrip {
                         let g1 = t_eq.get(j).copied().unwrap_or(1.0);
                         y += band * ramp(g0, g1, k);
                     }
-                    if self.filt_kind.is_some() {
+                    let wet = (wet0 + (target_wet - wet0).clamp(-step, step) * (k - i + 1) as f32).clamp(0.0, 1.0);
+                    let wet = if target_wet > wet0 { wet.min(target_wet) } else { wet.max(target_wet) };
+                    if self.filt_kind.is_some() && wet > 0.0 {
                         let [fa, fb] = &mut *fl;
-                        y = fb.process_sample(fa.process_sample(y));
+                        let yf = fb.process_sample(fa.process_sample(y));
+                        y += (yf - y) * wet;
                     }
                     *x = y * ramp(self.g_fader, t_fader, k);
                 }
             }
+            let moved = (target_wet - wet0).clamp(-step * len as f32, step * len as f32);
+            self.wet = (wet0 + moved).clamp(0.0, 1.0);
             i += len;
         }
         self.g_trim = t_trim;
@@ -457,6 +528,23 @@ mod tests {
         let mut res = DjStrip::new(SR, XfadeSide::A);
         res.filter = -0.5;
         assert!(level(&mut res, f) > -6.0);
+    }
+
+    #[test]
+    fn the_filter_fades_in_and_out_without_a_click() {
+        let mut s = DjStrip::new(SR, XfadeSide::A);
+        let x = sine(300.0, 512 * 40);
+        let mut out = Vec::new();
+        for (k, block) in x.chunks(512).enumerate() {
+            // In, across to the other side, out again: a knob jumping between blocks.
+            s.filter = [0.0, -0.6, 0.6, 0.0, 0.9, -0.9, 0.0][k % 7];
+            let mut b = vec![block.to_vec(), block.to_vec()];
+            s.process(&mut b, 512);
+            out.extend_from_slice(&b[0]);
+        }
+        let slope = std::f32::consts::TAU * 300.0 / SR * 0.5;
+        let worst = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        assert!(worst < 3.0 * slope, "step {worst} vs slope {slope}");
     }
 
     #[test]

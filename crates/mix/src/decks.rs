@@ -18,33 +18,45 @@
 //!   [`XFADE_S`] early, the spare that far before its target, so the target sample sounds
 //!   whole on the very sample the old position would have reached the seam: a beat loop is
 //!   bar-exact. A stretcher just restarted is run unheard for its output latency first, so its
-//!   first frames come out whole.
-//! - **Play** starts on the playhead's exact sample, hard; **pause** fades the playing head out
-//!   over [`XFADE_S`] (the playhead stays where pause was pressed).
+//!   first frames come out whole; for a quantised hot cue the spare is warmed up in the blocks
+//!   before and kept in step, so the jump needs no restart.
+//! - **Key-locked loops** don't jump: the playing head wraps what it feeds its stretcher (the
+//!   loop's last [`XFADE_S`] crossfaded into the audio before its start, input side), so the
+//!   stretcher never restarts, however short the loop.
+//! - **Play** starts on the playhead's exact sample, hard; **pause** fades whatever sounds out
+//!   over [`XFADE_S`] (both heads, in a jump's crossfade); the playhead stays where pause was
+//!   pressed.
 //!
 //! **Transport.** CDJ cue: while paused, cue down sets the cue point at the playhead (on the beat
 //! with quantise) and plays from it while held; release returns there and pauses. While
 //! playing, cue down returns to the cue point and pauses. Jog nudge bends the rate by up to
 //! [`JOG_BEND`] while jog events keep arriving ([`JOG_HOLD_S`] after the last); jog search moves
-//! the playhead. Hot cues: eight, set (on the beat with quantise), jumped to (with quantise,
-//! on the next beat of the playing deck, so the beat stays on time) and cleared. Loops: N beats
-//! from the nearest beat, loop in and out, halve, double, exit and reloop; beat jump moves the
-//! playhead (and an active loop) by whole beats.
+//! the playhead. Hot cues: eight, set (on the beat with quantise), jumped to (while playing,
+//! with quantise on the next beat, so the beat stays on time; while paused it plays from the cue
+//! while held and returns on release) and cleared. Loops: N beats (at least
+//! [`MIN_LOOP_BEATS`]) from the nearest beat, loop in and out, halve, double, exit and reloop;
+//! beat jump moves the playhead (and an active loop) by whole beats. Loading onto a deck that
+//! sounds fades it out first ([`Decks::load`]).
 //!
 //! **Sync.** A synced deck follows its master: the other deck, unless that deck is synced too and
 //! is not the one that started playing first. Each block the follower's tempo is set so its
-//! beats run at the master's rate (from both grids, where the decks are), and while both play
-//! its phase error (in beats, wrapped to ±½) is corrected by a rate bend of −[`SYNC_GAIN`]·error
-//! (at most ±[`SYNC_MAX`]): a half-beat error is gone in about two beats, and the lock is held
-//! from then on. Sync off keeps the rate it had.
+//! beats run at the master's rate (from both grids, where the decks are). Its phase is put right
+//! where that can't be heard: a follower that starts while its master plays, or is synced while
+//! stopped, moves its playhead by its phase error first; one synced while both play and more
+//! than [`SYNC_SNAP`] beats out jumps into phase (crossfaded). From then on a gentle trim of
+//! −[`SYNC_GAIN`]·error (at most ±[`SYNC_MAX`]) holds the lock. A jog nudge on a follower
+//! suspends the trim, and the phase it leaves is the one held. While either deck loops less than
+//! a beat only the tempo follows. Sync off keeps the rate it had; the pitch fader then takes over
+//! once it reaches that tempo.
 //!
 //! **Mixer.** Each deck runs through its [`DjStrip`] (trim, isolator EQ, filter, fader), then the
 //! crossfader (per its curve and the deck's side), the master volume and a Maximizer at −1 dBTP
-//! (true peak), into the main bus before the master faders.
+//! (true peak), into the main bus before the master faders; while the decks sound, the output
+//! after the master faders goes through a second one ([`Decks::limit_output`]).
 //!
 //! Nothing here allocates, locks or frees on the audio thread: the heads' buffers and
-//! stretchers come with the [`PreparedDeck`], and a replaced one goes back to the host to be
-//! dropped ([`Decks::load`] returns it).
+//! stretchers come with the [`PreparedDeck`], and one taken off a deck goes back to the host to
+//! be dropped ([`Decks::load`], [`Decks::take_retired`], [`Decks::drain`]).
 
 use crate::dj_strip::{DjStrip, EqBand, FaderCurve, XfadeCurve, XfadeSide};
 use soundcraft_dsp::{Plugin, db_to_gain};
@@ -71,10 +83,18 @@ pub const JOG_BEND: f64 = 0.1;
 pub const JOG_HOLD_S: f64 = 0.06;
 /// How far a jog search of `delta` 1 moves a deck without a beat grid, in seconds.
 const JOG_SEARCH_S: f64 = 0.5;
-/// Phase correction per beat of error (a bend of −gain × error).
-pub const SYNC_GAIN: f64 = 3.0;
-/// Largest phase-correction bend (fraction).
-pub const SYNC_MAX: f64 = 0.3;
+/// Phase trim per beat of error (a bend of −gain × error).
+pub const SYNC_GAIN: f64 = 0.8;
+/// Largest phase-trim bend (fraction).
+pub const SYNC_MAX: f64 = 0.02;
+/// Beats out of phase beyond which syncing a playing deck jumps it into phase.
+pub const SYNC_SNAP: f64 = 0.02;
+/// How near the held tempo (fraction) the pitch fader must come to take over after sync off.
+const TAKEOVER: f64 = 0.0005;
+/// How far (samples) a warmed-up spare may have drifted and still take over a jump as it is.
+const SHADOW_TOLERANCE: f64 = 24.0;
+/// The shortest loop, in beats.
+pub const MIN_LOOP_BEATS: f64 = 1.0 / 16.0;
 /// The pitch ranges a deck's pitch fader can have (fractions: ±8, ±16, ±50 %).
 pub const PITCH_RANGES: [f64; 3] = [0.08, 0.16, 0.5];
 /// The widest a synced deck's tempo goes from its track's own.
@@ -85,7 +105,7 @@ const RATE_LIMITS: (f64, f64) = (0.1, 4.0);
 const QUIET_S: f64 = 0.5;
 /// Most beats a grid holds.
 pub const MAX_GRID_BEATS: usize = 200_000;
-/// The Maximizer's ceiling over the decks (dBTP).
+/// The Maximizers' ceiling over the decks (dBTP).
 pub const CEILING_DB: f32 = -1.0;
 
 /// A deck.
@@ -282,14 +302,56 @@ impl Lag {
     }
 }
 
-/// Copies source frames `[start, start + n)` of every channel into `dst`, silence outside.
-fn fill(src: &[Vec<f32>], start: i64, n: usize, dst: &mut [Vec<f32>]) {
+/// A loop a key-locked head plays by wrapping what it feeds its stretcher: source frames
+/// `[a, a + len)` over and over, the last `xf` before the end crossfaded (input side) into those
+/// before `a`, so the wrap is seamless and the stretcher never restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InLoop {
+    a: i64,
+    len: i64,
+    xf: i64,
+}
+
+impl InLoop {
+    fn end(&self) -> i64 {
+        self.a.saturating_add(self.len)
+    }
+
+    /// The source frame fed for virtual frame `v`.
+    fn map(&self, v: i64) -> i64 {
+        if v < self.end() || self.len <= 0 { v } else { self.a + (v - self.a).rem_euclid(self.len) }
+    }
+
+    /// The source position heard for virtual position `v`.
+    fn map_f(&self, v: f64) -> f64 {
+        let (a, len) = (self.a as f64, self.len as f64);
+        if v < a + len || len <= 0.0 { v } else { a + (v - a).rem_euclid(len) }
+    }
+}
+
+/// Copies source frames `[start, start + n)` of every channel into `dst` (through the input loop
+/// `lp`, when there is one), silence outside the audio.
+fn fill(src: &[Vec<f32>], start: i64, n: usize, dst: &mut [Vec<f32>], lp: Option<InLoop>) {
     let nsrc = src.len();
+    let at = |ch: Option<&Vec<f32>>, k: i64| usize::try_from(k).ok().and_then(|k| ch.and_then(|v| v.get(k))).copied().unwrap_or(0.0);
     for (c, d) in dst.iter_mut().enumerate() {
         let ch = if nsrc == 0 { None } else { src.get(c % nsrc) };
         for (i, x) in d.iter_mut().take(n).enumerate() {
-            let idx = start.saturating_add(i as i64);
-            *x = usize::try_from(idx).ok().and_then(|k| ch.and_then(|v| v.get(k))).copied().unwrap_or(0.0);
+            let v = start.saturating_add(i as i64);
+            *x = match lp {
+                None => at(ch, v),
+                Some(l) => {
+                    let m = l.map(v);
+                    let from = l.end().saturating_sub(l.xf);
+                    if l.xf > 0 && m >= from && m < l.end() {
+                        let k = usize::try_from(m - from).unwrap_or(0);
+                        let g = fade_in(k, usize::try_from(l.xf).unwrap_or(1));
+                        at(ch, m) * (1.0 - g) + at(ch, m - l.len) * g
+                    } else {
+                        at(ch, m)
+                    }
+                }
+            };
         }
     }
 }
@@ -299,9 +361,15 @@ struct Stretch {
     st: Stretcher,
     input: Vec<Vec<f32>>,
     out: Vec<Vec<f32>>,
-    /// The source position fed next (fractional).
+    /// The (virtual) source position fed next, fractional.
     feed: f64,
     lag: Lag,
+    lp: Option<InLoop>,
+    /// Frames still to run unheard before the head is ready, and at what rate.
+    warm_left: usize,
+    warm_rate: f64,
+    /// Frames the stretcher produced (heard or not) since last read.
+    stretched: usize,
 }
 
 impl Stretch {
@@ -310,30 +378,54 @@ impl Stretch {
         let ch = channels.max(1);
         let st = Stretcher::new(ch, sample_rate, HEAD_BLOCK, Quality::Default).ok()?;
         let max_in = st.max_input();
-        Some(Stretch { input: vec![vec![0.0; max_in]; ch], out: vec![vec![0.0; HEAD_BLOCK]; ch], st, feed: 0.0, lag: Lag::new() })
+        Some(Stretch {
+            input: vec![vec![0.0; max_in]; ch],
+            out: vec![vec![0.0; HEAD_BLOCK]; ch],
+            st,
+            feed: 0.0,
+            lag: Lag::new(),
+            lp: None,
+            warm_left: 0,
+            warm_rate: 1.0,
+            stretched: 0,
+        })
     }
 
     /// The source position heard now: what was fed, less the stretcher's latency in source
-    /// frames (its output latency at the rates it ran at).
+    /// frames (its output latency at the rates it ran at), through the input loop.
     fn heard(&self) -> f64 {
-        self.feed - self.st.input_latency() as f64 - self.lag.sum(self.st.output_latency())
+        let v = self.feed - self.st.input_latency() as f64 - self.lag.sum(self.st.output_latency());
+        self.lp.map_or(v, |l| l.map_f(v))
     }
 
-    /// Restarts at source position `at`: primed with the audio before it, then run unheard for
-    /// its output latency, so the next frame out is `at`, whole.
-    fn start(&mut self, src: &[Vec<f32>], at: f64, rate: f64) {
+    fn warm_span(&self) -> usize {
+        self.st.output_latency().min(MAX_WARM)
+    }
+
+    /// Restarts at source position `at`, primed with the audio before it. Ready once it has run
+    /// unheard for its output latency ([`Stretch::warm`]); the next frame out is then `at`, whole.
+    fn start(&mut self, src: &[Vec<f32>], at: f64, rate: f64, lp: Option<InLoop>) {
         self.st.reset();
         self.lag.clear();
+        self.lp = lp;
         self.feed = at + self.st.input_latency() as f64;
         let pre = (self.st.input_latency() * 2 + 1024).min(self.st.max_input());
-        fill(src, self.feed.floor() as i64 - pre as i64, pre, &mut self.input);
+        fill(src, self.feed.floor() as i64 - pre as i64, pre, &mut self.input, lp);
         let _ = self.st.seek(&self.input, pre, rate);
-        let mut left = self.st.output_latency().min(MAX_WARM);
-        while left > 0 {
-            let n = left.min(HEAD_BLOCK);
-            self.run(src, n, rate);
-            left -= n;
+        self.warm_left = self.warm_span();
+        self.warm_rate = rate;
+    }
+
+    /// Runs up to `budget` frames of the warm-up still to go; returns how many ran.
+    fn warm(&mut self, src: &[Vec<f32>], budget: usize) -> usize {
+        let mut done = 0;
+        while self.warm_left > 0 && done < budget {
+            let n = self.warm_left.min(HEAD_BLOCK).min(budget - done);
+            self.run(src, n, self.warm_rate);
+            self.warm_left -= n;
+            done += n;
         }
+        done
     }
 
     /// Produces `n` frames (at most [`HEAD_BLOCK`]) into `out` at `rate`.
@@ -343,13 +435,14 @@ impl Stretch {
         let end = self.feed + n as f64 * rate;
         let want = usize::try_from((end.floor() as i64).saturating_sub(a)).unwrap_or(0);
         let n_in = want.min(self.st.max_input());
-        fill(src, a, n_in, &mut self.input);
+        fill(src, a, n_in, &mut self.input, self.lp);
         for c in self.out.iter_mut() {
             c.iter_mut().take(n).for_each(|x| *x = 0.0);
         }
         let ok = self.st.process(&self.input, n_in, &mut self.out, n, 1.0).is_ok();
         self.feed = if n_in == want { end } else { a as f64 + n_in as f64 };
         self.lag.push(n, rate);
+        self.stretched += n;
         ok
     }
 }
@@ -367,7 +460,7 @@ fn hermite(s: &[f32], pos: f64) -> f32 {
     if t == 0.0 {
         return x0;
     }
-    let (xm, x1, x2) = (at(i - 1), at(i + 1), at(i + 2));
+    let (xm, x1, x2) = (at(i.saturating_sub(1)), at(i.saturating_add(1)), at(i.saturating_add(2)));
     let c1 = 0.5 * (x1 - xm);
     let c2 = xm - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
     let c3 = 0.5 * (x2 - xm) + 1.5 * (x0 - x1);
@@ -392,16 +485,38 @@ impl Head {
         }
     }
 
-    /// Starts the head at source position `at`, key-locked when asked (and it can be).
-    fn start(&mut self, src: &[Vec<f32>], at: f64, rate: f64, keylock: bool) {
+    /// The input loop it plays (key-locked only).
+    fn in_loop(&self) -> Option<InLoop> {
+        self.stretch.as_ref().filter(|_| self.keylock).and_then(|s| s.lp)
+    }
+
+    /// Frames still to warm up before it can be heard.
+    fn warming(&self) -> usize {
+        self.stretch.as_ref().filter(|_| self.keylock).map_or(0, |s| s.warm_left)
+    }
+
+    /// Starts the head at source position `at`, key-locked when asked (and it can be), through
+    /// input loop `lp`. Unless `lazy`, a key-locked head warms up now.
+    fn start(&mut self, src: &[Vec<f32>], at: f64, rate: f64, keylock: bool, lp: Option<InLoop>, lazy: bool) {
         self.keylock = keylock && self.stretch.is_some();
         self.pos = at;
         if self.keylock
             && let Some(s) = self.stretch.as_mut()
         {
-            s.start(src, at, rate);
+            s.start(src, at, rate, lp);
+            if !lazy {
+                s.warm(src, usize::MAX);
+            }
         }
         self.ready = true;
+    }
+
+    /// Runs `n` frames unheard: warming up, or keeping in step with the playing head.
+    fn shadow(&mut self, src: &[Vec<f32>], n: usize, rate: f64) {
+        let warmed = if self.warming() > 0 { self.stretch.as_mut().map_or(0, |s| s.warm(src, n)) } else { 0 };
+        if warmed < n {
+            self.render(src, n - warmed, rate, &mut [], 0, |_| 0.0);
+        }
     }
 
     /// Adds `n` frames (at most [`HEAD_BLOCK`]) at `rate` into `out` from frame `off`, times
@@ -414,6 +529,8 @@ impl Head {
         if self.keylock
             && let Some(s) = self.stretch.as_mut()
         {
+            // A warm-up a lazy start left finishes before anything is heard.
+            s.warm(src, usize::MAX);
             if s.run(src, n, rate) {
                 let nout = s.out.len().max(1);
                 for (ch, dst) in out.iter_mut().enumerate() {
@@ -437,6 +554,11 @@ impl Head {
             }
         }
         self.pos = p0 + n as f64 * rate;
+    }
+
+    /// Frames its stretcher produced since last asked.
+    fn take_stretched(&mut self) -> usize {
+        self.stretch.as_mut().map_or(0, |s| std::mem::take(&mut s.stretched))
     }
 }
 
@@ -472,6 +594,14 @@ impl PreparedDeck {
     pub fn can_key_lock(&self) -> bool {
         self.heads.iter().all(|h| h.stretch.is_some())
     }
+
+    /// Lengths and capacities of its heads' buffers (they never change once built).
+    #[doc(hidden)]
+    pub fn storage(&self, v: &mut Vec<(usize, usize)>) {
+        for s in self.heads.iter().filter_map(|h| h.stretch.as_ref()) {
+            v.extend(s.input.iter().chain(s.out.iter()).map(|c| (c.len(), c.capacity())));
+        }
+    }
 }
 
 /// How a jog event moves a deck.
@@ -487,7 +617,10 @@ pub enum JogMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotCueAction {
     Set,
+    /// Pressed: a jump while playing; while stopped, plays from the cue while held.
     Jump,
+    /// Released: ends a preview the jump started (back to the cue, paused).
+    Release,
     Clear,
 }
 
@@ -780,14 +913,18 @@ fn fade_out(i: usize, n: usize) -> f32 {
     1.0 - fade_in(i, n)
 }
 
-/// A head fading out over `total` frames (`left` to go), and whether the playing head fades in
-/// over the same frames (a jump) or plays whole (a pause leaves it stopped).
+/// A head fading out over `total` frames (`left` to go), from gain `scale`.
 #[derive(Debug, Clone, Copy)]
-struct Fade {
-    head: usize,
+struct Out {
     left: usize,
     total: usize,
-    fade_in: bool,
+    scale: f32,
+}
+
+impl Out {
+    fn gain(&self, k: usize) -> f32 {
+        self.scale * fade_out(self.total - self.left + k, self.total)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -800,9 +937,15 @@ struct LoopSpan {
 /// One deck's transport.
 pub(crate) struct Deck {
     loaded: Option<Box<PreparedDeck>>,
+    /// A track waiting for the playing one to fade out ([`Decks::load`] while it plays).
+    next: Option<Box<PreparedDeck>>,
+    /// A track taken off the deck, for the host to drop ([`Decks::take_retired`]).
+    retired: Option<Box<PreparedDeck>>,
     active: usize,
     playing: bool,
+    /// Playing while a cue or hot cue is held; its release returns to `preview_from`.
     previewing: bool,
+    preview_from: f64,
     /// The playhead while stopped (while playing, the playing head's position).
     playhead: f64,
     cue: f64,
@@ -810,17 +953,27 @@ pub(crate) struct Deck {
     lp: LoopSpan,
     /// A quantised jump waiting for its beat: (at, to), source samples.
     pending: Option<(f64, f64)>,
-    /// A jump to make as soon as the crossfade under way ends.
+    /// The spare is warming up and running in step for `pending` (key lock).
+    shadowing: bool,
+    /// A jump to make as soon as the fades under way end.
     now: Option<f64>,
-    fade: Option<Fade>,
+    /// Each head's fade-out, and the playing head's fade-in (frames left, total).
+    outs: [Option<Out>; 2],
+    fin: Option<(usize, usize)>,
     pitch: f64,
     range: f64,
     keylock: bool,
     synced: bool,
+    /// After sync off, the pitch fader takes over only once it reaches the tempo held:
+    /// (pitch held, which side of it the fader was last).
+    takeover: Option<(f64, Option<bool>)>,
     /// When it started playing ([`Decks::clock`]), for which synced deck leads.
     started: u64,
     bend: f64,
     bend_left: usize,
+    /// A nudge moved a synced deck: its phase against the master is kept where the nudge left it.
+    nudged: bool,
+    sync_offset: f64,
     /// This block's rate, phase correction and phase error.
     rate: f64,
     correction: f64,
@@ -832,23 +985,31 @@ impl Deck {
     fn new() -> Deck {
         Deck {
             loaded: None,
+            next: None,
+            retired: None,
             active: 0,
             playing: false,
             previewing: false,
+            preview_from: 0.0,
             playhead: 0.0,
             cue: 0.0,
             hot: [None; HOT_CUES],
             lp: LoopSpan::default(),
             pending: None,
+            shadowing: false,
             now: None,
-            fade: None,
+            outs: [None; 2],
+            fin: None,
             pitch: 0.0,
             range: 0.08,
             keylock: false,
             synced: false,
+            takeover: None,
             started: 0,
             bend: 0.0,
             bend_left: 0,
+            nudged: false,
+            sync_offset: 0.0,
             rate: 1.0,
             correction: 0.0,
             phase_err: None,
@@ -862,6 +1023,16 @@ impl Deck {
 
     fn frames(&self) -> f64 {
         self.loaded.as_ref().map_or(0.0, |l| l.track.frames() as f64)
+    }
+
+    /// A crossfade or fade-out is under way.
+    fn busy(&self) -> bool {
+        self.fin.is_some() || self.outs.iter().any(Option::is_some)
+    }
+
+    /// Something is heard: playing, or fading out.
+    fn sounding(&self) -> bool {
+        self.playing || self.outs.iter().any(Option::is_some)
     }
 
     /// The playhead (source samples).
@@ -882,10 +1053,33 @@ impl Deck {
         }
     }
 
+    /// `p` moved by `beats` on the grid.
+    fn shifted(&self, p: f64, beats: f64) -> f64 {
+        self.grid().map_or(p, |g| g.pos_at(g.beat_at(p) + beats))
+    }
+
+    /// The loop length in beats, while a loop is on.
+    fn loop_beats(&self) -> Option<f64> {
+        let (Some(a), Some(b)) = (self.lp.a, self.lp.b) else { return None };
+        if !self.lp.on {
+            return None;
+        }
+        Some(self.grid().map_or(f64::INFINITY, |g| g.beat_at(b) - g.beat_at(a)))
+    }
+
+    /// The input loop a key-locked head plays the active loop through, when it can.
+    fn in_loop(&self, xf: usize) -> Option<InLoop> {
+        let (Some(a), Some(b)) = (self.lp.a, self.lp.b) else { return None };
+        let (a, len) = (a.round() as i64, (b - a).round() as i64);
+        let xf = i64::try_from(xf).unwrap_or(0);
+        (self.keylock && self.lp.on && len > 2 * xf + 2).then_some(InLoop { a, len, xf })
+    }
+
     fn unready(&mut self) {
         if let Some(l) = self.loaded.as_mut() {
             l.heads.iter_mut().for_each(|h| h.ready = false);
         }
+        self.shadowing = false;
     }
 
     fn load(&mut self, deck: Box<PreparedDeck>) -> Option<Box<PreparedDeck>> {
@@ -897,10 +1091,12 @@ impl Deck {
         self.previewing = false;
         self.playhead = start;
         self.cue = start;
+        self.preview_from = start;
         self.lp = LoopSpan::default();
         self.pending = None;
         self.now = None;
-        self.fade = None;
+        self.outs = [None; 2];
+        self.fin = None;
         self.bend = 0.0;
         self.bend_left = 0;
         self.phase_err = None;
@@ -908,19 +1104,39 @@ impl Deck {
         old
     }
 
-    fn play(&mut self, clock: u64) {
+    /// The head to start: the playing one, unless it is fading out (then the other, or the one
+    /// nearer the end of its fade, cut).
+    fn free_head(&mut self) -> usize {
+        let a = self.active.min(1);
+        let o = 1 - a;
+        match (self.outs[a], self.outs[o]) {
+            (None, _) => a,
+            (Some(_), None) => o,
+            (Some(x), Some(y)) => {
+                let h = if x.left <= y.left { a } else { o };
+                self.outs[h] = None;
+                h
+            }
+        }
+    }
+
+    fn play(&mut self, clock: u64, xf: usize) {
         if self.playing {
-            // Play while the cue is held: it plays on when the cue is released.
+            // Play while a cue is held: it plays on when the cue is released.
             self.previewing = false;
             return;
         }
-        let (at, rate, keylock) = (self.playhead, self.rate_now(), self.keylock);
+        if self.loaded.is_none() {
+            return;
+        }
+        self.active = self.free_head();
+        let (at, rate, keylock, lp) = (self.playhead, self.rate_now(), self.keylock, self.in_loop(xf));
         let Some(ld) = self.loaded.as_deref_mut() else { return };
         let PreparedDeck { track, heads, .. } = ld;
         if let Some(h) = heads.get_mut(self.active)
-            && !(h.ready && h.keylock == (keylock && h.stretch.is_some()) && (h.position() - at).abs() < 0.5)
+            && !(h.ready && h.keylock == (keylock && h.stretch.is_some()) && h.in_loop() == lp && (h.position() - at).abs() < 0.5)
         {
-            h.start(&track.source.buffer.channels, at, rate, keylock);
+            h.start(&track.source.buffer.channels, at, rate, keylock, lp, false);
         }
         self.playing = true;
         self.started = clock;
@@ -931,37 +1147,41 @@ impl Deck {
             return;
         }
         let p = self.pos();
-        self.fade = Some(Fade { head: self.active, left: xf, total: xf, fade_in: false });
-        self.active = 1 - self.active.min(1);
-        if let Some(h) = self.loaded.as_mut().and_then(|l| l.heads.get_mut(self.active)) {
-            h.ready = false;
+        // The playing head fades out from where it is in any fade-in; a head already fading out
+        // goes on fading.
+        let scale = self.fin.map_or(1.0, |(left, total)| fade_in(total - left, total));
+        if let Some(o) = self.outs.get_mut(self.active) {
+            *o = Some(Out { left: xf, total: xf, scale });
         }
+        self.fin = None;
         self.playing = false;
         self.previewing = false;
         self.playhead = p;
         self.pending = None;
         self.now = None;
+        self.unready();
     }
 
-    fn cue_button(&mut self, down: bool, quantise: bool, clock: u64, xf: usize) {
-        if self.loaded.is_none() {
-            return;
-        }
-        if down {
-            if self.playing && !self.previewing {
-                self.pause(xf);
-                self.playhead = self.cue;
-                self.unready();
-            } else if !self.playing {
-                let p = self.snap(self.playhead, quantise).clamp(0.0, self.frames());
-                self.cue = p;
-                self.playhead = p;
-                self.play(clock);
-                self.previewing = true;
-            }
-        } else if self.previewing {
+    /// Sets the cue point at the playhead (on the beat with quantise), there.
+    fn set_cue_here(&mut self, quantise: bool) {
+        let p = self.snap(self.playhead, quantise).clamp(0.0, self.frames());
+        self.cue = p;
+        self.playhead = p;
+        self.unready();
+    }
+
+    /// Starts a preview (a cue or hot cue held), which its release ends at `from`.
+    fn preview(&mut self, from: f64, clock: u64, xf: usize) {
+        self.play(clock, xf);
+        self.previewing = true;
+        self.preview_from = from;
+    }
+
+    /// A cue or hot cue released: a preview returns where it started and pauses.
+    fn release(&mut self, xf: usize) {
+        if self.previewing {
             self.pause(xf);
-            self.playhead = self.cue;
+            self.playhead = self.preview_from;
         }
     }
 
@@ -971,7 +1191,7 @@ impl Deck {
         if !self.playing {
             self.playhead = target;
             self.unready();
-        } else if self.fade.is_some() {
+        } else if self.busy() {
             self.now = Some(target);
         } else {
             self.fire(target - self.pos(), xf);
@@ -979,15 +1199,25 @@ impl Deck {
     }
 
     /// Starts the spare `delta` samples from where the playing head is and crossfades to it.
+    /// A spare already running in step for this jump takes over as it is.
     fn fire(&mut self, delta: f64, xf: usize) {
         let (p, rate, keylock) = (self.pos(), self.rate_now(), self.keylock);
+        let spare = 1 - self.active.min(1);
+        let target = p + delta;
+        let lp = self.in_loop(xf).filter(|l| target < (l.a + l.len) as f64);
+        let shadowed = std::mem::take(&mut self.shadowing);
         let Some(ld) = self.loaded.as_deref_mut() else { return };
         let PreparedDeck { track, heads, .. } = ld;
-        let spare = 1 - self.active.min(1);
         if let Some(h) = heads.get_mut(spare) {
-            h.start(&track.source.buffer.channels, p + delta, rate, keylock);
+            let in_step = shadowed && h.ready && h.keylock == keylock && h.warming() == 0 && (h.position() - target).abs() <= SHADOW_TOLERANCE;
+            if !in_step {
+                h.start(&track.source.buffer.channels, target, rate, keylock, lp, false);
+            }
         }
-        self.fade = Some(Fade { head: self.active, left: xf, total: xf, fade_in: true });
+        if let Some(o) = self.outs.get_mut(self.active) {
+            *o = Some(Out { left: xf, total: xf, scale: 1.0 });
+        }
+        self.fin = Some((xf, xf));
         self.active = spare;
     }
 
@@ -995,7 +1225,10 @@ impl Deck {
     fn next_event(&self) -> Option<(f64, f64, bool)> {
         let p = self.pos();
         let mut best = self.pending.map(|(at, to)| (at, to - at, true));
+        // A key-locked head plays the loop itself (input side); others jump at its end.
+        let looped_inside = self.loaded.as_ref().and_then(|l| l.heads.get(self.active)).is_some_and(|h| h.in_loop().is_some());
         if self.lp.on
+            && !looped_inside
             && let (Some(a), Some(b)) = (self.lp.a, self.lp.b)
             && b > a
         {
@@ -1014,9 +1247,57 @@ impl Deck {
         best
     }
 
-    /// Adds `n` frames of the deck into `out` (stereo). Returns nothing; a deck that reaches the
-    /// end of its track pauses there.
+    /// A key-locked deck's loop changed while playing: a head with the right input loop takes
+    /// over (once), inside the loop.
+    fn relink(&mut self, xf: usize) {
+        if !self.playing || !self.keylock {
+            return;
+        }
+        let want = self.in_loop(xf);
+        let have = self.loaded.as_ref().and_then(|l| l.heads.get(self.active)).and_then(Head::in_loop);
+        if want == have {
+            return;
+        }
+        let p = self.pos();
+        let target = match (want, self.lp.a, self.lp.b) {
+            (Some(_), Some(a), Some(b)) if p >= b && b > a => a + (p - a).rem_euclid(b - a),
+            _ => p,
+        };
+        if self.busy() {
+            self.now = Some(target);
+        } else {
+            self.fire(target - p, xf);
+        }
+    }
+
+    /// Starts the spare warming up for the pending quantised jump (key lock), so the jump needs
+    /// no restart: it is started where the jump will land, ahead by its warm-up, and runs in
+    /// step from then on ([`Head::shadow`]).
+    fn prewarm(&mut self) {
+        if !(self.playing && self.keylock) || self.busy() {
+            return;
+        }
+        let Some((at, to)) = self.pending else {
+            self.shadowing = false;
+            return;
+        };
+        if self.shadowing {
+            return;
+        }
+        let (p, rate) = (self.pos(), self.rate_now());
+        let spare = 1 - self.active.min(1);
+        let Some(ld) = self.loaded.as_deref_mut() else { return };
+        let PreparedDeck { track, heads, .. } = ld;
+        let Some(h) = heads.get_mut(spare) else { return };
+        let span = h.stretch.as_ref().map_or(0, Stretch::warm_span) as f64;
+        h.start(&track.source.buffer.channels, p + (to - at) + span * rate, rate, true, None, true);
+        self.shadowing = true;
+    }
+
+    /// Adds `n` frames of the deck into `out` (stereo). A deck that reaches the end of its
+    /// track pauses there.
     fn render(&mut self, out: &mut [Vec<f32>], n: usize, xf: usize) {
+        self.prewarm();
         let mut i = 0;
         let mut guard = 0;
         while i < n {
@@ -1025,7 +1306,7 @@ impl Deck {
                 break;
             }
             if self.playing
-                && self.fade.is_none()
+                && !self.busy()
                 && let Some(t) = self.now.take()
             {
                 self.fire(t - self.pos(), xf);
@@ -1033,7 +1314,7 @@ impl Deck {
             }
             let mut seg = (n - i).min(HEAD_BLOCK);
             if self.playing
-                && self.fade.is_none()
+                && !self.busy()
                 && let Some((at, delta, once)) = self.next_event()
             {
                 let r = self.rate.max(1e-3);
@@ -1051,38 +1332,48 @@ impl Deck {
                     seg = (m as usize).max(1);
                 }
             }
-            if let Some(f) = self.fade {
-                seg = seg.min(f.left.max(1));
+            for o in self.outs.iter().flatten() {
+                seg = seg.min(o.left.max(1));
             }
-            if !self.playing && self.fade.is_none() {
+            if let Some((left, _)) = self.fin {
+                seg = seg.min(left.max(1));
+            }
+            if !self.sounding() {
                 break;
             }
-            let rate = self.rate;
+            let (rate, outs, fin, active, playing, shadowing) = (self.rate, self.outs, self.fin, self.active.min(1), self.playing, self.shadowing);
             let Some(ld) = self.loaded.as_deref_mut() else { break };
             let PreparedDeck { track, heads, .. } = ld;
             let src = &track.source.buffer.channels;
-            if let Some(f) = self.fade
-                && let Some(h) = heads.get_mut(f.head)
-            {
-                let k0 = f.total - f.left;
-                h.render(src, seg, rate, out, i, |k| fade_out(k0 + k, f.total));
+            for (h, o) in heads.iter_mut().zip(outs.iter()) {
+                if let Some(o) = o {
+                    h.render(src, seg, rate, out, i, |k| o.gain(k));
+                }
             }
-            if self.playing
-                && let Some(h) = heads.get_mut(self.active)
-            {
-                match self.fade.filter(|f| f.fade_in) {
-                    Some(f) => {
-                        let k0 = f.total - f.left;
-                        h.render(src, seg, rate, out, i, |k| fade_in(k0 + k, f.total));
-                    }
+            if playing && let Some(h) = heads.get_mut(active) {
+                match fin {
+                    Some((left, total)) => h.render(src, seg, rate, out, i, |k| fade_in(total - left + k, total)),
                     None => h.render(src, seg, rate, out, i, |_| 1.0),
                 }
             }
-            if let Some(f) = self.fade.as_mut() {
-                f.left = f.left.saturating_sub(seg);
-                if f.left == 0 {
-                    self.fade = None;
+            if playing
+                && shadowing
+                && outs.get(1 - active).is_some_and(Option::is_none)
+                && let Some(h) = heads.get_mut(1 - active)
+            {
+                h.shadow(src, seg, rate);
+            }
+            for o in self.outs.iter_mut() {
+                if let Some(x) = o {
+                    x.left = x.left.saturating_sub(seg);
+                    if x.left == 0 {
+                        *o = None;
+                    }
                 }
+            }
+            if let Some((left, total)) = self.fin {
+                let left = left.saturating_sub(seg);
+                self.fin = (left > 0).then_some((left, total));
             }
             i += seg;
         }
@@ -1090,9 +1381,16 @@ impl Deck {
             self.pause(xf);
             self.playhead = self.frames();
         }
+        // A track waiting to load takes the deck once the one before is silent.
+        if !self.sounding()
+            && self.retired.is_none()
+            && let Some(n) = self.next.take()
+        {
+            self.retired = self.load(n);
+        }
     }
 
-    fn hot_cue(&mut self, n: usize, action: HotCueAction, quantise: bool, xf: usize) {
+    fn hot_cue(&mut self, n: usize, action: HotCueAction, quantise: bool, clock: u64, xf: usize) {
         if self.loaded.is_none() {
             return;
         }
@@ -1109,6 +1407,7 @@ impl Deck {
                     *h = None;
                 }
             }
+            HotCueAction::Release => self.release(xf),
             HotCueAction::Jump => {
                 let Some(to) = self.hot.get(n).copied().flatten() else { return };
                 if let (Some(a), Some(b)) = (self.lp.a, self.lp.b)
@@ -1116,14 +1415,23 @@ impl Deck {
                 {
                     self.lp.on = false;
                 }
-                match self.grid().filter(|_| quantise && self.playing) {
+                if !self.playing {
+                    // Stopped: it plays from the cue while held (CDJ).
+                    self.playhead = to.clamp(0.0, self.frames());
+                    self.unready();
+                    self.preview(to, clock, xf);
+                    return;
+                }
+                match self.grid().filter(|_| quantise) {
                     // On the next beat of what plays, so the beat stays where it was.
                     Some(g) => {
                         let at = g.pos_at(g.beat_at(p).ceil());
                         self.pending = Some((at, to));
+                        self.shadowing = false;
                     }
                     None => self.jump(to, xf),
                 }
+                self.relink(xf);
             }
         }
     }
@@ -1133,11 +1441,10 @@ impl Deck {
             return;
         }
         let p = self.pos();
-        let beats = |d: &Deck, from: f64, n: f64| d.grid().map(|g| g.pos_at(g.beat_at(from) + n));
         match action {
             LoopAction::Beats(n) => {
                 let Some(g) = self.grid() else { return };
-                let n = if n.is_finite() { n.clamp(1.0 / 32.0, 512.0) } else { return };
+                let n = if n.is_finite() { n.clamp(MIN_LOOP_BEATS, 512.0) } else { return };
                 let b0 = if quantise { g.beat_at(p).round() } else { g.beat_at(p) };
                 let (a, b) = (g.pos_at(b0), g.pos_at(b0 + n));
                 self.lp = LoopSpan { a: Some(a), b: Some(b), on: true };
@@ -1160,8 +1467,8 @@ impl Deck {
                 let k = if action == LoopAction::Halve { 0.5 } else { 2.0 };
                 let nb = match self.grid() {
                     Some(g) => {
-                        let len = g.beat_at(b) - g.beat_at(a);
-                        beats(self, a, len * k)
+                        let len = (g.beat_at(b) - g.beat_at(a)) * k;
+                        (len >= MIN_LOOP_BEATS - 1e-9).then(|| g.pos_at(g.beat_at(a) + len))
                     }
                     None => Some(a + (b - a) * k),
                 };
@@ -1181,6 +1488,7 @@ impl Deck {
                 }
             }
         }
+        self.relink(xf);
     }
 
     /// A loop just set or shortened with a stopped playhead past its end: back inside it,
@@ -1201,18 +1509,20 @@ impl Deck {
         }
         let p = self.pos();
         let target = match self.grid() {
-            Some(g) => g.pos_at(g.beat_at(p) + n),
-            None => p + n * self.loaded.as_ref().map_or(0.0, |l| l.track.source.buffer.sample_rate as f64) * JOG_SEARCH_S,
+            Some(_) => self.shifted(p, n),
+            None => p + n * self.loaded.as_ref().map_or(0.0, |l| f64::from(l.track.source.buffer.sample_rate)) * JOG_SEARCH_S,
         };
         let delta = target - p;
-        if self.lp.on
-            && let (Some(a), Some(b)) = (self.lp.a, self.lp.b)
-        {
+        let moves_loop = self.lp.on;
+        if moves_loop && let (Some(a), Some(b)) = (self.lp.a, self.lp.b) {
             // An active loop moves with it.
             self.lp.a = Some(a + delta);
             self.lp.b = Some(b + delta);
         }
         self.jump(target, xf);
+        if moves_loop {
+            self.relink(xf);
+        }
     }
 
     fn jog(&mut self, delta: f64, mode: JogMode, sr: f64, xf: usize) {
@@ -1224,11 +1534,14 @@ impl Deck {
             JogMode::Nudge if self.playing => {
                 self.bend = delta * JOG_BEND;
                 self.bend_left = (JOG_HOLD_S * sr) as usize;
+                if self.synced {
+                    self.nudged = true;
+                }
             }
             _ => {
                 let p = self.pos();
                 let target = match self.grid() {
-                    Some(g) => g.pos_at(g.beat_at(p) + delta),
+                    Some(_) => self.shifted(p, delta),
                     None => p + delta * JOG_SEARCH_S * sr,
                 };
                 self.jump(target, xf);
@@ -1244,7 +1557,7 @@ impl Deck {
         if self.playing {
             // The other kind of head takes over where it is, crossfaded.
             let p = self.pos();
-            if self.fade.is_some() {
+            if self.busy() {
                 self.now = Some(p);
             } else {
                 self.fire(0.0, xf);
@@ -1278,6 +1591,13 @@ impl Deck {
             ..DeckState::default()
         }
     }
+
+    /// Every buffer the deck's tracks own (lengths and capacities).
+    fn storage(&self, v: &mut Vec<(usize, usize)>) {
+        for d in self.loaded.iter().chain(self.next.iter()) {
+            d.storage(v);
+        }
+    }
 }
 
 /// What sync needs to know of a deck at the start of a block.
@@ -1290,6 +1610,8 @@ struct Snap {
     beat: f64,
     period: f64,
     base: f64,
+    /// Beats of the loop that plays, while one is on.
+    loop_beats: Option<f64>,
 }
 
 /// The two decks and the DJ mixer.
@@ -1308,6 +1630,8 @@ pub struct Decks {
     master_db: f32,
     g_master: f32,
     limiter: Option<Box<dyn Plugin>>,
+    /// The output stage's limiter, after the master faders ([`Decks::limit_output`]).
+    out_limiter: Option<Box<dyn Plugin>>,
     quantise: bool,
     /// Counts plays, so the deck that started first is known.
     clock: u64,
@@ -1317,18 +1641,22 @@ pub struct Decks {
     master_level: [f32; 2],
 }
 
+/// A Maximizer at the decks' ceiling, true peak (allocates).
+fn ceiling_limiter(sr: f32, max_block: usize) -> Option<Box<dyn Plugin>> {
+    soundcraft_dsp::create("maximizer").map(|mut m| {
+        m.set_param("threshold", 0.0);
+        m.set_param("ceiling", CEILING_DB);
+        m.set_param("true_peak", 1.0);
+        m.prepare(sr, max_block, 2);
+        m
+    })
+}
+
 impl Decks {
     /// The decks and mixer for blocks of up to `max_block` frames at `sample_rate` (allocates).
     pub fn new(sample_rate: f32, max_block: usize) -> Decks {
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { sample_rate } else { 48_000.0 };
         let max_block = max_block.clamp(16, 16_384);
-        let limiter = soundcraft_dsp::create("maximizer").map(|mut m| {
-            m.set_param("threshold", 0.0);
-            m.set_param("ceiling", CEILING_DB);
-            m.set_param("true_peak", 1.0);
-            m.prepare(sr, max_block, 2);
-            m
-        });
         let buf = || vec![vec![0.0f32; max_block]; 2];
         Decks {
             sr: f64::from(sr),
@@ -1343,7 +1671,8 @@ impl Decks {
             xg: [std::f32::consts::FRAC_1_SQRT_2; DECKS],
             master_db: 0.0,
             g_master: 1.0,
-            limiter,
+            limiter: ceiling_limiter(sr, max_block),
+            out_limiter: ceiling_limiter(sr, max_block),
             quantise: true,
             clock: 0,
             quiet: 0,
@@ -1352,22 +1681,34 @@ impl Decks {
         }
     }
 
-    /// Puts `deck` on deck `id` (stopped, at its first downbeat), returning the one it replaces
-    /// for the host to drop off the audio thread.
+    /// Puts `deck` on deck `id`, stopped at its first downbeat. While the deck sounds, the new
+    /// track waits: the playing one fades out first ([`XFADE_S`]) and is then swapped. Returns
+    /// what is to be dropped off the audio thread now (a track that was waiting, replaced);
+    /// tracks taken off later come from [`Decks::take_retired`].
     pub fn load(&mut self, id: DeckId, deck: Box<PreparedDeck>) -> Option<Box<PreparedDeck>> {
-        let i = id.index();
-        if let Some(s) = self.strips.get_mut(i) {
-            s.reset();
+        let xf = self.xf;
+        let Some(d) = self.decks.get_mut(id.index()) else { return Some(deck) };
+        if d.sounding() || d.retired.is_some() {
+            d.pause(xf);
+            return d.next.replace(deck);
         }
-        match self.decks.get_mut(i) {
-            Some(d) => d.load(deck),
-            None => Some(deck),
-        }
+        d.load(deck)
+    }
+
+    /// A track taken off a deck since last asked, for the host to drop off the audio thread.
+    pub fn take_retired(&mut self) -> Option<Box<PreparedDeck>> {
+        self.decks.iter_mut().find_map(|d| d.retired.take())
+    }
+
+    /// Every track the decks hold (loaded, waiting and retired), taken out: the engine is going
+    /// away and they are to be dropped off the audio thread.
+    pub fn drain(&mut self) -> impl Iterator<Item = Box<PreparedDeck>> + '_ {
+        self.decks.iter_mut().flat_map(|d| [d.loaded.take(), d.next.take(), d.retired.take()]).flatten()
     }
 
     /// True while a deck plays or its sound rings out.
     pub fn awake(&self) -> bool {
-        self.quiet > 0 || self.decks.iter().any(|d| d.playing || d.fade.is_some())
+        self.quiet > 0 || self.decks.iter().any(Deck::sounding)
     }
 
     /// True while a deck plays.
@@ -1383,17 +1724,44 @@ impl Decks {
         self.strips.get_mut(id.index())
     }
 
+    /// The phase (beats, wrapped to ±½) deck `x` is ahead of its master by, when it follows
+    /// one (and, with `playing`, only while the master plays).
+    fn phase_to_master(&self, x: usize, playing: bool) -> Option<f64> {
+        let (sx, sy) = (self.snap(x), self.snap(1 - x));
+        let follows = sx.synced && sx.grid && sy.grid && (!sy.synced || sy.playing);
+        if !follows || (playing && !sy.playing) {
+            return None;
+        }
+        let d = sx.beat - sy.beat;
+        Some(d - d.round())
+    }
+
+    /// Before deck `x` starts while its master plays: its playhead moves by its phase error, so
+    /// it starts in phase (a stopped deck's move is inaudible).
+    fn align_stopped(&mut self, x: usize, playing_master: bool) {
+        let Some(e) = self.phase_to_master(x, playing_master) else { return };
+        if let Some(d) = self.decks.get_mut(x)
+            && !d.playing
+        {
+            d.playhead = d.shifted(d.playhead, -e).clamp(0.0, d.frames());
+            d.sync_offset = 0.0;
+            d.nudged = false;
+            d.unready();
+        }
+    }
+
     /// Applies a command (no allocation: call it on the audio thread).
     pub fn apply(&mut self, cmd: DeckCmd) {
         let (q, xf, sr) = (self.quantise, self.xf, self.sr);
-        if matches!(cmd, DeckCmd::Play(_) | DeckCmd::Cue { down: true, .. }) {
+        if matches!(cmd, DeckCmd::Play(_) | DeckCmd::Cue { down: true, .. } | DeckCmd::HotCue { action: HotCueAction::Jump, .. }) {
             self.clock += 1;
         }
         let clock = self.clock;
         match cmd {
             DeckCmd::Play(id) => {
+                self.align_stopped(id.index(), true);
                 if let Some(d) = self.deck(id) {
-                    d.play(clock);
+                    d.play(clock, xf);
                 }
             }
             DeckCmd::Pause(id) => {
@@ -1402,8 +1770,19 @@ impl Decks {
                 }
             }
             DeckCmd::Cue { deck, down } => {
-                if let Some(d) = self.deck(deck) {
-                    d.cue_button(down, q, clock, xf);
+                let Some(d) = self.deck(deck).filter(|d| d.loaded.is_some()) else { return };
+                if !down {
+                    d.release(xf);
+                } else if d.playing && !d.previewing {
+                    d.pause(xf);
+                    d.playhead = d.cue;
+                } else if !d.playing {
+                    d.set_cue_here(q);
+                    let from = d.cue;
+                    self.align_stopped(deck.index(), true);
+                    if let Some(d) = self.deck(deck) {
+                        d.preview(from, clock, xf);
+                    }
                 }
             }
             DeckCmd::Seek { deck, at } => {
@@ -1415,6 +1794,7 @@ impl Decks {
                     }
                     d.pending = None;
                     d.jump(at, xf);
+                    d.relink(xf);
                 }
             }
             DeckCmd::Jog { deck, delta, mode } => {
@@ -1427,9 +1807,22 @@ impl Decks {
                     if let Some(r) = range.filter(|r| PITCH_RANGES.iter().any(|x| (x - r).abs() < 1e-9)) {
                         d.range = r;
                     }
-                    if value.is_finite() {
-                        d.pitch = value.clamp(-d.range, d.range);
-                        d.synced = false;
+                    // A synced deck's tempo is its master's; after sync off the fader takes
+                    // over once it reaches the tempo held (soft takeover).
+                    if value.is_finite() && !d.synced {
+                        let v = value.clamp(-d.range, d.range);
+                        match d.takeover {
+                            None => d.pitch = v,
+                            Some((held, side)) => {
+                                let now = v > held;
+                                if (v - held).abs() <= TAKEOVER || side.is_some_and(|s| s != now) {
+                                    d.pitch = v;
+                                    d.takeover = None;
+                                } else {
+                                    d.takeover = Some((held, Some(now)));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1439,17 +1832,36 @@ impl Decks {
                 }
             }
             DeckCmd::Sync { deck, on } => {
-                if let Some(d) = self.deck(deck) {
-                    d.synced = on;
-                    if !on {
-                        d.correction = 0.0;
-                        d.phase_err = None;
+                let x = deck.index();
+                let Some(d) = self.deck(deck) else { return };
+                if !on {
+                    if d.synced {
+                        d.takeover = Some((d.pitch, None));
                     }
+                    d.synced = false;
+                    d.correction = 0.0;
+                    d.phase_err = None;
+                    return;
+                }
+                d.synced = true;
+                d.sync_offset = 0.0;
+                d.nudged = false;
+                d.takeover = None;
+                let playing = d.playing;
+                if !playing {
+                    self.align_stopped(x, false);
+                } else if let Some(e) = self.phase_to_master(x, true).filter(|e| e.abs() > SYNC_SNAP)
+                    && let Some(d) = self.deck(deck)
+                {
+                    // Far out: one crossfaded jump into phase rather than a long bend.
+                    let p = d.pos();
+                    let target = d.shifted(p, -e);
+                    d.jump(target, xf);
                 }
             }
             DeckCmd::HotCue { deck, n, action } => {
                 if let Some(d) = self.deck(deck) {
-                    d.hot_cue(n, action, q, xf);
+                    d.hot_cue(n, action, q, clock, xf);
                 }
             }
             DeckCmd::Loop { deck, action } => {
@@ -1519,6 +1931,7 @@ impl Decks {
     fn snap(&self, i: usize) -> Snap {
         let Some(d) = self.decks.get(i) else { return Snap::default() };
         let p = d.pos();
+        let base = 1.0 + d.pitch;
         match d.grid() {
             Some(g) => Snap {
                 grid: true,
@@ -1527,13 +1940,15 @@ impl Decks {
                 started: d.started,
                 beat: g.beat_at(p),
                 period: g.period_at(p),
-                base: 1.0 + d.pitch,
+                base,
+                loop_beats: d.loop_beats(),
             },
-            None => Snap { playing: d.playing, synced: d.synced, started: d.started, base: 1.0 + d.pitch, ..Snap::default() },
+            None => Snap { playing: d.playing, synced: d.synced, started: d.started, base, ..Snap::default() },
         }
     }
 
-    /// Sets each deck's rate for the next `n` frames: pitch, sync (tempo and phase) and jog.
+    /// Sets each deck's rate for the next `n` frames: pitch, sync (tempo, then a gentle phase
+    /// trim) and jog.
     fn update(&mut self, n: usize) {
         let snaps = [self.snap(0), self.snap(1)];
         let mut masters = [false; DECKS];
@@ -1543,7 +1958,8 @@ impl Decks {
             if d.bend_left > 0 {
                 d.bend_left = d.bend_left.saturating_sub(n);
             }
-            if d.bend_left == 0 {
+            let nudging = d.bend_left > 0;
+            if !nudging {
                 d.bend = 0.0;
             }
             d.correction = 0.0;
@@ -1554,11 +1970,24 @@ impl Decks {
                 if base.is_finite() {
                     d.pitch = (base - 1.0).clamp(-SYNC_PITCH, SYNC_PITCH);
                 }
-                if sx.playing && sy.playing {
-                    let diff = sx.beat - sy.beat;
-                    let e = diff - diff.round();
-                    d.phase_err = Some(e);
-                    d.correction = (-SYNC_GAIN * e).clamp(-SYNC_MAX, SYNC_MAX);
+                // Loops shorter than a beat repeat a fraction of a beat: their phase is not the
+                // beat's, so only the tempo follows.
+                let short = |s: &Snap| s.loop_beats.is_some_and(|b| b < 1.0);
+                if sx.playing && sy.playing && !short(sx) && !short(sy) {
+                    let raw = sx.beat - sy.beat;
+                    let raw = raw - raw.round();
+                    if nudging {
+                        // The DJ rides it: no correction, and the phase it ends at is kept.
+                        d.nudged = true;
+                    } else {
+                        if std::mem::take(&mut d.nudged) {
+                            d.sync_offset = raw;
+                        }
+                        let e = raw - d.sync_offset;
+                        let e = e - e.round();
+                        d.phase_err = Some(e);
+                        d.correction = (-SYNC_GAIN * e).clamp(-SYNC_MAX, SYNC_MAX);
+                    }
                 }
                 if let Some(m) = masters.get_mut(1 - x) {
                     *m = true;
@@ -1576,7 +2005,7 @@ impl Decks {
     /// channels).
     pub fn render(&mut self, main: &mut [Vec<f32>], frames: usize) {
         let n = frames.min(self.max_block);
-        if n == 0 || !self.awake() {
+        if n == 0 || !(self.awake() || self.decks.iter().any(|d| d.next.is_some())) {
             return;
         }
         self.update(n);
@@ -1592,9 +2021,8 @@ impl Decks {
             }
             deck.render(buf, n, xf);
             strip.process(buf, n);
-            let level = self.levels.get_mut(k);
             let peaks: [f32; 2] = [0, 1].map(|c| buf.get(c).map_or(0.0, |b| b.iter().take(n).fold(0.0f32, |m, v| m.max(v.abs()))));
-            if let Some(l) = level {
+            if let Some(l) = self.levels.get_mut(k) {
                 *l = peaks;
             }
             let (g0, g1) = (self.xg.get(k).copied().unwrap_or(1.0), strip.side.pick(gains));
@@ -1619,20 +2047,46 @@ impl Decks {
                 *d += if s.is_finite() { *s } else { 0.0 };
             }
         }
-        if self.decks.iter().any(|d| d.playing || d.fade.is_some()) {
+        if self.decks.iter().any(Deck::sounding) {
             self.quiet = (QUIET_S * self.sr) as usize;
         } else {
             self.quiet = self.quiet.saturating_sub(n);
             if self.quiet == 0 {
                 // Silent: the next start rings nothing of this one.
                 self.strips.iter_mut().for_each(DjStrip::reset);
-                if let Some(l) = self.limiter.as_mut() {
+                for l in [self.limiter.as_mut(), self.out_limiter.as_mut()].into_iter().flatten() {
                     l.reset();
                 }
                 self.levels = [[0.0; 2]; DECKS];
                 self.master_level = [0.0; 2];
             }
         }
+    }
+
+    /// The output stage while the decks sound: the main output (after the master faders) through
+    /// a second Maximizer at the ceiling, so no master fader or insert takes the decks over it.
+    pub fn limit_output(&mut self, main: &mut [Vec<f32>], frames: usize) {
+        let n = frames.min(self.max_block);
+        if !self.awake() || n == 0 {
+            return;
+        }
+        if let Some(l) = self.out_limiter.as_mut() {
+            let stereo = main.len().min(2);
+            if let Some(io) = main.get_mut(..stereo) {
+                l.process(io, n);
+            }
+        }
+    }
+
+    /// Frames the decks' stretchers produced since last asked, per deck.
+    pub fn take_stretched(&mut self) -> [usize; DECKS] {
+        let mut out = [0; DECKS];
+        for (o, d) in out.iter_mut().zip(self.decks.iter_mut()) {
+            if let Some(l) = d.loaded.as_mut() {
+                *o = l.heads.iter_mut().map(Head::take_stretched).sum();
+            }
+        }
+        out
     }
 
     /// What the decks play, for publishing.
@@ -1661,7 +2115,7 @@ impl Decks {
         out
     }
 
-    /// Lengths and capacities of every buffer the decks own (they never change once built).
+    /// Lengths and capacities of the mixer's own buffers (they never change once built).
     #[doc(hidden)]
     pub fn storage(&self) -> Vec<(usize, usize)> {
         let mut v = Vec::new();
@@ -1669,12 +2123,15 @@ impl Decks {
             v.push((b.len(), b.capacity()));
             v.extend(b.iter().map(|c| (c.len(), c.capacity())));
         }
+        v
+    }
+
+    /// Lengths and capacities of the buffers of the tracks on (and waiting for) each deck.
+    #[doc(hidden)]
+    pub fn track_storage(&self) -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
         for d in &self.decks {
-            for h in d.loaded.iter().flat_map(|l| l.heads.iter()) {
-                if let Some(s) = &h.stretch {
-                    v.extend(s.input.iter().chain(s.out.iter()).map(|c| (c.len(), c.capacity())));
-                }
-            }
+            d.storage(&mut v);
         }
         v
     }
@@ -1717,25 +2174,60 @@ mod tests {
         }
     }
 
+    /// Bursts: 5 ms of 1 kHz from every beat, silence between.
+    fn bursts(bpm: f64, first: f64) -> impl Fn(usize) -> f32 {
+        let period = 60.0 * SR / bpm;
+        move |i| {
+            let t = i as f64 - first;
+            let into = t - (t / period).floor() * period;
+            if t >= 0.0 && into < 0.005 * SR { (std::f64::consts::TAU * 1000.0 * into / SR).sin() as f32 * 0.8 } else { 0.0 }
+        }
+    }
+
     fn decks() -> Decks {
         Decks::new(SR as f32, BLOCK)
     }
 
-    fn load(d: &mut Decks, id: DeckId, t: &Arc<DeckTrack>) {
-        assert!(d.load(id, Box::new(PreparedDeck::new(Arc::clone(t), SR as f32))).is_none());
+    fn prepared(t: &Arc<DeckTrack>) -> Box<PreparedDeck> {
+        Box::new(PreparedDeck::new(Arc::clone(t), SR as f32))
     }
 
-    /// The raw output of deck `k` for `blocks` blocks (rates set as the mixer would).
-    fn raw(d: &mut Decks, k: usize, blocks: usize) -> Vec<f32> {
-        let mut out = Vec::new();
+    fn load(d: &mut Decks, id: DeckId, t: &Arc<DeckTrack>) {
+        assert!(d.load(id, prepared(t)).is_none());
+    }
+
+    /// The raw outputs (left) of both decks for `blocks` blocks (rates set as the mixer would).
+    fn raw2(d: &mut Decks, blocks: usize) -> [Vec<f32>; 2] {
+        let mut out = [Vec::new(), Vec::new()];
         for _ in 0..blocks {
             d.update(BLOCK);
-            let mut buf = vec![vec![0.0f32; BLOCK]; 2];
-            d.decks[k].render(&mut buf, BLOCK, d.xf);
-            // The other deck runs too.
-            let mut other = vec![vec![0.0f32; BLOCK]; 2];
-            d.decks[1 - k].render(&mut other, BLOCK, d.xf);
-            out.extend_from_slice(&buf[0]);
+            for (k, o) in out.iter_mut().enumerate() {
+                let mut buf = vec![vec![0.0f32; BLOCK]; 2];
+                d.decks[k].render(&mut buf, BLOCK, d.xf);
+                o.extend_from_slice(&buf[0]);
+            }
+        }
+        out
+    }
+
+    fn raw(d: &mut Decks, k: usize, blocks: usize) -> Vec<f32> {
+        let [a, b] = raw2(d, blocks);
+        if k == 0 { a } else { b }
+    }
+
+    /// Where each burst starts: the first sample over 0.2 after 10 ms under 0.05.
+    fn onsets(x: &[f32]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut quiet = 0usize;
+        for (i, v) in x.iter().enumerate() {
+            if v.abs() > 0.2 {
+                if quiet >= 480 {
+                    out.push(i);
+                }
+                quiet = 0;
+            } else if v.abs() < 0.05 {
+                quiet += 1;
+            }
         }
         out
     }
@@ -1753,6 +2245,7 @@ mod tests {
         assert!(BeatGrid::new(vec![1.0]).is_none() && BeatGrid::new(vec![2.0, 1.0]).is_none() && BeatGrid::new(vec![0.0, f64::NAN]).is_none());
         let v = BeatGrid::new(vec![0.0, 100.0, 300.0]).unwrap();
         assert_eq!((v.beat_at(200.0), v.period_at(200.0), v.pos_at(1.5)), (1.5, 200.0, 200.0));
+        assert_eq!(hermite(&[1.0, 2.0], f64::from(i32::MAX) * 1e10), 0.0, "far out of range is silence");
     }
 
     #[test]
@@ -1771,7 +2264,7 @@ mod tests {
 
     #[test]
     fn cdj_cue_sets_previews_returns_and_pauses() {
-        let t = track(8.0, 120.0, 0.0, |i| (i as f32 * 0.01).sin());
+        let t = track(8.0, 120.0, 0.0, |_| 0.5);
         let mut d = decks();
         load(&mut d, DeckId::A, &t);
         let a = DeckId::A;
@@ -1803,11 +2296,37 @@ mod tests {
         d.apply(DeckCmd::Play(a));
         d.apply(DeckCmd::Cue { deck: a, down: false });
         assert!(st(&d).playing && !st(&d).previewing);
-        // The pause fades out: the tail after a pause is short and decays.
+        raw(&mut d, 0, 2);
+        // The pause fades out over 2 ms, never stepping, then is silent.
         d.apply(DeckCmd::Pause(a));
         let tail = raw(&mut d, 0, 1);
+        assert!((tail[0] - 0.5).abs() < 0.01, "starts from where it was");
+        assert!(tail.windows(2).take(d.xf).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.05), "a smooth fade");
         assert!(tail.iter().skip(d.xf).all(|v| *v == 0.0), "silent after the fade");
-        assert!(tail[0].abs() > 0.0 || tail[1].abs() > 0.0);
+    }
+
+    #[test]
+    fn a_pause_in_a_jumps_crossfade_fades_both_heads() {
+        // Two levels a jump crossfades between: 0.5 before 100 000, 0.25 after.
+        let t = track(8.0, 120.0, 0.0, |i| if i < 100_000 { 0.5 } else { 0.25 });
+        let mut d = decks();
+        load(&mut d, DeckId::A, &t);
+        d.apply(DeckCmd::Play(DeckId::A));
+        raw(&mut d, 0, 1);
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 200_000.0 });
+        let first = raw(&mut d, 0, 1);
+        assert!(first[0] > 0.4 && first[200] == 0.25, "the crossfade");
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 10_000.0 });
+        let x = raw(&mut d, 0, 1);
+        // Mid-crossfade back, then paused right away: nothing cuts.
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 300_000.0 });
+        d.decks[0].render(&mut vec![vec![0.0; 40]; 2], 40, d.xf);
+        d.apply(DeckCmd::Pause(DeckId::A));
+        let tail = raw(&mut d, 0, 1);
+        assert!(x[300] == 0.5);
+        assert!(tail[0] > 0.2, "{}", tail[0]);
+        assert!(tail.windows(2).all(|w| (w[1] - w[0]).abs() < 0.05), "no step");
+        assert!(tail.iter().skip(d.xf).all(|v| *v == 0.0));
     }
 
     #[test]
@@ -1830,9 +2349,26 @@ mod tests {
         // Beat 2 would have sounded 0.6 beats in; the cue's click (beat 8) sounds there instead.
         assert_eq!(first_click, (0.6 * 22_500.0) as usize);
         assert_eq!(out[first_click], 1.0, "whole, after the crossfade");
-        // The beats go on from beat 8, on time.
         let next = out.iter().skip(first_click + 1).position(|v| *v > 0.5).unwrap() + first_click + 1;
         assert_eq!(next - first_click, 22_500);
+    }
+
+    #[test]
+    fn a_hot_cue_pressed_while_paused_previews_and_returns_on_release() {
+        let t = track(10.0, 128.0, 0.0, |_| 0.3);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &t);
+        let a = DeckId::A;
+        d.apply(DeckCmd::Seek { deck: a, at: 45_000.0 });
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Set });
+        d.apply(DeckCmd::Seek { deck: a, at: 200_000.0 });
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Jump });
+        let s = d.state().decks[0];
+        assert!(s.playing && s.previewing && s.position == 45_000.0);
+        raw(&mut d, 0, 4);
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Release });
+        let s = d.state().decks[0];
+        assert!(!s.playing && s.position == 45_000.0);
     }
 
     /// Phase error (ms) of deck B against A, from their positions and grids.
@@ -1841,13 +2377,12 @@ mod tests {
         let (ga, gb) = (ta.grid.as_ref().unwrap(), tb.grid.as_ref().unwrap());
         let (ba, bb) = (ga.beat_at(s.decks[0].position), gb.beat_at(s.decks[1].position));
         let e = (bb - ba) - (bb - ba).round();
-        // In time: a beat of A as it plays.
         e * ga.period_at(s.decks[0].position) / s.decks[0].rate / SR * 1000.0
     }
 
     fn sync_locks(pitch_a: f64, key_lock: bool) {
-        let ta = track(120.0, 128.0, 0.0, |i| (i as f32 * 0.02).sin() * 0.3);
-        let tb = track(120.0, 132.0, 0.037 * SR, |i| (i as f32 * 0.03).sin() * 0.3);
+        let ta = track(120.0, 128.0, 0.0, bursts(128.0, 0.0));
+        let tb = track(120.0, 132.0, 0.037 * SR, bursts(132.0, 0.037 * SR));
         let mut d = decks();
         load(&mut d, DeckId::A, &ta);
         load(&mut d, DeckId::B, &tb);
@@ -1855,31 +2390,46 @@ mod tests {
         d.apply(DeckCmd::MasterTempo { deck: DeckId::B, on: key_lock });
         d.apply(DeckCmd::Play(DeckId::A));
         raw(&mut d, 0, 50);
-        // B starts somewhere off the beat, then syncs.
+        // B starts somewhere off the beat, then syncs: far out, so it jumps into phase.
         d.apply(DeckCmd::Seek { deck: DeckId::B, at: 3.37 * 48_000.0 });
         d.apply(DeckCmd::Play(DeckId::B));
         d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
         let beat_frames = 60.0 / (128.0 * (1.0 + pitch_a)) * SR;
         let blocks_per_beat = beat_frames / BLOCK as f64;
-        let mut worst_after = 0.0f64;
+        let (mut worst, mut worst_bend) = (0.0f64, 0.0f64);
         let blocks = (blocks_per_beat * 4.0 * 33.0) as usize;
+        let mut audio = [Vec::new(), Vec::new()];
         for b in 0..blocks {
-            raw(&mut d, 1, 1);
-            let ms = phase_ms(&d, &ta, &tb);
+            let [oa, ob] = raw2(&mut d, 1);
+            let s = d.state().decks[1];
+            worst_bend = worst_bend.max((s.rate / (1.0 + s.pitch) - 1.0).abs());
             if b as f64 > blocks_per_beat * 4.0 {
-                worst_after = worst_after.max(ms.abs());
+                worst = worst.max(phase_ms(&d, &ta, &tb).abs());
+                audio[0].extend(oa);
+                audio[1].extend(ob);
             }
         }
         let s = d.state();
         assert!(s.decks[1].synced && s.decks[0].master && !s.decks[1].master);
-        assert!(worst_after < 1.0, "phase error after 4 beats up to {worst_after} ms (pitch {pitch_a}, key lock {key_lock})");
+        assert!(worst < 1.0, "phase error after 4 beats up to {worst} ms (pitch {pitch_a}, key lock {key_lock})");
+        assert!(worst_bend <= SYNC_MAX + 1e-9, "the rate bent {worst_bend}: it should have jumped");
+        // On the audio: every burst of B within a millisecond of one of A.
+        let (oa, ob) = (onsets(&audio[0]), onsets(&audio[1]));
+        assert!(ob.len() > 100, "{}", ob.len());
+        let off = ob.iter().map(|b| oa.iter().map(|a| (*a as f64 - *b as f64).abs()).fold(f64::MAX, f64::min)).fold(0.0, f64::max);
+        assert!(off < 48.0, "bursts {off} samples apart (key lock {key_lock})");
         // Tempo matched: B's bpm is A's.
         assert!((s.decks[1].bpm - s.decks[0].bpm).abs() < 0.01, "{} vs {}", s.decks[1].bpm, s.decks[0].bpm);
-        // Sync off keeps the rate.
+        // Sync off keeps the rate, through blocks; the fader takes over only once it reaches it.
         let rate = s.decks[1].rate;
         d.apply(DeckCmd::Sync { deck: DeckId::B, on: false });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.06, range: Some(0.16) });
+        raw(&mut d, 1, 20);
+        assert!((d.state().decks[1].rate - rate).abs() < 1e-3, "{} vs {rate}", d.state().decks[1].rate);
+        let held = d.state().decks[1].pitch;
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: held - 0.01, range: None });
         raw(&mut d, 1, 1);
-        assert!((d.state().decks[1].rate - rate).abs() < 1e-4);
+        assert!((d.state().decks[1].pitch - (held - 0.01)).abs() < 1e-9, "crossed the held tempo: taken over");
     }
 
     #[test]
@@ -1894,8 +2444,75 @@ mod tests {
     }
 
     #[test]
-    fn sync_locks_a_key_locked_deck() {
+    fn sync_locks_a_key_locked_deck_on_the_audio() {
         sync_locks(0.0, true);
+    }
+
+    #[test]
+    fn a_synced_deck_starts_in_phase_and_syncing_a_stopped_deck_aligns_it() {
+        let ta = track(60.0, 128.0, 0.0, |_| 0.1);
+        let tb = track(60.0, 126.0, 1234.0, |_| 0.1);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &ta);
+        load(&mut d, DeckId::B, &tb);
+        d.apply(DeckCmd::Play(DeckId::A));
+        raw(&mut d, 0, 30);
+        d.apply(DeckCmd::Seek { deck: DeckId::B, at: 101_234.0 });
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        assert!(phase_ms(&d, &ta, &tb).abs() < 0.2, "aligned while stopped: {}", phase_ms(&d, &ta, &tb));
+        raw(&mut d, 0, 13);
+        d.apply(DeckCmd::Play(DeckId::B));
+        raw(&mut d, 0, 1);
+        assert!(phase_ms(&d, &ta, &tb).abs() < 0.2, "starts in phase: {}", phase_ms(&d, &ta, &tb));
+        let s = d.state().decks[1];
+        assert!((s.rate / (1.0 + s.pitch) - 1.0).abs() < 1e-3, "no bend needed");
+    }
+
+    #[test]
+    fn a_nudge_rides_a_follower_and_the_lock_holds_its_new_phase() {
+        let ta = track(60.0, 128.0, 0.0, |_| 0.1);
+        let tb = track(60.0, 128.0, 0.0, |_| 0.1);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &ta);
+        load(&mut d, DeckId::B, &tb);
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        d.apply(DeckCmd::Play(DeckId::A));
+        d.apply(DeckCmd::Play(DeckId::B));
+        raw(&mut d, 0, 20);
+        assert!(phase_ms(&d, &ta, &tb).abs() < 0.1);
+        for _ in 0..30 {
+            d.apply(DeckCmd::Jog { deck: DeckId::B, delta: 0.5, mode: JogMode::Nudge });
+            raw(&mut d, 0, 1);
+            let s = d.state().decks[1];
+            assert!((s.rate - 1.05).abs() < 1e-6, "the nudge bends it: {}", s.rate);
+        }
+        // The bend holds a moment after the last event.
+        raw(&mut d, 0, 10);
+        let ahead = phase_ms(&d, &ta, &tb);
+        assert!(ahead > 10.0, "{ahead}");
+        raw(&mut d, 0, 400);
+        assert!((phase_ms(&d, &ta, &tb) - ahead).abs() < 0.5, "the lock keeps where the nudge left it");
+        assert!((d.state().decks[1].rate - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_follower_looping_a_quarter_beat_follows_the_tempo_only() {
+        let ta = track(60.0, 128.0, 0.0, |_| 0.1);
+        let tb = track(60.0, 125.0, 0.0, |_| 0.1);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &ta);
+        load(&mut d, DeckId::B, &tb);
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        d.apply(DeckCmd::Play(DeckId::A));
+        d.apply(DeckCmd::Play(DeckId::B));
+        raw(&mut d, 0, 20);
+        d.apply(DeckCmd::Loop { deck: DeckId::B, action: LoopAction::Beats(0.25) });
+        let matched = 128.0 / 125.0;
+        for _ in 0..(8.0 * 22_500.0 / BLOCK as f64) as usize {
+            raw(&mut d, 0, 1);
+            let r = d.state().decks[1].rate;
+            assert!((r / matched - 1.0).abs() < 0.01, "{r}");
+        }
     }
 
     #[test]
@@ -1910,7 +2527,6 @@ mod tests {
         let s = d.state().decks[0];
         assert_eq!((s.loop_in, s.loop_out, s.loop_on), (Some(90_000.0), Some(180_000.0), true));
         let out = raw(&mut d, 0, 2000);
-        // Every click a beat apart, through every seam: the loop is bar-exact.
         let at: Vec<usize> = out.iter().enumerate().filter(|(_, v)| **v > 0.5).map(|(i, _)| i).collect();
         assert!(at.len() > 40);
         assert!(at.windows(2).all(|w| w[1] - w[0] == 22_500), "{:?}", &at[..8]);
@@ -1928,7 +2544,6 @@ mod tests {
         let slope = std::f64::consts::TAU * hz / SR * 0.5;
         let worst = out.windows(2).map(|w| (w[1] - w[0]).abs() as f64).fold(0.0, f64::max);
         assert!(worst < 2.0 * slope, "step {worst} vs slope {slope}");
-        // Halve and double.
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Halve });
         assert_eq!(d.state().decks[0].loop_out, Some(78_750.0));
         raw(&mut d, 0, 60);
@@ -1937,14 +2552,24 @@ mod tests {
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Double });
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Double });
         assert_eq!(d.state().decks[0].loop_out, Some(112_500.0));
+        // Halving stops at a sixteenth of a beat.
+        for _ in 0..8 {
+            d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Halve });
+        }
+        assert_eq!(d.state().decks[0].loop_out, Some(67_500.0 + 22_500.0 / 16.0));
+        d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Beats(1.0 / 64.0) });
+        let s = d.state().decks[0];
+        assert!((s.loop_out.unwrap() - s.loop_in.unwrap() - 22_500.0 / 16.0).abs() < 1e-6);
+        d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Beats(2.0) });
         // Exit plays on past the end; reloop goes back to the start.
+        let end = d.state().decks[0].loop_out.unwrap();
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Exit });
         raw(&mut d, 0, 200);
-        assert!(d.state().decks[0].position > 112_500.0);
+        assert!(d.state().decks[0].position > end);
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Reloop });
         raw(&mut d, 0, 1);
-        assert!(d.state().decks[0].position - 67_500.0 < 2.0 * BLOCK as f64);
-        // Beat jump moves by whole beats (and the loop with it).
+        let start = d.state().decks[0].loop_in.unwrap();
+        assert!(d.state().decks[0].position - start < 2.0 * BLOCK as f64);
         d.apply(DeckCmd::Loop { deck: a, action: LoopAction::Exit });
         let p0 = d.state().decks[0].position;
         d.apply(DeckCmd::BeatJump { deck: a, beats: 8.0 });
@@ -1953,16 +2578,73 @@ mod tests {
         assert!((p1 - p0 - 8.0 * 22_500.0 - BLOCK as f64).abs() < 1e-6, "{p0} -> {p1}");
     }
 
-    /// The frequency of `x` by zero crossings.
-    fn freq(x: &[f32]) -> f64 {
-        let ups: Vec<usize> = x.windows(2).enumerate().filter(|(_, w)| w[0] <= 0.0 && w[1] > 0.0).map(|(i, _)| i).collect();
-        let (Some(a), Some(b)) = (ups.first(), ups.last()) else { return 0.0 };
-        (ups.len() - 1) as f64 * SR / (b - a) as f64
+    #[test]
+    fn a_key_locked_loop_wraps_on_the_beat_and_short_loops_stay_in_budget() {
+        let t = track(30.0, 128.0, 0.0, bursts(128.0, 0.0));
+        let mut d = decks();
+        load(&mut d, DeckId::A, &t);
+        d.apply(DeckCmd::MasterTempo { deck: DeckId::A, on: true });
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 4.0 * 22_500.0 });
+        d.apply(DeckCmd::Play(DeckId::A));
+        d.apply(DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Beats(1.0) });
+        let out = raw(&mut d, 0, 800);
+        let on = onsets(&out[20_000..]);
+        assert!(on.len() > 10);
+        assert!(on.windows(2).all(|w| (w[1] as f64 - w[0] as f64 - 22_500.0).abs() < 48.0), "{on:?}");
+        let p = d.state().decks[0].position;
+        assert!((90_000.0..112_500.0).contains(&p), "{p}");
+        // Sixteenth-beat key-locked loops on both decks: no restarts, about a block of stretching
+        // per deck per callback.
+        let tb = track(30.0, 130.0, 0.0, bursts(130.0, 0.0));
+        load(&mut d, DeckId::B, &tb);
+        for id in DeckId::ALL {
+            d.apply(DeckCmd::MasterTempo { deck: id, on: true });
+            d.apply(DeckCmd::Play(id));
+            d.apply(DeckCmd::Loop { deck: id, action: LoopAction::Beats(1.0 / 16.0) });
+        }
+        let mut main = vec![vec![0.0f32; BLOCK]; 2];
+        for b in 0..400 {
+            d.render(&mut main, BLOCK);
+            let st = d.take_stretched();
+            if b > 50 {
+                assert!(st.iter().all(|s| *s <= 3 * BLOCK), "block {b}: {st:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_locked_quantised_hot_cue_is_prewarmed() {
+        let t = track(30.0, 128.0, 0.0, bursts(128.0, 0.0));
+        let mut d = decks();
+        load(&mut d, DeckId::A, &t);
+        d.apply(DeckCmd::MasterTempo { deck: DeckId::A, on: true });
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 8.0 * 22_500.0 });
+        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Set });
+        d.apply(DeckCmd::Seek { deck: DeckId::A, at: 1.05 * 22_500.0 });
+        d.apply(DeckCmd::Play(DeckId::A));
+        raw(&mut d, 0, 2);
+        d.take_stretched();
+        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Jump });
+        let mut out = Vec::new();
+        for _ in 0..120 {
+            out.extend(raw(&mut d, 0, 1));
+            let st = d.take_stretched()[0];
+            assert!(st <= 3 * BLOCK, "spread over the blocks before the jump");
+        }
+        // The cue's burst plays where beat 2's would have.
+        let on = onsets(&out);
+        let beat2 = 2.0 * 22_500.0 - (1.05 * 22_500.0 + 2.0 * BLOCK as f64);
+        assert!(on.iter().any(|o| (*o as f64 - beat2).abs() < 48.0), "{on:?} vs {beat2}");
+        assert!(d.state().decks[0].position > 8.0 * 22_500.0);
     }
 
     #[test]
     fn master_tempo_keeps_the_key_and_varispeed_does_not() {
         let t = track(10.0, 120.0, 0.0, |i| (std::f64::consts::TAU * 1000.0 * i as f64 / SR).sin() as f32 * 0.5);
+        let freq = |x: &[f32]| {
+            let ups: Vec<usize> = x.windows(2).enumerate().filter(|(_, w)| w[0] <= 0.0 && w[1] > 0.0).map(|(i, _)| i).collect();
+            (ups.len() - 1) as f64 * SR / (ups[ups.len() - 1] - ups[0]) as f64
+        };
         for (key_lock, want) in [(true, 1000.0), (false, 1080.0)] {
             let mut d = decks();
             load(&mut d, DeckId::A, &t);
@@ -1972,10 +2654,29 @@ mod tests {
             let out = raw(&mut d, 0, 200);
             let f = freq(&out[20_000..]);
             assert!((f - want).abs() < want * 0.005, "key lock {key_lock}: {f} Hz");
-            // The tempo moves either way.
             let p = d.state().decks[0].position;
             assert!((p - 200.0 * BLOCK as f64 * 1.08).abs() < 2_000.0, "{p}");
         }
+    }
+
+    #[test]
+    fn loading_onto_a_playing_deck_fades_it_out_then_swaps() {
+        let (ta, tb) = (track(10.0, 128.0, 0.0, |_| 0.5), track(10.0, 128.0, 0.0, |_| 0.25));
+        let mut d = decks();
+        let first = prepared(&ta);
+        let (id_a, next) = (first.load(), prepared(&tb));
+        let id_b = next.load();
+        assert!(d.load(DeckId::A, first).is_none());
+        d.apply(DeckCmd::Play(DeckId::A));
+        raw(&mut d, 0, 2);
+        assert!(d.load(DeckId::A, next).is_none(), "held, not dropped");
+        assert_eq!(d.state().decks[0].load, id_a, "the playing track stays until it is silent");
+        let out = raw(&mut d, 0, 1);
+        assert!((out[0] - 0.5).abs() < 0.01 && out.windows(2).all(|w| (w[1] - w[0]).abs() < 0.05), "faded, not cut");
+        assert_eq!(d.state().decks[0].load, id_b);
+        assert!(!d.state().decks[0].playing);
+        assert_eq!(d.take_retired().map(|r| r.load()), Some(id_a));
+        assert!(d.take_retired().is_none());
     }
 
     #[test]
@@ -2035,27 +2736,33 @@ mod tests {
     fn rendering_never_grows_or_reallocates_storage() {
         let ta = track(30.0, 128.0, 0.0, clicks(128.0, 0.0));
         let tb = track(30.0, 126.0, 1234.0, |i| (i as f32 * 0.01).sin());
+        let tc = track(30.0, 124.0, 0.0, |_| 0.1);
         let mut d = decks();
         load(&mut d, DeckId::A, &ta);
         load(&mut d, DeckId::B, &tb);
-        let before = d.storage();
+        let (mixer, tracks) = (d.storage(), d.track_storage());
+        let incoming = prepared(&tc);
+        let mut incoming_storage = Vec::new();
+        incoming.storage(&mut incoming_storage);
         let mut main = vec![vec![0.0f32; BLOCK]; 2];
         let cmds = [
             DeckCmd::Play(DeckId::A),
             DeckCmd::Play(DeckId::B),
             DeckCmd::Sync { deck: DeckId::B, on: true },
             DeckCmd::MasterTempo { deck: DeckId::A, on: true },
+            DeckCmd::MasterTempo { deck: DeckId::B, on: true },
             DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Beats(0.25) },
             DeckCmd::Jog { deck: DeckId::B, delta: 0.5, mode: JogMode::Nudge },
             DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Set },
             DeckCmd::BeatJump { deck: DeckId::B, beats: -4.0 },
             DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Jump },
+            DeckCmd::Seek { deck: DeckId::B, at: 300_000.0 },
             DeckCmd::Filter { deck: DeckId::A, value: -0.7 },
             DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Double },
+            DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Exit },
             DeckCmd::Cue { deck: DeckId::A, down: true },
             DeckCmd::Cue { deck: DeckId::A, down: true },
             DeckCmd::Cue { deck: DeckId::A, down: false },
-            DeckCmd::StopAll,
         ];
         for c in cmds {
             d.apply(c);
@@ -2063,6 +2770,17 @@ mod tests {
                 d.render(&mut main, BLOCK);
             }
         }
-        assert_eq!(d.storage(), before);
+        assert_eq!((d.storage(), d.track_storage()), (mixer.clone(), tracks), "key-locked restarts and loops keep every buffer");
+        // A load onto a playing deck: held, swapped, the old one retired whole.
+        d.apply(DeckCmd::Play(DeckId::B));
+        assert!(d.load(DeckId::B, incoming).is_none());
+        for _ in 0..4 {
+            d.render(&mut main, BLOCK);
+        }
+        let mut now = Vec::new();
+        d.decks[1].storage(&mut now);
+        assert_eq!(now, incoming_storage);
+        assert!(d.take_retired().is_some());
+        assert_eq!(d.storage(), mixer);
     }
 }

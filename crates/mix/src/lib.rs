@@ -573,6 +573,18 @@ impl MixEngine {
         self.decks.as_ref().map(|d| d.storage()).unwrap_or_default()
     }
 
+    /// A track a deck let go of since last asked (it faded out for the one loaded after it), to
+    /// be dropped off the audio thread.
+    pub fn take_retired_deck(&mut self) -> Option<Box<PreparedDeck>> {
+        self.decks.as_mut().and_then(|d| d.take_retired())
+    }
+
+    /// Every track the decks hold, taken out (the engine is being replaced): to be dropped off
+    /// the audio thread.
+    pub fn drain_decks(&mut self) -> impl Iterator<Item = Box<PreparedDeck>> + '_ {
+        self.decks.iter_mut().flat_map(|d| d.drain())
+    }
+
     /// Queues a Live launch or stop for its sample (one that is due already takes effect at the
     /// start of the next block). It replaces whatever the column had queued. Neither allocates
     /// nor frees: call it on the audio thread.
@@ -1043,7 +1055,21 @@ impl MixEngine {
 
     /// Reset all plugin state (on stop / seek).
     pub fn reset(&mut self) {
-        for s in self.strips.values_mut() {
+        self.reset_where(|_| true);
+    }
+
+    /// [`MixEngine::reset`], but the master faders' strips play on while the decks sound (an
+    /// arrangement stop or locate then must not cut the decks' audio in their inserts).
+    pub fn reset_for_transport(&mut self, s: &Session) {
+        if self.decks_awake() {
+            self.reset_where(|id| s.track(id).is_none_or(|t| t.kind != TrackKind::Master));
+        } else {
+            self.reset();
+        }
+    }
+
+    fn reset_where(&mut self, reset: impl Fn(TrackId) -> bool) {
+        for (_, s) in self.strips.iter_mut().filter(|(id, _)| reset(**id)) {
             for p in s.plugins.iter_mut().flatten() {
                 p.plugin.reset();
                 p.failed = false;
@@ -1395,6 +1421,11 @@ impl MixEngine {
                 m.measure(&self.main, frames, 0.0);
                 m.plugin_failures = strip.failures;
             }
+        }
+        // While the decks sound, the output stage holds them under the ceiling whatever the master
+        // faders do (the arrangement is stopped then).
+        if let Some(d) = self.decks.as_mut() {
+            d.limit_output(&mut self.main, frames);
         }
         // Metronome: summed after the master fader, so it reaches the speakers without passing
         // through any track, send or insert. Only the playback engine sets `metronome`.
