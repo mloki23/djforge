@@ -76,6 +76,19 @@ pub enum TransportRequest {
     AllNotesOff,
     /// A Session view launch or stop, for the host to place on the next quantise boundary.
     Live(LiveRequest),
+    /// A live deck or DJ mixer command (see `deck.*`), for the host's audio engine as it is.
+    Deck(DeckRequest),
+}
+
+/// A live deck command for the host's audio engine ([`soundcraft_mix::DeckCmd`]). Serialised as
+/// its debug text (the mixer type has no serde).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeckRequest(pub soundcraft_mix::DeckCmd);
+
+impl serde::Serialize for DeckRequest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{:?}", self.0))
+    }
 }
 
 /// A Session view launch or stop (see `live.launch`). The host turns it into the audio engine's
@@ -205,6 +218,15 @@ pub struct Engine {
     /// What analyses a file loaded into a Session view slot: none until the app sets it up
     /// ([`Engine::set_analyse`]), so no test runs mixforge's sidecar.
     analyse: Option<cmd::PrepAnalyse>,
+    /// What the live decks play, as the host's audio engine last reported it.
+    pub deck_status: soundcraft_mix::DecksState,
+    /// The track each deck was last given (`deck.load`), for `decks.state`.
+    pub deck_tracks: [Option<Arc<soundcraft_mix::DeckTrack>>; 2],
+    /// Tracks loaded for the decks, prepared off the UI thread, for the host to hand to its
+    /// audio engine (drained by the host each frame).
+    pub deck_loads: Vec<(soundcraft_mix::DeckId, Box<soundcraft_mix::PreparedDeck>)>,
+    /// `deck.load`s still decoding and analysing on their own threads.
+    deck_jobs: Vec<cmd::decks::DeckLoadJob>,
 }
 
 impl Default for Engine {
@@ -245,7 +267,42 @@ impl Engine {
             mixxx: None,
             ffmpeg: None,
             analyse: None,
+            deck_status: Default::default(),
+            deck_tracks: [None, None],
+            deck_loads: Vec::new(),
+            deck_jobs: Vec::new(),
         }
+    }
+
+    /// Finishes the `deck.load`s whose files are ready: each deck's track goes to `deck_tracks`
+    /// and its prepared deck to `deck_loads` (for the host). Returns what each finished load
+    /// reports (or its error), and also posts it to `messages`. Call once a frame.
+    pub fn poll_deck_loads(&mut self) -> Vec<Result<Value>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.deck_jobs.len() {
+            if !self.deck_jobs.get(i).is_some_and(cmd::decks::DeckLoadJob::finished) {
+                i += 1;
+                continue;
+            }
+            let job = self.deck_jobs.remove(i);
+            let r = job.finish(self);
+            match &r {
+                Ok(v) => self.messages.push(format!(
+                    "Deck {}: loaded {}",
+                    v["deck"].as_str().unwrap_or("?").to_uppercase(),
+                    v["title"].as_str().unwrap_or("")
+                )),
+                Err(err) => self.messages.push(format!("Deck load failed: {err}")),
+            }
+            out.push(r);
+        }
+        out
+    }
+
+    /// True while a `deck.load` is still reading its file.
+    pub fn deck_loading(&self) -> bool {
+        !self.deck_jobs.is_empty()
     }
 
     /// Splits into stems go into `cache` through `runner`, and sessions may read stems from

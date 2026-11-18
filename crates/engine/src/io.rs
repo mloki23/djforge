@@ -523,6 +523,14 @@ pub(crate) struct DecodedImport {
     key: Option<String>,
 }
 
+impl DecodedImport {
+    /// The audio (at the rate it was decoded for) and the Camelot key its tag gave, for audio
+    /// that is played without becoming a session source (a live deck's track).
+    pub(crate) fn into_parts(self) -> (AudioBuffer, Option<String>) {
+        (self.buf, self.key)
+    }
+}
+
 /// Decodes the file `name` (`bytes`) at the session rate `rate`, as an import does.
 pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<DecodedImport> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);

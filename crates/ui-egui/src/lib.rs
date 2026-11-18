@@ -8,6 +8,7 @@ pub mod band_jobs;
 pub mod bounce;
 pub mod control;
 pub mod credits;
+pub mod decks;
 pub mod dialogs;
 pub mod dj_marks;
 pub mod docking;
@@ -1405,8 +1406,10 @@ impl SoundApp {
                     }
                 }
                 TransportRequest::Live(req) => self.live_request(req, &mut live_frame),
+                TransportRequest::Deck(req) => self.deck_request(req),
             }
         }
+        self.sync_decks();
         self.sync_live_status();
         // Read back the position.
         if let Some(p) = &self.player {

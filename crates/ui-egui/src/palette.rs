@@ -3,6 +3,7 @@
 use crate::SoundApp;
 use crate::theme::{Tokens, mono};
 use egui::{Align2, Key, vec2};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Default)]
 pub struct PaletteState {
@@ -17,17 +18,33 @@ struct Entry {
     label: String,
     path: String,
     shortcut: String,
+    /// Parameters it runs with (a deck control), instead of the menu path's.
+    params: Option<Value>,
 }
 
 fn entries() -> Vec<Entry> {
     let mut v: Vec<Entry> = soundcraft_engine::command_specs()
         .iter()
         .map(|c| Entry {
-            id: c.id.to_string(), label: c.label.to_string(), path: c.menu.join(" › "), shortcut: c.shortcut.unwrap_or("").to_string()
+            id: c.id.to_string(),
+            label: c.label.to_string(),
+            path: c.menu.join(" › "),
+            shortcut: c.shortcut.unwrap_or("").to_string(),
+            params: None,
         })
         .collect();
     for (id, label, path, sc) in crate::menus::UI_COMMANDS {
-        v.push(Entry { id: id.to_string(), label: label.to_string(), path: path.replace(" > ", " › "), shortcut: sc.unwrap_or("").to_string() });
+        v.push(Entry {
+            id: id.to_string(),
+            label: label.to_string(),
+            path: path.replace(" > ", " › "),
+            shortcut: sc.unwrap_or("").to_string(),
+            params: None,
+        });
+    }
+    for (label, id, params) in crate::decks::PALETTE {
+        let params = (!params.is_empty()).then(|| serde_json::from_str(params).ok()).flatten();
+        v.push(Entry { id: id.to_string(), label: label.to_string(), path: "Decks".into(), shortcut: String::new(), params });
     }
     v
 }
@@ -69,7 +86,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         return;
     }
     let t = Tokens::current();
-    let mut run: Option<String> = None;
+    let mut run: Option<(String, Option<Value>)> = None;
     let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
     egui::Window::new("Search")
         .collapsible(false)
@@ -110,14 +127,22 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     l
                 });
                 if resp.inner.clicked() {
-                    run = Some(e.id.clone());
+                    run = Some((e.id.clone(), e.params.clone()));
                 }
             }
             if enter && let Some((_, e)) = hits.get(app.palette.selected) {
-                run = Some(e.id.clone());
+                run = Some((e.id.clone(), e.params.clone()));
             }
         });
-    if let Some(id) = run {
+    if let Some((id, params)) = run {
+        if let Some(params) = params.filter(|_| !app.palette.learn) {
+            if let Err(err) = app.run(&id, params) {
+                app.ui.status = err;
+            }
+            app.ui.show_search = false;
+            app.palette = PaletteState::default();
+            return;
+        }
         let path = entries().into_iter().find(|e| e.id == id).map(|e| e.path.replace(" › ", " > ")).unwrap_or_default();
         if id == "midi.learn_command" {
             // Stays open, now picking the command to learn.

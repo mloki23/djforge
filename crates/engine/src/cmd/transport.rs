@@ -11,15 +11,16 @@ pub fn specs() -> Vec<CommandSpec> {
             if let Some(at) = position_param(e, "transport.play", p, "from")? {
                 e.transport_requests.push(TransportRequest::Locate(at.max(0)));
             }
+            decks_yield(e);
             e.transport_requests.push(TransportRequest::Play);
             Ok(json!({}))
         }),
         cmd!(noundo "transport.stop", "Stop", [], Some("Space"), "{}", always, |e, _| { e.transport_requests.push(TransportRequest::Stop); Ok(json!({})) }),
-        cmd!(noundo "transport.toggle", "Play/Stop", [], Some("Space"), "{}", always, |e, _| { e.transport_requests.push(TransportRequest::TogglePlay); Ok(json!({})) }),
+        cmd!(noundo "transport.toggle", "Play/Stop", [], Some("Space"), "{}", always, |e, _| { if !e.transport.playing { decks_yield(e) } e.transport_requests.push(TransportRequest::TogglePlay); Ok(json!({})) }),
         cmd!(noundo "transport.record", "Record", [], Some("Cmd+Space"), "{}", always, |e, _| { e.transport_requests.push(TransportRequest::Record); Ok(json!({})) }),
         cmd!(noundo "transport.pause", "Pause", [], None, "{}", always, |e, _| { e.transport_requests.push(TransportRequest::Pause); Ok(json!({})) }),
         cmd!(noundo "transport.half_speed", "Half-Speed Playback", [], Some("Shift+Space"), "{}", always, |e, _| { e.transport_requests.push(TransportRequest::HalfSpeed); Ok(json!({})) }),
-        cmd!(noundo "transport.play_selection", "Play Edit", ["Edit", "Selection"], Some("Alt+["), "{}", always, |e, _| { e.transport_requests.push(TransportRequest::PlaySelection); Ok(json!({})) }),
+        cmd!(noundo "transport.play_selection", "Play Edit", ["Edit", "Selection"], Some("Alt+["), "{}", always, |e, _| { decks_yield(e); e.transport_requests.push(TransportRequest::PlaySelection); Ok(json!({})) }),
         cmd!(noundo "transport.rtz", "Return to Zero", [], Some("Home"), "{}", always, |e, _| locate(e, 0)),
         cmd!(noundo "transport.go_to_end", "Go to End", [], Some("End"), "{}", always, |e, _| { let end = e.session().content_end(); locate(e, end) }),
         cmd!(noundo "transport.rewind", "Rewind", [], None, "{seconds?: 1}", always, |e, p| {
@@ -54,4 +55,12 @@ fn locate(e: &mut Engine, at: i64) -> Result<Value> {
     }
     e.transport_requests.push(TransportRequest::Locate(at));
     Ok(json!({"at": at}))
+}
+
+/// The arrangement and the live decks never play together: arrangement play stops the decks
+/// (the audio engine does), and says so.
+fn decks_yield(e: &mut Engine) {
+    if e.deck_status.decks.iter().any(|d| d.playing) {
+        e.messages.push("The decks stopped: the arrangement plays".into());
+    }
 }

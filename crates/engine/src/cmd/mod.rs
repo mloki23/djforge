@@ -12,6 +12,7 @@ mod clap;
 mod clip;
 mod clip_list;
 mod clip_more;
+pub(crate) mod decks;
 pub(crate) mod dj;
 mod edit;
 mod edit_more;
@@ -165,6 +166,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(live::specs());
         v.extend(midi_take::specs());
         v.extend(prod::specs());
+        v.extend(decks::specs());
         v
     })
 }
