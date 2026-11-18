@@ -2,6 +2,7 @@
 
 Run as:  python -I -c <this file's text> MIXFORGE_DIR AUDIO_PATH
 Prints one JSON object. Reads mixforge's library; never writes it.
+The library is mixforge's (in MIXFORGE_HOME when set, as mixforge reads it).
 """
 import json
 import sys
@@ -34,6 +35,12 @@ def main(mixforge_dir, path):
     if info is None:
         print(json.dumps({"error": f"not analysed by mixforge: run `mixforge analyze \"{path}\"`"}))
         return 2
+    # Section boundaries from all-in-one, from the cache only (compute=False): never run here,
+    # never written. Optional: a track without them falls back to bar-change phrases.
+    try:
+        library.attach_structure([info], progress=None, compute=False)
+    except Exception:
+        pass
     keys = ("bpm", "first_downbeat", "duration", "audio_end", "key", "camelot", "lufs", "constant_tempo", "downbeat_confidence",
             "grid_ok_4bar", "bar_change", "sections")
     out = {k: info.get(k) for k in keys}
