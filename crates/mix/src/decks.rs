@@ -238,7 +238,7 @@ pub struct DeckTrack {
     pub title: String,
     pub artist: String,
     pub path: String,
-    /// Where the grid came from (`given`, `mixforge`, `tag`), if it has one.
+    /// Where the grid came from (`given`, `library`, `mixforge`, `tag`), if it has one.
     pub grid_from: Option<&'static str>,
 }
 

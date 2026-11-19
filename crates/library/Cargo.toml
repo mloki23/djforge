@@ -1,0 +1,15 @@
+[package]
+name = "soundcraft-library"
+description = "djforge's read-only reader of mixforge's track library (library.db: analyses and sections)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

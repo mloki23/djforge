@@ -233,6 +233,9 @@ pub struct Engine {
     /// has reported it (after which a report without it means the deck lost it).
     deck_loaded: [u64; 2],
     deck_seen: [bool; 2],
+    /// mixforge's library and the browser's folders: none until the app sets them up
+    /// ([`Engine::set_library`]), so no test reads the real library.
+    pub(crate) library: cmd::library::LibraryState,
 }
 
 impl Default for Engine {
@@ -280,6 +283,7 @@ impl Engine {
             deck_generation: [0; 2],
             deck_loaded: [0; 2],
             deck_seen: [false; 2],
+            library: Default::default(),
         }
     }
 
@@ -361,6 +365,24 @@ impl Engine {
     /// points call this, with [`cmd::mixforge_mixxx_runner`]; tests give a fake.
     pub fn set_mixxx_runner(&mut self, runner: cmd::MixxxRunner) {
         self.mixxx = Some(runner);
+    }
+
+    /// `library.*` lists, and `deck.load` grids files from, mixforge's library at `db` (only ever
+    /// read). Only the app's entry points call this, with [`cmd::mixforge_library_db`]; tests give
+    /// a library they built in a temporary folder.
+    pub fn set_library(&mut self, db: std::path::PathBuf) {
+        self.library.set_db(db);
+    }
+
+    /// The library browser's roots: the Music folder `music`, and the folders added, kept in
+    /// `prefs` (read now; `None` keeps them for this run only).
+    pub fn set_library_folders(&mut self, music: Option<std::path::PathBuf>, prefs: Option<std::path::PathBuf>) {
+        self.library.set_folders(music, prefs);
+    }
+
+    /// mixforge's library database, when set up.
+    pub fn library_db(&self) -> Option<&std::path::Path> {
+        self.library.db()
     }
 
     /// `live.slot_from_file` grids files through `analyse`. Only the app's entry points call this,

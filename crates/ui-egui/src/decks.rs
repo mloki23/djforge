@@ -52,6 +52,8 @@ pub const PALETTE: &[(&str, &str, &str)] = &[
     ("Deck B: Crossfader Thru", "deck.assign", r#"{"deck":"b","side":"thru"}"#),
     ("Decks Master Volume 0 dB", "deck.master_volume", r#"{"db":0}"#),
     ("Decks Quantise On", "deck.quantise", r#"{"on":true}"#),
+    ("Add Library Folder...", "library.add_folder", ""),
+    ("Remove Library Folder...", "library.remove_folder", ""),
 ];
 
 impl SoundApp {

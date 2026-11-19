@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track to Deck",
             [],
             None,
-            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its beat grid: the given bpm, else mixforge's analysis (when the app has it), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid, bpm, key, cues_from: session|mixforge|null, priming_ms, analysis_error}) goes to the status line",
+            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its beat grid and key: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time; read directly, no sidecar), else mixforge's analysis through its sidecar (a stale or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, library: fresh|stale|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, priming_ms, analysis_error}) goes to the status line",
             always,
             load
         ),
@@ -336,6 +336,10 @@ struct Loaded {
     cues_from: Option<&'static str>,
     /// How far an MP3's grid and cues moved to its gapless decode (ms).
     priming_ms: f64,
+    /// What mixforge's library had for the file (`None`: not looked at).
+    library: Option<&'static str>,
+    /// Why mixforge's library couldn't be read.
+    library_error: Option<String>,
 }
 
 /// A `deck.load` running on a thread of its own.
@@ -375,7 +379,7 @@ impl DeckLoadJob {
         }
         let t = &l.track;
         let out = json!({"deck": deck.id(), "path": t.path, "title": t.title, "artist": t.artist, "grid": t.grid_from, "bpm": t.bpm,
-            "key": t.key, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
+            "key": t.key, "grid_from": t.grid_from, "library": l.library, "library_error": l.library_error, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
             "can_key_lock": l.prepared.can_key_lock()});
         if let Some(slot) = e.deck_tracks.get_mut(deck.index()) {
             *slot = Some(Arc::clone(&l.track));
@@ -399,9 +403,11 @@ struct LoadPlan {
     given: Option<(f64, f64)>,
     /// Cues A–D the open DJ session gives the file (seconds, mixforge's timeline).
     session_cues: Option<[Option<f64>; 4]>,
+    /// mixforge's library, read first for the grid, key and mix points.
+    library: Option<std::path::PathBuf>,
 }
 
-/// Reads and decodes `path` at `rate`, finds its grid (given, mixforge, the BPM tag) and hot
+/// Reads and decodes `path` at `rate`, finds its grid (given, mixforge's library, its sidecar, the BPM tag) and hot
 /// cues (the open set's, else mixforge's mix points) and builds the deck's heads. Runs on the
 /// job's thread; `cancel` stops mixforge's sidecar early.
 ///
@@ -425,13 +431,26 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
     let (buf, tag_key) = decoded.into_parts();
     let frames = i64::try_from(buf.frames()).unwrap_or(i64::MAX);
     let sr = f64::from(rate);
-    let (mut key, mut planned, mut analysis_error) = (tag_key, None, None);
+    let (mut key, mut planned, mut analysis_error, mut library, mut library_error) = (tag_key, None, None, None, None);
     let (beats, grid_from) = match plan.given {
         Some((bpm, first)) => (Some(Beats::Constant { bpm, first }), Some("given")),
         None => {
-            let analysed = match analyse {
+            // mixforge's library row when it is of the file as it is now; else its sidecar (which
+            // also takes a row from before a retag whose audio is unchanged).
+            let row = plan.library.as_deref().map(|db| super::library::analysis_for(db, path, crate::io::size_and_mtime(path)));
+            library = row.as_ref().map(super::library::FromLibrary::id);
+            let sidecar = || match analyse {
                 Some(f) => f(path, &|| cancel.load(Ordering::Relaxed)),
                 None => Err("no mixforge analysis is set up".to_string()),
+            };
+            let (analysed, from) = match row {
+                Some(super::library::FromLibrary::Fresh(a)) => (Ok(a), "library"),
+                Some(super::library::FromLibrary::Unreadable(why)) => {
+                    log::warn!("mixforge's library: {why}");
+                    library_error = Some(why);
+                    (sidecar(), "mixforge")
+                }
+                _ => (sidecar(), "mixforge"),
             };
             match analysed.and_then(|a| {
                 planned = super::deck_cues::planned(&a);
@@ -440,7 +459,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
                 }
                 grid_of(&a).ok_or_else(|| "mixforge's analysis has no usable bpm/first_downbeat".to_string())
             }) {
-                Ok((bpm, first)) => (Some(Beats::Constant { bpm, first: first - priming }), Some("mixforge")),
+                Ok((bpm, first)) => (Some(Beats::Constant { bpm, first: first - priming }), Some(from)),
                 Err(why) => {
                     analysis_error = Some(why);
                     match tags.bpm.filter(|b| b.is_finite() && (20.0..=400.0).contains(b)) {
@@ -478,7 +497,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         grid_from,
     });
     let prepared = Box::new(PreparedDeck::new(Arc::clone(&track), rate as f32));
-    Ok(Loaded { track, prepared, analysis_error, cues_from, priming_ms: priming * 1000.0 })
+    Ok(Loaded { track, prepared, analysis_error, cues_from, priming_ms: priming * 1000.0, library, library_error })
 }
 
 fn load(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -502,7 +521,11 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
         (None, Some(_)) => return Err(bad(LOAD, "`first_beat` needs a `bpm`")),
         (None, None) => None,
     };
-    let plan = LoadPlan { given, session_cues: super::export::cues_for_file(e.session(), std::path::Path::new(&path)) };
+    let plan = LoadPlan {
+        given,
+        session_cues: super::export::cues_for_file(e.session(), std::path::Path::new(&path)),
+        library: e.library.db().map(std::path::Path::to_path_buf),
+    };
     // The last load issued for a deck wins: earlier ones still running are told to stop.
     let generation = e.deck_generation.get(deck.index()).copied().unwrap_or(0).wrapping_add(1);
     if let Some(g) = e.deck_generation.get_mut(deck.index()) {

@@ -403,6 +403,53 @@ pub(crate) fn list_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
     Ok(entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file())).collect())
 }
 
+/// The size and modification time (whole seconds since 1970, truncated as Python's
+/// `int(st_mtime)` is) of the regular file at `path`, inside the automation read root when there
+/// is one; `None` when there is no such file. mixforge keys its analyses by these.
+pub(crate) fn size_and_mtime(path: impl AsRef<Path>) -> Option<(u64, i64)> {
+    let path = path.as_ref();
+    crate::file_access::check_read(path).ok()?;
+    let m = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let mtime = match m.modified().ok()?.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).ok()?,
+        Err(before) => i64::try_from(before.duration().as_secs()).ok()?.checked_neg()?,
+    };
+    Some((m.len(), mtime))
+}
+
+/// Is there a folder at `path` the automation read root lets us see?
+pub(crate) fn dir_found(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    crate::file_access::check_read(path).is_ok() && path.is_dir()
+}
+
+/// What a folder holds directly: its subfolders and its regular files, each list at most `cap`
+/// long (`true` when entries were left out), inside the automation read root when there is one;
+/// unsorted. Errors name the folder.
+pub(crate) fn list_folder(dir: impl AsRef<Path>, cap: usize) -> Result<(Vec<PathBuf>, Vec<PathBuf>, bool)> {
+    let dir = dir.as_ref();
+    crate::file_access::check_read(dir).map_err(EngineError::Io)?;
+    let entries = std::fs::read_dir(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
+    let (mut dirs, mut files, mut more) = (Vec::new(), Vec::new(), false);
+    for e in entries.filter_map(|e| e.ok()) {
+        // The entry's own type, links followed (a linked folder is browsed like any).
+        let Ok(m) = std::fs::metadata(e.path()) else { continue };
+        let list = if m.is_dir() {
+            &mut dirs
+        } else if m.is_file() {
+            &mut files
+        } else {
+            continue;
+        };
+        if list.len() < cap {
+            list.push(e.path());
+        } else {
+            more = true;
+        }
+    }
+    Ok((dirs, files, more))
+}
+
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
 pub(crate) fn write_path(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<()> {
     let path = path.as_ref();

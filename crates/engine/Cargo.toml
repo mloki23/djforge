@@ -25,7 +25,12 @@ log.workspace = true
 zip.workspace = true
 craft-docpath.workspace = true
 
+# mixforge's library (SQLite): not on the web, which has no files to read.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+soundcraft-library.workspace = true
+
 [dev-dependencies]
+rusqlite.workspace = true
 proptest.workspace = true
 quick-xml.workspace = true
 

@@ -28,6 +28,7 @@ soundcraft-engine = { path = "crates/engine" }
 soundcraft-playback = { path = "crates/playback" }
 soundcraft-automation = { path = "crates/automation" }
 soundcraft-ui-egui = { path = "crates/ui-egui" }
+soundcraft-library = { path = "crates/library" }
 
 # foundation
 thiserror = "2"
@@ -50,6 +51,9 @@ cpal = "0.16"
 # MIDI input devices (WinMM / CoreMIDI / ALSA) and the realtime-safe SPSC ring buffer behind the MIDI event queue.
 midir = "0.11"
 rtrb = "0.4"
+
+# mixforge's library (library.db), read only; SQLite built in (public domain), so nothing to install.
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }

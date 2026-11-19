@@ -23,6 +23,7 @@ pub(crate) mod export;
 mod file;
 mod health;
 mod instrument;
+pub(crate) mod library;
 mod live;
 mod midi;
 mod midi_take;
@@ -54,6 +55,7 @@ pub use export::{
     set_refusal as export_set_refusal,
 };
 pub use file::bounce_job;
+pub use library::LibraryTrack;
 pub use live::{
     SlotFile, SlotFileJob, fold_into_loop as live_fold_into_loop, launch_margin as live_launch_margin, live_cmds,
     next_boundary as live_next_boundary, slot_file_job,
@@ -63,6 +65,9 @@ pub use prep::{
     Analyse as PrepAnalyse, PrepJob, PrepProgress, default_root as prep_default_root, mixforge_analysis as prep_mixforge_analysis, prep_job,
     prep_job_in, run as prep_run, start as prep_start,
 };
+/// Where mixforge keeps its library (`library.db`): for the app's entry points only.
+#[cfg(not(target_arch = "wasm32"))]
+pub use soundcraft_library::default_db as mixforge_library_db;
 
 pub(crate) use edit::remember_selection;
 
@@ -168,6 +173,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(midi_take::specs());
         v.extend(prod::specs());
         v.extend(decks::specs());
+        v.extend(library::specs());
         v
     })
 }

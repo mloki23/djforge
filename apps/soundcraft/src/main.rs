@@ -207,6 +207,27 @@ fn prefs_enabled() -> bool {
     std::env::var_os("SOUNDCRAFT_NO_PREFS").is_none()
 }
 
+/// The decks' library: mixforge's `library.db` (only ever read) and the browser's folders (the
+/// Music folder and the ones added, kept in `library-folders.json` in the settings folder). Runs
+/// without preferences (agents' test runs) leave the user's library, Music folder and settings
+/// alone, unless `DJFORGE_MIXFORGE_HOME` names a library on purpose.
+fn set_up_library(engine: &mut Engine) {
+    let chosen = std::env::var_os("DJFORGE_MIXFORGE_HOME").is_some_and(|v| !v.is_empty());
+    if prefs_enabled() || chosen {
+        match soundcraft_engine::cmd::mixforge_library_db() {
+            Ok(db) => engine.set_library(db),
+            Err(e) => log::warn!("no mixforge library: {e}"),
+        }
+    }
+    if !prefs_enabled() {
+        engine.set_library_folders(None, None);
+        return;
+    }
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    let music = var("USERPROFILE").or_else(|| var("HOME")).map(|h| h.join("Music"));
+    engine.set_library_folders(music, config_dir().map(|d| d.join("library-folders.json")));
+}
+
 fn load_prefs() -> Option<UiState> {
     if !prefs_enabled() {
         return None;
@@ -335,6 +356,7 @@ fn main() -> eframe::Result {
     engine.set_mixxx_runner(soundcraft_engine::cmd::mixforge_mixxx_runner());
     // Files loaded into Session view slots are gridded by mixforge's analysis.
     engine.set_analyse(soundcraft_engine::cmd::prep_mixforge_analysis());
+    set_up_library(&mut engine);
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
