@@ -69,6 +69,9 @@ pub use prep::{
 /// Where mixforge keeps its library (`library.db`): for the app's entry points only.
 #[cfg(not(target_arch = "wasm32"))]
 pub use soundcraft_library::default_db as mixforge_library_db;
+/// Where Mixed In Key keeps its library (`MIKStore.db`): for the app's entry points only.
+#[cfg(not(target_arch = "wasm32"))]
+pub use soundcraft_library::default_mik_db as mik_library_db;
 
 pub(crate) use edit::remember_selection;
 

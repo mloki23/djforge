@@ -2,8 +2,11 @@
 //! audio files.
 //!
 //! mixforge's `library.db` holds each analysed file's grid, key and length (see
-//! `soundcraft_library`). The app names it ([`Engine::set_library`]); nothing else does, so no test
-//! reaches the real one. What it holds is read once and kept until the database changes.
+//! `soundcraft_library`), and Mixed In Key's `MIKStore.db` its key and energy (MIK's win, as
+//! mixforge has it). The app names them ([`Engine::set_library`], [`Engine::set_mik_library`]);
+//! nothing else does, so no test reaches the real ones. They are read off the UI thread
+//! ([`Engine::poll_library`]) and kept until their files change and then stand still for a
+//! moment (mixforge may be writing); listings meanwhile give the last read's rows.
 //!
 //! A folder lists its audio files without decoding them: mixforge's analysis joins them by path,
 //! and the tags of the files a page returns fill in what it lacks. The folders offered as roots
@@ -38,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Library List",
             [],
             None,
-            "{source?, folder?, query?, sort?, desc?, offset?, limit?} — tracks to load on the decks: mixforge's library (read only; what it analysed) or the audio files (mp3, wav, flac, aiff, m4a, ogg) directly in a folder, joined to mixforge's analysis by path. source?: mixforge|folder (default mixforge), folder? (for source folder), query? (words that must all be in the title, artist or file name, any case), sort?: title|artist|bpm|key|energy|length|name (default title; key in Camelot order; unknowns last), desc?: bool, offset? (default 0), limit? (default 200, at most 1000). Returns {source, total, offset, rows: [{path, name, title, artist, bpm, key (Camelot), energy, length_s, analysed, stale (the file changed since mixforge analysed it), missing (no file there)}], from_copy (the library was busy: a copy was read)}, and for a folder {folder, folders: [{path, name}] (its subfolders), truncated}. A folder's files aren't decoded: sort, search and the rest use mixforge's analysis and the file names, and the tags of the rows returned fill in their title, artist, bpm and key",
+            "{source?, folder?, query?, sort?, desc?, offset?, limit?} — tracks to load on the decks: mixforge's library (read only; what it analysed) or the audio files (mp3, wav, flac, aiff, m4a, ogg) directly in a folder, joined to mixforge's analysis by path. source?: mixforge|folder (default mixforge), folder? (for source folder), query? (words that must all be in the title, artist or file name, any case), sort?: title|artist|bpm|key|energy|length|name (default title; key in Camelot order; unknowns last), desc?: bool, offset? (default 0), limit? (default 200, at most 1000). Returns {source, total, offset, rows: [{path, name, title, artist, bpm, key (Camelot), key_source: mik|mixforge|tag|null, energy (1–10), energy_source: mik|mixforge|tag|null, length_s, analysed, stale (the file changed since mixforge analysed it), outdated (analysed by another mixforge version: it analyses the file again), missing (no file there)}], from_copy (the library was busy: a copy was read), loading (the libraries are being read again off the UI thread: these rows are the last read's; ask again), library_error, mik_error}, and for a folder {folder, folders: [{path, name}] (its subfolders), truncated}. Key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). A folder's files aren't decoded: sort, search and the rest use the analysis and the file names, and the tags of the rows returned fill in their title, artist, bpm, key and energy. A file reached by another path than mixforge analysed it under (a mapped drive and its network path) is listed as not analysed",
             always,
             list
         ),
@@ -94,19 +97,23 @@ pub fn specs() -> Vec<CommandSpec> {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod db {
-    pub use soundcraft_library::{Stamp, StructureRow, TrackRow, path_key};
+    pub use soundcraft_library::{ANALYSIS_VERSION, MikSong, Stamp, StructureRow, TrackRow, TrackSummary, path_key};
     use std::path::Path;
 
     pub fn stamp(db: &Path) -> Option<Stamp> {
-        soundcraft_library::Library::new(db).stamp()
+        soundcraft_library::stamp_of(db)
     }
 
-    pub fn tracks(db: &Path) -> Result<(Vec<TrackRow>, bool), String> {
-        soundcraft_library::Library::new(db).tracks().map(|r| (r.value, r.from_copy)).map_err(|e| e.to_string())
+    pub fn summaries(db: &Path) -> Result<(Vec<TrackSummary>, bool), String> {
+        soundcraft_library::Library::new(db).summaries().map(|r| (r.value, r.from_copy)).map_err(|e| e.to_string())
     }
 
     pub fn track(db: &Path, path: &str) -> Result<Option<(TrackRow, Option<StructureRow>)>, String> {
         soundcraft_library::Library::new(db).track(path).map(|r| r.value).map_err(|e| e.to_string())
+    }
+
+    pub fn mik(db: &Path) -> Result<Vec<MikSong>, String> {
+        soundcraft_library::mik_songs(db).map(|r| r.value).map_err(|e| e.to_string())
     }
 }
 
@@ -115,12 +122,29 @@ mod db {
 mod db {
     use std::path::Path;
 
+    pub const ANALYSIS_VERSION: i64 = 9;
     pub type Stamp = ();
+
+    #[derive(Default)]
+    pub struct TrackSummary {
+        pub path: String,
+        pub size: Option<i64>,
+        pub mtime: Option<i64>,
+        pub version: Option<i64>,
+        pub title: Option<String>,
+        pub artist: Option<String>,
+        pub bpm: Option<f64>,
+        pub camelot: Option<String>,
+        pub key: Option<String>,
+        pub energy: Option<f64>,
+        pub duration: Option<f64>,
+    }
 
     pub struct TrackRow {
         pub path: String,
         pub size: Option<i64>,
         pub mtime: Option<i64>,
+        pub version: Option<i64>,
         pub data: String,
     }
 
@@ -128,6 +152,12 @@ mod db {
         pub size: Option<i64>,
         pub mtime: Option<i64>,
         pub data: String,
+    }
+
+    pub struct MikSong {
+        pub file: String,
+        pub energy: Option<i64>,
+        pub camelot: Option<String>,
     }
 
     pub fn path_key(path: &str) -> String {
@@ -138,16 +168,28 @@ mod db {
         None
     }
 
-    pub fn tracks(_: &Path) -> Result<(Vec<TrackRow>, bool), String> {
-        Err("mixforge's library can't be read on the web".into())
+    const NONE: &str = "libraries can't be read on the web";
+
+    pub fn summaries(_: &Path) -> Result<(Vec<TrackSummary>, bool), String> {
+        Err(NONE.into())
     }
 
     pub fn track(_: &Path, _: &str) -> Result<Option<(TrackRow, Option<StructureRow>)>, String> {
-        Err("mixforge's library can't be read on the web".into())
+        Err(NONE.into())
+    }
+
+    pub fn mik(_: &Path) -> Result<Vec<MikSong>, String> {
+        Err(NONE.into())
     }
 }
 
 pub(crate) use db::path_key;
+
+/// How long the library's files must stand still (mixforge busy writing) before they are read
+/// again.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+/// How often [`Engine::poll_library`] looks at the files.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A track as the library lists it.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,25 +204,92 @@ pub struct LibraryTrack {
     pub length_s: Option<f64>,
     /// mixforge analysed it.
     pub analysed: bool,
+    /// Where the key and energy came from: `mik` (Mixed In Key), `mixforge`, `tag`.
+    pub key_source: Option<&'static str>,
+    pub energy_source: Option<&'static str>,
+    /// mixforge's analysis version.
+    version: Option<i64>,
     /// The file's size and time when it was analysed.
     size: Option<i64>,
     mtime: Option<i64>,
 }
 
-/// What `library.db` held when last read.
-struct Cached {
-    stamp: db::Stamp,
+impl LibraryTrack {
+    /// A file nothing knows about yet: its name for a title.
+    fn plain(path: String) -> Self {
+        LibraryTrack {
+            title: file_stem(&path),
+            path,
+            artist: String::new(),
+            bpm: None,
+            key: None,
+            energy: None,
+            length_s: None,
+            analysed: false,
+            key_source: None,
+            energy_source: None,
+            version: None,
+            size: None,
+            mtime: None,
+        }
+    }
+
+    /// Mixed In Key's key and energy, where it has them: MIK is the reference (mixforge prefers
+    /// its key too).
+    fn with_mik(mut self, m: Option<&Mik>) -> Self {
+        if let Some(m) = m {
+            if let Some(k) = m.camelot.as_deref().and_then(soundcraft_model::camelot_of) {
+                (self.key, self.key_source) = (Some(k), Some("mik"));
+            }
+            if let Some(en) = m.energy {
+                (self.energy, self.energy_source) = (Some(en as f64), Some("mik"));
+            }
+        }
+        self
+    }
+}
+
+/// What Mixed In Key has for a file.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Mik {
+    pub energy: Option<i64>,
+    pub camelot: Option<String>,
+}
+
+/// What the libraries held when last read.
+pub(crate) struct Snapshot {
     tracks: Arc<Vec<LibraryTrack>>,
     /// Index into `tracks` by [`path_key`].
     by_key: Arc<HashMap<String, usize>>,
+    /// Mixed In Key's songs by [`path_key`].
+    mik: Arc<HashMap<String, Mik>>,
     from_copy: bool,
+    /// Why mixforge's library, or MIK's, couldn't be read.
+    error: Option<String>,
+    mik_error: Option<String>,
+}
+
+/// The stamps of mixforge's library and MIK's.
+type Stamps = (Option<db::Stamp>, Option<db::Stamp>);
+
+/// A read of the libraries running on a thread of its own.
+struct LibraryJob {
+    stamps: Stamps,
+    handle: std::thread::JoinHandle<Snapshot>,
 }
 
 /// The library's setup and what it last read.
 #[derive(Default)]
 pub struct LibraryState {
     db: Option<PathBuf>,
-    cache: Option<Cached>,
+    mik_db: Option<PathBuf>,
+    snapshot: Option<Arc<Snapshot>>,
+    /// The stamps the snapshot was read at.
+    read_at: Option<Stamps>,
+    /// The stamps last seen and since when.
+    seen: Option<(Stamps, std::time::Instant)>,
+    looked: Option<std::time::Instant>,
+    job: Option<LibraryJob>,
     music: Option<PathBuf>,
     added: Vec<PathBuf>,
     /// Where the added folders are kept; `None` keeps them for this run only.
@@ -195,7 +304,16 @@ impl LibraryState {
 
     pub(crate) fn set_db(&mut self, db: PathBuf) {
         self.db = Some(db);
-        self.cache = None;
+        self.forget();
+    }
+
+    pub(crate) fn set_mik(&mut self, db: PathBuf) {
+        self.mik_db = Some(db);
+        self.forget();
+    }
+
+    fn forget(&mut self) {
+        (self.snapshot, self.read_at, self.seen) = (None, None, None);
     }
 
     /// The Music folder and where added folders are kept (whose folders are read now).
@@ -204,6 +322,101 @@ impl LibraryState {
         self.added = prefs.as_deref().map(read_folders).unwrap_or_default();
         self.prefs = prefs;
     }
+
+    /// A read under way.
+    pub(crate) fn loading(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Takes a finished read, and starts another when the files changed and then stood still
+    /// for [`SETTLE`] (at once when nothing was read yet). `look` checks the files now rather
+    /// than at most every [`LOOK_EVERY`].
+    pub(crate) fn refresh(&mut self, look: bool) {
+        if self.job.as_ref().is_some_and(|j| j.handle.is_finished())
+            && let Some(job) = self.job.take()
+        {
+            match job.handle.join() {
+                Ok(s) => {
+                    self.snapshot = Some(Arc::new(s));
+                    self.read_at = Some(job.stamps);
+                }
+                Err(_) => log::warn!("reading the library failed"),
+            }
+        }
+        if self.db.is_none() && self.mik_db.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !look && self.looked.is_some_and(|t| now.duration_since(t) < LOOK_EVERY) {
+            return;
+        }
+        self.looked = Some(now);
+        let stamps: Stamps = (self.db.as_deref().and_then(db::stamp), self.mik_db.as_deref().and_then(db::stamp));
+        let since = match self.seen {
+            Some((s, at)) if s == stamps => at,
+            _ => {
+                self.seen = Some((stamps, now));
+                now
+            }
+        };
+        let changed = self.read_at != Some(stamps);
+        let settled = self.snapshot.is_none() || now.duration_since(since) >= SETTLE;
+        if changed && settled && self.job.is_none() {
+            self.start(stamps);
+        }
+    }
+
+    fn start(&mut self, stamps: Stamps) {
+        let (db, mik_db) = (self.db.clone(), self.mik_db.clone());
+        let old = self.snapshot.clone();
+        // Each library is read again only when its own files changed.
+        let (db_changed, mik_changed) = match self.read_at {
+            Some((d, m)) => (d != stamps.0, m != stamps.1),
+            None => (true, true),
+        };
+        let work = move || read_snapshot(db.as_deref(), mik_db.as_deref(), old.as_deref(), db_changed, mik_changed);
+        match std::thread::Builder::new().name("library-read".into()).spawn(work) {
+            Ok(handle) => self.job = Some(LibraryJob { stamps, handle }),
+            Err(e) => log::warn!("could not start reading the library: {e}"),
+        }
+    }
+}
+
+/// Reads the libraries (off the UI thread): mixforge's when `db_changed`, MIK's when
+/// `mik_changed`, keeping the rest of `old`.
+fn read_snapshot(db: Option<&Path>, mik_db: Option<&Path>, old: Option<&Snapshot>, db_changed: bool, mik_changed: bool) -> Snapshot {
+    let (mik, mik_error) = match (mik_db, old) {
+        (None, _) => (Arc::new(HashMap::new()), None),
+        (Some(_), Some(o)) if !mik_changed => (Arc::clone(&o.mik), o.mik_error.clone()),
+        (Some(p), _) => match db::mik(p) {
+            Ok(songs) => (Arc::new(songs.into_iter().map(|s| (path_key(&s.file), Mik { energy: s.energy, camelot: s.camelot })).collect()), None),
+            Err(e) => (Arc::new(HashMap::new()), Some(e)),
+        },
+    };
+    let (rows, from_copy, error) = match (db, old) {
+        (None, _) => (None, false, None),
+        (Some(_), Some(o)) if !db_changed => (None, o.from_copy, o.error.clone()),
+        (Some(p), _) => match db::summaries(p) {
+            Ok((rows, copy)) => (Some(rows), copy, None),
+            Err(e) => (Some(Vec::new()), false, Some(e)),
+        },
+    };
+    let tracks: Vec<LibraryTrack> = match (rows, old) {
+        (Some(rows), _) => rows
+            .iter()
+            .map(track_of)
+            .map(|t| {
+                let m = mik.get(&path_key(&t.path));
+                t.with_mik(m)
+            })
+            .collect(),
+        // MIK changed alone: its key and energy go onto the tracks read before.
+        (None, Some(o)) if mik_changed => o.tracks.iter().map(|t| t.clone().with_mik(mik.get(&path_key(&t.path)))).collect(),
+        (None, Some(o)) => return Snapshot { mik, mik_error, from_copy, error, tracks: Arc::clone(&o.tracks), by_key: Arc::clone(&o.by_key) },
+        (None, None) => Vec::new(),
+    };
+    let by_key: HashMap<String, usize> = tracks.iter().enumerate().map(|(i, t)| (path_key(&t.path), i)).collect();
+    Snapshot { tracks: Arc::new(tracks), by_key: Arc::new(by_key), mik, from_copy, error, mik_error }
 }
 
 /// The folders kept in the preferences file at `path` (`{"folders": [...]}`); none when it
@@ -214,26 +427,6 @@ fn read_folders(path: &Path) -> Vec<PathBuf> {
     v.get("folders").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(PathBuf::from).collect()).unwrap_or_default()
 }
 
-/// Reads an analysis's list fields leniently: a value of another type is as good as missing.
-#[derive(serde::Deserialize, Default)]
-struct Summary {
-    title: Option<Value>,
-    artist: Option<Value>,
-    bpm: Option<Value>,
-    camelot: Option<Value>,
-    key: Option<Value>,
-    energy: Option<Value>,
-    duration: Option<Value>,
-}
-
-fn text(v: &Option<Value>) -> Option<String> {
-    v.as_ref().and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
-}
-
-fn number(v: &Option<Value>) -> Option<f64> {
-    v.as_ref().and_then(Value::as_f64).filter(|x| x.is_finite())
-}
-
 fn file_name(path: &str) -> String {
     Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string()
 }
@@ -242,44 +435,56 @@ fn file_stem(path: &str) -> String {
     Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or(path).to_string()
 }
 
-fn track_of(row: &db::TrackRow) -> LibraryTrack {
-    let s: Summary = serde_json::from_str(&row.data).unwrap_or_default();
-    let key = [&s.camelot, &s.key].into_iter().filter_map(text).find_map(|k| soundcraft_model::camelot_of(&k));
+fn track_of(row: &db::TrackSummary) -> LibraryTrack {
+    let key = [&row.camelot, &row.key].into_iter().flatten().find_map(|k| soundcraft_model::camelot_of(k));
+    let energy = row.energy.filter(|e| e.is_finite());
     LibraryTrack {
         path: row.path.clone(),
-        title: text(&s.title).unwrap_or_else(|| file_stem(&row.path)),
-        artist: text(&s.artist).unwrap_or_default(),
-        bpm: number(&s.bpm).filter(|b| (20.0..=400.0).contains(b)),
+        title: row.title.clone().unwrap_or_else(|| file_stem(&row.path)),
+        artist: row.artist.clone().unwrap_or_default(),
+        bpm: row.bpm.filter(|b| (20.0..=400.0).contains(b)),
+        key_source: key.as_ref().map(|_| "mixforge"),
         key,
-        energy: number(&s.energy),
-        length_s: number(&s.duration).filter(|d| *d >= 0.0),
+        energy_source: energy.map(|_| "mixforge"),
+        energy,
+        length_s: row.duration.filter(|d| *d >= 0.0),
         analysed: true,
+        version: row.version,
         size: row.size,
         mtime: row.mtime,
     }
 }
 
-/// mixforge's library as it is now: read again when its files changed since the last read.
-fn library(e: &mut Engine, cmd: &str) -> Result<(Arc<Vec<LibraryTrack>>, Arc<HashMap<String, usize>>, bool)> {
+/// What the libraries hold now (the last read while a new one runs), and whether a read is
+/// under way. Refused when the app set no mixforge library up.
+fn library(e: &mut Engine, cmd: &str) -> Result<(Arc<Snapshot>, bool)> {
     let lib = &mut e.library;
-    let Some(dbp) = lib.db.clone() else {
+    if lib.db.is_none() {
         return Err(bad(cmd, "mixforge's library isn't set up: djforge reads it when it runs as the app"));
-    };
-    let stamp = db::stamp(&dbp);
-    if let Some(c) = &lib.cache
-        && Some(c.stamp) == stamp
-    {
-        return Ok((Arc::clone(&c.tracks), Arc::clone(&c.by_key), c.from_copy));
     }
-    let (rows, from_copy) = db::tracks(&dbp).map_err(EngineError::Io)?;
-    let tracks: Vec<LibraryTrack> = rows.iter().map(track_of).collect();
-    let by_key: HashMap<String, usize> = tracks.iter().enumerate().map(|(i, t)| (path_key(&t.path), i)).collect();
-    let (tracks, by_key) = (Arc::new(tracks), Arc::new(by_key));
-    // Kept only when the files stood still while they were read.
-    if let Some(s) = stamp.filter(|s| Some(*s) == db::stamp(&dbp)) {
-        lib.cache = Some(Cached { stamp: s, tracks: Arc::clone(&tracks), by_key: Arc::clone(&by_key), from_copy });
+    lib.refresh(true);
+    let empty =
+        || Arc::new(Snapshot { tracks: Arc::default(), by_key: Arc::default(), mik: Arc::default(), from_copy: false, error: None, mik_error: None });
+    Ok((lib.snapshot.clone().unwrap_or_else(empty), lib.loading()))
+}
+
+/// What Mixed In Key has for the file at `path`, as last read.
+pub(crate) fn mik_for(e: &Engine, path: &str) -> Option<Mik> {
+    e.library.snapshot.as_ref().and_then(|s| s.mik.get(&path_key(path)).cloned())
+}
+
+/// Mixed In Key's Camelot key and energy in a comment it wrote (`8A - Energy 6`).
+pub(crate) fn mik_comment(comment: &str) -> (Option<String>, Option<f64>) {
+    let mut words = comment.split(|c: char| c.is_whitespace() || c == '-' || c == '/' || c == ',').filter(|w| !w.is_empty());
+    let key = words.clone().next().and_then(|w| camelot(w).map(|(n, l)| format!("{n}{}", char::from(l))));
+    let mut energy = None;
+    while let Some(w) = words.next() {
+        if w.eq_ignore_ascii_case("energy") {
+            energy = words.next().and_then(|n| n.parse::<u8>().ok()).filter(|n| (1..=10).contains(n)).map(f64::from);
+            break;
+        }
     }
-    Ok((tracks, by_key, from_copy))
+    (key, energy)
 }
 
 // ---- deck.load -----------------------------------------------------------------------------
@@ -291,6 +496,8 @@ pub(crate) enum FromLibrary {
     Fresh(Value),
     /// A row for an older state of the file.
     Stale,
+    /// A row of another mixforge analysis version: mixforge analyses the file again.
+    Outdated,
     Absent,
     Unreadable(String),
 }
@@ -300,6 +507,7 @@ impl FromLibrary {
         match self {
             FromLibrary::Fresh(_) => "fresh",
             FromLibrary::Stale => "stale",
+            FromLibrary::Outdated => "outdated",
             FromLibrary::Absent => "absent",
             FromLibrary::Unreadable(_) => "unreadable",
         }
@@ -318,6 +526,9 @@ pub(crate) fn analysis_for(db: &Path, path: &str, stamp: Option<(u64, i64)>) -> 
         |size: Option<i64>, mtime: Option<i64>| stamp.is_some_and(|(s, m)| size.and_then(|x| u64::try_from(x).ok()) == Some(s) && mtime == Some(m));
     if !fresh(row.size, row.mtime) {
         return FromLibrary::Stale;
+    }
+    if row.version != Some(db::ANALYSIS_VERSION) {
+        return FromLibrary::Outdated;
     }
     let Ok(mut a) = serde_json::from_str::<Value>(&row.data) else {
         return FromLibrary::Unreadable(format!("{path}: its analysis in mixforge's library isn't JSON"));
@@ -431,10 +642,9 @@ fn matches(t: &LibraryTrack, words: &[String]) -> bool {
 /// A Camelot key's number (1–12) and letter (A minor, B major).
 fn camelot(key: &str) -> Option<(u8, u8)> {
     let k = key.trim().to_ascii_uppercase();
-    let (n, l) = k.split_at(k.len().checked_sub(1)?);
-    let n: u8 = n.parse().ok().filter(|n| (1..=12).contains(n))?;
-    let l = *l.as_bytes().first().filter(|l| matches!(l, b'A' | b'B'))?;
-    Some((n, l))
+    let l = k.chars().last().filter(|l| matches!(l, 'A' | 'B'))?;
+    let n: u8 = k.strip_suffix(l)?.parse().ok().filter(|n| (1..=12).contains(n))?;
+    Some((n, if l == 'A' { b'A' } else { b'B' }))
 }
 
 /// How track key `t` mixes with deck key `d`: `same`, `adjacent` (±1 round the wheel, the same
@@ -503,76 +713,89 @@ struct Listing {
     from_copy: bool,
     /// For a folder: it, its subfolders and whether entries were left out.
     folder: Option<(String, Vec<PathBuf>, bool)>,
-    /// mixforge's library couldn't be joined to a folder: why.
+    /// Why mixforge's library, or Mixed In Key's, couldn't be read.
     library_error: Option<String>,
+    mik_error: Option<String>,
+    /// A read of the libraries is under way: what was read before is listed.
+    loading: bool,
 }
 
 fn listing(e: &mut Engine, cmd: &str, q: &Query) -> Result<Listing> {
     let Some(folder) = &q.folder else {
-        let (tracks, _, from_copy) = library(e, cmd)?;
+        let (snap, loading) = library(e, cmd)?;
         return Ok(Listing {
-            tracks: tracks.iter().filter(|t| matches(t, &q.words)).cloned().collect(),
-            from_copy,
+            tracks: snap.tracks.iter().filter(|t| matches(t, &q.words)).cloned().collect(),
+            from_copy: snap.from_copy,
             folder: None,
-            library_error: None,
+            library_error: snap.error.clone(),
+            mik_error: snap.mik_error.clone(),
+            loading,
         });
     };
     let (dirs, files, truncated) = crate::io::list_folder(folder, MAX_FOLDER_ENTRIES)?;
-    let (joined, library_error, from_copy) = match e.library.db.is_some().then(|| library(e, cmd)) {
-        Some(Ok((t, k, copy))) => (Some((t, k)), None, copy),
-        Some(Err(err)) => (None, Some(err.to_string()), false),
-        None => (None, None, false),
-    };
+    // Without mixforge's library a folder still lists (with MIK's key and energy when set up).
+    e.library.refresh(true);
+    let (snap, loading) = (e.library.snapshot.clone(), e.library.loading());
     let tracks = files
         .iter()
         .filter(|p| is_audio(p))
         .map(|p| {
             let path = p.to_string_lossy().into_owned();
-            let row = joined.as_ref().and_then(|(t, k)| k.get(&path_key(&path)).and_then(|i| t.get(*i)));
+            let key = path_key(&path);
+            let row = snap.as_ref().and_then(|s| s.by_key.get(&key).and_then(|i| s.tracks.get(*i)));
             match row {
                 Some(r) => LibraryTrack { path, ..r.clone() },
-                None => LibraryTrack {
-                    title: file_stem(&path),
-                    path,
-                    artist: String::new(),
-                    bpm: None,
-                    key: None,
-                    energy: None,
-                    length_s: None,
-                    analysed: false,
-                    size: None,
-                    mtime: None,
-                },
+                None => LibraryTrack::plain(path).with_mik(snap.as_ref().and_then(|s| s.mik.get(&key))),
             }
         })
         .filter(|t| matches(t, &q.words))
         .collect();
-    Ok(Listing { tracks, from_copy, folder: Some((folder.clone(), dirs, truncated)), library_error })
+    Ok(Listing {
+        tracks,
+        from_copy: snap.as_ref().is_some_and(|s| s.from_copy),
+        folder: Some((folder.clone(), dirs, truncated)),
+        library_error: snap.as_ref().and_then(|s| s.error.clone()),
+        mik_error: snap.as_ref().and_then(|s| s.mik_error.clone()),
+        loading,
+    })
 }
 
-/// A listing's row, its file looked at now: missing, changed since analysed, and the tags of an
-/// MP3 filling what the analysis lacks.
+/// A listing's row, its file looked at now: missing, changed since analysed, of an outdated
+/// analysis, and the tags of an MP3 filling what the analysis and Mixed In Key lack (MIK's
+/// comment `8A - Energy 6`, its `EnergyLevel`, then `TKEY`).
 fn row(t: &LibraryTrack) -> Value {
     let stamp = crate::io::size_and_mtime(&t.path);
     let stale = t.analysed && stamp.is_some_and(|(s, m)| t.size.and_then(|x| u64::try_from(x).ok()) != Some(s) || t.mtime != Some(m));
+    let outdated = t.analysed && t.version != Some(db::ANALYSIS_VERSION);
     let mut t = t.clone();
     let is_mp3 = Path::new(&t.path).extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
-    let lacks = !t.analysed || t.artist.is_empty();
+    let lacks = !t.analysed || t.artist.is_empty() || t.key.is_none() || t.energy.is_none();
     if stamp.is_some() && is_mp3 && lacks {
         let tags = super::prep::tag_head(Path::new(&t.path)).map(|h| soundcraft_audio_io::mp3tags::read_basic(&h)).unwrap_or_default();
         if t.artist.is_empty() {
-            t.artist = tags.artist.unwrap_or_default();
+            t.artist = tags.artist.clone().unwrap_or_default();
         }
         if !t.analysed {
-            if let Some(title) = tags.title {
+            if let Some(title) = tags.title.clone() {
                 t.title = title;
             }
             t.bpm = t.bpm.or(tags.bpm.filter(|b| (20.0..=400.0).contains(b)));
-            t.key = t.key.or_else(|| tags.key.as_deref().and_then(soundcraft_model::camelot_of));
+        }
+        let (comment_key, comment_energy) = tags.comment.as_deref().map(mik_comment).unwrap_or_default();
+        if t.key.is_none()
+            && let Some(k) = comment_key.or_else(|| tags.key.as_deref().and_then(soundcraft_model::camelot_of))
+        {
+            (t.key, t.key_source) = (Some(k), Some("tag"));
+        }
+        if t.energy.is_none()
+            && let Some(en) = comment_energy.or(tags.energy.map(f64::from))
+        {
+            (t.energy, t.energy_source) = (Some(en), Some("tag"));
         }
     }
     json!({"path": t.path, "name": file_name(&t.path), "title": t.title, "artist": t.artist, "bpm": t.bpm, "key": t.key,
-        "energy": t.energy, "length_s": t.length_s, "analysed": t.analysed, "stale": stale, "missing": stamp.is_none()})
+        "key_source": t.key_source, "energy": t.energy, "energy_source": t.energy_source, "length_s": t.length_s,
+        "analysed": t.analysed, "stale": stale, "outdated": outdated, "missing": stamp.is_none()})
 }
 
 fn page(rows: &[LibraryTrack], q: &Query) -> Vec<Value> {
@@ -581,7 +804,7 @@ fn page(rows: &[LibraryTrack], q: &Query) -> Vec<Value> {
 
 fn listed(l: &Listing, q: &Query, rows: Vec<Value>) -> Value {
     let mut out = json!({"source": if l.folder.is_some() { "folder" } else { "mixforge" }, "total": l.tracks.len(), "offset": q.offset,
-        "rows": rows, "from_copy": l.from_copy});
+        "rows": rows, "from_copy": l.from_copy, "loading": l.loading, "library_error": l.library_error, "mik_error": l.mik_error});
     if let (Some((folder, dirs, truncated)), Some(o)) = (&l.folder, out.as_object_mut()) {
         let mut subs: Vec<(String, String)> = dirs
             .iter()
@@ -591,7 +814,6 @@ fn listed(l: &Listing, q: &Query, rows: Vec<Value>) -> Value {
         o.insert("folder".into(), json!(folder));
         o.insert("folders".into(), subs.into_iter().map(|(path, name)| json!({"path": path, "name": name})).collect());
         o.insert("truncated".into(), json!(truncated));
-        o.insert("library_error".into(), json!(l.library_error));
     }
     out
 }
@@ -791,6 +1013,12 @@ mod tests {
             ["Roaming/", "mixforge"],
             ["join(\"", "mixforge\")"],
             ["DJFORGE_", "MIXFORGE_HOME"],
+            ["var(\"MIXFORGE", "_HOME\""],
+            ["var_os(\"MIXFORGE", "_HOME\""],
+            ["default_mik", "_db("],
+            ["mik_library", "_db"],
+            ["MIK", "Store"],
+            ["hotcues", ".json"],
         ]
         .iter()
         .map(|w| w.concat())
@@ -800,13 +1028,34 @@ mod tests {
             let text = std::fs::read_to_string(&f).unwrap();
             let in_tests_dir = f.components().any(|c| c.as_os_str() == "tests");
             let test_code = if in_tests_dir { text.as_str() } else { text.split_once("#[cfg(test)]").map_or("", |(_, t)| t) };
+            let code = || test_code.lines().filter(|l| !l.trim_start().starts_with("//"));
             for word in &forbidden {
-                if test_code.lines().any(|l| l.contains(word.as_str()) && !l.trim_start().starts_with("//")) {
+                if code().any(|l| l.contains(word.as_str())) {
                     offenders.push(format!("{}: {word}", f.display()));
                 }
             }
+            // %APPDATA% and mixforge together: the real library's folder.
+            let app_data = ["APP", "DATA"].concat();
+            if code().any(|l| l.contains(app_data.as_str()) && l.to_lowercase().contains("mixforge")) {
+                offenders.push(format!("{}: {app_data} with mixforge", f.display()));
+            }
         }
         assert!(offenders.is_empty(), "tests must use a library.db built in a temporary folder: {offenders:#?}");
+    }
+
+    #[test]
+    fn mixed_in_keys_comment_gives_the_key_and_energy() {
+        assert_eq!(mik_comment("8A - Energy 6"), (Some("8A".into()), Some(6.0)));
+        assert_eq!(mik_comment("12b - energy 10 - 128 BPM"), (Some("12B".into()), Some(10.0)));
+        assert_eq!(mik_comment("Energy 4"), (None, Some(4.0)));
+        assert_eq!(mik_comment("great track"), (None, None));
+        assert_eq!(mik_comment("8A - Energy 11"), (Some("8A".into()), None));
+    }
+
+    #[test]
+    fn a_key_ending_in_a_wide_character_is_no_camelot_key() {
+        assert_eq!([camelot("8é"), camelot("é"), camelot("ÄA")], [None; 3]);
+        assert_eq!(camelot(" 10b "), Some((10, b'B')));
     }
 
     #[test]

@@ -368,7 +368,7 @@ fn arrangement_play_and_deck_play_say_that_the_other_stops() {
 fn hot_cues_the_user_sets_or_clears_are_kept_per_track_and_win_their_slots() {
     let dir = Scratch::new("hotcues");
     let path = wav(&dir.0, "track.wav", 75.0);
-    let store = dir.0.join("settings").join("hotcues.json");
+    let store = dir.0.join("settings").join("cue-store.json");
     let setup = |e: &mut Engine| {
         e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
         e.set_hotcue_store(store.clone());

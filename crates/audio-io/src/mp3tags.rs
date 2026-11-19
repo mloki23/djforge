@@ -180,6 +180,10 @@ pub struct TagBasics {
     pub key: Option<String>,
     /// `TBPM`, when it is a finite number.
     pub bpm: Option<f64>,
+    /// The first non-blank `COMM` (Mixed In Key writes `8A - Energy 6` there).
+    pub comment: Option<String>,
+    /// `TXXX:EnergyLevel` (Mixed In Key's energy, 1–10), when it is a whole number.
+    pub energy: Option<u8>,
 }
 
 /// The title, artist, album, key and BPM in the ID3v2 tag at the start of `bytes` (an MP3, or
@@ -202,6 +206,24 @@ pub fn read_basic(bytes: &[u8]) -> TagBasics {
             b"TPE1" => &mut out.artist,
             b"TALB" => &mut out.album,
             b"TKEY" => &mut out.key,
+            b"COMM" => {
+                if out.comment.is_none() {
+                    out.comment =
+                        decode(tag.major, raw).ok().and_then(|f| f.content().comment().map(|c| c.text.trim().to_string())).filter(|t| !t.is_empty());
+                }
+                continue;
+            }
+            b"TXXX" => {
+                if out.energy.is_none() {
+                    out.energy = decode(tag.major, raw)
+                        .ok()
+                        .and_then(|f| {
+                            f.content().extended_text().filter(|x| x.description.eq_ignore_ascii_case("EnergyLevel")).map(|x| x.value.clone())
+                        })
+                        .and_then(|v| v.trim().trim_end_matches(' ').parse::<u8>().ok());
+                }
+                continue;
+            }
             b"TBPM" => {
                 if out.bpm.is_none() {
                     out.bpm = text(raw).and_then(|t| t.parse::<f64>().ok()).filter(|b| b.is_finite());
@@ -898,6 +920,8 @@ mod tests {
                 album: Some("Album".into()),
                 key: Some("8A".into()),
                 bpm: Some(128.0),
+                comment: Some("9A - Energy 7".into()),
+                energy: Some(7),
             };
             assert_eq!(b, want, "{version:?}");
         }

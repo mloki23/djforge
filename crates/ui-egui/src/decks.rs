@@ -73,6 +73,7 @@ impl SoundApp {
     /// Once a frame: finishes `deck.load`s, hands their decks to the player, and reads back
     /// what the decks play.
     pub(crate) fn sync_decks(&mut self) {
+        self.engine.poll_library();
         for r in self.engine.poll_deck_loads() {
             if let Err(err) = r {
                 self.ui.status = err.to_string();

@@ -211,6 +211,9 @@ fn prefs_enabled() -> bool {
 /// Music folder and the ones added, kept in `library-folders.json` in the settings folder). Runs
 /// without preferences (agents' test runs) leave the user's library, Music folder and settings
 /// alone (and keep no hot cues), unless `DJFORGE_MIXFORGE_HOME` names a library on purpose.
+/// (mixforge's sidecar, which grids files mixforge's library has no fresh row for, still reads
+/// mixforge's own library: it runs mixforge's code.) Mixed In Key's library gives the key and
+/// energy where it has them; it too is left alone without preferences.
 fn set_up_library(engine: &mut Engine) {
     let chosen = std::env::var_os("DJFORGE_MIXFORGE_HOME").is_some_and(|v| !v.is_empty());
     if prefs_enabled() || chosen {
@@ -222,6 +225,10 @@ fn set_up_library(engine: &mut Engine) {
     if !prefs_enabled() {
         engine.set_library_folders(None, None);
         return;
+    }
+    match soundcraft_engine::cmd::mik_library_db() {
+        Ok(db) => engine.set_mik_library(db),
+        Err(e) => log::warn!("no Mixed In Key library: {e}"),
     }
     let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
     let music = var("USERPROFILE").or_else(|| var("HOME")).map(|h| h.join("Music"));

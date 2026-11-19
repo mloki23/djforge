@@ -426,6 +426,25 @@ impl Engine {
         self.library.db()
     }
 
+    /// `library.*` and `deck.load` take each track's key and energy from Mixed In Key's library
+    /// at `db` (`MIKStore.db`, only ever read, from a copy). Only the app's entry points call
+    /// this, with [`cmd::mik_library_db`]; tests give one they built in a temporary folder.
+    pub fn set_mik_library(&mut self, db: std::path::PathBuf) {
+        self.library.set_mik(db);
+    }
+
+    /// Takes a finished read of the libraries and starts another when their files changed (and
+    /// then stood still a moment: mixforge may be writing). Reads run off the UI thread; listings
+    /// meanwhile give the last read's rows. Call once a frame.
+    pub fn poll_library(&mut self) {
+        self.library.refresh(false);
+    }
+
+    /// True while the libraries are being read.
+    pub fn library_loading(&self) -> bool {
+        self.library.loading()
+    }
+
     /// `live.slot_from_file` grids files through `analyse`. Only the app's entry points call this,
     /// with [`cmd::prep_mixforge_analysis`]; tests give a fake.
     pub fn set_analyse(&mut self, analyse: cmd::PrepAnalyse) {

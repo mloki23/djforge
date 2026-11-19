@@ -1625,7 +1625,7 @@ impl SoundApp {
             self.handle_transport(0.0);
         }
         // A deck load finishing, or the decks playing, needs frames to be seen.
-        if self.engine.deck_loading() || self.engine.deck_status.decks.iter().any(|d| d.playing) {
+        if self.engine.deck_loading() || self.engine.library_loading() || self.engine.deck_status.decks.iter().any(|d| d.playing) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         // Here, not in logic(): a covered or minimized window runs only logic(), with no vsync to pace it.
