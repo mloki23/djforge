@@ -363,3 +363,67 @@ fn arrangement_play_and_deck_play_say_that_the_other_stops() {
     assert_eq!(run(&mut e, "deck.load", json!({"path": path}))["deck"], "b");
     wait(&mut e);
 }
+
+#[test]
+fn hot_cues_the_user_sets_or_clears_are_kept_per_track_and_win_their_slots() {
+    let dir = Scratch::new("hotcues");
+    let path = wav(&dir.0, "track.wav", 75.0);
+    let store = dir.0.join("settings").join("hotcues.json");
+    let setup = |e: &mut Engine| {
+        e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
+        e.set_hotcue_store(store.clone());
+    };
+    let mut e = engine();
+    setup(&mut e);
+    run(&mut e, "deck.load", json!({"path": path, "deck": "a"}));
+    assert_eq!(wait(&mut e)[0]["user_cues"], 0);
+    let computed = e.deck_tracks[0].clone().unwrap().cues;
+    let mut st = e.deck_status;
+    st.decks[0].load = e.deck_loads[0].1.load();
+    st.decks[0].hot = computed;
+    e.set_deck_status(st);
+    assert!(!store.exists(), "the deck reporting its track's own cues keeps nothing");
+    // The user sets A at 10 s and F at 5 s, and clears C.
+    let sr = f64::from(RATE);
+    st.decks[0].hot[0] = Some(10.0 * sr);
+    st.decks[0].hot[2] = None;
+    st.decks[0].hot[5] = Some(5.0 * sr);
+    e.set_deck_status(st);
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    let entry = kept["tracks"].as_object().unwrap().values().next().unwrap().clone();
+    assert_eq!(entry["cues"], json!({"1": 10.0, "3": null, "6": 5.0}), "{kept}");
+    assert_eq!(entry["path"], json!(path));
+    e.set_deck_status(st);
+    // Loaded again (another run): the user's cues win their slots, the computed ones fill the rest.
+    let mut again = engine();
+    setup(&mut again);
+    run(&mut again, "deck.load", json!({"path": path, "deck": "b"}));
+    assert_eq!(wait(&mut again)[0]["user_cues"], 3);
+    let cues = again.deck_tracks[1].clone().unwrap().cues;
+    assert_eq!(cues[..6], [Some(10.0 * sr), computed[1], None, computed[3], computed[4], Some(5.0 * sr)]);
+    // B moved later: kept beside the others.
+    let mut st = again.deck_status;
+    st.decks[1].load = again.deck_loads[0].1.load();
+    st.decks[1].hot = cues;
+    again.set_deck_status(st);
+    st.decks[1].hot[1] = Some(20.0 * sr);
+    again.set_deck_status(st);
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    assert_eq!(kept["tracks"].as_object().unwrap().values().next().unwrap()["cues"], json!({"1": 10.0, "2": 20.0, "3": null, "6": 5.0}));
+    // The file changed: it is a new track, and the cues kept for the old one don't apply.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    wav(&dir.0, "track.wav", 74.0);
+    run(&mut again, "deck.load", json!({"path": path, "deck": "a"}));
+    assert_eq!(wait(&mut again)[0]["user_cues"], 0);
+    // A store that isn't JSON is moved aside, not lost, and a new one written.
+    std::fs::write(&store, "not json").unwrap();
+    let load = again.deck_loads.last().unwrap().1.load();
+    let mut st = again.deck_status;
+    st.decks[0].load = load;
+    st.decks[0].hot = again.deck_tracks[0].clone().unwrap().cues;
+    again.set_deck_status(st);
+    st.decks[0].hot[7] = Some(sr);
+    again.set_deck_status(st);
+    assert!(std::fs::read_to_string(&store).unwrap().contains("\"8\": 1.0"));
+    assert!(std::fs::read_dir(store.parent().unwrap()).unwrap().flatten().any(|f| f.file_name().to_string_lossy().contains("corrupt")));
+}

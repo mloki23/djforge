@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track to Deck",
             [],
             None,
-            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its beat grid and key: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time; read directly, no sidecar), else mixforge's analysis through its sidecar (a stale or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, library: fresh|stale|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, priming_ms, analysis_error}) goes to the status line",
+            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its beat grid and key: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time; read directly, no sidecar), else mixforge's analysis through its sidecar (a stale or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, library: fresh|stale|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, user_cues (how many hot cues the user kept for the file took their slots: set ones replace the computed cue, cleared ones leave the slot empty), priming_ms, analysis_error}) goes to the status line",
             always,
             load
         ),
@@ -77,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Hot Cue",
             [],
             None,
-            "{deck: a|b, n: 1..=8, action?: set|jump|release|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (while playing, with quantise on the next beat, so the beat stays on time; while stopped it plays from the cue until `release`) or clear it",
+            "{deck: a|b, n: 1..=8, action?: set|jump|release|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (while playing, with quantise on the next beat, so the beat stays on time; while stopped it plays from the cue until `release`) or clear it. Cues set or cleared are kept for the track (by path, size and time) in djforge's settings folder and come back when it is loaded again",
             always,
             |e, p| transport(e, p, "deck.hotcue")
         ),
@@ -340,6 +340,10 @@ struct Loaded {
     library: Option<&'static str>,
     /// Why mixforge's library couldn't be read.
     library_error: Option<String>,
+    /// The file's size and time when it was read (what its hot cues are kept under).
+    stamp: Option<(u64, i64)>,
+    /// Hot cues the user kept for it, put in their slots.
+    user_cues: usize,
 }
 
 /// A `deck.load` running on a thread of its own.
@@ -379,10 +383,13 @@ impl DeckLoadJob {
         }
         let t = &l.track;
         let out = json!({"deck": deck.id(), "path": t.path, "title": t.title, "artist": t.artist, "grid": t.grid_from, "bpm": t.bpm,
-            "key": t.key, "grid_from": t.grid_from, "library": l.library, "library_error": l.library_error, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
+            "key": t.key, "grid_from": t.grid_from, "library": l.library, "library_error": l.library_error, "user_cues": l.user_cues, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
             "can_key_lock": l.prepared.can_key_lock()});
         if let Some(slot) = e.deck_tracks.get_mut(deck.index()) {
             *slot = Some(Arc::clone(&l.track));
+        }
+        if let Some(f) = e.deck_files.get_mut(deck.index()) {
+            *f = l.stamp.map(|s| (t.path.clone(), s));
         }
         e.note_deck_load(deck, l.prepared.load());
         e.deck_loads.push((deck, l.prepared));
@@ -405,6 +412,8 @@ struct LoadPlan {
     session_cues: Option<[Option<f64>; 4]>,
     /// mixforge's library, read first for the grid, key and mix points.
     library: Option<std::path::PathBuf>,
+    /// Where the user's hot cues are kept.
+    hotcues: Option<std::path::PathBuf>,
 }
 
 /// Reads and decodes `path` at `rate`, finds its grid (given, mixforge's library, its sidecar, the BPM tag) and hot
@@ -415,6 +424,7 @@ struct LoadPlan {
 /// plays the MP3's priming first: mixforge's grid and the cues (also on its timeline) move that
 /// much earlier.
 fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPlan, cancel: &AtomicBool) -> Result<Loaded> {
+    let stamp = crate::io::size_and_mtime(path);
     let bytes = crate::io::read_file(path)?;
     let decoded = crate::io::decode_import(&file_name(path), &bytes, rate)?;
     let is_mp3 = std::path::Path::new(path).extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
@@ -437,7 +447,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         None => {
             // mixforge's library row when it is of the file as it is now; else its sidecar (which
             // also takes a row from before a retag whose audio is unchanged).
-            let row = plan.library.as_deref().map(|db| super::library::analysis_for(db, path, crate::io::size_and_mtime(path)));
+            let row = plan.library.as_deref().map(|db| super::library::analysis_for(db, path, stamp));
             library = row.as_ref().map(super::library::FromLibrary::id);
             let sidecar = || match analyse {
                 Some(f) => f(path, &|| cancel.load(Ordering::Relaxed)),
@@ -484,6 +494,11 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         *h = c.map(|s| s - priming).filter(|s| s.is_finite() && (0.0..duration).contains(s)).map(|s| s * sr);
     }
     let cues_from = cues_from.filter(|_| hot.iter().any(Option::is_some));
+    // The user's own cues win their slots; the computed ones fill the rest.
+    let user_cues = match (plan.hotcues.as_deref(), stamp) {
+        (Some(store), Some(at)) => super::hotcues::stored(store, path, at).map_or(0, |s| super::hotcues::apply(&mut hot, &s, sr, frames as f64)),
+        _ => 0,
+    };
     let key = key.or_else(|| tags.key.as_deref().and_then(soundcraft_model::camelot_of));
     let track = Arc::new(DeckTrack {
         source: Arc::new(SourceAudio::new(buf)),
@@ -497,7 +512,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         grid_from,
     });
     let prepared = Box::new(PreparedDeck::new(Arc::clone(&track), rate as f32));
-    Ok(Loaded { track, prepared, analysis_error, cues_from, priming_ms: priming * 1000.0, library, library_error })
+    Ok(Loaded { track, prepared, analysis_error, cues_from, priming_ms: priming * 1000.0, library, library_error, stamp, user_cues })
 }
 
 fn load(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -525,6 +540,7 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
         given,
         session_cues: super::export::cues_for_file(e.session(), std::path::Path::new(&path)),
         library: e.library.db().map(std::path::Path::to_path_buf),
+        hotcues: e.hotcues.clone(),
     };
     // The last load issued for a deck wins: earlier ones still running are told to stop.
     let generation = e.deck_generation.get(deck.index()).copied().unwrap_or(0).wrapping_add(1);

@@ -22,6 +22,7 @@ mod event_more;
 pub(crate) mod export;
 mod file;
 mod health;
+pub(crate) mod hotcues;
 mod instrument;
 pub(crate) mod library;
 mod live;

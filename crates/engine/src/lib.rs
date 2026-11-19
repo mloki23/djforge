@@ -236,6 +236,12 @@ pub struct Engine {
     /// mixforge's library and the browser's folders: none until the app sets them up
     /// ([`Engine::set_library`]), so no test reads the real library.
     pub(crate) library: cmd::library::LibraryState,
+    /// Where the hot cues the user sets are kept per track: none until the app sets it up
+    /// ([`Engine::set_hotcue_store`]), so no test writes the app's.
+    hotcues: Option<std::path::PathBuf>,
+    /// Per deck, the file its track came from and its size and time then (what its hot cues are
+    /// kept under).
+    deck_files: [Option<(String, (u64, i64))>; 2],
 }
 
 impl Default for Engine {
@@ -284,6 +290,8 @@ impl Engine {
             deck_loaded: [0; 2],
             deck_seen: [false; 2],
             library: Default::default(),
+            hotcues: None,
+            deck_files: [None, None],
         }
     }
 
@@ -320,13 +328,25 @@ impl Engine {
     /// The host's audio engine reports what the decks play. A deck that no longer holds the
     /// track `deck_tracks` names (its engine was replaced) is forgotten, so `decks.state` never
     /// describes a track the audio thread lacks.
+    ///
+    /// Hot cues that change on a deck after its track was first reported are the user's (set or
+    /// cleared): they are kept for the track (see [`Engine::set_hotcue_store`]).
     pub fn set_deck_status(&mut self, status: soundcraft_mix::DecksState) {
+        let mut changed = Vec::new();
         for (i, d) in status.decks.iter().enumerate() {
             let (Some(loaded), Some(seen)) = (self.deck_loaded.get(i).copied(), self.deck_seen.get_mut(i)) else { continue };
             if loaded == 0 {
                 continue;
             }
             if d.load == loaded {
+                let before = self.deck_status.decks.get(i).filter(|b| *seen && b.load == loaded);
+                if let Some(b) = before {
+                    let slots: Vec<(usize, Option<f64>)> =
+                        b.hot.iter().zip(&d.hot).enumerate().filter(|(_, (x, y))| x != y).map(|(n, (_, y))| (n, *y)).collect();
+                    if !slots.is_empty() {
+                        changed.push((i, slots));
+                    }
+                }
                 *seen = true;
             } else if *seen {
                 *seen = false;
@@ -339,6 +359,27 @@ impl Engine {
             }
         }
         self.deck_status = status;
+        for (i, slots) in changed {
+            self.keep_hot_cues(i, &slots);
+        }
+    }
+
+    /// Keeps the user's hot cue changes `slots` (slot, source samples or cleared) on deck `i`.
+    fn keep_hot_cues(&mut self, i: usize, slots: &[(usize, Option<f64>)]) {
+        let (Some(store), Some(Some((path, stamp)))) = (self.hotcues.clone(), self.deck_files.get(i).cloned()) else { return };
+        let rate = self.session().sample_rate.as_f64().max(1.0);
+        let secs: Vec<(usize, Option<f64>)> = slots.iter().map(|(n, at)| (*n, at.map(|s| s / rate))).collect();
+        if let Err(err) = cmd::hotcues::save(&store, &path, stamp, &secs) {
+            log::warn!("hot cues not kept: {err}");
+            self.messages.push(format!("Hot cues not kept: {err}"));
+        }
+    }
+
+    /// The hot cues the user sets or clears on the decks are kept per track in `store` (a JSON
+    /// file) and come back when the track is loaded again. Only the app's entry points call this,
+    /// with a file in its settings folder; tests give a temporary one.
+    pub fn set_hotcue_store(&mut self, store: std::path::PathBuf) {
+        self.hotcues = Some(store);
     }
 
     /// A load was handed on for deck `deck` (see [`Engine::set_deck_status`]).
