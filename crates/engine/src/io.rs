@@ -568,6 +568,10 @@ pub(crate) struct DecodedImport {
     ext: Option<String>,
     /// The Camelot key in an MP3's `TKEY` tag, when it holds a recognised one.
     key: Option<String>,
+    /// The audio's fingerprint and length (seconds), as decoded at the file's own rate: the same
+    /// whatever its tags and the session's rate (see [`audio_fingerprint`]).
+    fingerprint: u64,
+    seconds: f64,
 }
 
 impl DecodedImport {
@@ -576,12 +580,47 @@ impl DecodedImport {
     pub(crate) fn into_parts(self) -> (AudioBuffer, Option<String>) {
         (self.buf, self.key)
     }
+
+    /// The audio's fingerprint and length in seconds (see [`audio_fingerprint`]).
+    pub(crate) fn fingerprint(&self) -> (u64, f64) {
+        (self.fingerprint, self.seconds)
+    }
+}
+
+/// Seconds of audio [`audio_fingerprint`] hashes.
+const FINGERPRINT_SECONDS: usize = 30;
+
+/// What tells one recording from another whatever its tags: an FNV-1a hash of `buf`'s rate,
+/// channel count and length in frames, then its first 30 seconds quantised to 16 bits (decoded
+/// at the file's own rate, so the session's rate doesn't matter). Retagging a file (Mixed In Key
+/// writes its key and energy) keeps it; other audio changes it.
+pub(crate) fn audio_fingerprint(buf: &AudioBuffer) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let frames = buf.frames();
+    eat(&buf.sample_rate.to_le_bytes());
+    eat(&(buf.num_channels() as u64).to_le_bytes());
+    eat(&(frames as u64).to_le_bytes());
+    let n = frames.min(FINGERPRINT_SECONDS.saturating_mul(buf.sample_rate as usize));
+    for k in 0..n {
+        for ch in &buf.channels {
+            let x = ch.get(k).copied().unwrap_or(0.0);
+            let q = if x.is_finite() { (x.clamp(-1.0, 1.0) * 32767.0).round() as i16 } else { 0 };
+            eat(&q.to_le_bytes());
+        }
+    }
+    h
 }
 
 /// Decodes the file `name` (`bytes`) at the session rate `rate`, as an import does.
 pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<DecodedImport> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (info, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
+    let (fingerprint, seconds) = (audio_fingerprint(&buf), buf.frames() as f64 / f64::from(buf.sample_rate.max(1)));
     let buf = at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
@@ -591,12 +630,12 @@ pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<Decod
         .then(|| soundcraft_audio_io::mp3tags::read_basic(bytes).key)
         .flatten()
         .and_then(|k| soundcraft_model::camelot_of(&k));
-    Ok(DecodedImport { info, buf, ext, key })
+    Ok(DecodedImport { info, buf, ext, key, fingerprint, seconds })
 }
 
 /// Adds decoded audio as a new source, as [`import_source_bytes`] does.
 pub(crate) fn add_import(e: &mut Engine, name: &str, decoded: DecodedImport, path: Option<&str>) -> Result<(SourceId, Samples, usize)> {
-    let DecodedImport { info, buf, ext, key } = decoded;
+    let DecodedImport { info, buf, ext, key, .. } = decoded;
     if buf.sample_rate != e.session().sample_rate.hz() {
         return Err(EngineError::Io(format!("{name}: the session's sample rate changed while it was read; load it again")));
     }

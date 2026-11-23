@@ -364,8 +364,32 @@ fn arrangement_play_and_deck_play_say_that_the_other_stops() {
     wait(&mut e);
 }
 
+/// The deck reports its track's own cues, with `edit` applied (slot, source samples or cleared).
+fn report(e: &mut Engine, deck: usize, edits: &[(usize, Option<f64>)]) {
+    let mut st = e.deck_status;
+    st.decks[deck].load = e.deck_loads.last().unwrap().1.load();
+    if st.decks[deck].load != e.deck_status.decks[deck].load {
+        st.decks[deck].hot = e.deck_tracks[deck].clone().unwrap().cues;
+    }
+    for (slot, at) in edits {
+        st.decks[deck].hot[*slot] = *at;
+    }
+    e.set_deck_status(st);
+}
+
+fn kept(store: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(store).unwrap()).unwrap()
+}
+
+fn only_entry(store: &Path) -> Value {
+    let v = kept(store);
+    let tracks = v["tracks"].as_object().unwrap();
+    assert_eq!(tracks.len(), 1, "{v}");
+    tracks.values().next().unwrap().clone()
+}
+
 #[test]
-fn hot_cues_the_user_sets_or_clears_are_kept_per_track_and_win_their_slots() {
+fn hot_cues_set_or_cleared_are_kept_per_track_and_win_their_slots() {
     let dir = Scratch::new("hotcues");
     let path = wav(&dir.0, "track.wav", 75.0);
     let store = dir.0.join("settings").join("cue-store.json");
@@ -373,57 +397,97 @@ fn hot_cues_the_user_sets_or_clears_are_kept_per_track_and_win_their_slots() {
         e.set_analyse(Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(analysis())));
         e.set_hotcue_store(store.clone());
     };
+    let sr = f64::from(RATE);
     let mut e = engine();
     setup(&mut e);
     run(&mut e, "deck.load", json!({"path": path, "deck": "a"}));
     assert_eq!(wait(&mut e)[0]["user_cues"], 0);
     let computed = e.deck_tracks[0].clone().unwrap().cues;
-    let mut st = e.deck_status;
-    st.decks[0].load = e.deck_loads[0].1.load();
-    st.decks[0].hot = computed;
-    e.set_deck_status(st);
-    assert!(!store.exists(), "the deck reporting its track's own cues keeps nothing");
-    // The user sets A at 10 s and F at 5 s, and clears C.
-    let sr = f64::from(RATE);
-    st.decks[0].hot[0] = Some(10.0 * sr);
-    st.decks[0].hot[2] = None;
-    st.decks[0].hot[5] = Some(5.0 * sr);
-    e.set_deck_status(st);
-    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
-    let entry = kept["tracks"].as_object().unwrap().values().next().unwrap().clone();
-    assert_eq!(entry["cues"], json!({"1": 10.0, "3": null, "6": 5.0}), "{kept}");
-    assert_eq!(entry["path"], json!(path));
-    e.set_deck_status(st);
+    // An edit before the deck first reported its track is kept once it shows.
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 1, "action": "set"}));
+    report(&mut e, 0, &[(0, Some(10.0 * sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0}));
+    // A change the user didn't make (no deck.hotcue) is not kept.
+    report(&mut e, 0, &[(0, Some(10.0 * sr)), (4, Some(3.0 * sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0}));
+    // Clear C and set F: each kept once the deck shows it.
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 3, "action": "clear"}));
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 6, "action": "set"}));
+    report(&mut e, 0, &[(0, Some(10.0 * sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0}), "not landed yet");
+    report(&mut e, 0, &[(0, Some(10.0 * sr)), (2, None), (5, Some(5.0 * sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0, "3": null, "6": 5.0}));
     // Loaded again (another run): the user's cues win their slots, the computed ones fill the rest.
     let mut again = engine();
     setup(&mut again);
     run(&mut again, "deck.load", json!({"path": path, "deck": "b"}));
-    assert_eq!(wait(&mut again)[0]["user_cues"], 3);
+    let v = wait(&mut again).remove(0);
+    assert_eq!((v["user_cues"].as_u64(), v["user_cues_previous"].clone()), (Some(3), json!([])));
     let cues = again.deck_tracks[1].clone().unwrap().cues;
     assert_eq!(cues[..6], [Some(10.0 * sr), computed[1], None, computed[3], computed[4], Some(5.0 * sr)]);
-    // B moved later: kept beside the others.
-    let mut st = again.deck_status;
-    st.decks[1].load = again.deck_loads[0].1.load();
-    st.decks[1].hot = cues;
-    again.set_deck_status(st);
-    st.decks[1].hot[1] = Some(20.0 * sr);
-    again.set_deck_status(st);
-    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
-    assert_eq!(kept["tracks"].as_object().unwrap().values().next().unwrap()["cues"], json!({"1": 10.0, "2": 20.0, "3": null, "6": 5.0}));
-    // The file changed: it is a new track, and the cues kept for the old one don't apply.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    wav(&dir.0, "track.wav", 74.0);
-    run(&mut again, "deck.load", json!({"path": path, "deck": "a"}));
-    assert_eq!(wait(&mut again)[0]["user_cues"], 0);
     // A store that isn't JSON is moved aside, not lost, and a new one written.
     std::fs::write(&store, "not json").unwrap();
-    let load = again.deck_loads.last().unwrap().1.load();
-    let mut st = again.deck_status;
-    st.decks[0].load = load;
-    st.decks[0].hot = again.deck_tracks[0].clone().unwrap().cues;
-    again.set_deck_status(st);
-    st.decks[0].hot[7] = Some(sr);
-    again.set_deck_status(st);
-    assert!(std::fs::read_to_string(&store).unwrap().contains("\"8\": 1.0"));
+    run(&mut again, "deck.hotcue", json!({"deck": "b", "n": 8, "action": "set"}));
+    report(&mut again, 1, &[(7, Some(sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"8": 1.0}));
     assert!(std::fs::read_dir(store.parent().unwrap()).unwrap().flatten().any(|f| f.file_name().to_string_lossy().contains("corrupt")));
+}
+
+/// A tagged MP3: Mixed In Key retags files, changing their size and time but not their audio.
+fn tagged_mp3(path: &Path, camelot: &str) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../audio-io/tests/fixtures/mp3/cbr128_44k_stereo.mp3");
+    let fill = soundcraft_audio_io::mp3tags::TagFill { camelot: Some(camelot), bpm: Some(124.0), prep_note: "" };
+    let (bytes, _) = soundcraft_audio_io::mp3tags::fill(&std::fs::read(fixture).unwrap(), &fill).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn hot_cues_survive_a_retag_and_a_rename_and_audio_changes_never_lose_them() {
+    let dir = Scratch::new("retag");
+    let mp3 = dir.0.join("tune.mp3");
+    tagged_mp3(&mp3, "8A");
+    let store = dir.0.join("cue-store.json");
+    let sr = f64::from(RATE);
+    let load = |e: &mut Engine, path: &Path| {
+        run(e, "deck.load", json!({"path": path, "deck": "a"}));
+        wait(e).remove(0)
+    };
+    let mut e = engine();
+    e.set_hotcue_store(store.clone());
+    load(&mut e, &mp3);
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 1, "action": "set"}));
+    report(&mut e, 0, &[(0, Some(0.25 * sr))]);
+    let first = only_entry(&store);
+    // Retagged: another size and time, the same audio. The cues come back and follow the stamp.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    tagged_mp3(&mp3, "11B");
+    let v = load(&mut e, &mp3);
+    assert_eq!(v["user_cues"], 1, "{v}");
+    assert_eq!(e.deck_tracks[0].clone().unwrap().cues[0], Some(0.25 * sr));
+    let after = only_entry(&store);
+    assert_ne!(after["size"], first["size"], "the entry was brought up to date");
+    assert_eq!(after["fp"], first["fp"]);
+    // A later edit keeps the earlier cues.
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 2, "action": "set"}));
+    report(&mut e, 0, &[(0, Some(0.25 * sr)), (1, Some(0.5 * sr))]);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 0.25, "2": 0.5}));
+    // Renamed: the cues follow the audio.
+    let renamed = dir.0.join("tune (renamed).mp3");
+    std::fs::rename(&mp3, &renamed).unwrap();
+    assert_eq!(load(&mut e, &renamed)["user_cues"], 2);
+    let moved = only_entry(&store);
+    assert_eq!(moved["path"], json!(renamed), "relinked to the new path");
+    // Other audio at that path: its cues aren't applied but kept, and offered as previous.
+    std::fs::remove_file(&renamed).unwrap();
+    let other = wav(&dir.0, "replacement.wav", 2.0);
+    std::fs::copy(&other, &renamed).unwrap();
+    let v = load(&mut e, &renamed);
+    assert_eq!(v["user_cues"], 0, "{v}");
+    assert_eq!(v["user_cues_previous"][0]["cues"], json!({"1": 0.25, "2": 0.5}), "{v}");
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 1, "action": "set"}));
+    report(&mut e, 0, &[(0, Some(1.0 * sr))]);
+    let now = only_entry(&store);
+    assert_eq!(now["cues"], json!({"1": 1.0}));
+    assert_eq!(now["previous"][0]["cues"], json!({"1": 0.25, "2": 0.5}), "never deleted: {now}");
+    assert!(now["previous"][0]["until"].is_u64());
 }

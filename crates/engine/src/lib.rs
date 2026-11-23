@@ -239,9 +239,10 @@ pub struct Engine {
     /// Where the hot cues the user sets are kept per track: none until the app sets it up
     /// ([`Engine::set_hotcue_store`]), so no test writes the app's.
     hotcues: Option<std::path::PathBuf>,
-    /// Per deck, the file its track came from and its size and time then (what its hot cues are
-    /// kept under).
-    deck_files: [Option<(String, (u64, i64))>; 2],
+    /// Per deck, what its track's hot cues are kept under, and the rate it was decoded at.
+    deck_files: [Option<(cmd::hotcues::TrackId, f64)>; 2],
+    /// Hot cues set or cleared on the decks, waiting to be reported where they landed.
+    pub(crate) hotcue_edits: Vec<cmd::hotcues::PendingCue>,
 }
 
 impl Default for Engine {
@@ -292,6 +293,7 @@ impl Engine {
             library: Default::default(),
             hotcues: None,
             deck_files: [None, None],
+            hotcue_edits: Vec::new(),
         }
     }
 
@@ -329,24 +331,16 @@ impl Engine {
     /// track `deck_tracks` names (its engine was replaced) is forgotten, so `decks.state` never
     /// describes a track the audio thread lacks.
     ///
-    /// Hot cues that change on a deck after its track was first reported are the user's (set or
-    /// cleared): they are kept for the track (see [`Engine::set_hotcue_store`]).
+    /// A hot cue set or cleared with `deck.hotcue` is kept for the track (see
+    /// [`Engine::set_hotcue_store`]) once a report shows where it landed (a set cue snaps to the
+    /// beat on the audio thread). Nothing else a report shows is kept.
     pub fn set_deck_status(&mut self, status: soundcraft_mix::DecksState) {
-        let mut changed = Vec::new();
         for (i, d) in status.decks.iter().enumerate() {
             let (Some(loaded), Some(seen)) = (self.deck_loaded.get(i).copied(), self.deck_seen.get_mut(i)) else { continue };
             if loaded == 0 {
                 continue;
             }
             if d.load == loaded {
-                let before = self.deck_status.decks.get(i).filter(|b| *seen && b.load == loaded);
-                if let Some(b) = before {
-                    let slots: Vec<(usize, Option<f64>)> =
-                        b.hot.iter().zip(&d.hot).enumerate().filter(|(_, (x, y))| x != y).map(|(n, (_, y))| (n, *y)).collect();
-                    if !slots.is_empty() {
-                        changed.push((i, slots));
-                    }
-                }
                 *seen = true;
             } else if *seen {
                 *seen = false;
@@ -359,19 +353,34 @@ impl Engine {
             }
         }
         self.deck_status = status;
-        for (i, slots) in changed {
-            self.keep_hot_cues(i, &slots);
+        // Edits of loads the decks no longer hold go; those that landed are kept.
+        let loaded = self.deck_loaded;
+        let mut landed = Vec::new();
+        self.hotcue_edits.retain_mut(|edit| {
+            if loaded.get(edit.deck).copied() != Some(edit.load) {
+                return false;
+            }
+            let Some(d) = status.decks.get(edit.deck).filter(|d| d.load == edit.load) else { return true };
+            edit.reports = edit.reports.saturating_add(1);
+            match edit.landed(&d.hot) {
+                Some(cue) => {
+                    landed.push((edit.deck, edit.slot, cue));
+                    false
+                }
+                None => !edit.given_up(),
+            }
+        });
+        for (deck, slot, cue) in landed {
+            self.keep_hot_cue(deck, slot, cue);
         }
     }
 
-    /// Keeps the user's hot cue changes `slots` (slot, source samples or cleared) on deck `i`.
-    fn keep_hot_cues(&mut self, i: usize, slots: &[(usize, Option<f64>)]) {
-        let (Some(store), Some(Some((path, stamp)))) = (self.hotcues.clone(), self.deck_files.get(i).cloned()) else { return };
-        let rate = self.session().sample_rate.as_f64().max(1.0);
-        let secs: Vec<(usize, Option<f64>)> = slots.iter().map(|(n, at)| (*n, at.map(|s| s / rate))).collect();
-        if let Err(err) = cmd::hotcues::save(&store, &path, stamp, &secs) {
-            log::warn!("hot cues not kept: {err}");
-            self.messages.push(format!("Hot cues not kept: {err}"));
+    /// Keeps hot cue `slot` of deck `deck`'s track (source samples, `None`: cleared).
+    fn keep_hot_cue(&mut self, deck: usize, slot: usize, cue: Option<f64>) {
+        let (Some(store), Some(Some((id, rate)))) = (self.hotcues.clone(), self.deck_files.get(deck).cloned()) else { return };
+        if let Err(err) = cmd::hotcues::save(&store, &id, &[(slot, cue.map(|s| s / rate.max(1.0)))]) {
+            log::warn!("hot cue not kept: {err}");
+            self.messages.push(format!("Hot cue not kept: {err}"));
         }
     }
 

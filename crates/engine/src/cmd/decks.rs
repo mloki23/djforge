@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track to Deck",
             [],
             None,
-            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). Its beat grid: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time) and of mixforge's analysis version (read directly, no sidecar), else mixforge's analysis through its sidecar (a stale, outdated or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, key_source: mik|mixforge|tag|null, energy, energy_source, library: fresh|stale|outdated|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, user_cues (how many hot cues the user kept for the file took their slots: set ones replace the computed cue, cleared ones leave the slot empty), priming_ms, analysis_error}) goes to the status line",
+            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). Its beat grid: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time) and of mixforge's analysis version (read directly, no sidecar), else mixforge's analysis through its sidecar (a stale, outdated or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, key_source: mik|mixforge|tag|null, energy, energy_source, library: fresh|stale|outdated|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, user_cues (how many hot cues the user kept for the track took their slots: set ones replace the computed cue, cleared ones leave the slot empty; a track is its audio, so a retag, move or rename keeps them), user_cues_previous ([{cues: {slot: seconds|null}, size, mtime, until?}]: cues kept for audio the file's path held before, never deleted), priming_ms, analysis_error}) goes to the status line",
             always,
             load
         ),
@@ -77,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Hot Cue",
             [],
             None,
-            "{deck: a|b, n: 1..=8, action?: set|jump|release|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (while playing, with quantise on the next beat, so the beat stays on time; while stopped it plays from the cue until `release`) or clear it. Cues set or cleared are kept for the track (by path, size and time) in djforge's settings folder and come back when it is loaded again",
+            "{deck: a|b, n: 1..=8, action?: set|jump|release|clear (default jump)} — hot cue n (A–H): set it at the playhead (on the nearest beat with quantise), jump to it (while playing, with quantise on the next beat, so the beat stays on time; while stopped it plays from the cue until `release`) or clear it. Cues set or cleared are kept for the track (its path and audio fingerprint, so a retag, move or rename keeps them) in djforge's settings folder once the deck reports where they landed, and come back when it is loaded again",
             always,
             |e, p| transport(e, p, "deck.hotcue")
         ),
@@ -224,6 +224,9 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
                 Some("release") => HotCueAction::Release,
                 Some(_) => return Err(bad(cmd, "`action` must be set, jump, release or clear")),
             };
+            if matches!(action, HotCueAction::Set | HotCueAction::Clear) {
+                note_hotcue_edit(e, deck, n - 1, action == HotCueAction::Set);
+            }
             DeckCmd::HotCue { deck, n: n - 1, action }
         }
         "deck.loop" => DeckCmd::Loop { deck, action: loop_action(e, cmd, p, deck)? },
@@ -240,6 +243,21 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
         e.messages.push("The arrangement stopped: a deck plays".into());
     }
     Ok(send(e, c))
+}
+
+/// A hot cue set or cleared: it is kept for the track once the deck reports where it landed
+/// (see [`Engine::set_deck_status`]); a later edit of the slot replaces one still waiting.
+fn note_hotcue_edit(e: &mut Engine, deck: DeckId, slot: usize, set: bool) {
+    let i = deck.index();
+    let Some(load) = e.deck_loaded.get(i).copied().filter(|l| *l != 0) else { return };
+    let reported = e.deck_status.decks.get(i).filter(|d| d.load == load).map(|d| d.hot);
+    let before = match reported {
+        Some(hot) => hot.get(slot).copied().flatten(),
+        // Not reported yet: the deck holds the track's own cues.
+        None => e.deck_tracks.get(i).and_then(Option::as_ref).and_then(|t| t.cues.get(slot).copied().flatten()),
+    };
+    e.hotcue_edits.retain(|p| !(p.deck == i && p.slot == slot));
+    e.hotcue_edits.push(super::hotcues::PendingCue { deck: i, load, slot, set, before, reports: 0 });
 }
 
 fn loop_action(e: &Engine, cmd: &str, p: &Value, deck: DeckId) -> Result<LoopAction> {
@@ -340,10 +358,14 @@ struct Loaded {
     library: Option<&'static str>,
     /// Why mixforge's library couldn't be read.
     library_error: Option<String>,
-    /// The file's size and time when it was read (what its hot cues are kept under).
-    stamp: Option<(u64, i64)>,
+    /// What its hot cues are kept under.
+    id: Option<super::hotcues::TrackId>,
     /// Hot cues the user kept for it, put in their slots.
     user_cues: usize,
+    /// Cues kept for other audio the file's path held before.
+    user_cues_previous: Vec<Value>,
+    /// Its kept cues were found by fingerprint or under an old size and time: bring them up to date.
+    relink: bool,
     /// Where its key came from (`mik`, `mixforge`, `tag`), its energy (1–10) and where that came
     /// from.
     key_source: Option<&'static str>,
@@ -388,13 +410,18 @@ impl DeckLoadJob {
         }
         let t = &l.track;
         let out = json!({"deck": deck.id(), "path": t.path, "title": t.title, "artist": t.artist, "grid": t.grid_from, "bpm": t.bpm,
-            "key": t.key, "key_source": l.key_source, "energy": l.energy, "energy_source": l.energy_source, "grid_from": t.grid_from, "library": l.library, "library_error": l.library_error, "user_cues": l.user_cues, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
+            "key": t.key, "key_source": l.key_source, "energy": l.energy, "energy_source": l.energy_source, "grid_from": t.grid_from, "library": l.library, "library_error": l.library_error, "user_cues": l.user_cues, "user_cues_previous": l.user_cues_previous, "analysis_error": l.analysis_error, "cues_from": l.cues_from, "priming_ms": l.priming_ms,
             "can_key_lock": l.prepared.can_key_lock()});
         if let Some(slot) = e.deck_tracks.get_mut(deck.index()) {
             *slot = Some(Arc::clone(&l.track));
         }
         if let Some(f) = e.deck_files.get_mut(deck.index()) {
-            *f = l.stamp.map(|s| (t.path.clone(), s));
+            *f = l.id.clone().map(|id| (id, f64::from(rate)));
+        }
+        if let (true, Some(store), Some(id)) = (l.relink, e.hotcues.clone(), l.id.as_ref())
+            && let Err(err) = super::hotcues::relink(&store, id)
+        {
+            log::warn!("hot cues not brought up to date: {err}");
         }
         e.note_deck_load(deck, l.prepared.load());
         e.deck_loads.push((deck, l.prepared));
@@ -445,6 +472,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         0.0
     };
     drop(bytes);
+    let (fp, seconds) = decoded.fingerprint();
     let (buf, tag_key) = decoded.into_parts();
     let frames = i64::try_from(buf.frames()).unwrap_or(i64::MAX);
     let sr = f64::from(rate);
@@ -504,10 +532,12 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
     }
     let cues_from = cues_from.filter(|_| hot.iter().any(Option::is_some));
     // The user's own cues win their slots; the computed ones fill the rest.
-    let user_cues = match (plan.hotcues.as_deref(), stamp) {
-        (Some(store), Some(at)) => super::hotcues::stored(store, path, at).map_or(0, |s| super::hotcues::apply(&mut hot, &s, sr, frames as f64)),
-        _ => 0,
+    let id = stamp.map(|stamp| super::hotcues::TrackId { path: path.to_string(), stamp, fp, seconds });
+    let recalled = match (plan.hotcues.as_deref(), id.as_ref()) {
+        (Some(store), Some(id)) => super::hotcues::recall(store, id),
+        _ => Default::default(),
     };
+    let user_cues = recalled.cues.map_or(0, |s| super::hotcues::apply(&mut hot, &s, sr, frames as f64));
     // Key and energy: Mixed In Key's (the reference, as mixforge has it), else mixforge's, else
     // the tags MIK wrote (its comment, EnergyLevel) and TKEY.
     let (comment_key, comment_energy) = tags.comment.as_deref().map(super::library::mik_comment).unwrap_or_default();
@@ -545,8 +575,10 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         priming_ms: priming * 1000.0,
         library,
         library_error,
-        stamp,
+        id,
         user_cues,
+        user_cues_previous: recalled.previous,
+        relink: recalled.relink,
         key_source,
         energy,
         energy_source,
