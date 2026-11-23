@@ -224,10 +224,8 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
                 Some("release") => HotCueAction::Release,
                 Some(_) => return Err(bad(cmd, "`action` must be set, jump, release or clear")),
             };
-            if matches!(action, HotCueAction::Set | HotCueAction::Clear) {
-                note_hotcue_edit(e, deck, n - 1, action == HotCueAction::Set);
-            }
-            DeckCmd::HotCue { deck, n: n - 1, action }
+            let seq = if matches!(action, HotCueAction::Set | HotCueAction::Clear) { note_hotcue_edit(e, deck, n - 1) } else { 0 };
+            DeckCmd::HotCue { deck, n: n - 1, action, seq }
         }
         "deck.loop" => DeckCmd::Loop { deck, action: loop_action(e, cmd, p, deck)? },
         "deck.beatjump" => {
@@ -245,19 +243,17 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
     Ok(send(e, c))
 }
 
-/// A hot cue set or cleared: it is kept for the track once the deck reports where it landed
-/// (see [`Engine::set_deck_status`]); a later edit of the slot replaces one still waiting.
-fn note_hotcue_edit(e: &mut Engine, deck: DeckId, slot: usize, set: bool) {
-    let i = deck.index();
-    let Some(load) = e.deck_loaded.get(i).copied().filter(|l| *l != 0) else { return };
-    let reported = e.deck_status.decks.get(i).filter(|d| d.load == load).map(|d| d.hot);
-    let before = match reported {
-        Some(hot) => hot.get(slot).copied().flatten(),
-        // Not reported yet: the deck holds the track's own cues.
-        None => e.deck_tracks.get(i).and_then(Option::as_ref).and_then(|t| t.cues.get(slot).copied().flatten()),
-    };
-    e.hotcue_edits.retain(|p| !(p.deck == i && p.slot == slot));
-    e.hotcue_edits.push(super::hotcues::PendingCue { deck: i, load, slot, set, before, reports: 0 });
+/// A hot cue set or cleared: its number, sent with it. It is kept for the track once the deck
+/// reports it applied it (see [`Engine::set_deck_status`]); a later edit of the slot replaces one
+/// still waiting.
+fn note_hotcue_edit(e: &mut Engine, deck: DeckId, slot: usize) -> u64 {
+    e.hotcue_seq = e.hotcue_seq.wrapping_add(1).max(1);
+    let (i, seq) = (deck.index(), e.hotcue_seq);
+    if let Some(load) = e.deck_loaded.get(i).copied().filter(|l| *l != 0) {
+        e.hotcue_edits.retain(|p| !(p.deck == i && p.slot == slot));
+        e.hotcue_edits.push(super::hotcues::PendingCue { deck: i, load, slot, seq });
+    }
+    seq
 }
 
 fn loop_action(e: &Engine, cmd: &str, p: &Value, deck: DeckId) -> Result<LoopAction> {
@@ -460,7 +456,7 @@ struct LoadPlan {
 fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPlan, cancel: &AtomicBool) -> Result<Loaded> {
     let stamp = crate::io::size_and_mtime(path);
     let bytes = crate::io::read_file(path)?;
-    let decoded = crate::io::decode_import(&file_name(path), &bytes, rate)?;
+    let decoded = crate::io::decode_import_as(&file_name(path), &bytes, rate, true)?;
     let is_mp3 = std::path::Path::new(path).extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("mp3"));
     let tags = if is_mp3 { soundcraft_audio_io::mp3tags::read_basic(&bytes) } else { Default::default() };
     let priming = if is_mp3 {
@@ -472,7 +468,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         0.0
     };
     drop(bytes);
-    let (fp, seconds) = decoded.fingerprint();
+    let print = decoded.print().cloned();
     let (buf, tag_key) = decoded.into_parts();
     let frames = i64::try_from(buf.frames()).unwrap_or(i64::MAX);
     let sr = f64::from(rate);
@@ -532,7 +528,13 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
     }
     let cues_from = cues_from.filter(|_| hot.iter().any(Option::is_some));
     // The user's own cues win their slots; the computed ones fill the rest.
-    let id = stamp.map(|stamp| super::hotcues::TrackId { path: path.to_string(), stamp, fp, seconds });
+    let id = stamp.zip(print).map(|(stamp, p)| super::hotcues::TrackId {
+        path: path.to_string(),
+        stamp,
+        fp: p.fp,
+        seconds: p.seconds,
+        envelope: p.envelope,
+    });
     let recalled = match (plan.hotcues.as_deref(), id.as_ref()) {
         (Some(store), Some(id)) => super::hotcues::recall(store, id),
         _ => Default::default(),

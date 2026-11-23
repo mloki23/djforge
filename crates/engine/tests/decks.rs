@@ -313,7 +313,7 @@ fn deck_commands_queue_the_audio_engines_and_refuse_what_cant_be_done() {
         DeckCmd::Cue { deck: a, down: false },
         DeckCmd::Seek { deck: a, at: 72_000.0 },
         DeckCmd::Pitch { deck: a, value: 0.04, range: Some(0.16) },
-        DeckCmd::HotCue { deck: a, n: 1, action: HotCueAction::Set },
+        DeckCmd::HotCue { deck: a, n: 1, action: HotCueAction::Set, seq: 1 },
         DeckCmd::Loop { deck: a, action: LoopAction::Beats(0.25) },
         DeckCmd::Loop { deck: a, action: LoopAction::Halve },
         DeckCmd::BeatJump { deck: a, beats: -4.0 },
@@ -366,14 +366,23 @@ fn arrangement_play_and_deck_play_say_that_the_other_stops() {
 
 /// The deck reports its track's own cues, with `edit` applied (slot, source samples or cleared).
 fn report(e: &mut Engine, deck: usize, edits: &[(usize, Option<f64>)]) {
+    let applied = deck_cmds(e).iter().filter_map(|c| if let DeckCmd::HotCue { seq, .. } = c { Some(*seq) } else { None }).max();
     let mut st = e.deck_status;
     st.decks[deck].load = e.deck_loads.last().unwrap().1.load();
     if st.decks[deck].load != e.deck_status.decks[deck].load {
         st.decks[deck].hot = e.deck_tracks[deck].clone().unwrap().cues;
     }
+    st.decks[deck].hot_seq = st.decks[deck].hot_seq.max(applied.unwrap_or(0));
     for (slot, at) in edits {
         st.decks[deck].hot[*slot] = *at;
     }
+    e.set_deck_status(st);
+}
+
+/// The fake audio thread is late: it publishes its state as before, the edits queued unapplied.
+fn report_late(e: &mut Engine, deck: usize) {
+    let mut st = e.deck_status;
+    st.decks[deck].load = e.deck_loads.last().unwrap().1.load();
     e.set_deck_status(st);
 }
 
@@ -413,10 +422,21 @@ fn hot_cues_set_or_cleared_are_kept_per_track_and_win_their_slots() {
     // Clear C and set F: each kept once the deck shows it.
     run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 3, "action": "clear"}));
     run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 6, "action": "set"}));
-    report(&mut e, 0, &[(0, Some(10.0 * sr))]);
-    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0}), "not landed yet");
+    report_late(&mut e, 0);
+    assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0}), "not applied yet");
     report(&mut e, 0, &[(0, Some(10.0 * sr)), (2, None), (5, Some(5.0 * sr))]);
     assert_eq!(only_entry(&store)["cues"], json!({"1": 10.0, "3": null, "6": 5.0}));
+    // A prefilled slot set again while the audio thread is late (its state, the old cue, comes
+    // frame after frame): the old position is never kept, the new one is once it is applied.
+    run(&mut e, "deck.hotcue", json!({"deck": "a", "n": 1, "action": "set"}));
+    let queued = std::mem::take(&mut e.transport_requests);
+    for _ in 0..50 {
+        report_late(&mut e, 0);
+    }
+    assert_eq!(only_entry(&store)["cues"]["1"], 10.0);
+    e.transport_requests = queued;
+    report(&mut e, 0, &[(0, Some(12.0 * sr))]);
+    assert_eq!(only_entry(&store)["cues"]["1"], 12.0);
     // Loaded again (another run): the user's cues win their slots, the computed ones fill the rest.
     let mut again = engine();
     setup(&mut again);
@@ -424,7 +444,7 @@ fn hot_cues_set_or_cleared_are_kept_per_track_and_win_their_slots() {
     let v = wait(&mut again).remove(0);
     assert_eq!((v["user_cues"].as_u64(), v["user_cues_previous"].clone()), (Some(3), json!([])));
     let cues = again.deck_tracks[1].clone().unwrap().cues;
-    assert_eq!(cues[..6], [Some(10.0 * sr), computed[1], None, computed[3], computed[4], Some(5.0 * sr)]);
+    assert_eq!(cues[..6], [Some(12.0 * sr), computed[1], None, computed[3], computed[4], Some(5.0 * sr)]);
     // A store that isn't JSON is moved aside, not lost, and a new one written.
     std::fs::write(&store, "not json").unwrap();
     run(&mut again, "deck.hotcue", json!({"deck": "b", "n": 8, "action": "set"}));
@@ -490,4 +510,71 @@ fn hot_cues_survive_a_retag_and_a_rename_and_audio_changes_never_lose_them() {
     assert_eq!(now["cues"], json!({"1": 1.0}));
     assert_eq!(now["previous"][0]["cues"], json!({"1": 0.25, "2": 0.5}), "never deleted: {now}");
     assert!(now["previous"][0]["until"].is_u64());
+}
+
+/// A WAV of `secs` of tone at `RATE`, with `change` applied to each (frame, sample) first.
+fn wav_with(dir: &Path, name: &str, secs: f64, change: impl Fn(usize, f32) -> f32) -> PathBuf {
+    let frames = (secs * f64::from(RATE)) as usize;
+    let channels = (0..2).map(|_| (0..frames).map(|k| change(k, (0.2 * (k as f64 * 0.05).sin()) as f32)).collect()).collect();
+    let buf = AudioBuffer { sample_rate: RATE, channels };
+    let mut bytes = wav_float_header(2, RATE, frames as u64).unwrap();
+    bytes.extend(buf.interleaved().iter().flat_map(|x| x.to_le_bytes()));
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn set_cue(e: &mut Engine, path: &Path, deck: &str, secs: f64) -> Value {
+    run(e, "deck.load", json!({"path": path, "deck": deck}));
+    let v = wait(e).remove(0);
+    let i = if deck == "a" { 0 } else { 1 };
+    run(e, "deck.hotcue", json!({"deck": deck, "n": 1, "action": "set"}));
+    report(e, i, &[(0, Some(secs * f64::from(RATE)))]);
+    v
+}
+
+#[test]
+fn a_clean_and_a_dirty_edit_and_two_copies_each_keep_their_own_cues() {
+    let dir = Scratch::new("editions");
+    let store = dir.0.join("cue-store.json");
+    // The same length and first 30 s; the dirty edit's word at 40 s isn't muted.
+    let clean = wav_with(&dir.0, "clean.wav", 45.0, |k, x| if (40 * RATE as usize..41 * RATE as usize).contains(&k) { 0.0 } else { x });
+    let dirty = wav_with(&dir.0, "dirty.wav", 45.0, |_, x| x);
+    let mut e = engine();
+    e.set_hotcue_store(store.clone());
+    set_cue(&mut e, &clean, "a", 2.0);
+    let v = set_cue(&mut e, &dirty, "b", 3.0);
+    assert_eq!(v["user_cues"], 0, "the dirty edit isn't the clean one: {v}");
+    assert_eq!(kept(&store)["tracks"].as_object().unwrap().len(), 2);
+    // A copy in another folder (the first still there): it starts with the first's cues, as an
+    // entry of its own, and each keeps its own from then on.
+    std::fs::create_dir_all(dir.0.join("usb")).unwrap();
+    let copy = dir.0.join("usb").join("clean.wav");
+    std::fs::copy(&clean, &copy).unwrap();
+    let v = set_cue(&mut e, &copy, "a", 4.0);
+    assert_eq!(v["user_cues"], 1, "{v}");
+    let tracks = kept(&store)["tracks"].as_object().unwrap().clone();
+    assert_eq!(tracks.len(), 3, "{tracks:?}");
+    let cue_of = |p: &Path| tracks.values().find(|t| t["path"] == json!(p)).unwrap()["cues"]["1"].clone();
+    assert_eq!((cue_of(&clean), cue_of(&copy), cue_of(&dirty)), (json!(2.0), json!(4.0), json!(3.0)));
+}
+
+#[test]
+fn another_decoders_last_bits_keep_the_cues() {
+    let dir = Scratch::new("decoder");
+    let store = dir.0.join("cue-store.json");
+    let path = wav_with(&dir.0, "track.wav", 8.0, |_, x| x);
+    let mut e = engine();
+    e.set_hotcue_store(store.clone());
+    set_cue(&mut e, &path, "a", 1.5);
+    let before = only_entry(&store);
+    // The same audio decoded a hair differently: 1 LSB of 16 bits of noise.
+    let lsb = 1.0 / 32768.0;
+    wav_with(&dir.0, "track.wav", 8.0, |k, x| x + if k % 3 == 0 { lsb } else { -lsb });
+    run(&mut e, "deck.load", json!({"path": path, "deck": "b"}));
+    let v = wait(&mut e).remove(0);
+    assert_eq!((v["user_cues"].as_u64(), v["user_cues_previous"].clone()), (Some(1), json!([])), "{v}");
+    let after = only_entry(&store);
+    assert_ne!(after["fp"], before["fp"], "the hash was brought up to date");
+    assert_eq!((after["cues"].clone(), after.get("previous")), (json!({"1": 1.5}), None), "nothing demoted");
 }

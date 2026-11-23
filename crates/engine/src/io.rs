@@ -568,10 +568,8 @@ pub(crate) struct DecodedImport {
     ext: Option<String>,
     /// The Camelot key in an MP3's `TKEY` tag, when it holds a recognised one.
     key: Option<String>,
-    /// The audio's fingerprint and length (seconds), as decoded at the file's own rate: the same
-    /// whatever its tags and the session's rate (see [`audio_fingerprint`]).
-    fingerprint: u64,
-    seconds: f64,
+    /// The audio's print, when asked for (see [`audio_print`]).
+    print: Option<AudioPrint>,
 }
 
 impl DecodedImport {
@@ -581,46 +579,77 @@ impl DecodedImport {
         (self.buf, self.key)
     }
 
-    /// The audio's fingerprint and length in seconds (see [`audio_fingerprint`]).
-    pub(crate) fn fingerprint(&self) -> (u64, f64) {
-        (self.fingerprint, self.seconds)
+    /// The audio's print, when [`decode_import_as`] was asked for it.
+    pub(crate) fn print(&self) -> Option<&AudioPrint> {
+        self.print.as_ref()
     }
 }
 
-/// Seconds of audio [`audio_fingerprint`] hashes.
-const FINGERPRINT_SECONDS: usize = 30;
+/// What tells one recording from another whatever its tags (see [`audio_print`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AudioPrint {
+    /// A hash of all of the audio, quantised to 16 bits.
+    pub fp: u64,
+    /// Its length in seconds.
+    pub seconds: f64,
+    /// Its loudness second by second: RMS in whole dB, floored at [`ENVELOPE_FLOOR_DB`]. Coarse
+    /// enough that another decoder's last bits don't change it.
+    pub envelope: Vec<i8>,
+}
 
-/// What tells one recording from another whatever its tags: an FNV-1a hash of `buf`'s rate,
-/// channel count and length in frames, then its first 30 seconds quantised to 16 bits (decoded
-/// at the file's own rate, so the session's rate doesn't matter). Retagging a file (Mixed In Key
-/// writes its key and energy) keeps it; other audio changes it.
-pub(crate) fn audio_fingerprint(buf: &AudioBuffer) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |bytes: &[u8]| {
-        for b in bytes {
-            h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
+/// The quietest an envelope step goes (dB RMS): dither and a decoder's last bits sit below it.
+pub(crate) const ENVELOPE_FLOOR_DB: i8 = -60;
+
+/// The print of `buf` (decoded at the file's own rate, so the session's rate doesn't matter):
+/// a hash of its rate, channel count, length and every sample quantised to 16 bits (one
+/// multiply a sample: a 6-minute stereo track takes tens of milliseconds), and its envelope.
+/// Retagging a file (Mixed In Key writes its key and energy) keeps it; other audio anywhere in
+/// the file (a clean edit's muted word) changes the hash.
+pub(crate) fn audio_print(buf: &AudioBuffer) -> AudioPrint {
     let frames = buf.frames();
-    eat(&buf.sample_rate.to_le_bytes());
-    eat(&(buf.num_channels() as u64).to_le_bytes());
-    eat(&(frames as u64).to_le_bytes());
-    let n = frames.min(FINGERPRINT_SECONDS.saturating_mul(buf.sample_rate as usize));
-    for k in 0..n {
-        for ch in &buf.channels {
-            let x = ch.get(k).copied().unwrap_or(0.0);
+    let rate = buf.sample_rate.max(1);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |v: u64| h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+    eat(u64::from(buf.sample_rate));
+    eat(buf.num_channels() as u64);
+    eat(frames as u64);
+    for ch in &buf.channels {
+        for x in ch {
             let q = if x.is_finite() { (x.clamp(-1.0, 1.0) * 32767.0).round() as i16 } else { 0 };
-            eat(&q.to_le_bytes());
+            eat(u64::from(q as u16));
         }
     }
-    h
+    let second = rate as usize;
+    let seconds_n = frames.div_ceil(second);
+    let mut envelope = Vec::with_capacity(seconds_n);
+    for s in 0..seconds_n {
+        let (from, to) = (s * second, ((s + 1) * second).min(frames));
+        let (mut sum, mut n) = (0.0f64, 0usize);
+        for ch in &buf.channels {
+            for x in ch.get(from..to.min(ch.len())).unwrap_or_default() {
+                if x.is_finite() {
+                    sum += f64::from(*x) * f64::from(*x);
+                    n += 1;
+                }
+            }
+        }
+        let db = if n == 0 || sum <= 0.0 { f64::from(ENVELOPE_FLOOR_DB) } else { 10.0 * (sum / n as f64).log10() };
+        envelope.push(db.round().clamp(f64::from(ENVELOPE_FLOOR_DB), 0.0) as i8);
+    }
+    AudioPrint { fp: h, seconds: frames as f64 / f64::from(rate), envelope }
 }
 
 /// Decodes the file `name` (`bytes`) at the session rate `rate`, as an import does.
 pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<DecodedImport> {
+    decode_import_as(name, bytes, rate, false)
+}
+
+/// [`decode_import`], also taking the audio's print when `print` (a live deck's track: its hot
+/// cues are kept under it).
+pub(crate) fn decode_import_as(name: &str, bytes: &[u8], rate: u32, print: bool) -> Result<DecodedImport> {
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (info, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
-    let (fingerprint, seconds) = (audio_fingerprint(&buf), buf.frames() as f64 / f64::from(buf.sample_rate.max(1)));
+    let print = print.then(|| audio_print(&buf));
     let buf = at_rate(buf, rate, MAX_IMPORT_SAMPLES).ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
@@ -630,7 +659,7 @@ pub(crate) fn decode_import(name: &str, bytes: &[u8], rate: u32) -> Result<Decod
         .then(|| soundcraft_audio_io::mp3tags::read_basic(bytes).key)
         .flatten()
         .and_then(|k| soundcraft_model::camelot_of(&k));
-    Ok(DecodedImport { info, buf, ext, key, fingerprint, seconds })
+    Ok(DecodedImport { info, buf, ext, key, print })
 }
 
 /// Adds decoded audio as a new source, as [`import_source_bytes`] does.
@@ -3467,6 +3496,29 @@ mod in_place_tests {
 #[cfg(test)]
 mod decoded_tests {
     use super::*;
+
+    /// The print of a 6-minute stereo track at 44.1 kHz: its time on the load thread, and that
+    /// a change anywhere in it, even at the end, changes the hash but not the envelope.
+    #[test]
+    fn a_print_covers_all_of_the_audio_quickly() {
+        let frames = 6 * 60 * 44_100;
+        let mut buf = AudioBuffer {
+            sample_rate: 44_100,
+            channels: (0..2).map(|c| (0..frames).map(|k| ((k + c) as f32 * 0.01).sin() * 0.5).collect()).collect(),
+        };
+        let started = std::time::Instant::now();
+        let a = audio_print(&buf);
+        let took = started.elapsed();
+        println!("audio_print: 6 min stereo 44.1 kHz in {took:?}");
+        let budget = if cfg!(debug_assertions) { 1000 } else { 100 };
+        assert!(took.as_millis() < budget, "{took:?}");
+        assert_eq!(a.envelope.len(), 360);
+        buf.channels[1][frames - 10] += 0.1;
+        let b = audio_print(&buf);
+        assert_ne!(a.fp, b.fp);
+        assert_eq!(a.envelope, b.envelope);
+        assert_eq!(a.seconds, 360.0);
+    }
 
     /// A file that could not be decoded once (caught mid-write) is not remembered as other
     /// audio: once it holds the audio again, at the same size and time, it decodes to it.

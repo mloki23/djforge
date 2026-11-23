@@ -679,6 +679,9 @@ pub enum DeckCmd {
         deck: DeckId,
         n: usize,
         action: HotCueAction,
+        /// The edit's number (set and clear): the deck reports the last it applied
+        /// ([`DeckState::hot_seq`]), so the UI knows where the edit landed. 0 for none.
+        seq: u64,
     },
     Loop {
         deck: DeckId,
@@ -748,6 +751,8 @@ pub struct DeckState {
     pub phase_error: Option<f64>,
     pub cue: f64,
     pub hot: [Option<f64>; HOT_CUES],
+    /// The last hot cue edit (set or clear) applied: its `seq` ([`DeckCmd::HotCue`]).
+    pub hot_seq: u64,
     pub loop_in: Option<f64>,
     pub loop_out: Option<f64>,
     pub loop_on: bool,
@@ -774,7 +779,7 @@ pub struct DecksState {
 }
 
 /// Words per deck in a [`DecksState`]'s encoding.
-const DECK_WORDS: usize = 27;
+const DECK_WORDS: usize = 28;
 /// Words in a [`DecksState`]'s encoding (for lock-free publishing).
 pub const STATE_WORDS: usize = DECKS * DECK_WORDS + 5;
 
@@ -832,6 +837,7 @@ impl DecksState {
             for h in d.hot {
                 put(opt(h));
             }
+            put(d.hot_seq);
             for v in [opt(d.loop_in), opt(d.loop_out), f32w(d.level[0]), f32w(d.level[1]), f32w(d.trim_db)] {
                 put(v);
             }
@@ -882,6 +888,7 @@ impl DecksState {
             for h in d.hot.iter_mut() {
                 *h = unopt(get());
             }
+            d.hot_seq = get();
             d.loop_in = unopt(get());
             d.loop_out = unopt(get());
             d.level = [wf32(get()), wf32(get())];
@@ -952,6 +959,8 @@ pub(crate) struct Deck {
     playhead: f64,
     cue: f64,
     hot: [Option<f64>; HOT_CUES],
+    /// The last hot cue edit applied (its `seq`).
+    hot_seq: u64,
     lp: LoopSpan,
     /// A quantised jump waiting for its beat: (at, to), source samples.
     pending: Option<(f64, f64)>,
@@ -1001,6 +1010,7 @@ impl Deck {
             playhead: 0.0,
             cue: 0.0,
             hot: [None; HOT_CUES],
+            hot_seq: 0,
             lp: LoopSpan::default(),
             pending: None,
             shadowing: false,
@@ -1411,7 +1421,7 @@ impl Deck {
         }
     }
 
-    fn hot_cue(&mut self, n: usize, action: HotCueAction, quantise: bool, clock: u64, xf: usize) {
+    fn hot_cue(&mut self, n: usize, action: HotCueAction, seq: u64, quantise: bool, clock: u64, xf: usize) {
         if self.loaded.is_none() {
             return;
         }
@@ -1422,11 +1432,13 @@ impl Deck {
                 if let Some(h) = self.hot.get_mut(n) {
                     *h = Some(at);
                 }
+                self.hot_seq = self.hot_seq.max(seq);
             }
             HotCueAction::Clear => {
                 if let Some(h) = self.hot.get_mut(n) {
                     *h = None;
                 }
+                self.hot_seq = self.hot_seq.max(seq);
             }
             HotCueAction::Release => self.release(xf),
             HotCueAction::Jump => {
@@ -1607,6 +1619,7 @@ impl Deck {
             phase_error: self.phase_err,
             cue: self.cue,
             hot: self.hot,
+            hot_seq: self.hot_seq,
             loop_in: self.lp.a,
             loop_out: self.lp.b,
             loop_on: self.lp.on,
@@ -1905,9 +1918,9 @@ impl Decks {
                     d.jump(target, xf);
                 }
             }
-            DeckCmd::HotCue { deck, n, action } => {
+            DeckCmd::HotCue { deck, n, action, seq } => {
                 if let Some(d) = self.deck(deck) {
-                    d.hot_cue(n, action, q, clock, xf);
+                    d.hot_cue(n, action, seq, q, clock, xf);
                 }
             }
             DeckCmd::Loop { deck, action } => {
@@ -2438,12 +2451,12 @@ mod tests {
         let a = DeckId::A;
         // Hot cue 3 on beat 8, set from a little off it (snapped).
         d.apply(DeckCmd::Seek { deck: a, at: 8.0 * 22_500.0 + 700.0 });
-        d.apply(DeckCmd::HotCue { deck: a, n: 3, action: HotCueAction::Set });
+        d.apply(DeckCmd::HotCue { deck: a, n: 3, action: HotCueAction::Set, seq: 0 });
         assert_eq!(d.state().decks[0].hot[3], Some(180_000.0));
         // Playing from 1.4 beats, jump: it lands on the next beat (beat 2's moment).
         d.apply(DeckCmd::Seek { deck: a, at: 1.4 * 22_500.0 });
         d.apply(DeckCmd::Play(a));
-        d.apply(DeckCmd::HotCue { deck: a, n: 3, action: HotCueAction::Jump });
+        d.apply(DeckCmd::HotCue { deck: a, n: 3, action: HotCueAction::Jump, seq: 0 });
         let out = raw(&mut d, 0, 120);
         let first_click = out.iter().position(|v| *v > 0.5).unwrap();
         // Beat 2 would have sounded 0.6 beats in; the cue's click (beat 8) sounds there instead.
@@ -2460,13 +2473,13 @@ mod tests {
         load(&mut d, DeckId::A, &t);
         let a = DeckId::A;
         d.apply(DeckCmd::Seek { deck: a, at: 45_000.0 });
-        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Set });
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Set, seq: 0 });
         d.apply(DeckCmd::Seek { deck: a, at: 200_000.0 });
-        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Jump });
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Jump, seq: 0 });
         let s = d.state().decks[0];
         assert!(s.playing && s.previewing && s.position == 45_000.0);
         raw(&mut d, 0, 4);
-        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Release });
+        d.apply(DeckCmd::HotCue { deck: a, n: 0, action: HotCueAction::Release, seq: 0 });
         let s = d.state().decks[0];
         assert!(!s.playing && s.position == 45_000.0);
     }
@@ -2802,12 +2815,12 @@ mod tests {
         load(&mut d, DeckId::A, &t);
         d.apply(DeckCmd::MasterTempo { deck: DeckId::A, on: true });
         d.apply(DeckCmd::Seek { deck: DeckId::A, at: 8.0 * 22_500.0 });
-        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Set });
+        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Set, seq: 0 });
         d.apply(DeckCmd::Seek { deck: DeckId::A, at: 1.05 * 22_500.0 });
         d.apply(DeckCmd::Play(DeckId::A));
         raw(&mut d, 0, 2);
         d.take_stretched();
-        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Jump });
+        d.apply(DeckCmd::HotCue { deck: DeckId::A, n: 0, action: HotCueAction::Jump, seq: 0 });
         let mut out = Vec::new();
         for _ in 0..120 {
             out.extend(raw(&mut d, 0, 1));
@@ -2936,9 +2949,9 @@ mod tests {
             DeckCmd::MasterTempo { deck: DeckId::B, on: true },
             DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Beats(0.25) },
             DeckCmd::Jog { deck: DeckId::B, delta: 0.5, mode: JogMode::Nudge },
-            DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Set },
+            DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Set, seq: 0 },
             DeckCmd::BeatJump { deck: DeckId::B, beats: -4.0 },
-            DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Jump },
+            DeckCmd::HotCue { deck: DeckId::B, n: 0, action: HotCueAction::Jump, seq: 0 },
             DeckCmd::Seek { deck: DeckId::B, at: 300_000.0 },
             DeckCmd::Filter { deck: DeckId::A, value: -0.7 },
             DeckCmd::Loop { deck: DeckId::A, action: LoopAction::Double },

@@ -415,7 +415,26 @@ fn read_snapshot(db: Option<&Path>, mik_db: Option<&Path>, old: Option<&Snapshot
         (None, Some(o)) => return Snapshot { mik, mik_error, from_copy, error, tracks: Arc::clone(&o.tracks), by_key: Arc::clone(&o.by_key) },
         (None, None) => Vec::new(),
     };
-    let by_key: HashMap<String, usize> = tracks.iter().enumerate().map(|(i, t)| (path_key(&t.path), i)).collect();
+    // One row per file: two spellings of one path (case, separators) keep the current analysis.
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<LibraryTrack> = Vec::with_capacity(tracks.len());
+    for t in tracks {
+        match by_key.get(&path_key(&t.path)).copied() {
+            Some(i) => {
+                if let Some(old) = kept.get_mut(i)
+                    && old.version != Some(db::ANALYSIS_VERSION)
+                    && t.version == Some(db::ANALYSIS_VERSION)
+                {
+                    *old = t;
+                }
+            }
+            None => {
+                by_key.insert(path_key(&t.path), kept.len());
+                kept.push(t);
+            }
+        }
+    }
+    let tracks = kept;
     Snapshot { tracks: Arc::new(tracks), by_key: Arc::new(by_key), mik, from_copy, error, mik_error }
 }
 

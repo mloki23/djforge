@@ -3,13 +3,17 @@
 //! ([`Engine::set_hotcue_store`]; tests give a temporary one).
 //!
 //! A track is its audio: an entry holds the file's path, its size and time when last seen, and
-//! its audio fingerprint (`fp`, see [`crate::io::audio_fingerprint`]: the decoded audio, so tags
-//! don't count). Loading a file finds its entry
+//! its audio print (see [`crate::io::audio_print`]: a hash of all of the decoded audio, so tags
+//! don't count, its length and its second-by-second loudness, `env`). Loading a file finds its
+//! entry
 //!
-//! - at its path, when the fingerprint is the same (a retag, which changes the size and time,
-//!   keeps the cues; the size and time are brought up to date), or for an entry made before
-//!   fingerprints, when the size and time are the same or the length within 0.05 s;
-//! - else anywhere by fingerprint (the file was moved or renamed: the entry follows it).
+//! - at its path, when the hash is the same (a retag, which changes the size and time, keeps the
+//!   cues; the size and time are brought up to date); or when the hash differs but the length is
+//!   within 0.05 s and the envelope matches (another decoder's last bits: the hash is brought up
+//!   to date); or, for an entry made before fingerprints, when the size and time are the same or
+//!   the length within 0.05 s;
+//! - else anywhere by hash: the file was moved or renamed, and the entry follows it, or (the
+//!   file it was for still being there) a copy of it was made, and the copy gets its own entry.
 //!
 //! Nothing is ever dropped: an entry at a path whose audio changed goes to that path's
 //! `previous` list when the new audio's cues are first kept, and `deck.load` reports the
@@ -21,7 +25,7 @@
 //!
 //! ```json
 //! {"version": 2, "tracks": {"<path key>": {"path": "...", "size": 123, "mtime": 1700000000,
-//!   "fp": "0123456789abcdef", "seconds": 312.5, "cues": {"1": 12.5, "3": null},
+//!   "fp": "0123456789abcdef", "seconds": 312.5, "env": [-14, -12, …], "cues": {"1": 12.5, "3": null},
 //!   "previous": [{"size": 120, "mtime": 1600000000, "fp": "...", "seconds": 300.0,
 //!                 "cues": {"1": 8.0}, "until": 1700000500}]}}}
 //! ```
@@ -48,6 +52,8 @@ pub(crate) struct TrackId {
     pub fp: u64,
     /// Its length in seconds.
     pub seconds: f64,
+    /// Its loudness second by second (see [`crate::io::AudioPrint`]).
+    pub envelope: Vec<i8>,
 }
 
 impl TrackId {
@@ -76,13 +82,29 @@ fn stamp_of(e: &Value) -> Option<(u64, i64)> {
     Some((e.get("size")?.as_u64()?, e.get("mtime")?.as_i64()?))
 }
 
+/// Whether two envelopes are of the same audio: their lengths within a second, and each second
+/// within 1 dB (a step's rounding).
+fn same_envelope(e: &Value, envelope: &[i8]) -> bool {
+    let Some(stored) = e.get("env").and_then(Value::as_array) else { return false };
+    stored.len().abs_diff(envelope.len()) <= 1
+        && !envelope.is_empty()
+        && stored.iter().zip(envelope).all(|(a, b)| a.as_i64().is_some_and(|a| a.abs_diff(i64::from(*b)) <= 1))
+}
+
 /// Whether the entry `e` (at the track's own path) is of the track's audio.
 fn same_audio(e: &Value, id: &TrackId) -> bool {
+    let same_length = e.get("seconds").and_then(Value::as_f64).is_some_and(|s| (s - id.seconds).abs() <= SAME_LENGTH_S);
     match e.get("fp").and_then(Value::as_str) {
-        Some(fp) => fp == id.fp_text(),
+        // Another hash of the same length and loudness: another decoder of the same audio.
+        Some(fp) => fp == id.fp_text() || (same_length && same_envelope(e, &id.envelope)),
         // Made before fingerprints: the same size and time, or the same length.
-        None => stamp_of(e) == Some(id.stamp) || e.get("seconds").and_then(Value::as_f64).is_some_and(|s| (s - id.seconds).abs() <= SAME_LENGTH_S),
+        None => stamp_of(e) == Some(id.stamp) || same_length,
     }
+}
+
+/// Whether the file the entry `e` was kept for is still there.
+fn still_there(e: &Value) -> bool {
+    e.get("path").and_then(Value::as_str).is_some_and(crate::io::file_found)
 }
 
 /// The key of the entry for the track: at its path when of its audio, else any of its
@@ -165,7 +187,19 @@ pub(crate) fn save(store: &Path, id: &TrackId, changes: &[(usize, Option<f64>)])
         let Some(tracks) = tracks.as_object_mut() else { return Err(EngineError::Io(format!("{}: no tracks", store.display()))) };
         let here = super::library::path_key(&id.path);
         let found = find(tracks, id);
-        let mut entry = found.as_ref().and_then(|k| tracks.remove(k)).unwrap_or_else(|| json!({}));
+        // Found elsewhere by its hash: moved there, unless its file is still where it was (this
+        // is a copy, which gets an entry of its own).
+        let mut entry = match &found {
+            Some(k) if *k != here && tracks.get(k).is_some_and(still_there) => {
+                let mut copy = tracks.get(k).cloned().unwrap_or_else(|| json!({}));
+                if let Some(o) = copy.as_object_mut() {
+                    o.remove("previous");
+                }
+                copy
+            }
+            Some(k) => tracks.remove(k).unwrap_or_else(|| json!({})),
+            None => json!({}),
+        };
         // What the path held for other audio is kept, as previous.
         let mut previous: Vec<Value> = entry.get("previous").and_then(Value::as_array).cloned().unwrap_or_default();
         if found.as_deref() != Some(here.as_str())
@@ -192,6 +226,7 @@ pub(crate) fn save(store: &Path, id: &TrackId, changes: &[(usize, Option<f64>)])
             o.insert("mtime".into(), json!(id.stamp.1));
             o.insert("fp".into(), json!(id.fp_text()));
             o.insert("seconds".into(), json!(id.seconds));
+            o.insert("env".into(), json!(id.envelope));
             o.insert("cues".into(), Value::Object(cues));
             if previous.is_empty() {
                 o.remove("previous");
@@ -231,40 +266,23 @@ pub(crate) fn apply(hot: &mut [Option<f64>; HOT_CUES], stored: &Stored, rate: f6
     n
 }
 
-/// A hot cue set or cleared on a deck, waiting for the deck to report where it landed (a set
-/// cue snaps to the beat on the audio thread).
+/// A hot cue set or cleared on a deck, waiting for the deck to report it applied the edit (a
+/// set cue snaps to the beat on the audio thread, which may be late to report).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingCue {
     pub deck: usize,
     /// The deck's load the edit was made on.
     pub load: u64,
     pub slot: usize,
-    pub set: bool,
-    /// The slot before the edit (source samples), to see the edit land.
-    pub before: Option<f64>,
-    /// Reports of the load seen since.
-    pub reports: u32,
+    /// The edit's number, as sent with it.
+    pub seq: u64,
 }
 
-/// Reports after which a set cue that landed where the slot already was is taken as landed.
-const SAME_PLACE_REPORTS: u32 = 3;
-/// Reports after which an edit that never showed is given up.
-const GIVE_UP_REPORTS: u32 = 200;
-
 impl PendingCue {
-    /// The edit's result in `hot` once it has landed: `Some(cue)` (or `Some(None)` for cleared);
-    /// `None` while it hasn't.
-    pub(crate) fn landed(&self, hot: &[Option<f64>; HOT_CUES]) -> Option<Option<f64>> {
-        let now = hot.get(self.slot).copied().flatten();
-        match (self.set, now) {
-            (false, None) => Some(None),
-            (true, Some(at)) if Some(at) != self.before || self.reports >= SAME_PLACE_REPORTS => Some(Some(at)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn given_up(&self) -> bool {
-        self.reports >= GIVE_UP_REPORTS
+    /// The edit's result once the deck reports it applied it (`hot_seq` at or past the edit's):
+    /// the slot as it shows then (`Some(None)` for empty); `None` before.
+    pub(crate) fn landed(&self, hot: &[Option<f64>; HOT_CUES], hot_seq: u64) -> Option<Option<f64>> {
+        (hot_seq >= self.seq).then(|| hot.get(self.slot).copied().flatten())
     }
 }
 
@@ -273,7 +291,7 @@ mod tests {
     use super::*;
 
     fn id() -> TrackId {
-        TrackId { path: "/m/a.mp3".into(), stamp: (100, 5), fp: 0xabc, seconds: 300.0 }
+        TrackId { path: "/m/a.mp3".into(), stamp: (100, 5), fp: 0xabc, seconds: 300.0, envelope: vec![-20, -12, -60] }
     }
 
     #[test]
@@ -285,21 +303,19 @@ mod tests {
         // With a fingerprint, only the fingerprint counts.
         assert!(same_audio(&json!({"size": 1, "mtime": 1, "fp": "0000000000000abc"}), &id()));
         assert!(!same_audio(&json!({"size": 100, "mtime": 5, "fp": "0000000000000abd"}), &id()));
+        // Another hash, the same length and loudness (within a step): another decoder.
+        assert!(same_audio(&json!({"fp": "0000000000000abd", "seconds": 300.02, "env": [-21, -12, -60]}), &id()));
+        assert!(!same_audio(&json!({"fp": "0000000000000abd", "seconds": 300.02, "env": [-23, -12, -60]}), &id()));
+        assert!(!same_audio(&json!({"fp": "0000000000000abd", "seconds": 300.5, "env": [-20, -12, -60]}), &id()));
     }
 
     #[test]
-    fn an_edit_lands_when_the_deck_shows_it() {
+    fn an_edit_lands_when_the_deck_says_it_applied_it() {
         let mut hot = [None; HOT_CUES];
-        let mut p = PendingCue { deck: 0, load: 1, slot: 0, set: true, before: Some(5.0), reports: 1 };
         hot[0] = Some(5.0);
-        assert_eq!(p.landed(&hot), None, "not moved yet");
-        hot[0] = Some(7.0);
-        assert_eq!(p.landed(&hot), Some(Some(7.0)));
-        hot[0] = Some(5.0);
-        p.reports = SAME_PLACE_REPORTS;
-        assert_eq!(p.landed(&hot), Some(Some(5.0)), "set where it already was");
-        let c = PendingCue { set: false, ..p };
-        assert_eq!(c.landed(&hot), None);
-        assert_eq!(c.landed(&[None; HOT_CUES]), Some(None));
+        let p = PendingCue { deck: 0, load: 1, slot: 0, seq: 7 };
+        assert_eq!(p.landed(&hot, 6), None, "not applied yet, whatever the slot shows");
+        assert_eq!(p.landed(&hot, 7), Some(Some(5.0)), "applied: set where it already was");
+        assert_eq!(p.landed(&[None; HOT_CUES], 9), Some(None));
     }
 }

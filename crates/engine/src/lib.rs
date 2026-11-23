@@ -243,6 +243,8 @@ pub struct Engine {
     deck_files: [Option<(cmd::hotcues::TrackId, f64)>; 2],
     /// Hot cues set or cleared on the decks, waiting to be reported where they landed.
     pub(crate) hotcue_edits: Vec<cmd::hotcues::PendingCue>,
+    /// The last hot cue edit's number.
+    pub(crate) hotcue_seq: u64,
 }
 
 impl Default for Engine {
@@ -294,6 +296,7 @@ impl Engine {
             hotcues: None,
             deck_files: [None, None],
             hotcue_edits: Vec::new(),
+            hotcue_seq: 0,
         }
     }
 
@@ -332,8 +335,9 @@ impl Engine {
     /// describes a track the audio thread lacks.
     ///
     /// A hot cue set or cleared with `deck.hotcue` is kept for the track (see
-    /// [`Engine::set_hotcue_store`]) once a report shows where it landed (a set cue snaps to the
-    /// beat on the audio thread). Nothing else a report shows is kept.
+    /// [`Engine::set_hotcue_store`]) once a report says the deck applied it (its `hot_seq`), as
+    /// the slot shows then (a set cue snaps to the beat on the audio thread). Edits wait as long
+    /// as the deck holds the load they were made on. Nothing else a report shows is kept.
     pub fn set_deck_status(&mut self, status: soundcraft_mix::DecksState) {
         for (i, d) in status.decks.iter().enumerate() {
             let (Some(loaded), Some(seen)) = (self.deck_loaded.get(i).copied(), self.deck_seen.get_mut(i)) else { continue };
@@ -361,13 +365,12 @@ impl Engine {
                 return false;
             }
             let Some(d) = status.decks.get(edit.deck).filter(|d| d.load == edit.load) else { return true };
-            edit.reports = edit.reports.saturating_add(1);
-            match edit.landed(&d.hot) {
+            match edit.landed(&d.hot, d.hot_seq) {
                 Some(cue) => {
                     landed.push((edit.deck, edit.slot, cue));
                     false
                 }
-                None => !edit.given_up(),
+                None => true,
             }
         });
         for (deck, slot, cue) in landed {

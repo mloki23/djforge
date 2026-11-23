@@ -467,6 +467,17 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// SQLite's file change counter (header bytes 24..28, big-endian): every commit in rollback
+/// mode bumps it. `None` for a file too short to have a header (an empty database).
+fn change_counter(db: &Path) -> Option<u32> {
+    use std::io::{Read as _, Seek as _};
+    let mut f = std::fs::File::open(db).ok()?;
+    f.seek(std::io::SeekFrom::Start(24)).ok()?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).ok()?;
+    Some(u32::from_be_bytes(b))
+}
+
 impl Copy {
     fn of(db: &Path) -> Result<Copy, String> {
         let n = COPIES.fetch_add(1, Ordering::Relaxed);
@@ -475,7 +486,7 @@ impl Copy {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let file = dir.join(db.file_name().unwrap_or(std::ffi::OsStr::new("copy.db")));
         let mut copy = Copy { dir, file, steady: false };
-        let before = stamp_of(db);
+        let (before, counter) = (stamp_of(db), change_counter(db));
         copy_file(db, &copy.file)?;
         for suffix in ["-wal", "-journal"] {
             let from = sidecar(db, suffix);
@@ -483,7 +494,9 @@ impl Copy {
                 copy_file(&from, &sidecar(&copy.file, suffix))?;
             }
         }
-        copy.steady = before.is_some() && stamp_of(db) == before;
+        // Steady: the files' sizes and times, and the change counter of the live file before and
+        // after, all the copy's (a commit within one timestamp tick still shows).
+        copy.steady = before.is_some() && stamp_of(db) == before && change_counter(db) == counter && change_counter(&copy.file) == counter;
         Ok(copy)
     }
 }
@@ -584,11 +597,12 @@ mod tests {
     #[test]
     fn the_analysis_version_is_mixforges() {
         // mixforge's source, when it is on this computer: a bump there must reach djforge.
-        let init = Path::new(r"C:\Users\marty\mixforge\mixforge\__init__.py");
-        let Ok(text) = std::fs::read_to_string(init) else {
-            println!("note: mixforge's source is not here; this test checks nothing");
+        // MIXFORGE_SRC: mixforge's checkout (holding mixforge/__init__.py).
+        let Some(src) = std::env::var_os("MIXFORGE_SRC").filter(|v| !v.is_empty()) else {
+            println!("note: MIXFORGE_SRC is not set; this test checks nothing");
             return;
         };
+        let text = std::fs::read_to_string(Path::new(&src).join("mixforge/__init__.py")).unwrap();
         let line = text.lines().find(|l| l.trim_start().starts_with("ANALYSIS_VERSION")).unwrap();
         let v: i64 = line.split('=').nth(1).unwrap().trim().parse().unwrap();
         assert_eq!(v, ANALYSIS_VERSION, "mixforge's ANALYSIS_VERSION changed: update soundcraft_library::ANALYSIS_VERSION");
@@ -689,6 +703,19 @@ mod tests {
         // An empty file is an empty database: no tables, no tracks.
         std::fs::write(dir.0.join("library.db"), b"").unwrap();
         assert_eq!(lib.summaries().unwrap().value, Vec::new());
+    }
+
+    #[test]
+    fn a_copy_is_steady_only_when_the_change_counter_stood_still() {
+        let dir = Scratch::new("counter");
+        let db = fixture(&dir.0);
+        let before = change_counter(&db).unwrap();
+        let copy = Copy::of(&db).unwrap();
+        assert!(copy.steady);
+        assert_eq!(change_counter(&copy.file), Some(before));
+        Connection::open(&db).unwrap().execute("DELETE FROM structure", []).unwrap();
+        assert_ne!(change_counter(&db), Some(before), "a commit bumps it");
+        assert_eq!(change_counter(&dir.0.join("none.db")), None);
     }
 
     #[test]
