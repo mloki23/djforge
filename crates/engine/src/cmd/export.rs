@@ -566,13 +566,29 @@ pub fn specs() -> Vec<super::CommandSpec> {
         "Export Set",
         [],
         None,
-        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). With stems: true, writes <file>.stem.mp4 for each split track: an NI STEM file (five ALAC tracks: the copy, then its drums, bass, other and vocals at the copy's gain, with NI's `stem` metadata) through ffmpeg (DJFORGE_FFMPEG or ffmpeg on the PATH; skipped without it); a file of that name an export didn't write is never replaced. A cancel stops prep before its next track, and the XML, the Mixxx write and each stem file before they start (a Mixxx write once started runs to its end); the result then has cancelled: true and what was written. Returns {root, rekordbox: path|null|{error}, report: path|null|{error}, mixxx, stems, tracks: [{file, path, title, prep, grid_bars, cues, doubts, found, prep_refused, in_mixxx}], prep, cancelled}",
+        "{targets?: [\"rekordbox\", \"mixxx\"] (default both), stems?: false, out?: folder path (default Music/djforge-prepped/<session name>), background?: bool (default false: true returns {job} at once and exports off the UI thread; see job.status)} — exports the session's DJ set (its transitions' tracks in timeline order) for playing out: preps level-matched copies of the files into `out` (as prep.tracks; originals are never written) and writes <session name>.rekordbox.xml there (one TEMPO per bar from the session's grid, nudges included; hot cues A mix in, B bass hit, C mix out, D bass gone; memory cues at A and C) and <session name>.export.txt; with \"mixxx\", writes the set (the copies, each with its grid at its median BPM, key and cues) into Mixxx's library through mixforge (skipped while Mixxx runs; mixforge backs up the database first). With stems: true, writes <file>.stem.mp4 for each split track: an NI STEM file (five ALAC tracks: the copy, then its drums, bass, other and vocals at the copy's gain, with NI's `stem` metadata) through ffmpeg (DJFORGE_FFMPEG or ffmpeg on the PATH; skipped without it); a file of that name an export didn't write is never replaced. A cancel stops prep before its next track, and the XML, the Mixxx write and each stem file before they start (a Mixxx write once started runs to its end); the result then has cancelled: true and what was written. Returns {root, rekordbox: path|null|{error}, report: path|null|{error}, mixxx, stems, tracks: [{file, path, title, prep, grid_bars, cues, doubts, found, prep_refused, in_mixxx}], prep, cancelled}",
         super::always,
         export_set
     )]
 }
 
 fn export_set(e: &mut crate::Engine, p: &Value) -> crate::Result<Value> {
+    if super::decks::bool_param(CMD, p, "background", Some(false))? {
+        let mut job = export_job(e, p)?;
+        return super::jobs::start(e, CMD, "export", move |ctx| {
+            loop {
+                if ctx.cancelled() && !job.cancelling() {
+                    job.cancel();
+                }
+                let pr = job.progress();
+                ctx.progress(serde_json::json!({"stage": pr.stage, "done": pr.done, "total": pr.total, "current": pr.current}));
+                if let Some(r) = job.poll() {
+                    return r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
     export_job(e, p)?.wait()
 }
 

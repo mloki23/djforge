@@ -659,8 +659,9 @@ impl SoundApp {
         if id == "dj.clear_stem_cache" {
             return stems::clear(self).map_err(RunError::App);
         }
-        // An export runs in the background too, into the app's prep root.
-        if id == "dj.export_set" {
+        // An export runs in the background too, into the app's prep root (an agent asking for a
+        // job with `background` gets the engine's, whose result it can read back).
+        if id == "dj.export_set" && params.get("background").and_then(serde_json::Value::as_bool) != Some(true) {
             return export::start(self, &params).map_err(RunError::App);
         }
         if id.starts_with("session.save") || id.starts_with("file.bounce") {

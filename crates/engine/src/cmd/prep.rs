@@ -41,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Prep Tracks",
         [],
         None,
-        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed|cancelled}], totals, cancelled (always false here; true when the app's progress window stopped the run early)}",
+        "{source: a mixforge plan.json or a folder of MP3s, out?: folder for the prepped copies (default Music/djforge-prepped/<set or folder name>), target_lufs?: -14, ceiling?: -1, background?: bool (default false: true returns {job} at once and preps off the UI thread; see job.status, job.cancel)} — copies every MP3 to `out` level-matched without re-encoding (global_gain steps of 1.5 dB, never above the ceiling in dBTP) with missing key/BPM tags filled from mixforge's analysis; originals are never written, and a file already in `out` is replaced only if it is an earlier prep copy or report. Tracks over 30 minutes are copied unadjusted. Writes out/prep-report.txt. Returns {out, report, target_lufs, ceiling, tracks: [{file, lufs_before, tp_before, steps, gain_db, lufs_after, tp_after, limited_by, filled, doubts, status: ok|not_adjusted|failed|cancelled}], totals, cancelled (always false here; true when the app's progress window stopped the run early)}",
         always,
         prep_tracks
     )]
@@ -56,6 +56,23 @@ fn num(p: &Value, key: &str, d: f64, range: std::ops::RangeInclusive<f64>) -> Re
 }
 
 fn prep_tracks(e: &mut Engine, p: &Value) -> Result<Value> {
+    if super::decks::bool_param(CMD, p, "background", Some(false))? {
+        // Every check is made, and `out` made, before the job starts; the job watches the run.
+        let mut job = prep_job_in(e, p, None, mixforge_analysis())?;
+        return super::jobs::start(e, CMD, "prep", move |ctx| {
+            loop {
+                if ctx.cancelled() && !job.cancelling() {
+                    job.cancel();
+                }
+                let pr = job.progress();
+                ctx.progress(serde_json::json!({"stage": "prepping", "done": pr.done, "total": pr.total, "current": pr.current}));
+                if let Some(r) = job.poll() {
+                    return r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
     let (source, out, target, ceiling) = params(p)?;
     run(e.session(), source, out, target, ceiling, &|path| mixforge(path, &|| false))
 }

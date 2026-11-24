@@ -121,9 +121,14 @@ pub(crate) fn start(e: &mut Engine, cmd: &str, kind: &'static str, work: impl Fn
     let id = jobs.next;
     let ctx = JobCtx { progress: Arc::new(Mutex::new(Value::Null)), cancel: Arc::new(AtomicBool::new(false)) };
     let theirs = ctx.clone();
+    // The job reads and writes only what the caller may (an agent's automation roots).
+    let roots = crate::file_access::current();
     let handle = std::thread::Builder::new()
         .name(format!("job-{kind}"))
-        .spawn(move || work(&theirs))
+        .spawn(move || match &roots {
+            Some(r) => crate::file_access::confine(Some(r), || work(&theirs)),
+            None => crate::file_access::unconfined(|| work(&theirs)),
+        })
         .map_err(|err| EngineError::Io(format!("could not start the {kind} job: {err}")))?;
     jobs.jobs.push(Job { id, kind, started: Instant::now(), ended: None, ctx, state: State::Running(handle) });
     Ok(json!({"job": id, "kind": kind, "state": "running"}))
