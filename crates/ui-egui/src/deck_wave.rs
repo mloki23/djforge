@@ -130,16 +130,55 @@ pub struct Scrolling<'a> {
     pub seconds: f64,
     /// The session's sample rate (the track's audio is at it).
     pub rate: f64,
+    /// The steady tempo factor it is drawn at ([`steady_tempo`]).
+    pub tempo: f64,
     pub by_freq: bool,
     pub tint: Color32,
 }
 
-/// The tempo factor a deck's waveform is drawn at: its rate (pitch, sync, a nudge), rounded so
-/// a steady rate keeps its columns.
-pub fn tempo_factor(s: &DeckState) -> f64 {
-    let r = if s.rate.is_finite() && (0.25..=4.0).contains(&s.rate) { s.rate } else { 1.0 + s.pitch };
-    let r = if r.is_finite() && r > 0.1 { r } else { 1.0 };
-    (r * 2000.0).round() / 2000.0
+/// A deck's free-running tempo as the waveforms take it: its rate, held through a jog nudge's
+/// bend (gone within 60 ms of the last event) and followed once a new rate has lasted
+/// [`RateHold::SETTLE`] seconds or is the pitch fader's.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RateHold {
+    held: f64,
+    last: f64,
+    since: f64,
+}
+
+impl RateHold {
+    pub const SETTLE: f64 = 0.25;
+
+    /// The held rate for the deck's state `s` at UI time `now`.
+    pub fn update(&mut self, s: &DeckState, now: f64) -> f64 {
+        let fader = 1.0 + s.pitch;
+        let fader = if fader.is_finite() && fader > 0.1 { fader } else { 1.0 };
+        let rate = if s.rate.is_finite() && s.rate > 0.1 { s.rate } else { fader };
+        if (rate - self.last).abs() > 1e-6 {
+            self.last = rate;
+            self.since = now;
+        }
+        if self.held <= 0.0 || self.held.is_nan() || (rate - fader).abs() < 1e-4 || now - self.since >= Self::SETTLE {
+            self.held = rate;
+        }
+        self.held
+    }
+}
+
+/// The tempo factor a deck's waveform is drawn at: its steady tempo, without a jog nudge's bend
+/// or sync's phase correction, so the waveform holds still while they act. Free, that is its
+/// held rate (`free`, from [`RateHold`]); synced, its master's over the two grids' tempos, so
+/// synced beats are equally spaced on both. `bpm` are the grids' tempos. Rounded so a steady
+/// deck keeps its columns.
+pub fn steady_tempo(s: &DeckState, free: f64, bpm: Option<f64>, other: &DeckState, other_free: f64, other_bpm: Option<f64>) -> f64 {
+    let ok = |b: Option<f64>| b.filter(|b| b.is_finite() && *b > 0.0);
+    let r = match (ok(bpm), ok(other_bpm)) {
+        // Following the other deck (when both say they follow, each keeps its own).
+        (Some(mine), Some(theirs)) if s.synced && !s.master && other.load != 0 && !(other.synced && !other.master) => other_free * theirs / mine,
+        _ => free,
+    };
+    let r = if r.is_finite() && (0.25..=4.0).contains(&r) { r } else { 1.0 };
+    (r * 1000.0).round() / 1000.0
 }
 
 /// Draws a deck's scrolling waveform in `rect`, its playhead fixed in the centre.
@@ -150,7 +189,7 @@ pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scr
     let px = 1.0 / ppp;
     let width = f64::from(rect.width().max(1.0));
     // Source samples per point.
-    let spp = (w.seconds * w.rate * tempo_factor(w.state) / width).max(1e-3);
+    let spp = (w.seconds * w.rate * w.tempo / width).max(1e-3);
     let step = spp * f64::from(px);
     let cx = rect.center().x;
     let x_at = |pos: f64| cx + ((pos - w.position) / spp) as f32;
@@ -191,7 +230,7 @@ pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scr
             let x = x_at(g.pos_at(b));
             let bar = (b.rem_euclid(4.0)).abs() < 1e-6;
             let (stroke, reach) =
-                if bar { (Stroke::new(1.5, Color32::from_white_alpha(150)), 1.0) } else { (Stroke::new(1.0, Color32::from_white_alpha(55)), 0.18) };
+                if bar { (Stroke::new(1.5, Color32::from_white_alpha(160)), 1.0) } else { (Stroke::new(1.0, Color32::from_white_alpha(115)), 0.3) };
             p.vline(x, rect.min.y..=rect.min.y + rect.height() * reach, stroke);
             if !bar {
                 p.vline(x, rect.max.y - rect.height() * reach..=rect.max.y, stroke);
@@ -326,6 +365,28 @@ mod tests {
         assert_eq!(back, compute(&a, 990, 1500, 160.0, Color32::RED, false));
         cache.columns(&a, 1, 320.0, 990, 1500, Color32::RED, false);
         assert_eq!(cache.computed, 1504 + 14 + 1500);
+    }
+
+    #[test]
+    fn the_waveform_scale_holds_through_a_nudge_and_follows_a_lasting_rate() {
+        let mut h = RateHold::default();
+        let mut s = DeckState { load: 1, playing: true, rate: 1.02, pitch: 0.02, ..Default::default() };
+        assert_eq!(h.update(&s, 0.0), 1.02);
+        // A jog nudge bends the rate for a moment: held.
+        s.rate = 1.12;
+        assert_eq!(h.update(&s, 0.05), 1.02);
+        s.rate = 1.02;
+        assert_eq!(h.update(&s, 0.1), 1.02);
+        // Sync off leaves a rate the fader is not at: followed once it lasts.
+        s.rate = 1.035;
+        assert_eq!(h.update(&s, 1.0), 1.02);
+        assert_eq!(h.update(&s, 1.0 + RateHold::SETTLE), 1.035);
+        // Synced, the scale is the master's over the grids' tempos, whatever the correction does.
+        let master = DeckState { load: 1, playing: true, master: true, ..Default::default() };
+        let follower = DeckState { load: 2, playing: true, synced: true, rate: 1.0461, ..Default::default() };
+        let r = steady_tempo(&follower, 1.0461, Some(132.0), &master, 1.01, Some(138.0));
+        assert!((r - 1.01 * 138.0 / 132.0).abs() < 1e-3, "{r}");
+        assert_eq!(steady_tempo(&master, 1.01, Some(138.0), &follower, 1.0461, Some(132.0)), 1.01);
     }
 
     #[test]

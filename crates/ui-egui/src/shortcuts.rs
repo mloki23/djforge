@@ -85,8 +85,9 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
         if crate::session_view::key(app, physical, mods) {
             continue;
         }
-        // The Decks tab's keys, while it is shown: Space plays the focused deck, never the arrangement.
-        if app.ui.window == MainWindow::Decks && crate::decks_view::key(app, key, mods) {
+        // The Decks tab's keys, while it is shown: Space plays the focused deck, never the
+        // arrangement, and no chord may start the arrangement (which would stop the decks).
+        if app.ui.window == MainWindow::Decks && (crate::decks_view::key(app, key, physical, mods) || !decks_passes(key, mods, mac)) {
             continue;
         }
         if fixed(app, key, mods, mac) {
@@ -105,6 +106,22 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     }
     // Tab moves the insertion point here, so egui must not also hand focus to the first widget: that would block every shortcut.
     ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+}
+
+/// The chords the Decks tab lets through: windows (Mix/Edit/Decks and the floating ones),
+/// Search, Save and Quit. Every other one is dropped there: transport chords would start the
+/// arrangement, which stops the decks, and edits act on an arrangement not in view.
+fn decks_passes(key: Key, m: Modifiers, mac: bool) -> bool {
+    if search_chord(m, mac) || (key == Key::Equals && m.command && !(mac && m.ctrl)) {
+        return true;
+    }
+    if let Some(id) = command_for(key, m, mac) {
+        return matches!(id, "session.save" | "session.save_as" | "app.quit");
+    }
+    crate::menus::UI_COMMANDS
+        .iter()
+        .find(|c| c.3.and_then(parse).is_some_and(|(want, k)| k == key && mods_match(want, m, mac)))
+        .is_some_and(|c| c.0.starts_with("window."))
 }
 
 fn command_for(key: Key, mods: Modifiers, mac: bool) -> Option<&'static str> {

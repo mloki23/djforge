@@ -241,6 +241,59 @@ fn the_decks_tab_loads_from_the_library_and_its_controls_drive_the_decks() {
     assert!(!h.state().is_playing(), "the arrangement stayed stopped throughout");
 }
 
+#[test]
+fn stray_chords_never_stop_the_decks_and_a_held_cue_always_lets_go() {
+    let dir = Scratch::new("safety");
+    let mut h = harness(&dir.0, 40.0);
+    wait_row(&mut h, "Alpha");
+    for (name, deck) in [("alpha.wav", "a"), ("beta.wav", "b")] {
+        let path = dir.0.join(name).to_string_lossy().into_owned();
+        h.state_mut().run("deck.load", json!({"path": path, "deck": deck})).unwrap();
+    }
+    until(&mut h, "both loaded", |s| s["decks"][0]["track"].is_object() && s["decks"][1]["track"].is_object() && s["decks"][1]["loading"] == false);
+
+    // Enter (and a double-click) with both decks loaded is refused: Deck B's track stays.
+    h.get_by_label("Track Alpha").click();
+    steps(&mut h, 2);
+    h.key_press(Key::Enter);
+    steps(&mut h, 4);
+    assert!(h.state().ui.status.contains("Both decks have a track"), "{}", h.state().ui.status);
+    assert_eq!(state(&mut h)["decks"][1]["track"]["title"], "beta");
+
+    // The pitch fader: dragging it up slows the deck down, as on a CDJ.
+    let fader = h.get_by_label("Deck A Pitch").rect();
+    h.drag_at(fader.center());
+    step(&mut h);
+    h.hover_at(fader.center() - vec2(0.0, fader.height() * 0.25));
+    step(&mut h);
+    h.drop_at(fader.center() - vec2(0.0, fader.height() * 0.25));
+    let st = until(&mut h, "pitched down", |s| s["decks"][0]["pitch"].as_f64().unwrap() < -1.0);
+    assert!(st["decks"][0]["rate"].as_f64().unwrap() < 1.0 || st["decks"][0]["playing"] == false, "{st}");
+
+    // With Deck A playing, chords that would start the arrangement do nothing in the Decks tab.
+    click(&mut h, "Deck A Play");
+    until(&mut h, "A plays", |s| s["decks"][0]["playing"] == true);
+    h.key_press_modifiers(Modifiers::ALT, Key::OpenBracket);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Space);
+    h.key_press(Key::F12);
+    steps(&mut h, 6);
+    assert!(!h.state().is_playing(), "the arrangement stayed stopped");
+    assert_eq!(state(&mut h)["decks"][0]["playing"], true, "Deck A still plays");
+
+    // W holds Deck B's CUE: a preview while held, back to the cue on release.
+    h.key_down(Key::W);
+    until(&mut h, "W previews B", |s| s["decks"][1]["previewing"] == true);
+    h.key_up(Key::W);
+    until(&mut h, "W let go", |s| s["decks"][1]["previewing"] == false && s["decks"][1]["playing"] == false);
+
+    // CUE held with the pointer, then the window changes (a menu, Cmd+=): the hold lets go.
+    press(&mut h, "Deck B Cue");
+    until(&mut h, "pointer previews B", |s| s["decks"][1]["previewing"] == true);
+    h.state_mut().run("window.edit", json!({})).unwrap();
+    until(&mut h, "the hold let go off the tab", |s| s["decks"][1]["previewing"] == false);
+    assert_eq!(state(&mut h)["decks"][0]["playing"], true, "Deck A played on throughout");
+}
+
 /// The Decks tab's cost per frame with two 10-minute tracks playing (run with
 /// `cargo test -p soundcraft-ui-egui --test decks_tab -- --ignored --nocapture`).
 #[test]

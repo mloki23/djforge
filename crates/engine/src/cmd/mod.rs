@@ -56,7 +56,7 @@ pub use export::{
     set_refusal as export_set_refusal,
 };
 pub use file::bounce_job;
-pub use library::LibraryTrack;
+pub use library::{LibraryQuery, LibraryTrack};
 pub use live::{
     SlotFile, SlotFileJob, fold_into_loop as live_fold_into_loop, launch_margin as live_launch_margin, live_cmds,
     next_boundary as live_next_boundary, slot_file_job,

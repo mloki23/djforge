@@ -3,8 +3,11 @@
 //! `library.search` and `library.compatible`. A track loads by dragging it onto a deck, by the
 //! Load buttons, by double-click (the first free deck) or by Shift+Left/Right.
 //!
-//! Queries run only when what is asked changes, or when a read of the libraries ends; a read
-//! under way keeps the last rows and says "library loading…".
+//! Queries run only when what is asked changes (the search text once typing pauses for
+//! [`DEBOUNCE_S`]), or when a read of the libraries ends, and off the UI thread
+//! ([`soundcraft_engine::Engine::start_library_query`]): a slow disk never stalls the decks. One
+//! runs at a time and the latest asked wins; the last rows stay meanwhile, with "library
+//! loading…".
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
@@ -17,6 +20,8 @@ use soundcraft_mix::DeckId;
 pub const PAGE: usize = 100;
 /// A row's height.
 const ROW_H: f32 = 20.0;
+/// Seconds the search text must stand still before it is asked.
+const DEBOUNCE_S: f64 = 0.15;
 
 /// Where the rows come from.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -119,6 +124,11 @@ pub struct Browser {
     /// The last query asked, and whether its rows were the last read's while another ran.
     asked: Option<String>,
     stale_rows: bool,
+    /// The query running, under its key, and when the search text last changed (UI time).
+    running: Option<(String, soundcraft_engine::LibraryQuery)>,
+    typed: Option<f64>,
+    /// The selection moved by key: scroll to it.
+    reveal: bool,
     pub error: Option<String>,
 }
 
@@ -126,6 +136,31 @@ impl Browser {
     /// The selected row's path.
     pub fn selected_path(&self) -> Option<String> {
         self.selected.and_then(|i| self.rows.get(i)).map(|r| r.path.clone())
+    }
+
+    /// Moves the selection `by` rows (Up/Down), on to the next or previous page past either end,
+    /// and scrolls to it.
+    pub fn step_selection(&mut self, by: isize) {
+        let n = self.rows.len();
+        if n == 0 {
+            return;
+        }
+        let i = self.selected.unwrap_or(0) as isize + if self.selected.is_some() { by } else { 0 };
+        if i < 0 && self.offset > 0 {
+            self.offset = self.offset.saturating_sub(PAGE);
+            self.selected = Some(PAGE - 1);
+        } else if i >= n as isize && self.offset + n < self.total {
+            self.offset += PAGE;
+            self.selected = Some(0);
+        } else {
+            self.selected = Some(i.clamp(0, n as isize - 1) as usize);
+        }
+        self.reveal = true;
+    }
+
+    /// Whether the rows shown are awaiting a query's answer.
+    pub fn querying(&self) -> bool {
+        self.running.is_some()
     }
 }
 
@@ -159,18 +194,33 @@ fn query(app: &SoundApp) -> (&'static str, Value, String) {
         Source::Compatible(d) => {
             p["deck"] = json!(d.id());
             let s = app.engine.deck_status.decks.get(d.index()).copied().unwrap_or_default();
-            let track = app.engine.deck_tracks.get(d.index()).and_then(Option::as_ref).map(|t| t.path.clone()).unwrap_or_default();
-            extra = format!("{track} {:.1}", s.bpm);
+            let track = app.engine.deck_tracks.get(d.index()).and_then(Option::as_ref);
+            // Its steady tempo to the half BPM: not a nudge or sync's correction, nor every beat
+            // of a grid whose tempo moves.
+            let bpm = track.and_then(|t| t.bpm).map_or(s.bpm, |b| b * (1.0 + s.pitch));
+            extra = format!("{} {:.0}", track.map(|t| t.path.as_str()).unwrap_or_default(), (bpm * 2.0).round());
             "library.compatible"
         }
     };
     (id, p, extra)
 }
 
-/// Runs the browser's query when what it asks changed or a read of the libraries ended.
-pub fn refresh(app: &mut SoundApp) {
+/// Takes a query's answer when it is in, and starts the browser's query when what it asks
+/// changed or a read of the libraries ended (none while the search text is being typed).
+pub fn refresh(app: &mut SoundApp, now: f64) {
     if !app.decks_view.browser.roots_read {
         read_roots(app);
+    }
+    if app.decks_view.browser.running.as_ref().is_some_and(|(_, q)| q.finished())
+        && let Some((key, q)) = app.decks_view.browser.running.take()
+    {
+        // An answer to an older question is dropped: the latest asked is asked next.
+        if app.decks_view.browser.asked.as_deref() == Some(key.as_str()) {
+            take(app, q.take());
+        }
+    }
+    if app.decks_view.browser.running.is_some() || app.decks_view.browser.typed.is_some_and(|t| now - t < DEBOUNCE_S) {
+        return;
     }
     let (id, p, extra) = query(app);
     let key = format!("{id} {p} {extra}");
@@ -181,7 +231,7 @@ pub fn refresh(app: &mut SoundApp) {
     let empty_deck =
         matches!(app.decks_view.browser.source, Source::Compatible(d) if app.engine.deck_tracks.get(d.index()).is_none_or(Option::is_none));
     let b = &mut app.decks_view.browser;
-    b.asked = Some(key);
+    b.asked = Some(key.clone());
     if empty_deck {
         b.rows.clear();
         b.total = 0;
@@ -190,7 +240,14 @@ pub fn refresh(app: &mut SoundApp) {
         b.stale_rows = false;
         return;
     }
-    let r = app.engine.execute(id, &p);
+    match app.engine.start_library_query(id, &p) {
+        Ok(q) => app.decks_view.browser.running = Some((key, q)),
+        Err(e) => take(app, Err(e)),
+    }
+}
+
+/// Shows a query's answer.
+fn take(app: &mut SoundApp, r: soundcraft_engine::Result<Value>) {
     let b = &mut app.decks_view.browser;
     match r {
         Ok(v) => {
@@ -204,7 +261,9 @@ pub fn refresh(app: &mut SoundApp) {
                 .unwrap_or_default();
             b.stale_rows = v.get("loading").and_then(Value::as_bool).unwrap_or(false);
             b.error = v.get("library_error").and_then(Value::as_str).map(|e| format!("mixforge's library: {e}"));
-            b.selected = before.and_then(|p| b.rows.iter().position(|r| r.path == p)).or(if b.rows.is_empty() { None } else { Some(0) });
+            // The selection stays on its track, or on the row asked for (a page turned by key).
+            let kept = before.and_then(|p| b.rows.iter().position(|r| r.path == p));
+            b.selected = kept.or(b.selected.filter(|i| *i < b.rows.len())).or(if b.rows.is_empty() { None } else { Some(0) });
         }
         Err(e) => {
             b.rows.clear();
@@ -283,7 +342,15 @@ enum Act {
 
 /// Draws the browser in `ui`'s rect.
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
-    refresh(app);
+    let now = ui.input(|i| i.time);
+    refresh(app, now);
+    if app.decks_view.browser.typed.is_some() || app.decks_view.browser.querying() {
+        // Frames until the debounce is over and the answer is in.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+    }
+    if app.decks_view.browser.typed.is_some_and(|t| now - t >= DEBOUNCE_S) {
+        app.decks_view.browser.typed = None;
+    }
     let t = Tokens::current();
     let mut act: Option<Act> = None;
     let full = ui.max_rect();
@@ -325,6 +392,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             ui.add(egui::TextEdit::singleline(&mut app.decks_view.browser.query).hint_text("Search title, artist, file…").desired_width(260.0));
         if search.changed() {
             app.decks_view.browser.offset = 0;
+            app.decks_view.browser.typed = Some(now);
         }
         let b = &app.decks_view.browser;
         let (from, to) = (b.offset.min(b.total), (b.offset + b.rows.len()).min(b.total));
@@ -335,7 +403,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         if ui.add_enabled(to < b.total, egui::Button::new("▶").small()).on_hover_text("Next page").clicked() {
             act = Some(Act::Page(1));
         }
-        if app.engine.library_loading() || b.stale_rows {
+        if app.engine.library_loading() || b.stale_rows || b.running.is_some() {
             ui.spinner();
             ui.label(egui::RichText::new("library loading…").color(t.text_dim));
         }
@@ -372,7 +440,22 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
     let subs = b.subfolders.clone();
     let n = subs.len() + b.rows.len();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("lib_rows").show_rows(&mut child, ROW_H, n, |ui, range| {
+    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("lib_rows");
+    if std::mem::take(&mut app.decks_view.browser.reveal)
+        && let Some(k) = app.decks_view.browser.selected
+    {
+        // Keep the selected row in view: scrolled only when it is off the list's visible part.
+        let row_top = (subs.len() + k) as f32 * (ROW_H + child.spacing().item_spacing.y);
+        let id = child.make_persistent_id("lib_rows");
+        let shown = egui::scroll_area::State::load(child.ctx(), id).map_or(0.0, |st| st.offset.y);
+        let h = body.height();
+        if row_top < shown {
+            scroll = scroll.vertical_scroll_offset(row_top);
+        } else if row_top + ROW_H > shown + h {
+            scroll = scroll.vertical_scroll_offset((row_top + ROW_H - h).max(0.0));
+        }
+    }
+    scroll.show_rows(&mut child, ROW_H, n, |ui, range| {
         for i in range {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
             let r = Rect::from_min_max(pos2(r.min.x + 6.0, r.min.y), pos2(r.max.x - 6.0, r.max.y));
@@ -430,18 +513,20 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 }
 
 /// The columns: (name, sort key, x, width).
+/// Title, then the tempo and key a trance DJ reads first, then the rest. Kept in
+/// `draw_row`'s order.
 fn columns(w: f32) -> Vec<(&'static str, Option<&'static str>, f32, f32)> {
-    let fixed = 22.0 + 60.0 + 60.0 + 54.0 + 60.0;
+    let fixed = 22.0 + 60.0 + 64.0 + 54.0 + 60.0;
     let flex = (w - fixed).max(120.0);
-    let (tw, aw) = (flex * 0.58, flex * 0.42);
+    let (tw, aw) = ((flex * 0.55).min(520.0), flex - (flex * 0.55).min(520.0));
     let mut x = 0.0;
     let mut out = Vec::new();
     for (name, sort, width) in [
         ("", None, 22.0),
         ("Title", Some("title"), tw),
-        ("Artist", Some("artist"), aw),
         ("BPM", Some("bpm"), 60.0),
-        ("Key", Some("key"), 60.0),
+        ("Key", Some("key"), 64.0),
+        ("Artist", Some("artist"), aw),
         ("Energy", Some("energy"), 54.0),
         ("Length", Some("length"), 60.0),
     ] {
@@ -473,14 +558,14 @@ fn draw_row(ui: &Ui, r: Rect, row: &Row, cols: &[(&'static str, Option<&'static 
     };
     let dim = if row.missing { t.text_dim } else { t.text };
     text(1, &row.title, dim);
-    text(2, &row.artist, t.text_dim);
-    text(3, &row.bpm.map_or_else(|| "–".into(), |b| format!("{b:.1}")), dim);
+    text(2, &row.bpm.map_or_else(|| "–".into(), |b| format!("{b:.1}")), dim);
     let key = match (&row.key, &row.key_source) {
         (Some(k), Some(s)) => format!("{k} · {}", source_short(s)),
         (Some(k), None) => k.clone(),
         _ => "–".into(),
     };
-    text(4, &key, dim);
+    text(3, &key, dim);
+    text(4, &row.artist, t.text_dim);
     text(5, &row.energy.map_or_else(|| "–".into(), |e| format!("{e:.0}")), dim);
     text(6, &row.length_s.map_or_else(|| "–".into(), clock), dim);
     p.hline(r.x_range(), r.max.y, Stroke::new(1.0, Color32::from_black_alpha(40)));

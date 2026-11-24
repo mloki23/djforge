@@ -12,16 +12,23 @@
 //! extrapolated from the deck's rate and the wall clock, and eased back to each published state,
 //! so the waveforms scroll smoothly at the display's rate rather than in block steps.
 //!
-//! Keys while the tab is shown: Space plays or pauses the focused deck (never the arrangement),
-//! Left/Right focus Deck A/B, Up/Down pick a library row, Enter loads it on the first free
-//! deck, Shift+Left/Right on Deck A/B. Other plain keys do nothing here; Cmd shortcuts work.
+//! Keys while the tab is shown (not while typing in the library's search): Space plays or pauses
+//! the focused deck (never the arrangement), Left/Right focus Deck A/B, Q and W are Deck A's and
+//! B's CUE (held), 1–8 the focused deck's hot cues (held; Shift clears), S its sync, L a 4-beat
+//! loop (again: exit), comma and full stop a beat jump back and on. Up/Down pick a library row,
+//! Enter loads it on an empty deck, Shift+Left/Right on Deck A/B. Other plain keys do nothing
+//! here, and of the Cmd shortcuts only windows, Search, Save and Quit work
+//! ([`crate::shortcuts`]): none can start the arrangement, which would stop the decks.
+//!
+//! A held CUE or pad (pointer or key) is let go by [`release_holds`] every frame, whatever the
+//! window: when the button or key comes up, the tab is left or the app loses focus.
 
-use crate::SoundApp;
-use crate::deck_wave::{self, ColumnCache, OverviewCache, Scrolling, hot_cue_colour, hot_cue_letter};
+use crate::deck_wave::{self, ColumnCache, OverviewCache, RateHold, Scrolling, hot_cue_colour, hot_cue_letter, steady_tempo};
 use crate::knob::{self, Knob};
 use crate::library_browser::{self, Browser, Dragged};
 use crate::theme::{Tokens, bold, mono, regular};
 use crate::widgets::{elided_text, key as key_face, key_fill, meter, shade};
+use crate::{MainWindow, SoundApp};
 use egui::{Align2, Color32, Id, Key, Modifiers, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_mix::{DeckId, DeckState, DeckTrack, EqBand, FaderCurve, HOT_CUES, PITCH_RANGES, XfadeCurve, XfadeSide};
@@ -36,8 +43,12 @@ const JUMPS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_JUMP: usize = 2;
 /// Beat loop lengths with buttons of their own (1/4 and 1/2 are in a menu).
 const LOOPS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
-/// A jog drag of this many points is one jog event at full deflection.
+/// A jog disc drag: this many points are a beat of search, and this many points a second a full
+/// nudge.
 const JOG_PX: f32 = 40.0;
+const NUDGE_PX_S: f32 = 1200.0;
+/// The beat loop the L key sets.
+const KEY_LOOP: f64 = 4.0;
 /// A playhead this far (seconds) from where the extrapolation has it jumps there (a seek, a
 /// loop, a hot cue) instead of easing.
 const SNAP_S: f64 = 0.06;
@@ -68,17 +79,46 @@ impl Clock {
             self.seen = now;
         }
         let rate = if s.rate.is_finite() { s.rate.clamp(0.0, 4.0) } else { 1.0 };
+        // In a loop the playhead goes round it, not on past its end until the next state.
+        let wrap = |x: f64| match (s.loop_on, s.loop_in, s.loop_out) {
+            (true, Some(a), Some(b)) if b > a && x >= b && (a..b).contains(&s.position) => a + (x - b) % (b - a),
+            _ => x,
+        };
         if !(s.playing || s.previewing) {
             self.shown = s.position;
         } else {
-            let target = self.published + (now - self.seen).clamp(0.0, 0.1) * rate * sr;
-            let predicted = self.shown + (now - self.at).clamp(0.0, 0.1) * rate * sr;
+            let target = wrap(self.published + (now - self.seen).clamp(0.0, 0.1) * rate * sr);
+            let predicted = wrap(self.shown + (now - self.at).clamp(0.0, 0.1) * rate * sr);
             let gap = target - predicted;
             self.shown = if gap.abs() > SNAP_S * sr { target } else { predicted + gap * EASE };
         }
         self.at = now;
         self.shown
     }
+}
+
+/// What a held CUE or pad does on release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Cue,
+    /// A hot cue pad: its slot, and whether its release is sent (a jump; a set or a clear has none).
+    Pad {
+        slot: usize,
+        release: bool,
+    },
+}
+
+/// What holds it down: the pointer, or a key (its logical key, as `key_down` knows it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum By {
+    Pointer,
+    Key(Key),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hold {
+    what: Held,
+    by: By,
 }
 
 /// What the Decks tab keeps between frames.
@@ -90,9 +130,15 @@ pub struct DecksView {
     clocks: [Clock; 2],
     waves: [ColumnCache; 2],
     overviews: [OverviewCache; 2],
-    cue_held: [bool; 2],
-    /// The pad held: (slot, whether its release is sent).
-    pad_held: [Option<(usize, bool)>; 2],
+    /// Each deck's held CUE or pad (one at a time), let go by [`release_holds`].
+    holds: [Option<Hold>; 2],
+    /// A pointer hold let go this frame: its click is not also a tap.
+    released: [bool; 2],
+    /// The waveforms' scale: each deck's held rate, and the steady tempo drawn at.
+    rates: [RateHold; 2],
+    tempo: [f64; 2],
+    /// A paused waveform drag: where the playhead was when it began, and the points dragged.
+    search: [Option<(f64, f32)>; 2],
     jump: [Option<usize>; 2],
     /// Each deck's last `deck.load` report, and its last refusal or failure.
     pub info: [Option<Value>; 2],
@@ -145,16 +191,18 @@ fn deck(app: &SoundApp, d: DeckId) -> (DeckState, Option<Arc<DeckTrack>>) {
     (app.engine.deck_status.decks.get(d.index()).copied().unwrap_or_default(), app.engine.deck_tracks.get(d.index()).cloned().flatten())
 }
 
-/// Loads `path` on `deck`, or the first free deck (empty, else not playing); `force` loads onto
-/// a playing deck. A refusal shows on the deck and in the status line.
+/// Loads `path` on `deck`, or on an empty deck (refused when neither is, so a track cued up on
+/// the other deck is never replaced unasked); `force` loads onto a playing deck. A refusal shows
+/// on the deck and in the status line.
 pub fn load(app: &mut SoundApp, path: &str, deck: Option<DeckId>, force: bool) {
     let deck = deck.or_else(|| {
         DeckId::ALL.into_iter().find(|d| app.engine.deck_tracks.get(d.index()).is_none_or(Option::is_none) && !app.engine.deck_loading_on(*d))
     });
-    let mut p = json!({"path": path});
-    if let Some(d) = deck {
-        p["deck"] = json!(d.id());
-    }
+    let Some(deck) = deck else {
+        app.ui.status = "Both decks have a track: load with Shift+Left or Shift+Right, a deck's LOAD, or by dragging onto a deck".into();
+        return;
+    };
+    let mut p = json!({"path": path, "deck": deck.id()});
     if force {
         p["force"] = json!(true);
     }
@@ -170,8 +218,8 @@ pub fn load(app: &mut SoundApp, path: &str, deck: Option<DeckId>, force: bool) {
             }
         }
         Err(e) => {
-            let d = deck.unwrap_or(DeckId::A);
-            if let Some(slot) = app.decks_view.load_error.get_mut(d.index()) {
+            app.ui.status = format!("Deck {}: {e}", name(deck));
+            if let Some(slot) = app.decks_view.load_error.get_mut(deck.index()) {
                 *slot = Some(e);
             }
         }
@@ -185,7 +233,7 @@ pub fn load_status(v: &Value) -> String {
     let title = v.get("title").and_then(Value::as_str).unwrap_or("");
     let mut s = format!("Deck {deck}: loaded {title}");
     match (v.get("bpm").and_then(Value::as_f64), v.get("grid_from").and_then(Value::as_str)) {
-        (Some(b), Some(from)) => s.push_str(&format!(" — {b:.1} BPM (grid from {from})")),
+        (Some(b), Some(from)) => s.push_str(&format!(" — {b:.1} BPM ({})", grid_source(from))),
         _ => s.push_str(" — no beat grid: sync, beat loops and quantise are off for it"),
     }
     if let (Some(k), src) = (v.get("key").and_then(Value::as_str), v.get("key_source").and_then(Value::as_str)) {
@@ -200,17 +248,20 @@ pub fn load_status(v: &Value) -> String {
     s
 }
 
-/// The Decks tab's keys. True when the key is the tab's (or does nothing here).
-pub fn key(app: &mut SoundApp, k: Key, m: Modifiers) -> bool {
+/// The Decks tab's keys (`k` the logical key, `physical` the key pressed). True when the key is
+/// the tab's or does nothing here; false for a Cmd, Ctrl or Alt chord, which
+/// [`crate::shortcuts`] lets through only when it is safe while the decks play.
+pub fn key(app: &mut SoundApp, k: Key, physical: Key, m: Modifiers) -> bool {
     if m.command || m.ctrl || m.alt {
         return false;
     }
+    let focus = deck_of(app.decks_view.focus);
+    let (s, track) = deck(app, focus);
+    let loaded = track.is_some();
     match k {
         Key::Space => {
-            let d = deck_of(app.decks_view.focus);
-            let (s, track) = deck(app, d);
-            if track.is_some() {
-                run(app, if s.playing { "deck.pause" } else { "deck.play" }, json!({"deck": d.id()}));
+            if loaded {
+                run(app, if s.playing { "deck.pause" } else { "deck.play" }, json!({"deck": focus.id()}));
             }
         }
         Key::ArrowLeft | Key::ArrowRight if m.shift => {
@@ -221,22 +272,133 @@ pub fn key(app: &mut SoundApp, k: Key, m: Modifiers) -> bool {
         }
         Key::ArrowLeft => app.decks_view.focus = 0,
         Key::ArrowRight => app.decks_view.focus = 1,
-        Key::ArrowUp | Key::ArrowDown => {
-            let b = &mut app.decks_view.browser;
-            let n = b.rows.len();
-            if n > 0 {
-                let i = b.selected.unwrap_or(0);
-                b.selected = Some(if k == Key::ArrowUp { i.saturating_sub(1) } else { (i + 1).min(n - 1) });
-            }
-        }
+        Key::ArrowUp | Key::ArrowDown => app.decks_view.browser.step_selection(if k == Key::ArrowUp { -1 } else { 1 }),
         Key::Enter => {
             if let Some(p) = app.decks_view.browser.selected_path() {
                 load(app, &p, None, false);
             }
         }
-        _ => {}
+        Key::Q | Key::W => {
+            let d = if k == Key::Q { DeckId::A } else { DeckId::B };
+            if deck(app, d).1.is_some() {
+                app.decks_view.focus = d.index();
+                press(app, d, Held::Cue, By::Key(k), false);
+            }
+        }
+        Key::S if loaded => run(app, "deck.sync", json!({"deck": focus.id(), "on": !s.synced})),
+        Key::L if loaded => {
+            let p = if s.loop_on { json!({"deck": focus.id(), "action": "exit"}) } else { json!({"deck": focus.id(), "beats": KEY_LOOP}) };
+            run(app, "deck.loop", p);
+        }
+        Key::Comma | Key::Period if loaded => {
+            let jump = jump_beats(app, focus);
+            run(app, "deck.beatjump", json!({"deck": focus.id(), "beats": if k == Key::Comma { -jump } else { jump }}));
+        }
+        _ => {
+            let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8];
+            if let Some(slot) = digits.iter().position(|d| *d == physical)
+                && loaded
+            {
+                let set = s.hot.get(slot).copied().flatten().is_some();
+                press(app, focus, Held::Pad { slot, release: set }, By::Key(k), m.shift);
+            }
+        }
     }
     true
+}
+
+/// The beats a beat jump on deck `d` moves.
+fn jump_beats(app: &SoundApp, d: DeckId) -> f64 {
+    JUMPS.get(app.decks_view.jump.get(d.index()).copied().flatten().unwrap_or(DEFAULT_JUMP)).copied().unwrap_or(4.0)
+}
+
+/// Presses deck `d`'s CUE or a pad, held by `by` until [`release_holds`] lets it go; nothing
+/// while the deck holds something else. A pad (`release`: it is set): `clear` clears it, else it
+/// jumps to a set cue or sets an empty one.
+fn press(app: &mut SoundApp, d: DeckId, what: Held, by: By, clear: bool) {
+    let i = d.index();
+    if app.decks_view.holds.get(i).copied().flatten().is_some() {
+        return;
+    }
+    app.decks_view.focus = i;
+    let what = match what {
+        Held::Cue => {
+            run(app, "deck.cue", json!({"deck": d.id(), "down": true}));
+            Held::Cue
+        }
+        Held::Pad { slot, release } => {
+            let action = if clear {
+                "clear"
+            } else if release {
+                "jump"
+            } else {
+                "set"
+            };
+            run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": action}));
+            Held::Pad { slot, release: release && !clear }
+        }
+    };
+    if let Some(h) = app.decks_view.holds.get_mut(i) {
+        *h = Some(Hold { what, by });
+    }
+}
+
+/// Sends the release of deck `d`'s hold `h`.
+fn release(app: &mut SoundApp, d: DeckId, h: Hold) {
+    match h.what {
+        Held::Cue => run(app, "deck.cue", json!({"deck": d.id(), "down": false})),
+        Held::Pad { slot, release: true } => run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "release"})),
+        Held::Pad { .. } => {}
+    }
+}
+
+/// Once a frame, whatever the window: lets go of a held CUE or pad once its pointer button or
+/// key is up, the Decks tab is not shown or the app has lost focus, so a preview never keeps
+/// playing on its own.
+pub fn release_holds(app: &mut SoundApp, ctx: &egui::Context) {
+    let shown = app.ui.window == MainWindow::Decks;
+    for d in DeckId::ALL {
+        let i = d.index();
+        let Some(h) = app.decks_view.holds.get(i).copied().flatten() else { continue };
+        let down = ctx.input(|inp| {
+            inp.focused
+                && match h.by {
+                    By::Pointer => inp.pointer.primary_down(),
+                    By::Key(k) => inp.key_down(k),
+                }
+        });
+        if down && shown {
+            continue;
+        }
+        if let Some(slot) = app.decks_view.holds.get_mut(i) {
+            *slot = None;
+        }
+        if h.by == By::Pointer
+            && let Some(r) = app.decks_view.released.get_mut(i)
+        {
+            *r = true;
+        }
+        release(app, d, h);
+    }
+}
+
+/// A pointer press on deck `d`'s CUE or pad `resp` this frame: held until the button comes up.
+/// A press and release inside one frame (a slow frame, a tap) is a tap: pressed and let go.
+fn pointer_hold(app: &mut SoundApp, ui: &Ui, resp: &Response, d: DeckId, what: Held, clear: bool) {
+    let i = d.index();
+    let free = app.decks_view.holds.get(i).copied().flatten().is_none();
+    let released = app.decks_view.released.get(i).copied().unwrap_or(false);
+    if !free {
+        return;
+    }
+    if resp.is_pointer_button_down_on() && ui.input(|inp| inp.pointer.primary_down()) {
+        press(app, d, what, By::Pointer, clear);
+    } else if resp.clicked() && !released {
+        press(app, d, what, By::Pointer, clear);
+        if let Some(h) = app.decks_view.holds.get_mut(i).and_then(Option::take) {
+            release(app, d, h);
+        }
+    }
 }
 
 /// Draws the Decks tab.
@@ -257,6 +419,14 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             *x = c.advance(&s, now, sr);
         }
     }
+    // The waveforms' scale: each deck's steady tempo (not a nudge's bend or sync's correction).
+    let states = [deck(app, DeckId::A), deck(app, DeckId::B)];
+    let free = [0, 1].map(|i| app.decks_view.rates.get_mut(i).map_or(1.0, |r| r.update(&states[i].0, now)));
+    let bpm = |i: usize| states[i].1.as_ref().and_then(|t| t.bpm);
+    app.decks_view.tempo = [
+        steady_tempo(&states[0].0, free[0], bpm(0), &states[1].0, free[1], bpm(1)),
+        steady_tempo(&states[1].0, free[1], bpm(1), &states[0].0, free[0], bpm(0)),
+    ];
     feed_meters(app, ui.input(|i| i.stable_dt).clamp(0.0, 0.25));
     let wave_h = (full.height() * 0.25).clamp(150.0, 260.0);
     let mid_h = (full.height() * 0.41).clamp(360.0, 430.0);
@@ -264,11 +434,14 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let mid = Rect::from_min_size(pos2(full.min.x, waves.max.y + 4.0), vec2(full.width(), mid_h));
     let lib = Rect::from_min_max(pos2(full.min.x, mid.max.y + 4.0), full.max);
     let before = app.decks_view.columns_computed();
+    let gap = 12.0;
+    let h = (waves.height() - 4.0 - gap) / 2.0;
     for (i, d) in DeckId::ALL.into_iter().enumerate() {
-        let h = (waves.height() - 6.0) / 2.0;
-        let r = Rect::from_min_size(pos2(waves.min.x + 4.0, waves.min.y + 2.0 + i as f32 * (h + 2.0)), vec2(waves.width() - 8.0, h));
+        let r = Rect::from_min_size(pos2(waves.min.x + 4.0, waves.min.y + 2.0 + i as f32 * (h + gap)), vec2(waves.width() - 8.0, h));
         scrolling_wave(app, ui, r, d, shown.get(i).copied().unwrap_or(0.0));
     }
+    let meter_r = Rect::from_min_size(pos2(waves.min.x + 38.0, waves.min.y + 2.0 + h + 2.0), vec2(waves.width() - 42.0, gap - 4.0));
+    phase_meter(app, ui, meter_r);
     app.decks_view.last_columns = app.decks_view.columns_computed().saturating_sub(before);
     let mixer_w = 380.0_f32.min(mid.width() * 0.32);
     let side = (mid.width() - mixer_w - 16.0) / 2.0;
@@ -281,6 +454,32 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(lib.shrink2(vec2(4.0, 0.0))));
     child.set_clip_rect(lib);
     library_browser::show(app, &mut child);
+    app.decks_view.released = [false; 2];
+}
+
+/// Between the waveforms: how far the following deck's beat is from its master's (±½ beat),
+/// while both play. Centred and green is in phase.
+fn phase_meter(app: &SoundApp, ui: &Ui, r: Rect) {
+    let t = Tokens::current();
+    let p = ui.painter();
+    p.rect_filled(r, 2.0, t.window_bg);
+    p.vline(r.center().x, r.y_range(), Stroke::new(1.0, t.text_dim));
+    for q in [0.25_f32, 0.75] {
+        p.vline(r.min.x + r.width() * q, r.y_range(), Stroke::new(1.0, t.text_dim.gamma_multiply(0.4)));
+    }
+    let st = &app.engine.deck_status;
+    let Some((d, e)) =
+        DeckId::ALL.into_iter().find_map(|d| st.decks.get(d.index()).and_then(|s| s.phase_error).filter(|e| e.is_finite()).map(|e| (d, e)))
+    else {
+        return;
+    };
+    let x = r.center().x + (e.clamp(-0.5, 0.5) as f32) * r.width();
+    let c = if e.abs() < 0.02 { t.meter_green } else { tint(d) };
+    p.rect_filled(Rect::from_center_size(pos2(x, r.center().y), vec2(10.0, r.height())), 2.0, c);
+    let ms = st.decks.get(d.index()).map(|s| s.bpm).filter(|b| *b > 0.0).map(|b| e * 60_000.0 / b);
+    if let Some(ms) = ms {
+        p.text(pos2(r.max.x - 4.0, r.center().y), Align2::RIGHT_CENTER, format!("{} {ms:+.0} ms", name(d)), regular(9.0), t.text_dim);
+    }
 }
 
 fn feed_meters(app: &mut SoundApp, dt: f32) {
@@ -309,12 +508,6 @@ fn button(ui: &mut Ui, r: Rect, text: &str, on: bool, on_colour: Color32, label:
     resp
 }
 
-/// A press-and-release key: returns (pressed this frame, released this frame).
-fn hold_edges(resp: &Response, held: bool, ui: &Ui) -> (bool, bool) {
-    let down = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
-    (down && !held, !down && held)
-}
-
 /// A drop of a library track inside `r` this frame.
 fn dropped(ui: &Ui, r: Rect) -> Option<String> {
     let ctx = ui.ctx();
@@ -331,19 +524,32 @@ fn dropped(ui: &Ui, r: Rect) -> Option<String> {
     None
 }
 
-/// Jog from a drag: a nudge while playing, a search while stopped.
-fn jog_drag(app: &mut SoundApp, resp: &Response, d: DeckId, s: &DeckState, invert: bool) {
+/// The jog disc dragged: a nudge as strong as the drag is fast while the deck is heard, else a
+/// search of a beat per [`JOG_PX`] points (none lost to a fast flick).
+fn jog_drag(app: &mut SoundApp, ui: &Ui, resp: &Response, d: DeckId, s: &DeckState) {
     if !resp.dragged() {
         return;
     }
-    let dx = resp.drag_delta().x * if invert { -1.0 } else { 1.0 };
+    let dx = resp.drag_delta().x;
     if dx.abs() < 0.5 {
         return;
     }
-    let delta = f64::from((dx / JOG_PX).clamp(-1.0, 1.0));
-    let mode = if s.playing { "nudge" } else { "search" };
     app.decks_view.focus = d.index();
-    run(app, "deck.jog", json!({"deck": d.id(), "delta": delta, "mode": mode}));
+    if s.playing || s.previewing {
+        let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.1);
+        let delta = f64::from((dx / dt / NUDGE_PX_S).clamp(-1.0, 1.0));
+        run(app, "deck.jog", json!({"deck": d.id(), "delta": delta, "mode": "nudge"}));
+        return;
+    }
+    let mut beats = f64::from(dx / JOG_PX);
+    for _ in 0..64 {
+        if beats.abs() < 1e-4 {
+            break;
+        }
+        let step = beats.clamp(-1.0, 1.0);
+        run(app, "deck.jog", json!({"deck": d.id(), "delta": step, "mode": "search"}));
+        beats -= step;
+    }
 }
 
 fn scrolling_wave(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64) {
@@ -377,17 +583,58 @@ fn scrolling_wave(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position:
     let by_freq = app.waveform_bands();
     let seconds = app.decks_view.seconds();
     let sr = app.engine.session().sample_rate.as_f64().max(1.0);
-    let w = Scrolling { track: &track, state: &s, position, seconds, rate: sr, by_freq, tint };
+    let tempo = app.decks_view.tempo.get(d.index()).copied().filter(|t| *t > 0.0).unwrap_or(1.0);
+    let w = Scrolling { track: &track, state: &s, position, seconds, rate: sr, tempo, by_freq, tint };
     if let Some(cache) = app.decks_view.waves.get_mut(d.index()) {
         deck_wave::scrolling(ui.painter(), wave, cache, &w);
     }
     if app.engine.deck_loading_on(d) {
         ui.painter().text(pos2(wave.max.x - 8.0, wave.min.y + 10.0), Align2::RIGHT_CENTER, "Analysing…", bold(11.0), t.accent);
     }
-    // Dragging the waveform jogs it (dragging it left moves the music on).
-    jog_drag(app, &resp, d, &s, true);
+    // Dragging the waveform: a nudge while heard (left moves the music on), else the music
+    // follows the pointer.
+    let i = d.index();
+    if resp.drag_started()
+        && let Some(x) = app.decks_view.search.get_mut(i)
+    {
+        *x = Some((s.position, 0.0));
+    }
+    if !resp.dragged() {
+        if let Some(x) = app.decks_view.search.get_mut(i) {
+            *x = None;
+        }
+    } else if s.playing || s.previewing {
+        let dx = -resp.drag_delta().x;
+        let dt = ui.input(|inp| inp.stable_dt).clamp(1.0 / 240.0, 0.1);
+        if dx.abs() >= 0.5 {
+            app.decks_view.focus = i;
+            run(app, "deck.jog", json!({"deck": d.id(), "delta": f64::from((dx / dt / NUDGE_PX_S).clamp(-1.0, 1.0)), "mode": "nudge"}));
+        }
+    } else if let Some((from, moved)) = app.decks_view.search.get(i).copied().flatten() {
+        let moved = moved + resp.drag_delta().x;
+        if let Some(x) = app.decks_view.search.get_mut(i) {
+            *x = Some((from, moved));
+        }
+        if resp.drag_delta().x.abs() > 0.0 {
+            let spp = seconds * sr * tempo / f64::from(wave.width().max(1.0));
+            let at = (from - f64::from(moved) * spp).clamp(0.0, track.frames() as f64);
+            app.decks_view.focus = i;
+            run(app, "deck.seek", json!({"deck": d.id(), "at": at / sr}));
+        }
+    }
     if let Some(p) = dropped(ui, wave) {
         load(app, &p, Some(d), false);
+    }
+}
+
+/// Where a deck's beat grid came from, in words.
+fn grid_source(from: &str) -> &'static str {
+    match from {
+        "given" => "grid set by hand",
+        "library" => "grid from mixforge's library",
+        "mixforge" => "grid analysed by mixforge",
+        "tag" => "grid from the BPM tag",
+        _ => "beat grid",
     }
 }
 
@@ -447,22 +694,25 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
         .as_ref()
         .and_then(|t| t.key.clone())
         .map_or_else(|| "key –".into(), |k| if key_src.is_empty() { k } else { format!("{k} · {key_src}") });
-    ui.painter().text(pos2(right, inner.min.y + 30.0), Align2::RIGHT_TOP, key_text, bold(11.5), t.accent);
+    let has_key = track.as_ref().is_some_and(|t| t.key.is_some());
+    ui.painter().text(pos2(right, inner.min.y + 30.0), Align2::RIGHT_TOP, key_text, bold(11.5), if has_key { t.accent } else { t.text_dim });
     // Times, state and errors.
     let line = inner.min.y + 36.0;
     if let Some(tr) = &track {
         let total = tr.frames() as f64 / sr;
         let now = position / sr;
         let rate = if s.rate.is_finite() && s.rate > 0.05 { s.rate } else { 1.0 };
-        let times = format!("{}   -{}", clock_tenths(now), clock_tenths(((total - now) / rate).max(0.0)));
-        ui.painter().text(pos2(tx, line), Align2::LEFT_TOP, times, mono(12.5), t.text);
-        let grid = tr.grid_from.map_or_else(|| "no grid".to_string(), |g| format!("grid: {g}"));
-        ui.painter().text(pos2(tx + 170.0, line + 1.0), Align2::LEFT_TOP, grid, regular(11.0), t.text_dim);
+        let elapsed = ui.painter().text(pos2(tx, line - 2.0), Align2::LEFT_TOP, clock_tenths(now), mono(17.0), t.text);
+        let remain = format!("-{}", clock_tenths(((total - now) / rate).max(0.0)));
+        ui.painter().text(pos2(elapsed.max.x + 14.0, line - 2.0), Align2::LEFT_TOP, remain, mono(17.0), t.text_dim);
+        let grid = tr.grid_from.map_or_else(|| "no beat grid".to_string(), |g| grid_source(g).to_string());
+        ui.painter().text(pos2(tx + 210.0, line + 3.0), Align2::LEFT_TOP, grid, regular(11.0), t.text_dim);
     }
+    let note_x = tx + 330.0;
     if app.engine.deck_loading_on(d) {
-        ui.painter().text(pos2(tx + 260.0, line + 1.0), Align2::LEFT_TOP, "Analysing…", bold(11.0), t.accent);
+        ui.painter().text(pos2(note_x, line + 3.0), Align2::LEFT_TOP, "Analysing…", bold(11.0), t.accent);
     } else if let Some(e) = app.decks_view.load_error.get(i).cloned().flatten() {
-        elided_text(ui.painter(), pos2(tx + 260.0, line + 1.0), Align2::LEFT_TOP, &e, regular(11.0), t.rec, (inner.max.x - tx - 260.0).max(20.0));
+        elided_text(ui.painter(), pos2(note_x, line + 3.0), Align2::LEFT_TOP, &e, regular(11.0), t.rec, (inner.max.x - note_x).max(20.0));
     }
     // The overview: click or drag to seek.
     let ov = Rect::from_min_size(pos2(inner.min.x, inner.min.y + 56.0), vec2(inner.width(), 42.0));
@@ -504,18 +754,19 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
     };
     pitch_fader(app, ui, pitch_r, d, &s, track.as_deref());
     jog(app, ui, jog_r, d, &s, position, track.as_deref());
-    transport(app, ui, main_r, d, &s, track.is_some());
+    transport(app, ui, main_r, d, &s, track.as_deref());
     if let Some(p) = dropped(ui, r) {
         load(app, &p, Some(d), false);
     }
 }
 
-fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, loaded: bool) {
+fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, track: Option<&DeckTrack>) {
     let t = Tokens::current();
+    let loaded = track.is_some();
     let i = d.index();
     let n = name(d);
     let gap = 6.0;
-    // Row 1: Play, Cue | Sync, Master Tempo, Quantise | Load.
+    // Row 1: Play, Cue | Sync, Master Tempo | Load.
     let row = Rect::from_min_size(r.min, vec2(r.width(), 40.0));
     let mut x = row.min.x;
     let mut cell = |w: f32, h: f32| {
@@ -527,7 +778,6 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     let cue_r = cell(62.0, 40.0);
     let sync_r = cell(50.0, 28.0);
     let mt_r = cell(40.0, 28.0);
-    let q_r = cell(30.0, 28.0);
     let play = button(ui, play_r, "", s.playing, t.transport_play, &format!("Deck {n} Play"), 16.0);
     // The icon, drawn: a triangle, or two bars while playing.
     let (c, ink) = (play_r.center(), if s.playing { t.text_dark } else { t.text });
@@ -548,22 +798,15 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
         app.decks_view.focus = i;
         run(app, if s.playing { "deck.pause" } else { "deck.play" }, json!({"deck": d.id()}));
     }
-    let cue = button(ui, cue_r, "CUE", s.previewing, t.accent, &format!("Deck {n} Cue"), 13.0)
-        .on_hover_text("Stopped: sets the cue here and plays while held. Playing: back to the cue, paused");
-    let held = app.decks_view.cue_held.get(i).copied().unwrap_or(false);
-    let (press, release) = hold_edges(&cue, held, ui);
-    if press && loaded {
-        app.decks_view.focus = i;
-        run(app, "deck.cue", json!({"deck": d.id(), "down": true}));
-    }
-    if release && loaded {
-        run(app, "deck.cue", json!({"deck": d.id(), "down": false}));
-    }
-    if let Some(h) = app.decks_view.cue_held.get_mut(i) {
-        *h = (*h || press) && !release;
+    let cue = button(ui, cue_r, "CUE", s.previewing, t.accent, &format!("Deck {n} Cue"), 13.0).on_hover_text(format!(
+        "Stopped: sets the cue here and plays while held. Playing: back to the cue, paused. Key: {}",
+        if d == DeckId::A { "Q" } else { "W" }
+    ));
+    if loaded {
+        pointer_hold(app, ui, &cue, d, Held::Cue, false);
     }
     if button(ui, sync_r, "SYNC", s.synced, tint(d), &format!("Deck {n} Sync"), 11.0)
-        .on_hover_text("Beat sync to the other deck (tempo, then phase)")
+        .on_hover_text("Beat sync to the other deck (tempo, then phase). Key: S on the focused deck")
         .clicked()
     {
         run(app, "deck.sync", json!({"deck": d.id(), "on": !s.synced}));
@@ -571,21 +814,16 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     if button(ui, mt_r, "MT", s.key_lock, t.accent, &format!("Deck {n} Master Tempo"), 11.0).on_hover_text("Master Tempo (key lock)").clicked() {
         run(app, "deck.master_tempo", json!({"deck": d.id(), "on": !s.key_lock}));
     }
-    let q = app.engine.deck_status.quantise;
-    if button(ui, q_r, "Q", q, t.accent, &format!("Deck {n} Quantise"), 11.0)
-        .on_hover_text("Quantise cues, hot cues and loops to the beat (both decks)")
-        .clicked()
-    {
-        run(app, "deck.quantise", json!({"on": !q}));
-    }
     let load_r = Rect::from_min_max(pos2((row.max.x - 64.0).max(x), row.min.y + 6.0), pos2(row.max.x, row.max.y - 6.0));
-    let locked = s.playing;
-    let load_resp = button(ui, load_r, "LOAD", false, t.accent, &format!("Deck {n} Load"), 11.0);
+    // Load Lock: the deck is heard (playing, or a cue preview).
+    let locked = s.playing || s.previewing;
+    let load_resp =
+        button(ui, load_r, if locked { "LOCKED" } else { "LOAD" }, false, t.accent, &format!("Deck {n} Load"), if locked { 9.5 } else { 11.0 });
+    if locked {
+        ui.painter().rect_stroke(load_r, 3.0, Stroke::new(2.0, t.rec), egui::StrokeKind::Inside);
+    }
     // The deck-has-track light.
     ui.painter().circle_filled(pos2(load_r.min.x + 7.0, load_r.min.y + 7.0), 3.0, if loaded { t.meter_green } else { t.meter_bg });
-    if locked {
-        ui.painter().text(pos2(load_r.max.x - 4.0, load_r.min.y + 2.0), Align2::RIGHT_TOP, "LOCK", bold(7.0), t.rec);
-    }
     let tip = if locked {
         format!("Deck {n} is playing: Load Lock. Shift+click loads anyway (it fades out first)")
     } else {
@@ -600,12 +838,12 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
         }
     }
     // Row 2: the hot cue pads.
-    let pad_h = (r.height() - 40.0 - 24.0 - 24.0 - 8.0 - 8.0 - 6.0 - 24.0).clamp(34.0, 64.0);
+    let pad_h = (r.height() - 40.0 - 26.0 - 26.0 - 8.0 - 8.0 - 6.0 - 4.0).clamp(34.0, 72.0);
     let pads = Rect::from_min_size(pos2(r.min.x, row.max.y + 8.0), vec2(r.width(), pad_h));
     let pw = (pads.width() - gap * (HOT_CUES as f32 - 1.0)) / HOT_CUES as f32;
     for slot in 0..HOT_CUES {
         let pr = Rect::from_min_size(pos2(pads.min.x + slot as f32 * (pw + gap), pads.min.y), vec2(pw, pads.height()));
-        pad(app, ui, pr, d, s, slot, loaded);
+        pad(app, ui, pr, d, s, slot, track);
     }
     // Row 3: beat loops.
     let lr = Rect::from_min_size(pos2(r.min.x, pads.max.y + 8.0), vec2(r.width(), 26.0));
@@ -662,12 +900,14 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     {
         run(app, "deck.loop", json!({"deck": d.id(), "action": action}));
     }
-    let jump = JUMPS.get(app.decks_view.jump.get(i).copied().flatten().unwrap_or(DEFAULT_JUMP)).copied().unwrap_or(4.0);
+    let jump = jump_beats(app, d);
     let back = cell_at(5, r4);
     let size = cell_at(6, r4);
     let fwd = cell_at(7, r4);
     ui.painter().text(pos2(cell_at(4, r4).max.x, r4.center().y), Align2::RIGHT_CENTER, "JUMP", bold(9.5), t.text_dim);
-    if button(ui, back, "◀", false, t.accent, &format!("Deck {n} Beat Jump Back"), 11.0).on_hover_text(format!("Jump {jump:.0} beats back")).clicked()
+    if button(ui, back, "◀", false, t.accent, &format!("Deck {n} Beat Jump Back"), 11.0)
+        .on_hover_text(format!("Jump {jump:.0} beats back (key: comma)"))
+        .clicked()
     {
         run(app, "deck.beatjump", json!({"deck": d.id(), "beats": -jump}));
     }
@@ -680,17 +920,12 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
             *j = Some((k + 1) % JUMPS.len());
         }
     }
-    if button(ui, fwd, "▶", false, t.accent, &format!("Deck {n} Beat Jump Forward"), 11.0).on_hover_text(format!("Jump {jump:.0} beats on")).clicked()
+    if button(ui, fwd, "▶", false, t.accent, &format!("Deck {n} Beat Jump Forward"), 11.0)
+        .on_hover_text(format!("Jump {jump:.0} beats on (key: full stop)"))
+        .clicked()
     {
         run(app, "deck.beatjump", json!({"deck": d.id(), "beats": jump}));
     }
-    ui.painter().text(
-        pos2(r.min.x, r4.max.y + 8.0),
-        Align2::LEFT_TOP,
-        "Pads: click sets an empty one, jumps to a set one; Shift+click or right-click clears",
-        regular(10.0),
-        t.text_dim,
-    );
 }
 
 /// The loop's length in beats, while one is set.
@@ -703,8 +938,10 @@ fn loop_length(app: &SoundApp, d: DeckId, s: &DeckState) -> Option<f64> {
     Some(g.beat_at(b) - g.beat_at(a))
 }
 
-fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot: usize, loaded: bool) {
-    let i = d.index();
+/// The names of hot cues A–D when they come from a DJ set or mixforge.
+const CUE_NAMES: [&str; 4] = ["Mix in", "Bass hit", "Mix out", "Bass gone"];
+
+fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot: usize, track: Option<&DeckTrack>) {
     let set = s.hot.get(slot).copied().flatten().is_some();
     let colour = hot_cue_colour(slot);
     let letter = hot_cue_letter(slot);
@@ -718,41 +955,22 @@ fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot:
     ui.painter().text(r.center(), Align2::CENTER_CENTER, letter, bold(14.0), if set { Color32::BLACK } else { colour });
     let on = set;
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, &label));
-    let resp =
-        resp.on_hover_text(if set { "Jump (held while stopped: plays from it). Shift+click or right-click clears" } else { "Set a hot cue here" });
-    if !loaded {
+    // A pad still at the cue the set or mixforge gave it keeps that cue's name.
+    let given = track.and_then(|t| t.cues.get(slot).copied().flatten());
+    let named = CUE_NAMES.get(slot).filter(|_| given.is_some_and(|g| s.hot.get(slot).copied().flatten().is_some_and(|h| (h - g).abs() < 1.0)));
+    let tip = match (set, named) {
+        (true, Some(n)) => format!("{n}: jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
+        (true, None) => format!("Jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
+        (false, _) => format!("Set a hot cue here. Key: {}", slot + 1),
+    };
+    let resp = resp.on_hover_text(tip);
+    if track.is_none() {
         return;
     }
-    let held = app.decks_view.pad_held.get(i).copied().flatten();
-    let down = resp.is_pointer_button_down_on() && ui.input(|inp| inp.pointer.primary_down());
-    let seq = |action: &str| json!({"deck": d.id(), "n": slot + 1, "action": action});
-    if down && held.is_none_or(|(k, _)| k != slot) {
-        app.decks_view.focus = i;
-        let shift = ui.input(|inp| inp.modifiers.shift);
-        let release = if shift {
-            run(app, "deck.hotcue", seq("clear"));
-            false
-        } else if set {
-            run(app, "deck.hotcue", seq("jump"));
-            true
-        } else {
-            run(app, "deck.hotcue", seq("set"));
-            false
-        };
-        if let Some(h) = app.decks_view.pad_held.get_mut(i) {
-            *h = Some((slot, release));
-        }
-    } else if !down && let Some((k, release)) = held.filter(|(k, _)| *k == slot) {
-        if release {
-            run(app, "deck.hotcue", seq("release"));
-        }
-        let _ = k;
-        if let Some(h) = app.decks_view.pad_held.get_mut(i) {
-            *h = None;
-        }
-    }
+    let shift = ui.input(|inp| inp.modifiers.shift);
+    pointer_hold(app, ui, &resp, d, Held::Pad { slot, release: set }, shift);
     if resp.secondary_clicked() && set {
-        run(app, "deck.hotcue", seq("clear"));
+        run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "clear"}));
     }
 }
 
@@ -808,38 +1026,49 @@ fn hold_value(app: &mut SoundApp, id: Id, resp: &Response, value: Option<f32>) {
     }
 }
 
+/// The pitch fader's travel (0 bottom, 1 top) for `pitch` (a fraction) in ±`range`: up is
+/// slower, as on a CDJ.
+fn pitch_travel(pitch: f64, range: f64) -> f32 {
+    (0.5 - pitch / (2.0 * range)).clamp(0.0, 1.0) as f32
+}
+
+/// The pitch (a fraction) at the fader's `travel`.
+fn travel_pitch(travel: f32, range: f64) -> f64 {
+    (0.5 - f64::from(travel)) * 2.0 * range
+}
+
 fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, track: Option<&DeckTrack>) {
     let t = Tokens::current();
     let range = if s.range > 0.0 { s.range } else { PITCH_RANGES[0] };
     let fr = Rect::from_min_max(r.min, pos2(r.max.x, r.max.y - 26.0));
     let id = Id::new(("decks_pitch", d.id()));
-    // Up is slower, as on a CDJ: the top is −range.
-    let reported = (0.5 - s.pitch / (2.0 * range)) as f32;
+    // Up is slower, as on a CDJ: the top (travel 1) is −range, the bottom +range.
+    let reported = pitch_travel(s.pitch, range);
     let travel = shown_value(app, id, reported);
     ui.painter().text(pos2(fr.center().x, fr.min.y - 2.0), Align2::CENTER_BOTTOM, "−", bold(10.0), t.text_dim);
-    let (v, resp) = vfader(ui, fr, 1.0 - travel, id, &format!("Deck {} Pitch", name(d)), 0.5);
+    ui.painter().text(pos2(fr.center().x, fr.max.y + 1.0), Align2::CENTER_TOP, "+", bold(10.0), t.text_dim);
+    let (v, resp) = vfader(ui, fr, travel, id, &format!("Deck {} Pitch", name(d)), 0.5);
     // Soft takeover: where the deck's tempo really is (sync, a nudge), when not where the fader is.
     if let Some(bpm) = track.and_then(|tr| tr.bpm).filter(|b| *b > 0.0 && s.bpm > 0.0) {
         let actual = s.bpm / bpm - 1.0;
         if (actual - s.pitch).abs() > 0.0005 {
-            let at = (0.5 - actual / (2.0 * range)).clamp(0.0, 1.0) as f32;
+            let at = pitch_travel(actual, range);
             let slot_h = fr.height() - 16.0;
-            let y = fr.min.y + 8.0 + slot_h * at;
+            let y = fr.max.y - 8.0 - slot_h * at;
             ui.painter().hline(fr.min.x + 2.0..=fr.max.x - 2.0, y, Stroke::new(2.0, t.accent.gamma_multiply(0.8)));
         }
     }
     let resp = resp.on_hover_text(
         "Pitch (up is slower, as on a CDJ). The yellow line is the tempo now (sync): move the fader to it to take over. Double-click: 0 %",
     );
-    let pitch = v.map(|v| 1.0 - v);
-    hold_value(app, id, &resp, pitch);
-    if let Some(p) = pitch
+    hold_value(app, id, &resp, v);
+    if let Some(v) = v
         && track.is_some()
     {
-        let value = (0.5 - f64::from(p)) * 2.0 * range * 100.0;
+        let value = travel_pitch(v, range) * 100.0;
         run(app, "deck.pitch", json!({"deck": d.id(), "value": (value * 100.0).round() / 100.0}));
     }
-    let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - 22.0), r.max);
+    let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - 20.0), r.max);
     let label = format!("±{:.0}", range * 100.0);
     if button(ui, rr, &label, false, t.accent, &format!("Deck {} Pitch Range", name(d)), 10.5)
         .on_hover_text("Pitch range: ±8, ±16 or ±50 %")
@@ -873,10 +1102,10 @@ fn jog(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, posit
     let a = (turn.fract() * std::f64::consts::TAU) as f32 - std::f32::consts::FRAC_PI_2;
     let dir = vec2(a.cos(), a.sin());
     p.line_segment([c + dir * rad * 0.66, c + dir * (rad - 3.0)], Stroke::new(3.0, if s.playing { Color32::WHITE } else { t.text_dim }));
-    p.text(c, Align2::CENTER_CENTER, if s.playing { "NUDGE" } else { "SEARCH" }, bold(9.5), t.text_dim);
+    p.text(c, Align2::CENTER_CENTER, if s.playing || s.previewing { "NUDGE" } else { "SEARCH" }, bold(9.5), t.text_dim);
     let resp = resp.on_hover_text("Drag sideways: nudge while playing, search while stopped");
     if track.is_some() {
-        jog_drag(app, &resp, d, s, false);
+        jog_drag(app, ui, &resp, d, s);
     }
 }
 
@@ -906,7 +1135,7 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     if resp.changed() {
         run(app, "deck.master_volume", json!({"db": (db * 10.0).round() / 10.0}));
     }
-    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 64.0), vec2(18.0, (body.height() - 104.0).max(40.0)));
+    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 64.0), vec2(18.0, (body.height() - 128.0).max(40.0)));
     let [l, rgt] = app.decks_view.meters[2];
     meter(ui, Rect::from_min_size(mr.min, vec2(8.0, mr.height())), l, l, l >= 1.0);
     meter(ui, Rect::from_min_size(pos2(mr.min.x + 10.0, mr.min.y), vec2(8.0, mr.height())), rgt, rgt, rgt >= 1.0);
@@ -916,6 +1145,12 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
         FaderCurve::Smooth => (FaderCurve::Sharp, "SMOOTH"),
         FaderCurve::Sharp => (FaderCurve::Linear, "SHARP"),
     };
+    let qr = Rect::from_center_size(pos2(c.center().x, body.max.y - 38.0), vec2(centre_w - 12.0, 20.0));
+    let q = st.quantise;
+    if button(ui, qr, "QUANTISE", q, t.accent, "Quantise", 9.0).on_hover_text("Quantise cues, hot cues and loops to the beat (both decks)").clicked()
+    {
+        run(app, "deck.quantise", json!({"on": !q}));
+    }
     let cr = Rect::from_center_size(pos2(c.center().x, body.max.y - 14.0), vec2(centre_w - 12.0, 20.0));
     if button(ui, cr, text, false, t.accent, "Channel Fader Curve", 9.5).on_hover_text("Channel fader curve (both channels)").clicked() {
         for d in DeckId::ALL {
@@ -923,7 +1158,7 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
         }
     }
     // The crossfader and its curve.
-    let xr = Rect::from_min_max(pos2(r.min.x + 40.0, r.max.y - xf_h + 10.0), pos2(r.max.x - 40.0, r.max.y - 14.0));
+    let xr = Rect::from_min_max(pos2(r.min.x + 44.0, r.max.y - xf_h + 10.0), pos2(r.max.x - 68.0, r.max.y - 14.0));
     let id = Id::new("decks_xfader");
     let reported = if st.xfader.is_finite() { st.xfader * 0.5 + 0.5 } else { 0.5 };
     let travel = shown_value(app, id, reported);
@@ -962,11 +1197,8 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
         XfadeCurve::Smooth => (XfadeCurve::Sharp, "SMOOTH"),
         XfadeCurve::Sharp => (XfadeCurve::Smooth, "CUT"),
     };
-    let cr = Rect::from_center_size(pos2(r.center().x, r.max.y - 6.0), vec2(60.0, 12.0));
-    let resp = ui.interact(cr, Id::new("decks_xcurve"), Sense::click());
-    ui.painter().text(cr.center(), Align2::CENTER_CENTER, format!("curve: {text}"), regular(9.5), if resp.hovered() { t.text } else { t.text_dim });
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Crossfader Curve"));
-    if resp.on_hover_text("Crossfader curve: smooth (constant power) or cut").clicked() {
+    let cr = Rect::from_center_size(pos2(r.max.x - 22.0, r.max.y - xf_h / 2.0 - 2.0), vec2(38.0, 18.0));
+    if button(ui, cr, text, false, t.accent, "Crossfader Curve", 8.5).on_hover_text("Crossfader curve: smooth (constant power) or cut").clicked() {
         run(app, "deck.xfader", json!({"curve": next.id()}));
     }
 }
@@ -1117,10 +1349,23 @@ mod tests {
     }
 
     #[test]
+    fn the_pitch_fader_is_slower_at_the_top() {
+        // Up is slower, as on a CDJ.
+        assert_eq!(pitch_travel(-0.08, 0.08), 1.0);
+        assert_eq!(pitch_travel(0.08, 0.08), 0.0);
+        assert_eq!(pitch_travel(0.0, 0.08), 0.5);
+        assert!((travel_pitch(1.0, 0.08) + 0.08).abs() < 1e-9);
+        assert!((travel_pitch(pitch_travel(0.031, 0.16), 0.16) - 0.031).abs() < 1e-6);
+    }
+
+    #[test]
     fn load_status_says_where_the_grid_came_from_and_any_fallback() {
         let v = json!({"deck": "a", "title": "Tidal", "bpm": 138.0, "grid_from": "tag", "key": "9A", "key_source": "mik", "analysis_error": "no mixforge"});
         let s = load_status(&v);
-        assert!(s.contains("Deck A: loaded Tidal") && s.contains("grid from tag") && s.contains("key 9A (MIK)") && s.contains("no mixforge"), "{s}");
+        assert!(
+            s.contains("Deck A: loaded Tidal") && s.contains("grid from the BPM tag") && s.contains("key 9A (MIK)") && s.contains("no mixforge"),
+            "{s}"
+        );
         let none = load_status(&json!({"deck": "b", "title": "X", "bpm": null, "grid_from": null}));
         assert!(none.contains("no beat grid"), "{none}");
         assert_eq!(clock_tenths(83.45), "1:23.4");

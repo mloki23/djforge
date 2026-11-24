@@ -23,7 +23,7 @@ use soundcraft_time::Samples;
 use std::cell::Cell;
 use std::sync::Arc;
 
-pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
+pub use cmd::{CommandInfo, CommandSpec, LibraryQuery, command_specs, find_command};
 pub use soundcraft_model as model;
 pub use soundcraft_model::APP_NAME;
 

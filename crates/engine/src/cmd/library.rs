@@ -14,6 +14,10 @@
 //!
 //! `deck.load` asks [`analysis_for`] first: a fresh row gives the grid, key and mix points with
 //! no sidecar run.
+//!
+//! A listing looks at the files it returns (are they there, changed, their tags) and a folder's
+//! is read from disk: on a network drive or a sleeping disk that takes a while, so the app runs
+//! them off the UI thread ([`Engine::start_library_query`]); the commands run them in place.
 
 use super::*;
 use crate::cmd;
@@ -739,44 +743,155 @@ struct Listing {
     loading: bool,
 }
 
-fn listing(e: &mut Engine, cmd: &str, q: &Query) -> Result<Listing> {
-    let Some(folder) = &q.folder else {
-        let (snap, loading) = library(e, cmd)?;
-        return Ok(Listing {
-            tracks: snap.tracks.iter().filter(|t| matches(t, &q.words)).cloned().collect(),
-            from_copy: snap.from_copy,
-            folder: None,
-            library_error: snap.error.clone(),
-            mik_error: snap.mik_error.clone(),
-            loading,
-        });
+/// What a query needs of the engine, taken when it is asked; [`Prepared::run`] then does the
+/// file reads, on any thread.
+struct Prepared {
+    q: Query,
+    /// The libraries as last read (none: mixforge's isn't set up and a folder is listed), and
+    /// whether a read is under way.
+    snap: Option<Arc<Snapshot>>,
+    loading: bool,
+    /// `library.compatible`: the deck, its tempo and key.
+    compatible: Option<(soundcraft_mix::DeckId, f64, Option<String>)>,
+}
+
+const SEARCH: &str = "library.search";
+const COMPATIBLE: &str = "library.compatible";
+
+/// Checks a `library.list`, `library.search` or `library.compatible` and takes what it needs.
+fn prepare(e: &mut Engine, cmd: &str, p: &Value) -> Result<Prepared> {
+    let compatible = if cmd == COMPATIBLE {
+        let deck = str_param(p, "deck").and_then(soundcraft_mix::DeckId::parse).ok_or_else(|| bad(cmd, "`deck` must be a or b"))?;
+        let Some(t) = e.deck_tracks.get(deck.index()).and_then(Option::as_ref) else {
+            return Err(bad(cmd, format!("deck {} is empty: load a track first (deck.load)", deck.id().to_uppercase())));
+        };
+        let now = e.deck_status.decks.get(deck.index()).map(|s| s.bpm).filter(|b| b.is_finite() && *b > 0.0);
+        let (bpm, key) = (now.or(t.bpm).filter(|b| b.is_finite() && *b > 0.0), t.key.clone());
+        let Some(bpm) = bpm else {
+            return Err(bad(cmd, format!("deck {}'s track has no tempo to match: load it with a bpm", deck.id().to_uppercase())));
+        };
+        Some((deck, bpm, key))
+    } else {
+        None
     };
-    let (dirs, files, truncated) = crate::io::list_folder(folder, MAX_FOLDER_ENTRIES)?;
-    // Without mixforge's library a folder still lists (with MIK's key and energy when set up).
-    e.library.refresh(true);
-    let (snap, loading) = (e.library.snapshot.clone(), e.library.loading());
-    let tracks = files
-        .iter()
-        .filter(|p| is_audio(p))
-        .map(|p| {
-            let path = p.to_string_lossy().into_owned();
-            let key = path_key(&path);
-            let row = snap.as_ref().and_then(|s| s.by_key.get(&key).and_then(|i| s.tracks.get(*i)));
-            match row {
-                Some(r) => LibraryTrack { path, ..r.clone() },
-                None => LibraryTrack::plain(path).with_mik(snap.as_ref().and_then(|s| s.mik.get(&key))),
-            }
+    if cmd == SEARCH && str_param(p, "query").is_none_or(|q| q.trim().is_empty()) {
+        return Err(bad(SEARCH, "`query` required: words to find in the title, artist or file name"));
+    }
+    let q = query_of(cmd, p)?;
+    let (snap, loading) = if q.folder.is_none() {
+        let (snap, loading) = library(e, cmd)?;
+        (Some(snap), loading)
+    } else {
+        // Without mixforge's library a folder still lists (with MIK's key and energy when set up).
+        e.library.refresh(true);
+        (e.library.snapshot.clone(), e.library.loading())
+    };
+    Ok(Prepared { q, snap, loading, compatible })
+}
+
+impl Prepared {
+    /// Lists, sorts and pages the query, looking at the files it returns.
+    fn run(self) -> Result<Value> {
+        let mut l = self.listing()?;
+        let q = &self.q;
+        let Some((deck, bpm, key)) = &self.compatible else {
+            sort_rows(&mut l.tracks, q.sort.unwrap_or(Sort::Title), q.desc);
+            let rows = page(&l.tracks, q);
+            return Ok(listed(&l, q, rows));
+        };
+        compatible_rows(l, q, *deck, *bpm, key.clone())
+    }
+
+    fn listing(&self) -> Result<Listing> {
+        let q = &self.q;
+        let snap = self.snap.as_ref();
+        let Some(folder) = &q.folder else {
+            let tracks = snap.map(|s| s.tracks.iter().filter(|t| matches(t, &q.words)).cloned().collect()).unwrap_or_default();
+            return Ok(Listing {
+                tracks,
+                from_copy: snap.is_some_and(|s| s.from_copy),
+                folder: None,
+                library_error: snap.and_then(|s| s.error.clone()),
+                mik_error: snap.and_then(|s| s.mik_error.clone()),
+                loading: self.loading,
+            });
+        };
+        let (dirs, files, truncated) = crate::io::list_folder(folder, MAX_FOLDER_ENTRIES)?;
+        let tracks = files
+            .iter()
+            .filter(|p| is_audio(p))
+            .map(|p| {
+                let path = p.to_string_lossy().into_owned();
+                let key = path_key(&path);
+                let row = snap.and_then(|s| s.by_key.get(&key).and_then(|i| s.tracks.get(*i)));
+                match row {
+                    Some(r) => LibraryTrack { path, ..r.clone() },
+                    None => LibraryTrack::plain(path).with_mik(snap.and_then(|s| s.mik.get(&key))),
+                }
+            })
+            .filter(|t| matches(t, &q.words))
+            .collect();
+        Ok(Listing {
+            tracks,
+            from_copy: snap.is_some_and(|s| s.from_copy),
+            folder: Some((folder.clone(), dirs, truncated)),
+            library_error: snap.and_then(|s| s.error.clone()),
+            mik_error: snap.and_then(|s| s.mik_error.clone()),
+            loading: self.loading,
         })
-        .filter(|t| matches(t, &q.words))
-        .collect();
-    Ok(Listing {
-        tracks,
-        from_copy: snap.as_ref().is_some_and(|s| s.from_copy),
-        folder: Some((folder.clone(), dirs, truncated)),
-        library_error: snap.as_ref().and_then(|s| s.error.clone()),
-        mik_error: snap.as_ref().and_then(|s| s.mik_error.clone()),
-        loading,
-    })
+    }
+}
+
+/// A library query the app runs off the UI thread ([`Engine::start_library_query`]).
+pub struct LibraryQuery(QueryState);
+
+enum QueryState {
+    Running(std::thread::JoinHandle<Result<Value>>),
+    Done(Option<Result<Value>>),
+}
+
+impl std::fmt::Debug for LibraryQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.finished() { "LibraryQuery(finished)" } else { "LibraryQuery(running)" })
+    }
+}
+
+impl LibraryQuery {
+    /// Whether its answer is in.
+    pub fn finished(&self) -> bool {
+        match &self.0 {
+            QueryState::Running(h) => h.is_finished(),
+            QueryState::Done(_) => true,
+        }
+    }
+
+    /// Its answer, what the command would have given (waits for it if it isn't in).
+    pub fn take(self) -> Result<Value> {
+        match self.0 {
+            QueryState::Running(h) => h.join().unwrap_or_else(|_| Err(EngineError::Io("reading the library failed".into()))),
+            QueryState::Done(r) => r.unwrap_or_else(|| Err(EngineError::Io("reading the library failed".into()))),
+        }
+    }
+}
+
+impl Engine {
+    /// Starts `library.list`, `library.search` or `library.compatible` with `p`: checked and
+    /// given what it needs from the engine now, its file reads (the folder, and each row's file
+    /// and tags) on a thread of its own, so a slow disk never holds up the UI. Refused as the
+    /// command would refuse it.
+    pub fn start_library_query(&mut self, id: &str, p: &Value) -> Result<LibraryQuery> {
+        let cmd: &'static str = match id {
+            LIST => LIST,
+            SEARCH => SEARCH,
+            COMPATIBLE => COMPATIBLE,
+            other => return Err(EngineError::UnknownCommand(other.to_string())),
+        };
+        let prepared = prepare(self, cmd, p)?;
+        Ok(LibraryQuery(match std::thread::Builder::new().name("library-query".into()).spawn(move || prepared.run()) {
+            Ok(h) => QueryState::Running(h),
+            Err(e) => QueryState::Done(Some(Err(EngineError::Io(format!("could not start reading the library: {e}"))))),
+        }))
+    }
 }
 
 /// A listing's row, its file looked at now: missing, changed since analysed, of an outdated
@@ -838,39 +953,21 @@ fn listed(l: &Listing, q: &Query, rows: Vec<Value>) -> Value {
 }
 
 fn list(e: &mut Engine, p: &Value) -> Result<Value> {
-    list_as(e, p, LIST)
-}
-
-fn list_as(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
-    let q = query_of(cmd, p)?;
-    let mut l = listing(e, cmd, &q)?;
-    sort_rows(&mut l.tracks, q.sort.unwrap_or(Sort::Title), q.desc);
-    let rows = page(&l.tracks, &q);
-    Ok(listed(&l, &q, rows))
+    prepare(e, LIST, p)?.run()
 }
 
 fn search(e: &mut Engine, p: &Value) -> Result<Value> {
-    const SEARCH: &str = "library.search";
-    if str_param(p, "query").is_none_or(|q| q.trim().is_empty()) {
-        return Err(bad(SEARCH, "`query` required: words to find in the title, artist or file name"));
-    }
-    list_as(e, p, SEARCH)
+    prepare(e, SEARCH, p)?.run()
 }
 
 fn compatible(e: &mut Engine, p: &Value) -> Result<Value> {
-    const CMD: &str = "library.compatible";
-    let deck = str_param(p, "deck").and_then(soundcraft_mix::DeckId::parse).ok_or_else(|| bad(CMD, "`deck` must be a or b"))?;
-    let Some(t) = e.deck_tracks.get(deck.index()).and_then(Option::as_ref) else {
-        return Err(bad(CMD, format!("deck {} is empty: load a track first (deck.load)", deck.id().to_uppercase())));
-    };
-    let now = e.deck_status.decks.get(deck.index()).map(|s| s.bpm).filter(|b| b.is_finite() && *b > 0.0);
-    let (bpm, key) = (now.or(t.bpm).filter(|b| b.is_finite() && *b > 0.0), t.key.clone());
-    let Some(bpm) = bpm else {
-        return Err(bad(CMD, format!("deck {}'s track has no tempo to match: load it with a bpm", deck.id().to_uppercase())));
-    };
+    prepare(e, COMPATIBLE, p)?.run()
+}
+
+/// The tracks of `l` that mix with `deck`'s (`bpm`, `key`): ranked by key match then tempo, or
+/// sorted by `q`'s sort.
+fn compatible_rows(mut l: Listing, q: &Query, deck: soundcraft_mix::DeckId, bpm: f64, key: Option<String>) -> Result<Value> {
     let deck_key = key.as_deref().and_then(camelot);
-    let q = query_of(CMD, p)?;
-    let mut l = listing(e, CMD, &q)?;
     // (key rank, |tempo off|, why, key match, ratio, off).
     let mut found: Vec<(LibraryTrack, (u8, f64), Value)> = l
         .tracks
@@ -932,7 +1029,7 @@ fn compatible(e: &mut Engine, p: &Value) -> Result<Value> {
         })
         .collect();
     l.tracks = found.into_iter().map(|f| f.0).collect();
-    let mut out = listed(&l, &q, rows);
+    let mut out = listed(&l, q, rows);
     if let Some(o) = out.as_object_mut() {
         o.insert("deck".into(), json!({"deck": deck.id(), "key": key, "bpm": bpm}));
     }

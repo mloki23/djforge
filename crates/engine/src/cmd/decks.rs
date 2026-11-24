@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Track to Deck",
             [],
             None,
-            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck unless `force`. Its key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). Its beat grid: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time) and of mixforge's analysis version (read directly, no sidecar), else mixforge's analysis through its sidecar (a stale, outdated or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, key_source: mik|mixforge|tag|null, energy, energy_source, library: fresh|stale|outdated|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, user_cues (how many hot cues the user kept for the track took their slots: set ones replace the computed cue, cleared ones leave the slot empty; a track is its audio, so a retag, move or rename keeps them), user_cues_previous ([{cues: {slot: seconds|null}, size, mtime, until?}]: cues kept for audio the file's path held before, never deleted), priming_ms, analysis_error}) goes to the status line",
+            "{path, deck?: a|b (default: a deck that is not playing, A first), force?: bool (load onto a playing deck: it fades out first), bpm? + first_beat? (seconds of a downbeat)} — reads and decodes the audio file on a thread of its own and loads it on the deck, stopped at its first downbeat; the last load issued for a deck wins. Refuses a playing deck (a cue preview counts) unless `force`. Its key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). Its beat grid: the given bpm, else mixforge's library row for the file when it is of the file as it is now (same size and time) and of mixforge's analysis version (read directly, no sidecar), else mixforge's analysis through its sidecar (a stale, outdated or missing row), else the MP3's BPM tag (first downbeat at 0), else none (no sync, loops or quantise). Hot cues A–D (Mix in, Bass hit, Mix out, Bass gone): the open DJ set's when it plays the file, else mixforge's mix points. On an MP3, mixforge's grid and the cues move by its priming to its gapless decode. Returns {deck, path, loading: true}; the result ({deck, title, grid and grid_from: given|library|mixforge|tag|null, bpm, key, key_source: mik|mixforge|tag|null, energy, energy_source, library: fresh|stale|outdated|absent|unreadable|null (the file's row in mixforge's library), cues_from: session|mixforge|null, user_cues (how many hot cues the user kept for the track took their slots: set ones replace the computed cue, cleared ones leave the slot empty; a track is its audio, so a retag, move or rename keeps them), user_cues_previous ([{cues: {slot: seconds|null}, size, mtime, until?}]: cues kept for audio the file's path held before, never deleted), priming_ms, analysis_error}) goes to the status line",
             always,
             load
         ),
@@ -388,12 +388,12 @@ impl DeckLoadJob {
         self.handle.is_finished()
     }
 
-    /// A later load for its deck was issued: this one is to be dropped.
     /// Whether this load is for `deck`.
     pub(crate) fn on(&self, deck: DeckId) -> bool {
         self.deck == deck
     }
 
+    /// A later load for its deck was issued: this one is to be dropped.
     pub(crate) fn superseded(&self, e: &Engine) -> bool {
         e.deck_generation.get(self.deck.index()).is_some_and(|g| *g != self.generation)
     }
@@ -406,7 +406,7 @@ impl DeckLoadJob {
         if e.session().sample_rate.hz() != rate {
             return Err(bad(LOAD, format!("{path}: the session's sample rate changed while it loaded; load it again")));
         }
-        if !force && e.deck_status.decks.get(deck.index()).is_some_and(|s| s.playing) {
+        if !force && e.deck_status.decks.get(deck.index()).is_some_and(|s| s.playing || s.previewing) {
             return Err(bad(LOAD, format!("Deck {} is playing: pause it first (or load with force)", deck.id().to_uppercase())));
         }
         let t = &l.track;
@@ -596,7 +596,8 @@ fn load(e: &mut Engine, p: &Value) -> Result<Value> {
     need_audio(e, LOAD)?;
     let path = str_param(p, "path").filter(|s| !s.is_empty()).ok_or_else(|| bad(LOAD, "`path` required"))?.to_string();
     let force = bool_param(LOAD, p, "force", Some(false))?;
-    let playing = |d: DeckId| e.deck_status.decks.get(d.index()).is_some_and(|s| s.playing);
+    // A cue preview is heard too: Load Lock keeps it.
+    let playing = |d: DeckId| e.deck_status.decks.get(d.index()).is_some_and(|s| s.playing || s.previewing);
     let deck = match p.get("deck") {
         None | Some(Value::Null) => {
             DeckId::ALL.into_iter().find(|d| !playing(*d)).ok_or_else(|| bad(LOAD, "both decks are playing: name the `deck` to load"))?
