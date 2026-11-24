@@ -45,7 +45,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Library List",
             [],
             None,
-            "{source?, folder?, query?, sort?, desc?, offset?, limit?} — tracks to load on the decks: mixforge's library (read only; what it analysed) or the audio files (mp3, wav, flac, aiff, m4a, ogg) directly in a folder, joined to mixforge's analysis by path. source?: mixforge|folder (default mixforge), folder? (for source folder), query? (words that must all be in the title, artist or file name, any case), sort?: title|artist|bpm|key|energy|length|name (default title; key in Camelot order; unknowns last), desc?: bool, offset? (default 0), limit? (default 200, at most 1000). Returns {source, total, offset, rows: [{path, name, title, artist, bpm, key (Camelot), key_source: mik|mixforge|tag|null, energy (1–10), energy_source: mik|mixforge|tag|null, length_s, analysed, stale (the file changed since mixforge analysed it), outdated (analysed by another mixforge version: it analyses the file again), missing (no file there)}], from_copy (the library was busy: a copy was read), loading (the libraries are being read again off the UI thread: these rows are the last read's; ask again), library_error, mik_error}, and for a folder {folder, folders: [{path, name}] (its subfolders), truncated}. Key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). A folder's files aren't decoded: sort, search and the rest use the analysis and the file names, and the tags of the rows returned fill in their title, artist, bpm, key and energy. A file reached by another path than mixforge analysed it under (a mapped drive and its network path) is listed as not analysed",
+            "{source?, folder?, query?, bpm_min?, bpm_max?, keys?, energy_min?, energy_max?, status?, sort?, desc?, offset?, limit?} — tracks to load on the decks: mixforge's library (read only; what it analysed) or the audio files (mp3, wav, flac, aiff, m4a, ogg) directly in a folder, joined to mixforge's analysis by path. source?: mixforge|folder (default mixforge), folder? (for source folder), query? (words that must all be in the title, artist or file name, any case), bpm_min?/bpm_max? (the track's own tempo), keys? (Camelot keys, any of them: \"8A\" or [\"8A\", \"9A\"]), energy_min?/energy_max? (1–10), status?: any|analysed|unanalysed (a folder's files mixforge hasn't analysed; tracks lacking a value a filter asks about are left out), sort?: title|artist|bpm|key|energy|length|name (default title; key in Camelot order; unknowns last), desc?: bool, offset? (default 0), limit? (default 200, at most 1000). Returns {source, total, offset, rows: [{path, name, title, artist, bpm, key (Camelot), key_source: mik|mixforge|tag|null, energy (1–10), energy_source: mik|mixforge|tag|null, length_s, analysed, stale (the file changed since mixforge analysed it), outdated (analysed by another mixforge version: it analyses the file again), missing (no file there)}], from_copy (the library was busy: a copy was read), loading (the libraries are being read again off the UI thread: these rows are the last read's; ask again), library_error, mik_error}, and for a folder {folder, folders: [{path, name}] (its subfolders), truncated}. Key and energy: Mixed In Key's (when the app set it up), else mixforge's, else the MP3's tags (MIK's comment `8A - Energy 6`, EnergyLevel, TKEY). A folder's files aren't decoded: sort, search and the rest use the analysis and the file names, and the tags of the rows returned fill in their title, artist, bpm, key and energy. A file reached by another path than mixforge analysed it under (a mapped drive and its network path) is listed as not analysed",
             always,
             list
         ),
@@ -75,6 +75,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{} — the folders the library browser starts from: the Music folder and the ones added (library.add_folder), each {path, name, kind: music|added, found}, and mixforge's library {path, found} (null when the app hasn't set it up)",
             always,
             folders
+        ),
+        cmd!(
+            query "library.health",
+            "Library Health",
+            [],
+            None,
+            "{folders?: bool (default true: also look through the browser's folders), limit?: 1..=10000 (default 100: entries listed per kind; the counts are complete)} — a background job (returns {job}; see job.status): what in the library needs looking after. Read only: it never changes a file or tag. Result {counts: {tracks, missing, stale, outdated, unanalysed, duplicates, key_disagreements, lacking}, missing (mixforge has a track whose file is gone), stale (the file changed since mixforge analysed it; a tag edit such as Mixed In Key's counts, and re-analysing settles it), outdated (analysed by another mixforge version), unanalysed (audio files in the folders mixforge hasn't analysed), duplicates ([{artist, title, paths}]: the same artist and title more than once), key_disagreements ([{path, title, mik, mixforge}]), lacking ([{path, title, lacks: [bpm|key|energy]}]), to_analyze (the stale, outdated and unanalysed files: give them to library.analyze), truncated (kinds with more than `limit`)}. Progress {stage, done, total}",
+            always,
+            health
         ),
         cmd!(
             noundo "library.add_folder",
@@ -211,6 +220,8 @@ pub struct LibraryTrack {
     /// Where the key and energy came from: `mik` (Mixed In Key), `mixforge`, `tag`.
     pub key_source: Option<&'static str>,
     pub energy_source: Option<&'static str>,
+    /// mixforge's own key (Camelot), whatever Mixed In Key says.
+    mixforge_key: Option<String>,
     /// mixforge's analysis version.
     version: Option<i64>,
     /// The file's size and time when it was analysed.
@@ -232,6 +243,7 @@ impl LibraryTrack {
             analysed: false,
             key_source: None,
             energy_source: None,
+            mixforge_key: None,
             version: None,
             size: None,
             mtime: None,
@@ -467,11 +479,12 @@ fn track_of(row: &db::TrackSummary) -> LibraryTrack {
         artist: row.artist.clone().unwrap_or_default(),
         bpm: row.bpm.filter(|b| (20.0..=400.0).contains(b)),
         key_source: key.as_ref().map(|_| "mixforge"),
-        key,
+        key: key.clone(),
         energy_source: energy.map(|_| "mixforge"),
         energy,
         length_s: row.duration.filter(|d| *d >= 0.0),
         analysed: true,
+        mixforge_key: key.clone(),
         version: row.version,
         size: row.size,
         mtime: row.mtime,
@@ -609,6 +622,7 @@ enum Sort {
 struct Query {
     folder: Option<String>,
     words: Vec<String>,
+    filter: Filter,
     sort: Option<Sort>,
     desc: bool,
     offset: usize,
@@ -651,7 +665,49 @@ fn query_of(cmd: &str, p: &Value) -> Result<Query> {
     if limit == 0 || limit > MAX_LIMIT {
         return Err(bad(cmd, format!("`limit` must be 1..={MAX_LIMIT}")));
     }
-    Ok(Query { folder, words, sort, desc, offset, limit })
+    Ok(Query { folder, words, filter: filter_of(cmd, p)?, sort, desc, offset, limit })
+}
+
+/// What `bpm_min`, `bpm_max`, `keys`, `energy_min`, `energy_max` and `status` keep.
+#[derive(Default)]
+struct Filter {
+    bpm: Option<(f64, f64)>,
+    keys: Vec<(u8, u8)>,
+    energy: Option<(f64, f64)>,
+    analysed: Option<bool>,
+}
+
+fn filter_of(cmd: &str, p: &Value) -> Result<Filter> {
+    let n = |key: &str| super::decks::num(cmd, p, key, 0.0..=1000.0);
+    let range = |lo: Option<f64>, hi: Option<f64>| match (lo, hi) {
+        (None, None) => None,
+        (lo, hi) => Some((lo.unwrap_or(f64::NEG_INFINITY), hi.unwrap_or(f64::INFINITY))),
+    };
+    let keys = match p.get("keys") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(k)) => vec![camelot(k).ok_or_else(|| bad(cmd, format!("`keys`: {k} isn't a Camelot key (1A–12B)")))?],
+        Some(Value::Array(a)) => {
+            a.iter().map(|v| v.as_str().and_then(camelot).ok_or_else(|| bad(cmd, "`keys` must be Camelot keys (1A–12B)"))).collect::<Result<_>>()?
+        }
+        Some(_) => return Err(bad(cmd, "`keys` must be Camelot keys (1A–12B)")),
+    };
+    let analysed = match str_param(p, "status") {
+        None | Some("any") => None,
+        Some("analysed") => Some(true),
+        Some("unanalysed") => Some(false),
+        Some(_) => return Err(bad(cmd, "`status` must be any, analysed or unanalysed")),
+    };
+    Ok(Filter { bpm: range(n("bpm_min")?, n("bpm_max")?), keys, energy: range(n("energy_min")?, n("energy_max")?), analysed })
+}
+
+impl Filter {
+    fn keeps(&self, t: &LibraryTrack) -> bool {
+        let within = |v: Option<f64>, r: Option<(f64, f64)>| r.is_none_or(|(lo, hi)| v.is_some_and(|v| lo <= v && v <= hi));
+        within(t.bpm, self.bpm)
+            && within(t.energy, self.energy)
+            && (self.keys.is_empty() || key_rank(&t.key).is_some_and(|k| self.keys.contains(&k)))
+            && self.analysed.is_none_or(|a| a == t.analysed)
+    }
 }
 
 fn matches(t: &LibraryTrack, words: &[String]) -> bool {
@@ -806,7 +862,7 @@ impl Prepared {
         let q = &self.q;
         let snap = self.snap.as_ref();
         let Some(folder) = &q.folder else {
-            let tracks = snap.map(|s| s.tracks.iter().filter(|t| matches(t, &q.words)).cloned().collect()).unwrap_or_default();
+            let tracks = snap.map(|s| s.tracks.iter().filter(|t| matches(t, &q.words) && q.filter.keeps(t)).cloned().collect()).unwrap_or_default();
             return Ok(Listing {
                 tracks,
                 from_copy: snap.is_some_and(|s| s.from_copy),
@@ -829,7 +885,7 @@ impl Prepared {
                     None => LibraryTrack::plain(path).with_mik(snap.and_then(|s| s.mik.get(&key))),
                 }
             })
-            .filter(|t| matches(t, &q.words))
+            .filter(|t| matches(t, &q.words) && q.filter.keeps(t))
             .collect();
         Ok(Listing {
             tracks,
@@ -1032,6 +1088,147 @@ fn compatible_rows(mut l: Listing, q: &Query, deck: soundcraft_mix::DeckId, bpm:
     let mut out = listed(&l, q, rows);
     if let Some(o) = out.as_object_mut() {
         o.insert("deck".into(), json!({"deck": deck.id(), "key": key, "bpm": bpm}));
+    }
+    Ok(out)
+}
+
+// ---- health --------------------------------------------------------------------------------
+
+/// Most audio files the health scan looks through in the folders.
+const HEALTH_MAX_FILES: usize = 200_000;
+
+fn health(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "library.health";
+    let folders = super::decks::bool_param(CMD, p, "folders", Some(true))?;
+    let limit = match p.get("limit") {
+        None | Some(Value::Null) => 100,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=10_000).contains(n))
+            .ok_or_else(|| bad(CMD, "`limit` must be 1..=10000"))?,
+    };
+    let (snap, loading) = library(e, CMD)?;
+    if loading && e.library.read_at.is_none() {
+        return Err(bad(CMD, "the libraries are being read for the first time: ask again in a moment"));
+    }
+    let roots: Vec<PathBuf> = if folders { e.library.music.iter().chain(e.library.added.iter()).cloned().collect() } else { Vec::new() };
+    super::jobs::start(e, CMD, "health", move |ctx| health_scan(&snap, &roots, limit, ctx))
+}
+
+/// An artist or title for comparing: lower case, letters and digits, single spaces.
+fn plain_words(s: &str) -> String {
+    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// The audio files in `roots` and below (at most [`HEALTH_MAX_FILES`]), and whether that cut it short.
+fn audio_below(roots: &[PathBuf], ctx: &super::jobs::JobCtx) -> (Vec<PathBuf>, bool) {
+    let mut out = Vec::new();
+    let mut todo: Vec<PathBuf> = roots.to_vec();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dir) = todo.pop() {
+        if ctx.cancelled() || out.len() >= HEALTH_MAX_FILES {
+            return (out, true);
+        }
+        if !seen.insert(path_key(&dir.to_string_lossy())) {
+            continue;
+        }
+        let Ok((dirs, files, _)) = crate::io::list_folder(&dir, MAX_FOLDER_ENTRIES) else { continue };
+        out.extend(files.into_iter().filter(|f| is_audio(f)));
+        todo.extend(dirs);
+        ctx.progress(json!({"stage": "looking through the folders", "files": out.len()}));
+    }
+    (out, false)
+}
+
+fn health_scan(snap: &Snapshot, roots: &[PathBuf], limit: usize, ctx: &super::jobs::JobCtx) -> Result<Value> {
+    const CMD: &str = "library.health";
+    let stopped = || bad(CMD, "cancelled");
+    let tracks = &snap.tracks;
+    let (mut missing, mut stale, mut outdated, mut key_off, mut lacking) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut by_name: HashMap<String, Vec<&LibraryTrack>> = HashMap::new();
+    for (i, t) in tracks.iter().enumerate() {
+        if i % 200 == 0 {
+            if ctx.cancelled() {
+                return Err(stopped());
+            }
+            ctx.progress(json!({"stage": "checking mixforge's tracks", "done": i, "total": tracks.len()}));
+        }
+        match crate::io::size_and_mtime(&t.path) {
+            None => missing.push(json!(t.path)),
+            Some((size, mtime)) => {
+                if t.size.and_then(|x| u64::try_from(x).ok()) != Some(size) || t.mtime != Some(mtime) {
+                    stale.push(json!(t.path));
+                }
+            }
+        }
+        if t.version != Some(db::ANALYSIS_VERSION) {
+            outdated.push(json!(t.path));
+        }
+        if let (Some("mik"), Some(mine), Some(theirs)) = (t.key_source, &t.mixforge_key, &t.key)
+            && mine != theirs
+        {
+            key_off.push(json!({"path": t.path, "title": t.title, "mik": theirs, "mixforge": mine}));
+        }
+        let lacks: Vec<&str> = [("bpm", t.bpm.is_none()), ("key", t.key.is_none()), ("energy", t.energy.is_none())]
+            .into_iter()
+            .filter_map(|(k, gone)| gone.then_some(k))
+            .collect();
+        if !lacks.is_empty() {
+            lacking.push(json!({"path": t.path, "title": t.title, "lacks": lacks}));
+        }
+        let title = plain_words(&t.title);
+        if !title.is_empty() {
+            by_name.entry(format!("{}|{title}", plain_words(&t.artist))).or_default().push(t);
+        }
+    }
+    let mut duplicates: Vec<Value> = by_name
+        .into_values()
+        .filter(|g| g.len() > 1)
+        .map(|g| json!({"artist": g.first().map(|t| t.artist.clone()), "title": g.first().map(|t| t.title.clone()), "paths": g.iter().map(|t| t.path.clone()).collect::<Vec<_>>()}))
+        .collect();
+    duplicates.sort_by_key(|d| d["title"].as_str().unwrap_or("").to_lowercase());
+    let (files, cut_short) = audio_below(roots, ctx);
+    if ctx.cancelled() {
+        return Err(stopped());
+    }
+    let mut unanalysed: Vec<Value> = Vec::new();
+    let mut listed = std::collections::HashSet::new();
+    for f in files {
+        let path = f.to_string_lossy().into_owned();
+        let key = path_key(&path);
+        if !snap.by_key.contains_key(&key) && listed.insert(key) {
+            unanalysed.push(json!(path));
+        }
+    }
+    let counts = json!({"tracks": tracks.len(), "missing": missing.len(), "stale": stale.len(), "outdated": outdated.len(),
+        "unanalysed": unanalysed.len(), "duplicates": duplicates.len(), "key_disagreements": key_off.len(), "lacking": lacking.len()});
+    let to_analyze: Vec<Value> = stale.iter().chain(outdated.iter()).chain(unanalysed.iter()).take(limit).cloned().collect();
+    let mut truncated: Vec<&str> = Vec::new();
+    let mut cap = |name: &'static str, mut v: Vec<Value>| {
+        if v.len() > limit {
+            v.truncate(limit);
+            truncated.push(name);
+        }
+        v
+    };
+    let out = json!({
+        "counts": counts,
+        "missing": cap("missing", missing),
+        "stale": cap("stale", stale),
+        "outdated": cap("outdated", outdated),
+        "unanalysed": cap("unanalysed", unanalysed),
+        "duplicates": cap("duplicates", duplicates),
+        "key_disagreements": cap("key_disagreements", key_off),
+        "lacking": cap("lacking", lacking),
+        "to_analyze": to_analyze,
+        "folders_cut_short": cut_short,
+        "library_error": snap.error,
+        "mik_error": snap.mik_error,
+    });
+    let mut out = out;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("truncated".into(), json!(truncated));
     }
     Ok(out)
 }

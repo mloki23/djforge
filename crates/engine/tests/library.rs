@@ -449,3 +449,81 @@ fn mixed_in_keys_key_and_energy_win_in_listings_and_on_the_deck() {
         "{loaded}"
     );
 }
+
+/// Waits for a background job (job.status) to end; returns its status.
+fn job(e: &mut Engine, started: &Value) -> Value {
+    let id = started["job"].as_u64().unwrap_or_else(|| panic!("no job: {started}"));
+    for _ in 0..4000 {
+        let s = run(e, "job.status", json!({"job": id}));
+        if s["state"] != "running" && s["state"] != "stopping" {
+            return s;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("job {id} never ended");
+}
+
+#[test]
+fn the_health_scan_reports_what_needs_looking_after_and_changes_nothing() {
+    let dir = Scratch::new("health");
+    let (db, paths) = library(&dir.0);
+    // The same artist and title twice; a file changed since it was analysed; a file in a
+    // subfolder of the Music folder that mixforge never analysed.
+    let again = wav(&dir.0, "ocean-copy.wav", 2.0);
+    store(&db, &again, stamp(&again), track("Ocean Drive", Some("Arty"), 138.0, "8A", 2.0));
+    let changed = wav(&dir.0, "changed.wav", 1.0);
+    store(&db, &changed, (1, 1), track("Changed", Some("Someone"), 140.0, "8A", 1.0));
+    let sub = dir.0.join("Music").join("New");
+    std::fs::create_dir_all(&sub).unwrap();
+    let fresh = wav(&sub, "fresh.wav", 1.0);
+    // Mixed In Key hears Ocean Drive in 3B; mixforge, 8A.
+    let mik = mik_db(&dir.0, &[(&paths[0], Some(6), "3B")]);
+    let before: Vec<(String, (i64, i64))> = paths.iter().chain([&again, &changed, &fresh]).map(|p| (p.clone(), stamp(p))).collect();
+    let db_bytes = std::fs::read(&db).unwrap();
+    let mut e = engine();
+    e.set_library(db.clone());
+    e.set_mik_library(mik);
+    e.set_library_folders(Some(dir.0.join("Music")), None);
+    ask(&mut e, "library.list", json!({}));
+    let started = run(&mut e, "library.health", json!({}));
+    let s = job(&mut e, &started);
+    assert_eq!(s["state"], "done", "{s}");
+    let r = &s["result"];
+    assert_eq!(r["counts"]["tracks"], 8, "{r}");
+    assert_eq!(r["missing"], json!([dir.0.join("gone.wav").to_string_lossy()]));
+    assert_eq!(r["stale"], json!([changed]));
+    assert_eq!(r["unanalysed"], json!([fresh]));
+    assert_eq!(r["duplicates"][0]["title"], "Ocean Drive");
+    assert_eq!(r["duplicates"][0]["paths"].as_array().unwrap().len(), 2);
+    assert_eq!(r["key_disagreements"], json!([{"path": paths[0], "title": "Ocean Drive", "mik": "3B", "mixforge": "8A"}]));
+    assert!(r["to_analyze"].as_array().unwrap().contains(&json!(fresh)) && r["to_analyze"].as_array().unwrap().contains(&json!(changed)));
+    // Listed per kind up to `limit`; the counts stay whole.
+    let started = run(&mut e, "library.health", json!({"limit": 1, "folders": false}));
+    let s = job(&mut e, &started);
+    assert_eq!(s["result"]["counts"]["unanalysed"], 0, "folders off");
+    assert!(err(&mut e, "library.health", json!({"limit": 0})).contains("limit"));
+    // Nothing was written.
+    for (p, at) in before {
+        assert_eq!(stamp(&p), at, "{p}");
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), db_bytes);
+}
+
+#[test]
+fn listings_filter_by_tempo_key_energy_and_status() {
+    let dir = Scratch::new("filters");
+    let (db, _) = library(&dir.0);
+    let mut e = engine();
+    e.set_library(db);
+    let v = ask(&mut e, "library.list", json!({"bpm_min": 135, "bpm_max": 141}));
+    assert_eq!(titles(&v), ["Gone Track", "Ocean Drive", "Silent Hour"]);
+    let v = ask(&mut e, "library.list", json!({"keys": ["9A", "12B"]}));
+    assert_eq!(titles(&v), ["Silent Hour", "Zenith"]);
+    let v = ask(&mut e, "library.search", json!({"query": "ocean", "keys": "1A"}));
+    assert_eq!(titles(&v), ["Night Ocean"]);
+    assert!(err(&mut e, "library.list", json!({"keys": ["H7"]})).contains("Camelot"));
+    // A folder's files: analysed or not.
+    let plain = wav(&dir.0, "plain.wav", 1.0);
+    let v = ask(&mut e, "library.list", json!({"source": "folder", "folder": dir.0, "status": "unanalysed"}));
+    assert_eq!(v["rows"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect::<Vec<_>>(), [plain.as_str()]);
+}
