@@ -3984,6 +3984,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "log",
+ "rusqlite",
  "serde",
  "serde_json",
  "soundcraft-au-host",

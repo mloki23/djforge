@@ -42,6 +42,20 @@ impl BandJobs {
         }
     }
 
+    /// Queue sources outside the session's pool (the decks' tracks) whose bands nobody is
+    /// building, while waveforms are coloured by frequency (as [`BandJobs::queue`] last set).
+    pub fn queue_sources<'s>(&mut self, ctx: &egui::Context, sources: impl IntoIterator<Item = &'s Arc<SourceAudio>>) {
+        if !self.on.load(Ordering::Acquire) || cfg!(target_arch = "wasm32") {
+            return;
+        }
+        for audio in sources {
+            if audio.claim_bands() && !self.send(ctx, Arc::downgrade(audio)) {
+                audio.unclaim_bands();
+                break;
+            }
+        }
+    }
+
     /// Hand `audio` to the worker, starting it if need be. False when there is none to take it.
     #[cfg(not(target_arch = "wasm32"))]
     fn send(&mut self, ctx: &egui::Context, audio: Weak<SourceAudio>) -> bool {

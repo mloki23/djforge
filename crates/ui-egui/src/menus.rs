@@ -12,6 +12,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.mix", "Mix", "Window > Mix", Some("Cmd+=")),
     ("window.edit", "Edit", "Window > Edit", Some("Cmd+=")),
     ("window.toggle_mix_edit", "Toggle Mix/Edit", "", Some("Cmd+=")),
+    ("window.decks", "Decks", "", Some("Cmd+6")),
     ("window.mix_separate", "Mix in Separate Window", "", None),
     ("window.transport", "Transport", "Window > Transport", Some("Cmd+1")),
     ("window.big_counter", "Big Counter", "Window > Big Counter", Some("Cmd+3")),
@@ -337,7 +338,11 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                     "{}{}  —  {}",
                     app.engine.session().name,
                     if app.engine.is_dirty() { " *" } else { "" },
-                    if app.ui.window == MainWindow::Edit || app.ui.mix_separate { "Edit" } else { "Mix" }
+                    match app.ui.window {
+                        MainWindow::Decks => "Decks",
+                        MainWindow::Mix if !app.ui.mix_separate => "Mix",
+                        _ => "Edit",
+                    }
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(title).color(t.text_dim));
@@ -409,6 +414,7 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("view.main_counter") => path.rsplit(" > ").next().map(ruler_id).is_some_and(|r| e.main_counter.id() == r),
         Some("window.mix") => app.ui.window == MainWindow::Mix,
         Some("window.edit") => app.ui.window == MainWindow::Edit,
+        Some("window.decks") => app.ui.window == MainWindow::Decks,
         Some("window.track_list") => app.ui.show_tracks_list,
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
@@ -482,6 +488,8 @@ pub(crate) fn params_for(path: &str, id: &str) -> Value {
 /// Menu items that open a SoundCraft window when clicked (programmatic calls still run the command).
 const MENU_WINDOWS: &[(&str, &str)] = &[
     ("View > Session", "window.session"),
+    ("View > Decks", "window.decks"),
+    ("Window > Decks", "window.decks"),
     ("Setup > Appearance", "window.ui_customization"),
     ("Setup > Hardware...", "window.playback_engine"),
     ("Setup > Playback Engine...", "window.playback_engine"),
@@ -605,6 +613,10 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.edit" => {
             app.ui.window = MainWindow::Edit;
             json!({"window": "edit"})
+        }
+        "window.decks" => {
+            app.ui.window = MainWindow::Decks;
+            json!({"window": "decks"})
         }
         "window.toggle_mix_edit" => {
             if app.ui.mix_separate {

@@ -176,7 +176,7 @@ fn dock_tabs(app: &mut SoundApp, ui: &mut Ui) {
     }
 }
 
-fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
+pub(crate) fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::current();
     let r = ui.max_rect();
     let s = app.engine.session();

@@ -85,6 +85,10 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
         if crate::session_view::key(app, physical, mods) {
             continue;
         }
+        // The Decks tab's keys, while it is shown: Space plays the focused deck, never the arrangement.
+        if app.ui.window == MainWindow::Decks && crate::decks_view::key(app, key, mods) {
+            continue;
+        }
         if fixed(app, key, mods, mac) {
             continue;
         }

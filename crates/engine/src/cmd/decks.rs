@@ -389,6 +389,11 @@ impl DeckLoadJob {
     }
 
     /// A later load for its deck was issued: this one is to be dropped.
+    /// Whether this load is for `deck`.
+    pub(crate) fn on(&self, deck: DeckId) -> bool {
+        self.deck == deck
+    }
+
     pub(crate) fn superseded(&self, e: &Engine) -> bool {
         e.deck_generation.get(self.deck.index()).is_some_and(|g| *g != self.generation)
     }

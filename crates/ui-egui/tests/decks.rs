@@ -68,7 +68,7 @@ fn a_deck_starting_stops_the_half_speed_arrangement_and_plays_at_its_own_rate() 
 fn the_deck_search_entries_run_real_commands_with_valid_parameters() {
     for (label, id, params) in soundcraft_ui_egui::decks::PALETTE {
         let spec = soundcraft_engine::find_command(id).unwrap_or_else(|| panic!("{label}: {id} is not a command"));
-        assert!(spec.id.starts_with("deck."), "{label}");
+        assert!(spec.id.starts_with("deck.") || spec.id.starts_with("library."), "{label}");
         if !params.is_empty() {
             let v: Value = serde_json::from_str(params).unwrap_or_else(|e| panic!("{label}: {e}"));
             assert!(v.is_object(), "{label}");

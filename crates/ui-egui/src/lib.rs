@@ -8,7 +8,9 @@ pub mod band_jobs;
 pub mod bounce;
 pub mod control;
 pub mod credits;
+pub mod deck_wave;
 pub mod decks;
+pub mod decks_view;
 pub mod dialogs;
 pub mod dj_marks;
 pub mod docking;
@@ -17,6 +19,8 @@ pub mod export;
 pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
+pub mod knob;
+pub mod library_browser;
 mod live_transport;
 pub mod menus;
 pub mod midi_devices;
@@ -57,11 +61,13 @@ use std::sync::mpsc::Receiver;
 
 pub use control::ControlRequest;
 
-/// Which main window is in front (Window › Mix / Edit).
+/// Which main window is in front (Window › Mix / Edit / Decks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MainWindow {
     Edit,
     Mix,
+    /// The live decks: two decks, the DJ mixer and the library browser ([`decks_view`]).
+    Decks,
 }
 
 /// One line on what opening media found: missing files, files changed on disk since they were
@@ -446,6 +452,8 @@ pub struct SoundApp {
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     /// View › Session: the Live columns' clip slots.
     pub session_view: session_view::SessionView,
+    /// Window › Decks: what the Decks tab shows and holds between frames.
+    pub decks_view: decks_view::DecksView,
     /// The Produce menu's Starter Pattern dialog and Replace question.
     pub produce: produce::ProduceState,
     sample_reads: Vec<sampler_window::SampleRead>,
@@ -569,6 +577,7 @@ impl SoundApp {
             synthetic: Vec::new(),
             sample_drop_targets: Vec::new(),
             session_view: session_view::SessionView::default(),
+            decks_view: decks_view::DecksView::default(),
             produce: produce::ProduceState::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
@@ -1490,6 +1499,7 @@ impl SoundApp {
         // The sources of the clips in view go first; only looked for while some wait.
         let first = if on && s.pool.audio().any(|a| a.bands_pending()) { visible_sources(s, self.edit_layout.timeline) } else { Vec::new() };
         self.band_jobs.queue(ctx, &s.pool, on, &first);
+        self.band_jobs.queue_sources(ctx, self.engine.deck_tracks.iter().flatten().map(|t| &t.source));
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
@@ -1599,11 +1609,12 @@ impl SoundApp {
         // Floating windows stay below the menu bar and first open below the toolbar.
         let top = ui.available_rect_before_wrap().top();
         // With the Mix window in its own native window, the main window keeps Edit.
-        let main = if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window };
+        let main = if self.ui.mix_separate && self.ui.window == MainWindow::Mix { MainWindow::Edit } else { self.ui.window };
         windows::set_work_area(&ctx, top, if main == MainWindow::Edit { top + toolbar::HEIGHT } else { top });
         match main {
             MainWindow::Edit => edit_window::show(self, ui),
             MainWindow::Mix => mix_window::show(self, ui),
+            MainWindow::Decks => decks_view::show(self, ui),
         }
         if self.ui.mix_separate {
             mix_window::show_separate(self, &ctx);
@@ -1627,6 +1638,10 @@ impl SoundApp {
         // A deck load finishing, or the decks playing, needs frames to be seen.
         if self.engine.deck_loading() || self.engine.library_loading() || self.engine.deck_status.decks.iter().any(|d| d.playing) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // The Decks tab scrolls its waveforms smoothly while a deck plays: every display frame.
+        if main == MainWindow::Decks && decks_view::moving(self) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 60));
         }
         // Here, not in logic(): a covered or minimized window runs only logic(), with no vsync to pace it.
         if self.meters_live() {

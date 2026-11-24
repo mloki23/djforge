@@ -406,6 +406,11 @@ impl Engine {
         !self.deck_jobs.is_empty()
     }
 
+    /// True while a `deck.load` for `deck` is still reading its file.
+    pub fn deck_loading_on(&self, deck: soundcraft_mix::DeckId) -> bool {
+        self.deck_jobs.iter().any(|j| j.on(deck))
+    }
+
     /// Splits into stems go into `cache` through `runner`, and sessions may read stems from
     /// `cache` (a known stem cache). Only the app's entry points call this, with
     /// `StemCache::at_default()`; tests give a temporary cache.
