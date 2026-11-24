@@ -1773,6 +1773,12 @@ impl Decks {
         self.decks.iter_mut().flat_map(|d| [d.loaded.take(), d.next.take(), d.retired.take()]).flatten()
     }
 
+    /// Sets the decks' rates from their faders and sync without rendering: what a callback with
+    /// nothing to hear does, so a stopped deck shows the tempo it will play at.
+    pub fn settle(&mut self) {
+        self.update(0);
+    }
+
     /// True while a deck plays or its sound rings out.
     pub fn awake(&self) -> bool {
         self.quiet > 0 || self.decks.iter().any(Deck::sounding)
@@ -2117,6 +2123,9 @@ impl Decks {
         let n = frames.min(self.max_block);
         self.held = false;
         if n == 0 || !(self.awake() || self.decks.iter().any(|d| d.next.is_some())) {
+            // Nothing to hear, but the rates still follow the faders and sync, so a stopped deck
+            // shows the tempo it will play at.
+            self.update(n);
             return;
         }
         self.update(n);
@@ -2755,6 +2764,26 @@ mod tests {
         let st = d.state();
         assert!(!st.decks[1].synced);
         assert_eq!(st.decks[1].pitch, -0.05);
+    }
+
+    #[test]
+    fn a_stopped_deck_shows_the_tempo_its_fader_sets() {
+        let ta = track(60.0, 128.0, 0.0, |_| 0.1);
+        let tb = track(60.0, 125.0, 0.0, |_| 0.1);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &ta);
+        load(&mut d, DeckId::B, &tb);
+        // Rendered as the mixer does (not `raw`, which sets the rates itself).
+        let mut main = vec![vec![0.0f32; BLOCK]; 2];
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        d.render(&mut main, BLOCK);
+        // Both stopped: A's fader moves A's tempo now, and B (synced) follows it.
+        d.apply(DeckCmd::Pitch { deck: DeckId::A, value: -0.03, range: None, takeover: false });
+        d.render(&mut main, BLOCK);
+        let st = d.state();
+        assert!(!st.decks[0].playing && !st.decks[1].playing);
+        assert!((st.decks[0].bpm - 128.0 * 0.97).abs() < 0.01, "{}", st.decks[0].bpm);
+        assert!((st.decks[1].bpm - 128.0 * 0.97).abs() < 0.01, "{}", st.decks[1].bpm);
     }
 
     #[test]

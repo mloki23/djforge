@@ -991,6 +991,8 @@ impl AudioState {
             self.pending_len = 0;
             self.read = 0.0;
             out.iter_mut().for_each(|x| *x = 0.0);
+            // Stopped decks still show the tempo their faders (and sync) set.
+            self.mix.decks_settle();
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 // Zeroed in place: the map keeps its entries, so rendering again inserts nothing.
                 zero_meter(&mut m.main);

@@ -290,8 +290,13 @@ fn stray_chords_never_stop_the_decks_and_a_held_cue_always_lets_go() {
     h.hover_at(fader.center() - vec2(0.0, fader.height() * 0.25));
     step(&mut h);
     h.drop_at(fader.center() - vec2(0.0, fader.height() * 0.25));
+    // Stopped, the deck's tempo shows what it will play at (Alpha is 120 BPM).
     let st = until(&mut h, "pitched down", |s| s["decks"][0]["pitch"].as_f64().unwrap() < -1.0);
-    assert!(st["decks"][0]["rate"].as_f64().unwrap() < 1.0 || st["decks"][0]["playing"] == false, "{st}");
+    assert_eq!(st["decks"][0]["playing"], false);
+    until(&mut h, "the stopped deck's BPM follows its fader", |s| {
+        let (bpm, pitch) = (s["decks"][0]["bpm"].as_f64().unwrap(), s["decks"][0]["pitch"].as_f64().unwrap());
+        (bpm - 120.0 * (1.0 + pitch / 100.0)).abs() < 0.05
+    });
 
     // With Deck A playing, chords that would start the arrangement do nothing in the Decks tab.
     click(&mut h, "Deck A Play");

@@ -558,6 +558,13 @@ impl MixEngine {
         self.decks.as_ref().map(|d| d.state()).unwrap_or_default()
     }
 
+    /// [`Decks::settle`]: the decks' rates follow their faders while nothing renders.
+    pub fn decks_settle(&mut self) {
+        if let Some(d) = self.decks.as_mut() {
+            d.settle();
+        }
+    }
+
     /// True while a deck plays or rings out, so the host keeps rendering.
     pub fn decks_awake(&self) -> bool {
         self.decks.as_ref().is_some_and(|d| d.awake())
