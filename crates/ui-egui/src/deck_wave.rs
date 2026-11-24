@@ -201,8 +201,21 @@ pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scr
     if let (Some(a), Some(b)) = (w.state.loop_in, w.state.loop_out) {
         let r = Rect::from_x_y_ranges(x_at(a).max(rect.min.x)..=x_at(b).min(rect.max.x), rect.y_range());
         if r.width() > 0.0 {
-            let c = if w.state.loop_on { Color32::from_rgba_unmultiplied(255, 170, 40, 46) } else { Color32::from_white_alpha(14) };
-            p.rect_filled(r, 0.0, c);
+            // A light band with bars along its top and foot, and its ends marked.
+            let (fill, edge) = if w.state.loop_on {
+                (Color32::from_rgba_unmultiplied(255, 170, 40, 18), Color32::from_rgb(255, 170, 40))
+            } else {
+                (Color32::from_white_alpha(8), Color32::from_white_alpha(70))
+            };
+            p.rect_filled(r, 0.0, fill);
+            for y in [r.min.y + 2.0, r.max.y - 2.0] {
+                p.hline(r.x_range(), y, Stroke::new(3.0, edge.gamma_multiply(0.8)));
+            }
+            for x in [x_at(a), x_at(b)] {
+                if r.x_range().contains(x) {
+                    p.vline(x, rect.y_range(), Stroke::new(1.5, edge));
+                }
+            }
         }
     }
     let wave = crate::widgets::shade(w.tint, -0.15);

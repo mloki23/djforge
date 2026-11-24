@@ -38,6 +38,8 @@ use std::sync::Arc;
 /// Seconds of playback across a scrolling waveform, by zoom step.
 const ZOOMS: [f64; 7] = [2.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0];
 const DEFAULT_ZOOM: usize = 3;
+/// The height of a deck's loop and jump rows (the pitch range key lines up with the last).
+const KEY_ROW: f32 = 30.0;
 /// Beat jump sizes.
 const JUMPS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_JUMP: usize = 2;
@@ -497,6 +499,21 @@ fn feed_meters(app: &mut SoundApp, dt: f32) {
     }
 }
 
+/// A small rounded label ending at `right` (its top at `right.y`): filled in `c` when `filled`,
+/// else outlined. Returns its rect.
+fn chip(ui: &Ui, right: egui::Pos2, text: &str, c: Color32, filled: bool) -> Rect {
+    let t = Tokens::current();
+    let g = ui.painter().layout_no_wrap(text.to_string(), if filled { bold(11.0) } else { mono(11.0) }, if filled { t.text_dark } else { c });
+    let r = Rect::from_min_max(pos2(right.x - g.size().x - 14.0, right.y), pos2(right.x, right.y + g.size().y + 4.0));
+    if filled {
+        ui.painter().rect_filled(r, r.height() / 2.0, c);
+    } else {
+        ui.painter().rect_stroke(r, r.height() / 2.0, Stroke::new(1.0, c.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+    }
+    ui.painter().galley(pos2(r.min.x + 7.0, r.min.y + 2.0), g, c);
+    r
+}
+
 /// A key with text: lit in `on_colour` while `on`. Its accessible name is `label`.
 fn button(ui: &mut Ui, r: Rect, text: &str, on: bool, on_colour: Color32, label: &str, size: f32) -> Response {
     let t = Tokens::current();
@@ -663,21 +680,21 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
     if ui.input(|inp| inp.pointer.any_pressed() && inp.pointer.interact_pos().is_some_and(|p| r.contains(p))) {
         app.decks_view.focus = i;
     }
-    let inner = r.shrink(8.0);
-    // Header: badge, title, artist; BPM, pitch and key on the right.
-    let badge = Rect::from_min_size(inner.min, vec2(30.0, 30.0));
-    ui.painter().rect_filled(badge, 4.0, tint);
-    ui.painter().text(badge.center(), Align2::CENTER_CENTER, name(d), bold(17.0), Color32::BLACK);
-    let info_w = 150.0;
+    let inner = r.shrink(10.0);
+    // Header: badge, title and artist; the tempo, pitch and key on the right.
+    let badge = Rect::from_min_size(inner.min, vec2(34.0, 34.0));
+    ui.painter().rect_filled(badge, 5.0, tint);
+    ui.painter().text(badge.center(), Align2::CENTER_CENTER, name(d), bold(19.0), Color32::BLACK);
+    let info_w = 190.0;
     let title_w = (inner.width() - badge.width() - info_w - 16.0).max(40.0);
-    let tx = badge.max.x + 8.0;
+    let tx = badge.max.x + 10.0;
     let (title, artist) = track.as_ref().map_or(("No track".to_string(), String::new()), |t| (t.title.clone(), t.artist.clone()));
     elided_text(
         ui.painter(),
-        pos2(tx, inner.min.y),
+        pos2(tx, inner.min.y - 1.0),
         Align2::LEFT_TOP,
         &title,
-        bold(15.0),
+        bold(16.0),
         if track.is_some() { t.text } else { t.text_dim },
         title_w,
     );
@@ -685,37 +702,39 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
     let right = inner.max.x;
     let bpm =
         if s.bpm > 0.0 { format!("{:.2}", s.bpm) } else { track.as_ref().and_then(|t| t.bpm).map_or_else(|| "–".into(), |b| format!("{b:.2}")) };
-    ui.painter().text(pos2(right, inner.min.y - 2.0), Align2::RIGHT_TOP, bpm, mono(22.0), if s.synced { tint } else { t.text });
-    let pitch = format!("{:+.2} %  ±{:.0}", s.pitch * 100.0, s.range.max(PITCH_RANGES[0]) * 100.0);
-    ui.painter().text(pos2(right - 82.0, inner.min.y + 30.0), Align2::RIGHT_TOP, pitch, mono(11.0), t.text_dim);
+    let bpm_r = ui.painter().text(pos2(right, inner.min.y - 4.0), Align2::RIGHT_TOP, bpm, mono(26.0), if s.synced { tint } else { t.text });
+    ui.painter().text(pos2(bpm_r.min.x - 6.0, bpm_r.max.y - 4.0), Align2::RIGHT_BOTTOM, "BPM", bold(9.0), t.text_dim);
+    // Chips under the tempo: the pitch and its range, then the key.
     let info = app.decks_view.info.get(i).cloned().flatten();
     let key_src = info.as_ref().and_then(|v| v.get("key_source")).and_then(Value::as_str).map(library_browser::source_short).unwrap_or("");
-    let key_text = track
-        .as_ref()
-        .and_then(|t| t.key.clone())
-        .map_or_else(|| "key –".into(), |k| if key_src.is_empty() { k } else { format!("{k} · {key_src}") });
-    let has_key = track.as_ref().is_some_and(|t| t.key.is_some());
-    ui.painter().text(pos2(right, inner.min.y + 30.0), Align2::RIGHT_TOP, key_text, bold(11.5), if has_key { t.accent } else { t.text_dim });
-    // Times, state and errors.
-    let line = inner.min.y + 36.0;
+    let key = track.as_ref().and_then(|t| t.key.clone());
+    let chip_y = bpm_r.max.y + 3.0;
+    let key_text = key.as_ref().map_or_else(|| "no key".to_string(), |k| if key_src.is_empty() { k.clone() } else { format!("{k} · {key_src}") });
+    let key_r = chip(ui, pos2(right, chip_y), &key_text, if key.is_some() { t.accent } else { t.text_dim }, key.is_some());
+    let pitch = format!("{:+.2} %  ±{:.0}", s.pitch * 100.0, s.range.max(PITCH_RANGES[0]) * 100.0);
+    let off = s.pitch.abs() > 1e-6;
+    chip(ui, pos2(key_r.min.x - 6.0, chip_y), &pitch, if off { t.text } else { t.text_dim }, false);
+    // Times: elapsed bright, remaining dim, both large.
+    let line = inner.min.y + 40.0;
     if let Some(tr) = &track {
         let total = tr.frames() as f64 / sr;
         let now = position / sr;
         let rate = if s.rate.is_finite() && s.rate > 0.05 { s.rate } else { 1.0 };
-        let elapsed = ui.painter().text(pos2(tx, line - 2.0), Align2::LEFT_TOP, clock_tenths(now), mono(17.0), t.text);
+        let elapsed = ui.painter().text(pos2(inner.min.x, line), Align2::LEFT_TOP, clock_tenths(now), mono(19.0), t.text);
         let remain = format!("-{}", clock_tenths(((total - now) / rate).max(0.0)));
-        ui.painter().text(pos2(elapsed.max.x + 14.0, line - 2.0), Align2::LEFT_TOP, remain, mono(17.0), t.text_dim);
-        let grid = tr.grid_from.map_or_else(|| "no beat grid".to_string(), |g| grid_source(g).to_string());
-        ui.painter().text(pos2(tx + 210.0, line + 3.0), Align2::LEFT_TOP, grid, regular(11.0), t.text_dim);
+        let rem = ui.painter().text(pos2(elapsed.max.x + 16.0, line), Align2::LEFT_TOP, remain, mono(19.0), t.text_dim);
+        // The grid's source, in words; a missing grid in the warning colour (no sync or loops).
+        let (grid, colour) = tr.grid_from.map_or(("no beat grid: sync and loops off", t.rec), |g| (grid_source(g), t.text_dim));
+        ui.painter().text(pos2(rem.max.x + 16.0, rem.center().y), Align2::LEFT_CENTER, grid, regular(10.5), colour);
     }
-    let note_x = tx + 330.0;
+    let note_x = inner.min.x + 360.0;
     if app.engine.deck_loading_on(d) {
-        ui.painter().text(pos2(note_x, line + 3.0), Align2::LEFT_TOP, "Analysing…", bold(11.0), t.accent);
+        ui.painter().text(pos2(note_x, line + 5.0), Align2::LEFT_TOP, "Analysing…", bold(11.0), t.accent);
     } else if let Some(e) = app.decks_view.load_error.get(i).cloned().flatten() {
-        elided_text(ui.painter(), pos2(note_x, line + 3.0), Align2::LEFT_TOP, &e, regular(11.0), t.rec, (inner.max.x - note_x).max(20.0));
+        elided_text(ui.painter(), pos2(note_x, line + 5.0), Align2::LEFT_TOP, &e, regular(11.0), t.rec, (inner.max.x - note_x).max(20.0));
     }
     // The overview: click or drag to seek.
-    let ov = Rect::from_min_size(pos2(inner.min.x, inner.min.y + 56.0), vec2(inner.width(), 42.0));
+    let ov = Rect::from_min_size(pos2(inner.min.x, inner.min.y + 68.0), vec2(inner.width(), 44.0));
     let ov_resp = ui.interact(ov, Id::new(("decks_overview", d.id())), Sense::click_and_drag());
     let ov_label = format!("Deck {} Overview", name(d));
     ov_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, &ov_label));
@@ -740,9 +759,9 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
         ui.painter().rect_filled(ov, 2.0, t.window_bg);
     }
     // Controls: pitch on the outer side, the jog on the inner.
-    let ctl = Rect::from_min_max(pos2(inner.min.x, ov.max.y + 8.0), inner.max);
+    let ctl = Rect::from_min_max(pos2(inner.min.x, ov.max.y + 10.0), inner.max);
     let pitch_w = 46.0;
-    let jog_w = ctl.height().clamp(90.0, 150.0);
+    let jog_w = ctl.height().clamp(90.0, 170.0);
     let (pitch_r, main_r, jog_r) = if d == DeckId::A {
         let p = Rect::from_min_size(ctl.min, vec2(pitch_w, ctl.height()));
         let j = Rect::from_min_size(pos2(ctl.max.x - jog_w, ctl.min.y), vec2(jog_w, ctl.height()));
@@ -767,17 +786,17 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     let n = name(d);
     let gap = 6.0;
     // Row 1: Play, Cue | Sync, Master Tempo | Load.
-    let row = Rect::from_min_size(r.min, vec2(r.width(), 40.0));
+    let row = Rect::from_min_size(r.min, vec2(r.width(), 44.0));
     let mut x = row.min.x;
     let mut cell = |w: f32, h: f32| {
         let c = Rect::from_min_size(pos2(x, row.min.y + (row.height() - h) / 2.0), vec2(w, h));
         x += w + gap;
         c
     };
-    let play_r = cell(62.0, 40.0);
-    let cue_r = cell(62.0, 40.0);
-    let sync_r = cell(50.0, 28.0);
-    let mt_r = cell(40.0, 28.0);
+    let play_r = cell(66.0, 44.0);
+    let cue_r = cell(66.0, 44.0);
+    let sync_r = cell(54.0, 30.0);
+    let mt_r = cell(42.0, 30.0);
     let play = button(ui, play_r, "", s.playing, t.transport_play, &format!("Deck {n} Play"), 16.0);
     // The icon, drawn: a triangle, or two bars while playing.
     let (c, ink) = (play_r.center(), if s.playing { t.text_dark } else { t.text });
@@ -814,7 +833,7 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     if button(ui, mt_r, "MT", s.key_lock, t.accent, &format!("Deck {n} Master Tempo"), 11.0).on_hover_text("Master Tempo (key lock)").clicked() {
         run(app, "deck.master_tempo", json!({"deck": d.id(), "on": !s.key_lock}));
     }
-    let load_r = Rect::from_min_max(pos2((row.max.x - 64.0).max(x), row.min.y + 6.0), pos2(row.max.x, row.max.y - 6.0));
+    let load_r = Rect::from_min_max(pos2((row.max.x - 70.0).max(x), row.min.y + 7.0), pos2(row.max.x, row.max.y - 7.0));
     // Load Lock: the deck is heard (playing, or a cue preview).
     let locked = s.playing || s.previewing;
     let load_resp =
@@ -838,23 +857,29 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
         }
     }
     // Row 2: the hot cue pads.
-    let pad_h = (r.height() - 40.0 - 26.0 - 26.0 - 8.0 - 8.0 - 6.0 - 4.0).clamp(34.0, 72.0);
-    let pads = Rect::from_min_size(pos2(r.min.x, row.max.y + 8.0), vec2(r.width(), pad_h));
+    // The pads take the height the rows below leave, so the rows reach the panel's foot.
+    let row_h = KEY_ROW;
+    let pad_h = (r.height() - row.height() - 2.0 * row_h - 3.0 * 10.0).clamp(34.0, 120.0);
+    let pads = Rect::from_min_size(pos2(r.min.x, row.max.y + 10.0), vec2(r.width(), pad_h));
     let pw = (pads.width() - gap * (HOT_CUES as f32 - 1.0)) / HOT_CUES as f32;
     for slot in 0..HOT_CUES {
         let pr = Rect::from_min_size(pos2(pads.min.x + slot as f32 * (pw + gap), pads.min.y), vec2(pw, pads.height()));
         pad(app, ui, pr, d, s, slot, track);
     }
     // Row 3: beat loops.
-    let lr = Rect::from_min_size(pos2(r.min.x, pads.max.y + 8.0), vec2(r.width(), 26.0));
+    let lr = Rect::from_min_size(pos2(r.min.x, pads.max.y + 10.0), vec2(r.width(), row_h));
     let loop_beats = loop_length(app, d, s);
     let small = 8;
     let lw = (lr.width() - gap * (small as f32 - 1.0)) / small as f32;
     let cell_at = |k: usize, row: Rect| Rect::from_min_size(pos2(row.min.x + k as f32 * (lw + gap), row.min.y), vec2(lw, row.height()));
     let frac = cell_at(0, lr);
-    let mut menu = ui.new_child(egui::UiBuilder::new().max_rect(frac));
     let frac_on = loop_beats.is_some_and(|b| b < 0.99);
-    let fresp = menu.add_sized(frac.size(), egui::Button::new(egui::RichText::new("¼ ½").size(11.0)).selected(frac_on));
+    let frac_text = match loop_beats {
+        Some(b) if b < 0.3 => "¼ beat",
+        Some(b) if b < 0.99 => "½ beat",
+        _ => "¼ ½",
+    };
+    let fresp = button(ui, frac, frac_text, frac_on, t.accent, &format!("Deck {n} Short Loops"), 10.5).on_hover_text("A loop of ¼ or ½ beat");
     egui::Popup::menu(&fresp).show(|ui| {
         for (label, beats) in [("1/4 beat", "1/4"), ("1/2 beat", "1/2")] {
             if ui.button(label).clicked() {
@@ -886,7 +911,7 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
         run(app, "deck.loop", json!({"deck": d.id(), "action": "double"}));
     }
     // Row 4: loop in/out, exit or reloop, beat jump.
-    let r4 = Rect::from_min_size(pos2(r.min.x, lr.max.y + 6.0), vec2(r.width(), 26.0));
+    let r4 = Rect::from_min_size(pos2(r.min.x, lr.max.y + 10.0), vec2(r.width(), row_h));
     for (k, (text, action, tip)) in [("IN", "in", "Loop in here"), ("OUT", "out", "Loop out here: the loop starts")].into_iter().enumerate() {
         if button(ui, cell_at(k, r4), text, false, t.accent, &format!("Deck {n} Loop {text}"), 10.5).on_hover_text(tip).clicked() {
             run(app, "deck.loop", json!({"deck": d.id(), "action": action}));
@@ -1040,7 +1065,7 @@ fn travel_pitch(travel: f32, range: f64) -> f64 {
 fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, track: Option<&DeckTrack>) {
     let t = Tokens::current();
     let range = if s.range > 0.0 { s.range } else { PITCH_RANGES[0] };
-    let fr = Rect::from_min_max(r.min, pos2(r.max.x, r.max.y - 26.0));
+    let fr = Rect::from_min_max(pos2(r.min.x, r.min.y + 12.0), pos2(r.max.x, r.max.y - 44.0));
     let id = Id::new(("decks_pitch", d.id()));
     // Up is slower, as on a CDJ: the top (travel 1) is −range, the bottom +range.
     let reported = pitch_travel(s.pitch, range);
@@ -1048,6 +1073,10 @@ fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckStat
     ui.painter().text(pos2(fr.center().x, fr.min.y - 2.0), Align2::CENTER_BOTTOM, "−", bold(10.0), t.text_dim);
     ui.painter().text(pos2(fr.center().x, fr.max.y + 1.0), Align2::CENTER_TOP, "+", bold(10.0), t.text_dim);
     let (v, resp) = vfader(ui, fr, travel, id, &format!("Deck {} Pitch", name(d)), 0.5);
+    // 0 %: a bright mark either side of the slot.
+    let mid = fr.center().y;
+    ui.painter().hline(fr.min.x + 1.0..=fr.min.x + 9.0, mid, Stroke::new(2.0, t.meter_green));
+    ui.painter().hline(fr.max.x - 9.0..=fr.max.x - 1.0, mid, Stroke::new(2.0, t.meter_green));
     // Soft takeover: where the deck's tempo really is (sync, a nudge), when not where the fader is.
     if let Some(bpm) = track.and_then(|tr| tr.bpm).filter(|b| *b > 0.0 && s.bpm > 0.0) {
         let actual = s.bpm / bpm - 1.0;
@@ -1068,7 +1097,7 @@ fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckStat
         let value = travel_pitch(v, range) * 100.0;
         run(app, "deck.pitch", json!({"deck": d.id(), "value": (value * 100.0).round() / 100.0}));
     }
-    let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - 20.0), r.max);
+    let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - KEY_ROW), r.max);
     let label = format!("±{:.0}", range * 100.0);
     if button(ui, rr, &label, false, t.accent, &format!("Deck {} Pitch Range", name(d)), 10.5)
         .on_hover_text("Pitch range: ±8, ±16 or ±50 %")
@@ -1091,18 +1120,47 @@ fn jog(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, posit
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &label));
     let p = ui.painter();
     let rad = size / 2.0 - 2.0;
-    p.circle_filled(c, rad, shade(t.panel_bg2, if resp.dragged() { 0.1 } else { 0.0 }));
-    p.circle_stroke(c, rad, Stroke::new(2.0, t.border));
-    p.circle_stroke(c, rad * 0.62, Stroke::new(1.0, t.border));
+    let tint = tint(d);
+    // The platter: a rim of ticks, the track's progress round it in the deck's colour, a disc.
+    p.circle_filled(c, rad, t.window_bg);
+    for k in 0..48 {
+        let a = k as f32 / 48.0 * std::f32::consts::TAU;
+        let dir = vec2(a.sin(), -a.cos());
+        let long = k % 4 == 0;
+        p.line_segment(
+            [c + dir * (rad - if long { 7.0 } else { 4.0 }), c + dir * (rad - 1.0)],
+            Stroke::new(1.0, t.text_dim.gamma_multiply(if long { 0.7 } else { 0.35 })),
+        );
+    }
+    if let Some(tr) = track {
+        let frac = (position / tr.frames().max(1) as f64).clamp(0.0, 1.0) as f32;
+        let n = (frac * 96.0).ceil() as usize;
+        let ring = rad - 11.0;
+        let pts: Vec<egui::Pos2> = (0..=n)
+            .map(|k| {
+                let a = k as f32 / 96.0 * std::f32::consts::TAU;
+                c + vec2(a.sin(), -a.cos()) * ring
+            })
+            .collect();
+        if pts.len() > 1 {
+            p.add(egui::Shape::line(pts, Stroke::new(3.0, tint.gamma_multiply(0.85))));
+        }
+    }
+    let disc = rad - 16.0;
+    p.circle_filled(c, disc, shade(t.panel_bg2, if resp.dragged() { 0.12 } else { 0.04 }));
+    p.circle_stroke(c, disc, Stroke::new(1.0, t.border));
+    p.circle_filled(c, disc * 0.42, t.panel_bg);
+    p.circle_stroke(c, disc * 0.42, Stroke::new(1.0, t.border));
     // A mark that turns once a bar (once every two seconds without a grid).
     let turn = match track.and_then(|tr| tr.grid.as_ref()) {
         Some(g) => g.beat_at(position) / 4.0,
         None => position / app.engine.session().sample_rate.as_f64().max(1.0) / 2.0,
     };
-    let a = (turn.fract() * std::f64::consts::TAU) as f32 - std::f32::consts::FRAC_PI_2;
-    let dir = vec2(a.cos(), a.sin());
-    p.line_segment([c + dir * rad * 0.66, c + dir * (rad - 3.0)], Stroke::new(3.0, if s.playing { Color32::WHITE } else { t.text_dim }));
-    p.text(c, Align2::CENTER_CENTER, if s.playing || s.previewing { "NUDGE" } else { "SEARCH" }, bold(9.5), t.text_dim);
+    let a = (turn.fract() * std::f64::consts::TAU) as f32;
+    let dir = vec2(a.sin(), -a.cos());
+    let live = s.playing || s.previewing;
+    p.line_segment([c + dir * disc * 0.5, c + dir * (disc - 4.0)], Stroke::new(3.0, if live { Color32::WHITE } else { t.text_dim }));
+    p.text(c, Align2::CENTER_CENTER, if live { "NUDGE" } else { "SEARCH" }, bold(9.0), t.text_dim);
     let resp = resp.on_hover_text("Drag sideways: nudge while playing, search while stopped");
     if track.is_some() {
         jog_drag(app, ui, &resp, d, s);
@@ -1135,30 +1193,30 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     if resp.changed() {
         run(app, "deck.master_volume", json!({"db": (db * 10.0).round() / 10.0}));
     }
-    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 64.0), vec2(18.0, (body.height() - 128.0).max(40.0)));
+    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 66.0), vec2(18.0, (body.height() - 156.0).max(40.0)));
     let [l, rgt] = app.decks_view.meters[2];
     meter(ui, Rect::from_min_size(mr.min, vec2(8.0, mr.height())), l, l, l >= 1.0);
     meter(ui, Rect::from_min_size(pos2(mr.min.x + 10.0, mr.min.y), vec2(8.0, mr.height())), rgt, rgt, rgt >= 1.0);
     let curve = st.decks[0].fader_curve;
     let (next, text) = match curve {
-        FaderCurve::Linear => (FaderCurve::Smooth, "LIN"),
-        FaderCurve::Smooth => (FaderCurve::Sharp, "SMOOTH"),
-        FaderCurve::Sharp => (FaderCurve::Linear, "SHARP"),
+        FaderCurve::Linear => (FaderCurve::Smooth, "CH: LIN"),
+        FaderCurve::Smooth => (FaderCurve::Sharp, "CH: SMOOTH"),
+        FaderCurve::Sharp => (FaderCurve::Linear, "CH: SHARP"),
     };
-    let qr = Rect::from_center_size(pos2(c.center().x, body.max.y - 38.0), vec2(centre_w - 12.0, 20.0));
+    let qr = Rect::from_center_size(pos2(c.center().x, body.max.y - 62.0), vec2(centre_w - 10.0, 20.0));
     let q = st.quantise;
     if button(ui, qr, "QUANTISE", q, t.accent, "Quantise", 9.0).on_hover_text("Quantise cues, hot cues and loops to the beat (both decks)").clicked()
     {
         run(app, "deck.quantise", json!({"on": !q}));
     }
-    let cr = Rect::from_center_size(pos2(c.center().x, body.max.y - 14.0), vec2(centre_w - 12.0, 20.0));
-    if button(ui, cr, text, false, t.accent, "Channel Fader Curve", 9.5).on_hover_text("Channel fader curve (both channels)").clicked() {
+    let cr = Rect::from_center_size(pos2(c.center().x, body.max.y - 38.0), vec2(centre_w - 10.0, 20.0));
+    if button(ui, cr, text, false, t.accent, "Channel Fader Curve", 8.5).on_hover_text("Channel fader curve (both channels)").clicked() {
         for d in DeckId::ALL {
             run(app, "deck.fader", json!({"deck": d.id(), "curve": next.id()}));
         }
     }
     // The crossfader and its curve.
-    let xr = Rect::from_min_max(pos2(r.min.x + 44.0, r.max.y - xf_h + 10.0), pos2(r.max.x - 68.0, r.max.y - 14.0));
+    let xr = Rect::from_min_max(pos2(r.min.x + 40.0, r.max.y - xf_h + 10.0), pos2(r.max.x - 40.0, r.max.y - 14.0));
     let id = Id::new("decks_xfader");
     let reported = if st.xfader.is_finite() { st.xfader * 0.5 + 0.5 } else { 0.5 };
     let travel = shown_value(app, id, reported);
@@ -1194,10 +1252,10 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     }
     let xc = st.xfader_curve;
     let (next, text) = match xc {
-        XfadeCurve::Smooth => (XfadeCurve::Sharp, "SMOOTH"),
-        XfadeCurve::Sharp => (XfadeCurve::Smooth, "CUT"),
+        XfadeCurve::Smooth => (XfadeCurve::Sharp, "XF: SMOOTH"),
+        XfadeCurve::Sharp => (XfadeCurve::Smooth, "XF: CUT"),
     };
-    let cr = Rect::from_center_size(pos2(r.max.x - 22.0, r.max.y - xf_h / 2.0 - 2.0), vec2(38.0, 18.0));
+    let cr = Rect::from_center_size(pos2(c.center().x, body.max.y - 14.0), vec2(centre_w - 10.0, 20.0));
     if button(ui, cr, text, false, t.accent, "Crossfader Curve", 8.5).on_hover_text("Crossfader curve: smooth (constant power) or cut").clicked() {
         run(app, "deck.xfader", json!({"curve": next.id()}));
     }
