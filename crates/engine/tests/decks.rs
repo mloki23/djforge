@@ -312,7 +312,7 @@ fn deck_commands_queue_the_audio_engines_and_refuse_what_cant_be_done() {
         DeckCmd::Play(a),
         DeckCmd::Cue { deck: a, down: false },
         DeckCmd::Seek { deck: a, at: 72_000.0 },
-        DeckCmd::Pitch { deck: a, value: 0.04, range: Some(0.16) },
+        DeckCmd::Pitch { deck: a, value: 0.04, range: Some(0.16), takeover: true },
         DeckCmd::HotCue { deck: a, n: 1, action: HotCueAction::Set, seq: 1 },
         DeckCmd::Loop { deck: a, action: LoopAction::Beats(0.25) },
         DeckCmd::Loop { deck: a, action: LoopAction::Halve },

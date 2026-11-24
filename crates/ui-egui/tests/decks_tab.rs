@@ -164,6 +164,19 @@ fn double_click(h: &mut Harness<'_, SoundApp>, label: &str) {
     steps(h, 2);
 }
 
+/// Drags the control `label` from its centre by `dy` points (up is negative).
+fn drag_by(h: &mut Harness<'_, SoundApp>, label: &str, dy: f32) {
+    let c = h.get_by_label(label).rect().center();
+    h.drag_at(c);
+    step(h);
+    h.hover_at(c + vec2(0.0, dy * 0.5));
+    step(h);
+    h.hover_at(c + vec2(0.0, dy));
+    step(h);
+    h.drop_at(c + vec2(0.0, dy));
+    steps(h, 2);
+}
+
 fn click(h: &mut Harness<'_, SoundApp>, label: &str) {
     h.get_by_label(label).click();
     steps(h, 2);
@@ -302,6 +315,32 @@ fn stray_chords_never_stop_the_decks_and_a_held_cue_always_lets_go() {
     h.state_mut().run("window.edit", json!({})).unwrap();
     until(&mut h, "the hold let go off the tab", |s| s["decks"][1]["previewing"] == false);
     assert_eq!(state(&mut h)["decks"][0]["playing"], true, "Deck A played on throughout");
+    // Let go of the mouse (still down since the press).
+    h.drop_at(egui::pos2(5.0, 5.0));
+    h.state_mut().run("window.decks", json!({})).unwrap();
+    steps(&mut h, 3);
+
+    // The tempo faders while both play synced: A leads, so A's fader moves both decks' tempo…
+    h.state_mut().run("deck.pitch", json!({"deck": "a", "value": 0})).unwrap();
+    // B syncs to A first (A keeps its own tempo), then A too: both synced, A playing first leads.
+    click(&mut h, "Deck B Sync");
+    click(&mut h, "Deck A Sync");
+    click(&mut h, "Deck B Play");
+    let st = until(&mut h, "both play synced", |s| {
+        s["decks"][1]["playing"] == true
+            && s["decks"][0]["master"] == true
+            && (s["decks"][0]["bpm"].as_f64().unwrap() - s["decks"][1]["bpm"].as_f64().unwrap()).abs() < 0.05
+    });
+    let (a0, b0) = (st["decks"][0]["bpm"].as_f64().unwrap(), st["decks"][1]["bpm"].as_f64().unwrap());
+    drag_by(&mut h, "Deck A Pitch", 40.0);
+    let st = until(&mut h, "A faster, B following", |s| {
+        s["decks"][0]["bpm"].as_f64().unwrap() > a0 + 1.0 && s["decks"][1]["bpm"].as_f64().unwrap() > b0 + 1.0
+    });
+    assert_eq!(st["decks"][0]["synced"], true, "{st}");
+    // …and B's fader takes B out of sync and moves its tempo.
+    let b1 = st["decks"][1]["bpm"].as_f64().unwrap();
+    drag_by(&mut h, "Deck B Pitch", -40.0);
+    until(&mut h, "B slower, on its own", |s| s["decks"][1]["synced"] == false && s["decks"][1]["bpm"].as_f64().unwrap() < b1 - 1.0);
 }
 
 /// The Decks tab's cost per frame with two 10-minute tracks playing (run with

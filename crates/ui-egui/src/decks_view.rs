@@ -1137,7 +1137,8 @@ fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckStat
         && track.is_some()
     {
         let value = travel_pitch(v, range) * 100.0;
-        run(app, "deck.pitch", json!({"deck": d.id(), "value": (value * 100.0).round() / 100.0}));
+        // Drawn at the deck's tempo, so it applies at once (no soft takeover).
+        run(app, "deck.pitch", json!({"deck": d.id(), "value": (value * 100.0).round() / 100.0, "takeover": false}));
     }
     let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - KEY_ROW), r.max);
     let label = format!("±{:.0}", range * 100.0);

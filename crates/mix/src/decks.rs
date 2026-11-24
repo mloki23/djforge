@@ -671,11 +671,14 @@ pub enum DeckCmd {
         delta: f64,
         mode: JogMode,
     },
-    /// The pitch fader (a fraction, within the range; turns sync off), and optionally its range.
+    /// The pitch fader (a fraction, within the range), and optionally its range. With `takeover`
+    /// (a hardware fader, which may sit anywhere) it takes over from a held tempo only once it
+    /// reaches it; without (an on-screen fader, drawn at the tempo) it applies at once.
     Pitch {
         deck: DeckId,
         value: f64,
         range: Option<f64>,
+        takeover: bool,
     },
     MasterTempo {
         deck: DeckId,
@@ -1865,17 +1868,28 @@ impl Decks {
                     d.jog(delta, mode, q, sr, xf);
                 }
             }
-            DeckCmd::Pitch { deck, value, range } => {
+            DeckCmd::Pitch { deck, value, range, takeover } => {
+                // The deck the other follows sets the tempo with its fader (the follower keeps up);
+                // moving a following deck's fader turns its sync off, and the fader takes over
+                // once it reaches the tempo held (soft takeover).
+                let other_leads = self.decks.get(1 - deck.index()).is_some_and(|o| o.master);
                 if let Some(d) = self.deck(deck) {
                     if let Some(r) = range.filter(|r| PITCH_RANGES.iter().any(|x| (x - r).abs() < 1e-9)) {
                         d.range = r;
                     }
-                    // A synced deck's tempo is its master's; after sync off the fader takes
-                    // over once it reaches the tempo held (soft takeover).
+                    if value.is_finite() && d.synced && other_leads {
+                        d.takeover = Some((d.pitch, d.fader_at.map(|f| f > d.pitch)));
+                        d.synced = false;
+                        d.correction = 0.0;
+                        d.phase_err = None;
+                    }
                     if value.is_finite() {
                         d.fader_at = Some(value.clamp(-d.range, d.range));
+                        if !takeover {
+                            d.takeover = None;
+                        }
                     }
-                    if value.is_finite() && !d.synced {
+                    if value.is_finite() && !(d.synced && other_leads) {
                         let v = value.clamp(-d.range, d.range);
                         match d.takeover {
                             None => d.pitch = v,
@@ -2510,7 +2524,7 @@ mod tests {
         let mut d = decks();
         load(&mut d, DeckId::A, &ta);
         load(&mut d, DeckId::B, &tb);
-        d.apply(DeckCmd::Pitch { deck: DeckId::A, value: pitch_a, range: Some(0.16) });
+        d.apply(DeckCmd::Pitch { deck: DeckId::A, value: pitch_a, range: Some(0.16), takeover: true });
         d.apply(DeckCmd::MasterTempo { deck: DeckId::B, on: key_lock });
         d.apply(DeckCmd::Play(DeckId::A));
         raw(&mut d, 0, 50);
@@ -2547,11 +2561,11 @@ mod tests {
         // Sync off keeps the rate, through blocks; the fader takes over only once it reaches it.
         let rate = s.decks[1].rate;
         d.apply(DeckCmd::Sync { deck: DeckId::B, on: false });
-        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.06, range: Some(0.16) });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.06, range: Some(0.16), takeover: true });
         raw(&mut d, 1, 20);
         assert!((d.state().decks[1].rate - rate).abs() < 1e-3, "{} vs {rate}", d.state().decks[1].rate);
         let held = d.state().decks[1].pitch;
-        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: held - 0.01, range: None });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: held - 0.01, range: None, takeover: true });
         raw(&mut d, 1, 1);
         assert!((d.state().decks[1].pitch - (held - 0.01)).abs() < 1e-9, "crossed the held tempo: taken over");
     }
@@ -2689,17 +2703,58 @@ mod tests {
         load(&mut d, DeckId::A, &ta);
         load(&mut d, DeckId::B, &tb);
         // The fader sits at -2 %; synced, B runs +2.4 %; off, it holds +2.4 %.
-        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: -0.02, range: None });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: -0.02, range: None, takeover: true });
         d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
         raw(&mut d, 0, 1);
         d.apply(DeckCmd::Sync { deck: DeckId::B, on: false });
         let held = d.state().decks[1].pitch;
         assert!((held - 0.024).abs() < 1e-3);
         // A move still below it does nothing; one jump past it takes over.
-        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.01, range: None });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.01, range: None, takeover: true });
         assert_eq!(d.state().decks[1].pitch, held);
-        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.05, range: None });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: 0.05, range: None, takeover: true });
         assert_eq!(d.state().decks[1].pitch, 0.05);
+    }
+
+    #[test]
+    fn the_master_s_fader_sets_the_tempo_and_a_follower_s_fader_turns_its_sync_off() {
+        let ta = track(60.0, 128.0, 0.0, |_| 0.1);
+        let tb = track(60.0, 125.0, 0.0, |_| 0.1);
+        let mut d = decks();
+        load(&mut d, DeckId::A, &ta);
+        load(&mut d, DeckId::B, &tb);
+        // Both synced, A started first: A leads.
+        d.apply(DeckCmd::Sync { deck: DeckId::A, on: true });
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        d.apply(DeckCmd::Play(DeckId::A));
+        raw(&mut d, 0, 2);
+        d.apply(DeckCmd::Play(DeckId::B));
+        raw(&mut d, 0, 4);
+        assert!(d.state().decks[0].master);
+        // A's fader moves A's tempo, and B follows it.
+        d.apply(DeckCmd::Pitch { deck: DeckId::A, value: 0.04, range: None, takeover: true });
+        raw(&mut d, 0, 2);
+        let st = d.state();
+        assert_eq!(st.decks[0].pitch, 0.04);
+        assert!(st.decks[0].synced, "the master stays synced");
+        assert!((st.decks[1].pitch - (1.04 * 128.0 / 125.0 - 1.0)).abs() < 1e-3, "{}", st.decks[1].pitch);
+        // B's fader, moved from where it shows (its tempo now), turns B's sync off and takes over.
+        let held = st.decks[1].pitch;
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: held, range: None, takeover: true });
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: held - 0.01, range: None, takeover: true });
+        raw(&mut d, 0, 2);
+        let st = d.state();
+        assert!(!st.decks[1].synced);
+        assert!((st.decks[1].pitch - (held - 0.01)).abs() < 1e-9);
+        assert!((st.decks[1].rate - (1.0 + held - 0.01)).abs() < 1e-6, "{}", st.decks[1].rate);
+        // An on-screen fader (no takeover) applies wherever it is grabbed, even after sync off.
+        d.apply(DeckCmd::Sync { deck: DeckId::B, on: true });
+        raw(&mut d, 0, 2);
+        d.apply(DeckCmd::Pitch { deck: DeckId::B, value: -0.05, range: None, takeover: false });
+        raw(&mut d, 0, 1);
+        let st = d.state();
+        assert!(!st.decks[1].synced);
+        assert_eq!(st.decks[1].pitch, -0.05);
     }
 
     #[test]
@@ -2855,7 +2910,7 @@ mod tests {
         for (key_lock, want) in [(true, 1000.0), (false, 1080.0)] {
             let mut d = decks();
             load(&mut d, DeckId::A, &t);
-            d.apply(DeckCmd::Pitch { deck: DeckId::A, value: 0.08, range: None });
+            d.apply(DeckCmd::Pitch { deck: DeckId::A, value: 0.08, range: None, takeover: true });
             d.apply(DeckCmd::MasterTempo { deck: DeckId::A, on: key_lock });
             d.apply(DeckCmd::Play(DeckId::A));
             let out = raw(&mut d, 0, 200);

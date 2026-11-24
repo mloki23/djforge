@@ -58,7 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Pitch",
             [],
             None,
-            "{deck: a|b, value?: percent (within the range), range?: 8|16|50 (percent)} — the pitch fader: rate = 1 + value/100. Moving it turns sync off",
+            "{deck: a|b, value?: percent (within the range), range?: 8|16|50 (percent), takeover?: bool (default true; false for a fader drawn at the deck's tempo, which applies at once)} — the pitch fader: rate = 1 + value/100. On a synced deck the other follows, it sets the tempo (the other keeps up); on a deck following the other, moving it turns sync off and it takes over once it reaches the tempo held (soft takeover)",
             always,
             |e, p| transport(e, p, "deck.pitch")
         ),
@@ -200,7 +200,7 @@ fn transport(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
             if value.is_none() && range.is_none() {
                 return Err(bad(cmd, "give `value` (percent) or `range`"));
             }
-            DeckCmd::Pitch { deck, value: value.map_or(f64::NAN, |v| v / 100.0), range }
+            DeckCmd::Pitch { deck, value: value.map_or(f64::NAN, |v| v / 100.0), range, takeover: bool_param(cmd, p, "takeover", Some(true))? }
         }
         "deck.master_tempo" => DeckCmd::MasterTempo { deck, on: bool_param(cmd, p, "on", None)? },
         "deck.sync" => {
