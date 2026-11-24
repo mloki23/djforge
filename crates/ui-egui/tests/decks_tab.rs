@@ -65,6 +65,11 @@ fn library(dir: &Path, tracks: &[(&str, &str, f64, &str, f64)]) -> PathBuf {
             "audio_end": secs, "camelot": camelot, "key": "A minor", "bars": (secs / (240.0 / bpm)) as i64, "constant_tempo": true});
         c.execute("INSERT OR REPLACE INTO tracks VALUES (?1, ?2, ?3, 9, ?4)", rusqlite::params![path, m.len() as i64, mtime, data.to_string()])
             .unwrap();
+        // all-in-one's sections: an intro, a drop and an outro.
+        let st = json!({"segments": [{"start": 0.0, "end": 16.0, "label": "intro"}, {"start": 16.0, "end": 32.0, "label": "drop"},
+            {"start": 32.0, "end": secs, "label": "outro"}]});
+        c.execute("INSERT OR REPLACE INTO structure VALUES (?1, ?2, ?3, ?4)", rusqlite::params![path, m.len() as i64, mtime, st.to_string()])
+            .unwrap();
     }
     db
 }
@@ -175,6 +180,11 @@ fn the_decks_tab_loads_from_the_library_and_its_controls_drive_the_decks() {
     double_click(&mut h, "Track Alpha");
     let st = until(&mut h, "Alpha on Deck A", |s| s["decks"][0]["track"]["title"] == "alpha" && s["decks"][0]["loading"] == false);
     assert_eq!(st["decks"][0]["track"]["grid"], "library", "{st}");
+    // mixforge's sections came with it, on its bars.
+    let sections = &st["decks"][0]["track"]["sections"];
+    assert_eq!(sections[0]["label"], "intro", "{st}");
+    assert_eq!(sections[1]["label"], "drop", "{st}");
+    assert!((sections[1]["start"].as_f64().unwrap() - 16.0).abs() < 0.01, "{st}");
     assert!(h.state().ui.status.contains("Deck A: loaded alpha"), "{}", h.state().ui.status);
     // Shift+Right loads the selected row on Deck B.
     h.get_by_label("Track Beta").click();

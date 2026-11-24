@@ -734,7 +734,8 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
         elided_text(ui.painter(), pos2(note_x, line + 5.0), Align2::LEFT_TOP, &e, regular(11.0), t.rec, (inner.max.x - note_x).max(20.0));
     }
     // The overview: click or drag to seek.
-    let ov = Rect::from_min_size(pos2(inner.min.x, inner.min.y + 68.0), vec2(inner.width(), 44.0));
+    let ov = Rect::from_min_size(pos2(inner.min.x, inner.min.y + 68.0), vec2(inner.width(), 40.0));
+    let phrase = Rect::from_min_size(pos2(ov.min.x, ov.max.y + 2.0), vec2(ov.width(), 5.0));
     let ov_resp = ui.interact(ov, Id::new(("decks_overview", d.id())), Sense::click_and_drag());
     let ov_label = format!("Deck {} Overview", name(d));
     ov_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, true, &ov_label));
@@ -743,6 +744,7 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
         if let Some(cache) = app.decks_view.overviews.get_mut(i) {
             deck_wave::overview(ui.painter(), ov, cache, tr, &s, position, by_freq, tint);
         }
+        deck_wave::phrase_bar(ui, phrase, tr, position);
         if (ov_resp.clicked() || ov_resp.dragged())
             && let Some(p) = ov_resp.interact_pointer_pos()
         {
@@ -759,7 +761,7 @@ fn deck_panel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, position: f64
         ui.painter().rect_filled(ov, 2.0, t.window_bg);
     }
     // Controls: pitch on the outer side, the jog on the inner.
-    let ctl = Rect::from_min_max(pos2(inner.min.x, ov.max.y + 10.0), inner.max);
+    let ctl = Rect::from_min_max(pos2(inner.min.x, phrase.max.y + 10.0), inner.max);
     let pitch_w = 46.0;
     let jog_w = ctl.height().clamp(90.0, 170.0);
     let (pitch_r, main_r, jog_r) = if d == DeckId::A {
@@ -859,11 +861,14 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     // Row 2: the hot cue pads.
     // The pads take the height the rows below leave, so the rows reach the panel's foot.
     let row_h = KEY_ROW;
-    let pad_h = (r.height() - row.height() - 2.0 * row_h - 3.0 * 10.0).clamp(34.0, 120.0);
+    let pad_h = (r.height() - row.height() - 2.0 * row_h - 3.0 * 10.0).clamp(80.0, 148.0);
     let pads = Rect::from_min_size(pos2(r.min.x, row.max.y + 10.0), vec2(r.width(), pad_h));
-    let pw = (pads.width() - gap * (HOT_CUES as f32 - 1.0)) / HOT_CUES as f32;
+    // A named list: A–D down the left, E–H down the right.
+    let rows = HOT_CUES.div_ceil(2);
+    let (cw, rh) = ((pads.width() - gap) / 2.0, ((pads.height() - 4.0 * (rows as f32 - 1.0)) / rows as f32).min(34.0));
     for slot in 0..HOT_CUES {
-        let pr = Rect::from_min_size(pos2(pads.min.x + slot as f32 * (pw + gap), pads.min.y), vec2(pw, pads.height()));
+        let (col, row) = (slot / rows, slot % rows);
+        let pr = Rect::from_min_size(pos2(pads.min.x + col as f32 * (cw + gap), pads.min.y + row as f32 * (rh + 4.0)), vec2(cw, rh));
         pad(app, ui, pr, d, s, slot, track);
     }
     // Row 3: beat loops.
@@ -966,27 +971,64 @@ fn loop_length(app: &SoundApp, d: DeckId, s: &DeckState) -> Option<f64> {
 /// The names of hot cues A–D when they come from a DJ set or mixforge.
 const CUE_NAMES: [&str; 4] = ["Mix in", "Bass hit", "Mix out", "Bass gone"];
 
+/// What hot cue `slot` is called: the set's or mixforge's name while it is still at the cue they
+/// gave it, else the section starting there, else its time.
+fn cue_name(slot: usize, s: &DeckState, track: Option<&DeckTrack>, sr: f64) -> Option<String> {
+    let at = s.hot.get(slot).copied().flatten()?;
+    let given = track.and_then(|t| t.cues.get(slot).copied().flatten());
+    if let Some(n) = CUE_NAMES.get(slot).filter(|_| given.is_some_and(|g| (at - g).abs() < 1.0)) {
+        return Some((*n).to_string());
+    }
+    let beat = track.and_then(|t| t.grid.as_ref()).map_or(0.25 * sr, |g| g.period_at(at) / 2.0);
+    if let Some(x) = track.and_then(|t| deck_wave::section_at(t, at, beat)) {
+        return Some(deck_wave::section_name(&x.label));
+    }
+    Some(library_browser::clock(at / sr))
+}
+
+/// A hot cue row: its letter in its colour, then its name (or a dash while empty). Click: jump
+/// (held while stopped: plays from it) or set; Shift+click or right-click clears.
 fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot: usize, track: Option<&DeckTrack>) {
+    let t = Tokens::current();
     let set = s.hot.get(slot).copied().flatten().is_some();
     let colour = hot_cue_colour(slot);
     let letter = hot_cue_letter(slot);
     let label = format!("Deck {} Hot Cue {letter}", name(d));
     let resp = ui.interact(r, Id::new(("decks_pad", d.id(), slot)), Sense::click());
-    let fill = if set { if resp.is_pointer_button_down_on() { shade(colour, 0.2) } else { colour } } else { key_fill(&resp) };
-    key_face(ui.painter(), r, &resp, fill);
-    if !set {
-        ui.painter().rect_stroke(r.shrink(2.0), 2.0, Stroke::new(1.0, colour.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+    let down = resp.is_pointer_button_down_on();
+    let p = ui.painter();
+    let bg = if down && set {
+        colour.gamma_multiply(0.45)
+    } else if resp.hovered() {
+        t.button_hi
+    } else {
+        t.window_bg
+    };
+    p.rect_filled(r, 3.0, bg);
+    let sq = Rect::from_min_size(r.min, vec2(r.height(), r.height()));
+    if set {
+        p.rect_filled(sq, 3.0, colour);
+    } else {
+        p.rect_stroke(sq.shrink(1.0), 3.0, Stroke::new(1.0, colour.gamma_multiply(0.6)), egui::StrokeKind::Inside);
     }
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, letter, bold(14.0), if set { Color32::BLACK } else { colour });
+    p.text(sq.center(), Align2::CENTER_CENTER, letter, bold(13.0), if set { Color32::BLACK } else { colour });
+    let sr = app.engine.session().sample_rate.as_f64().max(1.0);
+    let cue = cue_name(slot, s, track, sr);
+    let text_r = r.max.x - sq.max.x - 12.0;
+    elided_text(
+        p,
+        pos2(sq.max.x + 8.0, r.center().y),
+        Align2::LEFT_CENTER,
+        cue.as_deref().unwrap_or("—"),
+        if set { bold(12.5) } else { regular(12.0) },
+        if set { t.text } else { t.text_dim.gamma_multiply(0.6) },
+        text_r.max(10.0),
+    );
     let on = set;
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, &label));
-    // A pad still at the cue the set or mixforge gave it keeps that cue's name.
-    let given = track.and_then(|t| t.cues.get(slot).copied().flatten());
-    let named = CUE_NAMES.get(slot).filter(|_| given.is_some_and(|g| s.hot.get(slot).copied().flatten().is_some_and(|h| (h - g).abs() < 1.0)));
-    let tip = match (set, named) {
-        (true, Some(n)) => format!("{n}: jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
-        (true, None) => format!("Jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
-        (false, _) => format!("Set a hot cue here. Key: {}", slot + 1),
+    let tip = match cue {
+        Some(n) => format!("{n}: jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
+        None => format!("Set a hot cue here. Key: {}", slot + 1),
     };
     let resp = resp.on_hover_text(tip);
     if track.is_none() {
@@ -1146,21 +1188,26 @@ fn jog(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, posit
             p.add(egui::Shape::line(pts, Stroke::new(3.0, tint.gamma_multiply(0.85))));
         }
     }
+    // Inside the ring: a dark disc with the tempo, the pitch and its range; a dot runs round its
+    // edge once a bar (once every two seconds without a grid).
     let disc = rad - 16.0;
-    p.circle_filled(c, disc, shade(t.panel_bg2, if resp.dragged() { 0.12 } else { 0.04 }));
-    p.circle_stroke(c, disc, Stroke::new(1.0, t.border));
-    p.circle_filled(c, disc * 0.42, t.panel_bg);
-    p.circle_stroke(c, disc * 0.42, Stroke::new(1.0, t.border));
-    // A mark that turns once a bar (once every two seconds without a grid).
+    p.circle_filled(c, disc, shade(t.window_bg, if resp.dragged() { 0.1 } else { 0.0 }));
+    p.circle_stroke(c, disc, Stroke::new(1.5, t.border));
     let turn = match track.and_then(|tr| tr.grid.as_ref()) {
         Some(g) => g.beat_at(position) / 4.0,
         None => position / app.engine.session().sample_rate.as_f64().max(1.0) / 2.0,
     };
     let a = (turn.fract() * std::f64::consts::TAU) as f32;
-    let dir = vec2(a.sin(), -a.cos());
     let live = s.playing || s.previewing;
-    p.line_segment([c + dir * disc * 0.5, c + dir * (disc - 4.0)], Stroke::new(3.0, if live { Color32::WHITE } else { t.text_dim }));
-    p.text(c, Align2::CENTER_CENTER, if live { "NUDGE" } else { "SEARCH" }, bold(9.0), t.text_dim);
+    p.circle_filled(c + vec2(a.sin(), -a.cos()) * (disc - 6.0), 4.0, if live { Color32::WHITE } else { t.text_dim });
+    if track.is_some() {
+        let bpm = if s.bpm > 0.0 { format!("{:.2}", s.bpm) } else { track.and_then(|tr| tr.bpm).map_or_else(|| "–".into(), |b| format!("{b:.2}")) };
+        let size = (disc * 0.36).clamp(14.0, 26.0);
+        p.text(c - vec2(0.0, size * 0.15), Align2::CENTER_CENTER, bpm, mono(size), if s.synced { tint } else { t.text });
+        let pitch = format!("{:+.1} %  ±{:.0}", s.pitch * 100.0, s.range.max(PITCH_RANGES[0]) * 100.0);
+        p.text(c + vec2(0.0, size * 0.75), Align2::CENTER_CENTER, pitch, mono((size * 0.45).max(9.0)), t.text_dim);
+    }
+    p.text(c + vec2(0.0, disc * 0.62), Align2::CENTER_CENTER, if live { "NUDGE" } else { "SEARCH" }, bold(8.0), t.text_dim.gamma_multiply(0.7));
     let resp = resp.on_hover_text("Drag sideways: nudge while playing, search while stopped");
     if track.is_some() {
         jog_drag(app, ui, &resp, d, s);

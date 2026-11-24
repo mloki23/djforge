@@ -135,6 +135,26 @@ pub(crate) fn planned(a: &Value) -> Option<[Option<f64>; 4]> {
     Some([Some(at(in_bar)), Some(at(in_bar + BUILD_BARS)), Some(at(out_bar)), Some(at(out_bar + BUILD_BARS + OUT_BARS))])
 }
 
+/// The track's sections from mixforge analysis `a`: (start, end, label) in file seconds on
+/// mixforge's timeline, each ending where the next starts (the last at its own length, else the
+/// audio's end), on the same bars [`planned`] places the cues on. Empty without sections or a
+/// usable grid.
+pub(crate) fn sections(a: &Value) -> Vec<(f64, f64, String)> {
+    let Some(t) = Track::of(a) else { return Vec::new() };
+    let at = |bar: i64| t.first + bar as f64 * t.bar;
+    let mut s: Vec<&(i64, String, Option<i64>)> = t.sections.iter().filter(|s| s.0 >= 0 && s.0 < t.total).collect();
+    s.sort_by_key(|s| s.0);
+    s.iter()
+        .enumerate()
+        .map(|(i, (bar, label, bars))| {
+            let next = s.get(i + 1).map_or(t.total, |n| n.0);
+            let end = bars.map_or(next, |b| (bar + b.max(1)).min(next));
+            (at(*bar), at(end), label.clone())
+        })
+        .filter(|(a, b, _)| b > a)
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -167,6 +187,23 @@ mod tests {
         // the transition (it can start up to bar 104).
         assert_eq!(c[2], Some(0.5 + 96.0 * bar));
         assert_eq!(c[3], Some(0.5 + 120.0 * bar), "Bass gone 24 bars after Mix out");
+    }
+
+    #[test]
+    fn sections_lie_on_the_bars_the_cues_do_and_end_where_the_next_starts() {
+        let bar = 1.875;
+        let s = sections(&analysis());
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0], (0.5, 0.5 + 16.0 * bar, "intro".to_string()));
+        assert_eq!(s[2], (0.5 + 48.0 * bar, 0.5 + 64.0 * bar, "break".to_string()));
+        assert!(s[4].2 == "outro" && s[4].1 > s[4].0);
+        // A section's own length ends it early, never past the next.
+        let mut a = analysis();
+        a["sections"] = json!([{"bar": 80, "label": "break", "bars": 16}, {"bar": 82, "label": "drop"}, {"bar": 8, "label": "verse", "bars": 4}]);
+        let s = sections(&a);
+        assert_eq!(s[0], (0.5 + 8.0 * bar, 0.5 + 12.0 * bar, "verse".to_string()));
+        assert_eq!(s[1].1, 0.5 + 82.0 * bar);
+        assert!(sections(&json!({"sections": [{"bar": 0, "label": "intro"}]})).is_empty(), "no grid, no sections");
     }
 
     #[test]

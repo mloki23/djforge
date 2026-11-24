@@ -240,6 +240,16 @@ pub struct DeckTrack {
     pub path: String,
     /// Where the grid came from (`given`, `library`, `mixforge`, `tag`), if it has one.
     pub grid_from: Option<&'static str>,
+    /// Its sections (intro, build, drop…) from mixforge's analysis, in order; none when unknown.
+    pub sections: Vec<Section>,
+}
+
+/// A section of a track: where it starts and ends (source samples) and mixforge's label for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    pub start: f64,
+    pub end: f64,
+    pub label: String,
 }
 
 impl DeckTrack {
@@ -2275,6 +2285,7 @@ mod tests {
             artist: String::new(),
             path: String::new(),
             grid_from: Some("given"),
+            sections: Vec::new(),
         })
     }
 

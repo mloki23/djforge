@@ -46,7 +46,11 @@ fn main() {
         .and_then(|s| s.split_once('x'))
         .and_then(|(a, b)| Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?)))
         .unwrap_or((1600.0, 1000.0));
-    let engine = if blank { soundcraft_engine::Engine::default() } else { soundcraft_engine::demo::demo_engine() };
+    let mut engine = if blank { soundcraft_engine::Engine::default() } else { soundcraft_engine::demo::demo_engine() };
+    // `--library DB`: a mixforge library for the decks to read (a fixture; never the real one).
+    if let Some(db) = args.iter().position(|a| a == "--library").and_then(|i| args.get(i + 1)) {
+        engine.set_library(std::path::PathBuf::from(db));
+    }
     let (tx, rx) = mpsc::channel::<ControlRequest>();
     let player = args.iter().any(|a| a == "--decks").then(|| soundcraft_playback::Player::silent(engine.session_arc()));
     let mut app = SoundApp::new(engine, player, Services::default()).with_control(rx);

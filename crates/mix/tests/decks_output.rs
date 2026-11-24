@@ -22,6 +22,7 @@ fn loud(hz: f64) -> Box<PreparedDeck> {
         artist: String::new(),
         path: String::new(),
         grid_from: None,
+        sections: Vec::new(),
     };
     Box::new(PreparedDeck::new(Arc::new(track), SR as f32))
 }
@@ -88,6 +89,7 @@ fn arrangement_play_after_the_decks_hands_over_without_a_click() {
         artist: String::new(),
         path: String::new(),
         grid_from: None,
+        sections: Vec::new(),
     };
     assert!(eng.deck_load(DeckId::A, Box::new(PreparedDeck::new(Arc::new(track), SR as f32))).is_none());
     eng.deck(DeckCmd::Play(DeckId::A));

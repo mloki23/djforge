@@ -69,6 +69,7 @@ mod live_in;
 mod warp;
 pub use decks::{
     BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HOT_CUES, HotCueAction, JogMode, LoopAction, PITCH_RANGES, PreparedDeck,
+    Section,
 };
 pub use dj_strip::{EqBand, FaderCurve, XfadeCurve, XfadeSide};
 pub use live::{

@@ -120,6 +120,62 @@ fn compute(audio: &SourceAudio, first: i64, n: usize, step: f64, wave: Color32, 
         .collect()
 }
 
+/// The waveforms' background, in every theme: near black, as on a DJ deck, so the band colours
+/// and the grid read.
+pub const WAVE_BG: Color32 = Color32::from_rgb(5, 6, 8);
+
+/// A section's colour by mixforge's label: intro and outro cool, builds amber, breakdowns
+/// violet, drops red; anything else a steady colour of its own.
+pub fn section_colour(label: &str) -> Color32 {
+    let l = label.to_ascii_lowercase();
+    let has = |w: &str| l.contains(w);
+    if has("intro") {
+        Color32::from_rgb(0x4f, 0x8f, 0xf7)
+    } else if has("outro") {
+        Color32::from_rgb(0x6b, 0x7a, 0x99)
+    } else if has("build") || has("rise") || has("up") {
+        Color32::from_rgb(0xf5, 0xa6, 0x23)
+    } else if has("break") || has("down") {
+        Color32::from_rgb(0x9b, 0x6b, 0xe8)
+    } else if has("drop") || has("chorus") || has("peak") {
+        Color32::from_rgb(0xe5, 0x48, 0x4d)
+    } else if has("verse") || has("groove") || has("main") {
+        Color32::from_rgb(0x46, 0xc4, 0x6a)
+    } else {
+        let h = l.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+        let palette = [Color32::from_rgb(0x2e, 0xc4, 0xb6), Color32::from_rgb(0xd9, 0x6c, 0xc9), Color32::from_rgb(0xc9, 0xc9, 0x4f)];
+        palette.get(h as usize % palette.len()).copied().unwrap_or(Color32::GRAY)
+    }
+}
+
+/// A section's label as shown: its first letter capitalised.
+pub fn section_name(label: &str) -> String {
+    let mut c = label.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// The section that starts within `slack` samples of `at`, if any.
+pub fn section_at(track: &DeckTrack, at: f64, slack: f64) -> Option<&soundcraft_mix::Section> {
+    track.sections.iter().find(|x| (x.start - at).abs() <= slack)
+}
+
+/// The next hot cue (else the next section start) ahead of `position`, and the whole beats to it
+/// on the grid: (label, colour, bars, beats). `None` without a grid or anything ahead.
+pub fn next_mark(track: &DeckTrack, s: &DeckState, position: f64) -> Option<(String, Color32, i64, i64)> {
+    let g = track.grid.as_ref()?;
+    let ahead = |at: f64| at > position + 1.0;
+    let cue = s
+        .hot
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, h)| h.filter(|h| ahead(*h)).map(|h| (h, hot_cue_letter(slot).to_string(), hot_cue_colour(slot))))
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    let section = || track.sections.iter().find(|x| ahead(x.start)).map(|x| (x.start, section_name(&x.label), section_colour(&x.label)));
+    let (at, label, colour) = cue.or_else(section)?;
+    let beats = (g.beat_at(at) - g.beat_at(position)).ceil().max(0.0) as i64;
+    Some((label, colour, beats / 4, beats % 4))
+}
+
 /// What a scrolling waveform shows.
 pub struct Scrolling<'a> {
     pub track: &'a DeckTrack,
@@ -184,7 +240,7 @@ pub fn steady_tempo(s: &DeckState, free: f64, bpm: Option<f64>, other: &DeckStat
 /// Draws a deck's scrolling waveform in `rect`, its playhead fixed in the centre.
 pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scrolling<'_>) {
     let t = Tokens::current();
-    painter.rect_filled(rect, 2.0, t.window_bg);
+    painter.rect_filled(rect, 2.0, WAVE_BG);
     let ppp = painter.pixels_per_point();
     let px = 1.0 / ppp;
     let width = f64::from(rect.width().max(1.0));
@@ -197,6 +253,19 @@ pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scr
     let first = (left / step).floor() as i64;
     let n = ((rect.width() * ppp).ceil() as usize).saturating_add(2);
     let p = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+    // The sections: a strip of their colours along the foot, each named where it starts.
+    for x in &w.track.sections {
+        let (x0, x1) = (x_at(x.start), x_at(x.end));
+        if x1 < rect.min.x || x0 > rect.max.x {
+            continue;
+        }
+        let c = section_colour(&x.label);
+        p.rect_filled(Rect::from_x_y_ranges(x0.max(rect.min.x)..=x1.min(rect.max.x), rect.max.y - 4.0..=rect.max.y), 0.0, c.gamma_multiply(0.85));
+        if x0 >= rect.min.x - 1.0 {
+            p.vline(x0, rect.max.y - 16.0..=rect.max.y, Stroke::new(1.0, c));
+            p.text(pos2(x0 + 3.0, rect.max.y - 6.0), Align2::LEFT_BOTTOM, section_name(&x.label), crate::theme::bold(9.5), c);
+        }
+    }
     // The loop, under the waveform.
     if let (Some(a), Some(b)) = (w.state.loop_in, w.state.loop_out) {
         let r = Rect::from_x_y_ranges(x_at(a).max(rect.min.x)..=x_at(b).min(rect.max.x), rect.y_range());
@@ -266,6 +335,25 @@ pub fn scrolling(painter: &Painter, rect: Rect, cache: &mut ColumnCache, w: &Scr
             }
         }
     }
+    // Bars and beats (16.2: 16 bars and 2 beats) to the next hot cue (else section), top right.
+    if let Some((label, colour, bars, beats)) = next_mark(w.track, w.state, w.position) {
+        // One line on a dark backing, inside the waveform: "C in 16.2 BARS".
+        let lead = p.layout_no_wrap(format!("{label} in "), crate::theme::bold(11.0), colour);
+        let num = p.layout_no_wrap(format!("{bars}.{beats}"), crate::theme::mono(16.0), colour);
+        let unit = p.layout_no_wrap(" BARS".to_string(), crate::theme::bold(9.0), t.text_dim);
+        let w = lead.size().x + num.size().x + unit.size().x;
+        let h = num.size().y;
+        let back = Rect::from_min_size(pos2(rect.max.x - w - 18.0, rect.min.y + 4.0), vec2(w + 12.0, h + 4.0));
+        p.rect_filled(back, 4.0, WAVE_BG.gamma_multiply(0.85));
+        let y = back.center().y;
+        let mut x = back.min.x + 6.0;
+        for g in [lead, num, unit] {
+            let gw = g.size().x;
+            let gy = y - g.size().y / 2.0;
+            p.galley(pos2(x, gy), g, colour);
+            x += gw;
+        }
+    }
     // The playhead, fixed.
     p.vline(cx, rect.y_range(), Stroke::new(2.0, Color32::WHITE));
     p.add(egui::Shape::convex_polygon(
@@ -304,7 +392,7 @@ pub fn overview(
     tint: Color32,
 ) {
     let t = Tokens::current();
-    painter.rect_filled(rect, 2.0, t.window_bg);
+    painter.rect_filled(rect, 2.0, WAVE_BG);
     let frames = track.frames().max(1) as f64;
     let ppp = painter.pixels_per_point();
     let n = ((rect.width() * ppp).ceil() as usize).clamp(1, MAX_COLS);
@@ -350,6 +438,27 @@ pub fn overview(
         }
     }
     p.vline(played, rect.y_range(), Stroke::new(1.5, Color32::WHITE));
+}
+
+/// The track's sections as a bar of their colours across `rect` (the overview's width), the
+/// played part dimmed; a section's name shows on hover. Nothing without sections.
+pub fn phrase_bar(ui: &egui::Ui, rect: Rect, track: &DeckTrack, position: f64) {
+    let frames = track.frames().max(1) as f64;
+    let x_at = |pos: f64| rect.min.x + (pos / frames).clamp(0.0, 1.0) as f32 * rect.width();
+    let p = ui.painter();
+    if track.sections.is_empty() {
+        return;
+    }
+    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|h| rect.expand2(vec2(0.0, 3.0)).contains(*h));
+    for x in &track.sections {
+        let r = Rect::from_x_y_ranges(x_at(x.start)..=(x_at(x.end) - 1.0).max(x_at(x.start) + 1.0), rect.y_range());
+        let c = section_colour(&x.label);
+        p.rect_filled(r, 1.0, if x.end <= position { c.gamma_multiply(0.45) } else { c });
+        if hover.is_some_and(|h| r.x_range().contains(h.x)) {
+            egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), ui.id().with(("phrase", x.start.to_bits())), egui::PopupAnchor::Pointer)
+                .show(|ui| ui.label(section_name(&x.label)));
+        }
+    }
 }
 
 #[cfg(test)]

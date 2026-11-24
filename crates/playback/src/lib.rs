@@ -3599,6 +3599,7 @@ mod deck_tests {
             artist: String::new(),
             path: String::new(),
             grid_from: Some("given"),
+            sections: Vec::new(),
         };
         Box::new(PreparedDeck::new(Arc::new(track), 48_000.0))
     }

@@ -104,7 +104,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Decks State",
             [],
             None,
-            "{} — per deck: its track (title, artist, path, key, bpm, grid, length), playing, previewing, position (seconds and samples), bpm now, rate, pitch and range (percent), master tempo, synced, master, phase error (beats and ms), cue, hot cues, loop and levels, plus its mixer channel; and the crossfader, master volume, master level and quantise, as the audio engine last reported",
+            "{} — per deck: its track (title, artist, path, key, bpm, grid, length, sections), playing, previewing, position (seconds and samples), bpm now, rate, pitch and range (percent), master tempo, synced, master, phase error (beats and ms), cue, hot cues, loop and levels, plus its mixer channel; and the crossfader, master volume, master level and quantise, as the audio engine last reported",
             always,
             state
         ),
@@ -479,6 +479,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
     let sr = f64::from(rate);
     let (mut key, mut planned, mut analysis_error, mut library, mut library_error) = (None, None, None, None, None);
     let mut analysed_energy = None;
+    let mut sections = Vec::new();
     let (beats, grid_from) = match plan.given {
         Some((bpm, first)) => (Some(Beats::Constant { bpm, first }), Some("given")),
         None => {
@@ -501,6 +502,7 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
             };
             match analysed.and_then(|a| {
                 planned = super::deck_cues::planned(&a);
+                sections = super::deck_cues::sections(&a);
                 if let Some(k) = analysed_key(&a) {
                     key = Some(k);
                 }
@@ -572,6 +574,21 @@ fn read_track(path: &str, rate: u32, analyse: Option<&PrepAnalyse>, plan: LoadPl
         artist: tags.artist.clone().unwrap_or_default(),
         path: path.to_string(),
         grid_from,
+        // mixforge's sections, moved by the MP3's priming as its grid and cues are; none
+        // without its grid.
+        sections: if grid_from == Some("library") || grid_from == Some("mixforge") {
+            sections
+                .into_iter()
+                .map(|(a, b, label)| soundcraft_mix::Section {
+                    start: ((a - priming) * sr).max(0.0),
+                    end: ((b - priming) * sr).min(frames as f64),
+                    label,
+                })
+                .filter(|s| s.end > s.start)
+                .collect()
+        } else {
+            Vec::new()
+        },
     });
     let prepared = Box::new(PreparedDeck::new(Arc::clone(&track), rate as f32));
     Ok(Loaded {
@@ -661,7 +678,8 @@ fn state(e: &mut Engine, _: &Value) -> Result<Value> {
             let s = st.decks.get(d.index()).copied().unwrap_or_default();
             let track = e.deck_tracks.get(d.index()).and_then(Option::as_ref).map(|t| {
                 json!({"title": t.title, "artist": t.artist, "path": t.path, "key": t.key, "bpm": t.bpm, "grid": t.grid_from,
-                    "seconds": t.frames() as f64 / rate})
+                    "seconds": t.frames() as f64 / rate,
+                    "sections": t.sections.iter().map(|x| json!({"start": x.start / rate, "end": x.end / rate, "label": x.label})).collect::<Vec<_>>()})
             });
             let beat_ms = e
                 .deck_tracks
