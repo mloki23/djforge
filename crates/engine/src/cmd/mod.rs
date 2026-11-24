@@ -6,6 +6,7 @@ use soundcraft_model::{ClipId, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::sync::OnceLock;
 
+mod agent;
 mod audio_midi;
 mod audiosuite;
 mod clap;
@@ -24,6 +25,7 @@ mod file;
 mod health;
 pub(crate) mod hotcues;
 mod instrument;
+pub(crate) mod jobs;
 pub(crate) mod library;
 mod live;
 mod midi;
@@ -50,6 +52,7 @@ mod view_more;
 mod vst3;
 mod zoom_toggle;
 
+pub use agent::{AgentRunner, mixforge_agent};
 pub use clip_list::{ClearEffect, clear_effect};
 pub use export::{
     ExportJob, ExportProgress, MixxxRunner, export_job, export_job_in, mixforge_mixxx_runner, set_is_split as export_set_is_split,
@@ -178,6 +181,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(prod::specs());
         v.extend(decks::specs());
         v.extend(library::specs());
+        v.extend(jobs::specs());
+        v.extend(agent::specs());
         v
     })
 }

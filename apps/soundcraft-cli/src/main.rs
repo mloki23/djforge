@@ -8,7 +8,9 @@
 //! djforge-cli commands [FILTER]                  list commands
 //! djforge-cli describe ID                        one command's details
 //! djforge-cli app [--port P] METHOD [JSON]        call a running app's control channel
-//! djforge-cli mcp [--connect PORT] [--demo] [--automation-read-root DIR] [--automation-write-root DIR]
+//! djforge-cli mcp [--connect PORT] [--demo] [--library] [--automation-read-root DIR] [--automation-write-root DIR]
+//!   (--library: the in-process server reads the decks' library as the app does — mixforge's,
+//!   Mixed In Key's, the browser's folders — and runs mixforge for set planning and analysis)
 //!                                                 MCP server on stdio. The two roots confine every file the
 //!                                                 agent's commands read (open, import, presets) and write
 //!                                                 (save, bounce, export) to those folders, links followed;
@@ -412,6 +414,7 @@ fn app(args: &[String]) -> ExitCode {
 struct McpArgs {
     connect: Option<String>,
     demo: bool,
+    library: bool,
     roots: Option<std::sync::Arc<AutomationRoots>>,
 }
 
@@ -420,6 +423,7 @@ struct McpArgs {
 fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
     let mut connect = None;
     let mut demo = false;
+    let mut library = false;
     let mut roots_args = automation_args::AutomationArgs::new(None, None);
     let mut it = args.iter().cloned();
     while let Some(a) = it.next() {
@@ -429,6 +433,7 @@ fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
         match a.as_str() {
             "--connect" => connect = Some(it.next().ok_or("--connect needs a port or host:port")?),
             "--demo" => demo = true,
+            "--library" => library = true,
             other if other.starts_with("--automation-") => return Err(format!("unknown mcp option `{other}`")),
             _ => {}
         }
@@ -439,11 +444,14 @@ fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
 so drop --connect (or use --connect without the roots)"
             .into());
     }
-    Ok(McpArgs { connect, demo, roots })
+    if library && connect.is_some() {
+        return Err("--library sets up the in-process server's library; a running app has its own, so drop --library with --connect".into());
+    }
+    Ok(McpArgs { connect, demo, library, roots })
 }
 
 fn mcp(args: &[String]) -> ExitCode {
-    let McpArgs { connect, demo, roots } = match parse_mcp_args(args) {
+    let McpArgs { connect, demo, library, roots } = match parse_mcp_args(args) {
         Ok(a) => a,
         Err(err) => return fail(err),
     };
@@ -454,7 +462,10 @@ fn mcp(args: &[String]) -> ExitCode {
         s.serve(stdin.lock(), stdout.lock())
     } else {
         // `--demo` is the operator's own choice, made before the roots come into force.
-        let e = with_stems(if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() });
+        let mut e = with_stems(if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() });
+        if library {
+            soundcraft_engine::settings::set_up_library(&mut e);
+        }
         let mut h = Headless::new(e);
         if let Some(roots) = roots {
             // Every thread of this process, not only the server's: nothing reaches past the roots.

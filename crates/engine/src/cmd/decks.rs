@@ -124,7 +124,7 @@ fn deck_param(cmd: &str, p: &Value) -> Result<DeckId> {
     str_param(p, "deck").and_then(DeckId::parse).ok_or_else(|| bad(cmd, "`deck` must be a or b"))
 }
 
-fn bool_param(cmd: &str, p: &Value, key: &str, default: Option<bool>) -> Result<bool> {
+pub(crate) fn bool_param(cmd: &str, p: &Value, key: &str, default: Option<bool>) -> Result<bool> {
     match p.get(key) {
         Some(Value::Bool(b)) => Ok(*b),
         None | Some(Value::Null) => default.ok_or_else(|| bad(cmd, format!("`{key}` must be true or false"))),
@@ -133,7 +133,7 @@ fn bool_param(cmd: &str, p: &Value, key: &str, default: Option<bool>) -> Result<
 }
 
 /// A finite number in `range`, or `None` when absent.
-fn num(cmd: &str, p: &Value, key: &str, range: std::ops::RangeInclusive<f64>) -> Result<Option<f64>> {
+pub(crate) fn num(cmd: &str, p: &Value, key: &str, range: std::ops::RangeInclusive<f64>) -> Result<Option<f64>> {
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v

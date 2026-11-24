@@ -16,6 +16,7 @@ pub mod file_access;
 pub mod inspect;
 pub mod io;
 pub mod score;
+pub mod settings;
 
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, Session, TrackId, ZoomState};
@@ -236,6 +237,11 @@ pub struct Engine {
     /// mixforge's library and the browser's folders: none until the app sets them up
     /// ([`Engine::set_library`]), so no test reads the real library.
     pub(crate) library: cmd::library::LibraryState,
+    /// Background jobs (`job.*`): work that takes a while, off the UI thread.
+    pub(crate) jobs: cmd::jobs::Jobs,
+    /// What runs mixforge's suggestions, planner and analysis for agents: none until the app
+    /// sets it up ([`Engine::set_agent`]), so no test runs mixforge.
+    pub(crate) agent: Option<cmd::AgentRunner>,
     /// Where the hot cues the user sets are kept per track: none until the app sets it up
     /// ([`Engine::set_hotcue_store`]), so no test writes the app's.
     hotcues: Option<std::path::PathBuf>,
@@ -293,6 +299,8 @@ impl Engine {
             deck_loaded: [0; 2],
             deck_seen: [false; 2],
             library: Default::default(),
+            jobs: Default::default(),
+            agent: None,
             hotcues: None,
             deck_files: [None, None],
             hotcue_edits: Vec::new(),
@@ -460,6 +468,12 @@ impl Engine {
     /// True while the libraries are being read.
     pub fn library_loading(&self) -> bool {
         self.library.loading()
+    }
+
+    /// `library.suggest`, `dj.plan_set` and `library.analyze` run mixforge through `agent`. Only
+    /// the app's entry points call this, with [`cmd::mixforge_agent`]; tests give a fake.
+    pub fn set_agent(&mut self, agent: cmd::AgentRunner) {
+        self.agent = Some(agent);
     }
 
     /// `live.slot_from_file` grids files through `analyse`. Only the app's entry points call this,

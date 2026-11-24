@@ -207,36 +207,9 @@ fn prefs_enabled() -> bool {
     std::env::var_os("SOUNDCRAFT_NO_PREFS").is_none()
 }
 
-/// The decks' library: mixforge's `library.db` (only ever read) and the browser's folders (the
-/// Music folder and the ones added, kept in `library-folders.json` in the settings folder). Runs
-/// without preferences (agents' test runs) leave the user's library, Music folder and settings
-/// alone (and keep no hot cues), unless `DJFORGE_MIXFORGE_HOME` names a library on purpose.
-/// (mixforge's sidecar, which grids files mixforge's library has no fresh row for, still reads
-/// mixforge's own library: it runs mixforge's code.) Mixed In Key's library gives the key and
-/// energy where it has them; it too is left alone without preferences.
+/// The decks' library and mixforge for agents ([`soundcraft_engine::settings::set_up_library`]).
 fn set_up_library(engine: &mut Engine) {
-    let chosen = std::env::var_os("DJFORGE_MIXFORGE_HOME").is_some_and(|v| !v.is_empty());
-    if prefs_enabled() || chosen {
-        match soundcraft_engine::cmd::mixforge_library_db() {
-            Ok(db) => engine.set_library(db),
-            Err(e) => log::warn!("no mixforge library: {e}"),
-        }
-    }
-    if !prefs_enabled() {
-        engine.set_library_folders(None, None);
-        return;
-    }
-    match soundcraft_engine::cmd::mik_library_db() {
-        Ok(db) => engine.set_mik_library(db),
-        Err(e) => log::warn!("no Mixed In Key library: {e}"),
-    }
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    let music = var("USERPROFILE").or_else(|| var("HOME")).map(|h| h.join("Music"));
-    engine.set_library_folders(music, config_dir().map(|d| d.join("library-folders.json")));
-    // The hot cues set on the decks, kept per track.
-    if let Some(dir) = config_dir() {
-        engine.set_hotcue_store(dir.join("hotcues.json"));
-    }
+    soundcraft_engine::settings::set_up_library(engine);
 }
 
 fn load_prefs() -> Option<UiState> {

@@ -3,16 +3,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy)]
-enum Platform {
-    Mac,
-    Windows,
-    Other,
-}
+use soundcraft_engine::settings::{Platform, config_dir_with, legacy_config_dir_with, platform};
 
-/// djforge's settings folder. A nonempty `$SOUNDCRAFT_CONFIG_DIR` overrides the platform default.
-/// The override is the complete directory; no application-name suffix is appended. An explicitly
-/// empty value disables the settings directory instead of falling back to a personal profile.
+/// djforge's settings folder ([`soundcraft_engine::settings::config_dir`]).
 pub fn config_dir() -> Option<PathBuf> {
     config_dir_with(platform(), |name| std::env::var_os(name))
 }
@@ -21,41 +14,6 @@ pub fn config_dir() -> Option<PathBuf> {
 /// None with `$SOUNDCRAFT_CONFIG_DIR` set: an overridden folder has nothing to migrate.
 pub fn legacy_config_dir() -> Option<PathBuf> {
     legacy_config_dir_with(platform(), |name| std::env::var_os(name))
-}
-
-fn platform() -> Platform {
-    if cfg!(target_os = "macos") {
-        Platform::Mac
-    } else if cfg!(windows) {
-        Platform::Windows
-    } else {
-        Platform::Other
-    }
-}
-
-fn config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if let Some(dir) = env("SOUNDCRAFT_CONFIG_DIR") {
-        return (!dir.is_empty()).then(|| PathBuf::from(dir));
-    }
-    platform_dir(platform, &env, [soundcraft_engine::APP_NAME, soundcraft_engine::APP_NAME])
-}
-
-fn legacy_config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if env("SOUNDCRAFT_CONFIG_DIR").is_some() {
-        return None;
-    }
-    platform_dir(platform, &env, ["SoundCraft", "soundcraft"])
-}
-
-/// The platform's per-user settings folder named `name` (macOS and Windows) or `unix` (elsewhere).
-fn platform_dir(platform: Platform, env: &impl Fn(&str) -> Option<OsString>, [name, unix]: [&str; 2]) -> Option<PathBuf> {
-    match platform {
-        Platform::Mac => env("HOME").map(|h| PathBuf::from(h).join("Library/Application Support").join(name)),
-        Platform::Windows => env("APPDATA").map(|a| PathBuf::from(a).join(name)),
-        Platform::Other => {
-            env("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config"))).map(|c| c.join(unix))
-        }
-    }
 }
 
 /// What [`migrate`] did.
