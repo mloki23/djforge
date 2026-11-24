@@ -1,9 +1,11 @@
 //! Render the real UI offscreen (no window, no focus stealing) and save PNGs.
 //!
-//! `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl] [--blank] [--size WxH] [--system-theme light|dark|none] [--fake-midi NAME,NAME]`
+//! `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl] [--blank] [--decks] [--size WxH] [--system-theme light|dark|none] [--fake-midi NAME,NAME]`
+//!
+//! `--decks` runs a silent audio engine (no device opened), so the live decks load and play.
 //!
 //! Script lines are control requests (`{"method": "...", "params": {...}}`), `{"shot": "path.png"}`,
-//! `{"steps": n}` or `{"wait_bands": seconds}` (steps frames until every source's frequency bands
+//! `{"steps": n}`, `{"wait_decks": seconds}` (steps until no deck load runs) or `{"wait_bands": seconds}` (steps frames until every source's frequency bands
 //! are built, so waveforms are coloured, or the time runs out; at once when the colours are off). `--fake-midi` plugs simulated MIDI
 //! input devices with those names in (a `FakeSource`; no real MIDI ports are opened). `{"system_theme": "light"}` (also `"dark"` or `"none"`) changes the
 //! simulated OS appearance for subsequent frames. The demo session is loaded unless `--blank`.
@@ -46,7 +48,8 @@ fn main() {
         .unwrap_or((1600.0, 1000.0));
     let engine = if blank { soundcraft_engine::Engine::default() } else { soundcraft_engine::demo::demo_engine() };
     let (tx, rx) = mpsc::channel::<ControlRequest>();
-    let mut app = SoundApp::new(engine, None, Services::default()).with_control(rx);
+    let player = args.iter().any(|a| a == "--decks").then(|| soundcraft_playback::Player::silent(engine.session_arc()));
+    let mut app = SoundApp::new(engine, player, Services::default()).with_control(rx);
     if let Some(names) = args.iter().position(|a| a == "--fake-midi").and_then(|i| args.get(i + 1)) {
         match soundcraft_midi_io::FakeSource::new(soundcraft_midi_io::MidiClock::new()) {
             Ok(mut src) => {
@@ -112,10 +115,24 @@ fn main() {
                 shoot(&mut harness, p);
                 continue;
             }
+            if let Some(secs) = v.get("wait_decks").and_then(|x| x.as_f64()) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs.max(0.0));
+                while harness.state().engine.deck_loading() && std::time::Instant::now() < deadline {
+                    step(&mut harness);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                for _ in 0..6 {
+                    step(&mut harness);
+                }
+                println!("decks loaded: {}", harness.state().engine.deck_tracks.iter().flatten().count());
+                continue;
+            }
             if let Some(secs) = v.get("wait_bands").and_then(|x| x.as_f64()) {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs.max(0.0));
                 let ready = |h: &egui_kittest::Harness<SoundApp>| {
-                    !h.state().waveform_bands() || h.state().engine.session().pool.audio().all(|a| a.bands_ready())
+                    let e = &h.state().engine;
+                    !h.state().waveform_bands()
+                        || (e.session().pool.audio().all(|a| a.bands_ready()) && e.deck_tracks.iter().flatten().all(|t| t.source.bands_ready()))
                 };
                 while !ready(&harness) && std::time::Instant::now() < deadline {
                     step(&mut harness);
