@@ -159,3 +159,17 @@ fn the_binary_under_test_reaches_no_real_mixforge_demucs_or_stem_cache() {
         assert!(dir.is_some_and(|d| d.starts_with(&temp)), "{var}: {dir:?}");
     }
 }
+
+#[test]
+fn mcp_setup_prints_the_claude_code_registration_and_changes_nothing() {
+    let out = bin().arg("mcp-setup").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("claude mcp add --scope user djforge -- "), "{text}");
+    assert!(text.lines().next().unwrap().ends_with(" mcp --auto"), "{text}");
+    assert!(text.contains("--apply"), "{text}");
+    // --auto picks its own backend: it can't be combined with --connect or the roots.
+    let out = bin().args(["mcp", "--auto", "--connect", "1"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--auto"));
+}

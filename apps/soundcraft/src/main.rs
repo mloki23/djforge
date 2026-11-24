@@ -377,10 +377,14 @@ fn main() -> eframe::Result {
             }
             // Live MIDI input: the devices enabled in the preferences open on the first frame.
             app.midi_host = soundcraft_ui_egui::midi_input::system_host();
-            if let Some(port) = control_port {
+            // --control (or SOUNDCRAFT_CONTROL_PORT), else DJ › Allow AI Agents' port when it is on.
+            let port = control_port.or_else(|| app.ui.agents.then_some(soundcraft_ui_egui::AGENT_PORT));
+            if let Some(port) = port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
             }
+            let ctx = cc.egui_ctx.clone();
+            app = app.with_control_starter(Box::new(move |port| control_server::start(port, ctx.clone())));
             for f in &files {
                 open_path(&mut app, f);
             }

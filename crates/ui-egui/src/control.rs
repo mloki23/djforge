@@ -98,6 +98,9 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
         "engine.execute" | "command" => {
             let id = p.get("command").or_else(|| p.get("id")).and_then(Value::as_str).unwrap_or("");
             let params = p.get("params").cloned().unwrap_or(json!({}));
+            if let Some(why) = deck_guard(app, id, &params) {
+                return Some(err(why));
+            }
             match app.run(id, params) {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
@@ -323,6 +326,28 @@ pub fn base64(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Why an agent may not run `id` now: a `deck.*` command acting on a deck that is heard (playing
+/// or previewing), unless DJ › Let Agents Change Playing Decks is on. One naming no deck (the
+/// crossfader, master volume, quantise) is refused while either deck is heard. A playing deck is
+/// the DJ's.
+pub fn deck_guard(app: &SoundApp, id: &str, params: &Value) -> Option<String> {
+    if app.ui.agents_play_decks || !id.starts_with("deck.") {
+        return None;
+    }
+    let heard = |d: soundcraft_mix::DeckId| app.engine.deck_status.decks.get(d.index()).is_some_and(|s| s.playing || s.previewing);
+    let named = params.get("deck").and_then(Value::as_str).and_then(soundcraft_mix::DeckId::parse);
+    let busy = match named {
+        Some(d) => heard(d).then_some(d),
+        // deck.load without a deck picks one that isn't playing (Load Lock): let it.
+        None if id == "deck.load" => None,
+        None => soundcraft_mix::DeckId::ALL.into_iter().find(|d| heard(*d)),
+    }?;
+    Some(format!(
+        "Deck {} is playing: agents may not change a playing deck (the DJ can allow it: DJ > Let Agents Change Playing Decks)",
+        busy.id().to_uppercase()
+    ))
 }
 
 #[cfg(test)]

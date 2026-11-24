@@ -61,6 +61,9 @@ use std::sync::mpsc::Receiver;
 
 pub use control::ControlRequest;
 
+/// The control port DJ › Allow AI Agents opens (and `djforge-cli mcp --auto` looks for).
+pub use soundcraft_engine::settings::AGENT_PORT;
+
 /// Which main window is in front (Window › Mix / Edit / Decks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MainWindow {
@@ -209,6 +212,12 @@ pub struct UiState {
     pub configurations: Vec<(String, Value)>,
     /// Appearance (`ui.theme`): djforge Dark by default; Light, System or SoundCraft Classic on request.
     pub theme: theme::ThemeMode,
+    /// DJ › Allow AI Agents (`ui.agents`): the control port at [`AGENT_PORT`], which
+    /// `djforge-cli mcp --connect` (or `--auto`) talks to. Off by default.
+    pub agents: bool,
+    /// DJ › Let Agents Change Playing Decks (`ui.agents_play_decks`): off, an agent's `deck.*`
+    /// commands are refused while the deck they act on is heard ([`control`]).
+    pub agents_play_decks: bool,
     /// Colour waveforms by frequency (`ui.waveform_bands`); `None` follows the palette: on in
     /// djforge Dark, off in Light and SoundCraft Classic ([`theme::Palette::colours_waveforms`]).
     pub waveform_bands: Option<bool>,
@@ -306,6 +315,8 @@ impl Default for UiState {
             show_midi_mappings: false,
             waveform_bands: None,
             deck_colours: None,
+            agents: false,
+            agents_play_decks: false,
         }
     }
 }
@@ -459,6 +470,9 @@ pub struct SoundApp {
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
+    /// Opens the control port when DJ › Allow AI Agents is switched on (the app's entry point
+    /// gives it; without it the setting takes effect at the next start).
+    control_starter: Option<Box<dyn Fn(u16) -> Receiver<ControlRequest>>>,
     pending_shots: Vec<control::PendingShot>,
     last_rev: u64,
     fonts_ready: bool,
@@ -582,6 +596,7 @@ impl SoundApp {
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
+            control_starter: None,
             pending_shots: Vec::new(),
             last_rev: 0,
             fonts_ready: false,
@@ -620,6 +635,32 @@ impl SoundApp {
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
         self
+    }
+
+    /// What opens the control port when the user allows agents while the app runs.
+    pub fn with_control_starter(mut self, start: Box<dyn Fn(u16) -> Receiver<ControlRequest>>) -> Self {
+        self.control_starter = Some(start);
+        self
+    }
+
+    /// DJ › Allow AI Agents switched on or off: on opens the control port at [`AGENT_PORT`] now
+    /// (when it isn't open), off stops answering it. Returns the status to show.
+    pub(crate) fn set_agents(&mut self, on: bool) -> String {
+        self.ui.agents = on;
+        if !on {
+            self.control_rx = None;
+            return "AI agents are off: djforge no longer answers them".into();
+        }
+        if self.control_rx.is_none()
+            && let Some(start) = &self.control_starter
+        {
+            self.control_rx = Some(start(AGENT_PORT));
+        }
+        if self.control_rx.is_some() {
+            format!("AI agents can connect: djforge-cli mcp --connect {AGENT_PORT} (or djforge-cli mcp-setup)")
+        } else {
+            "AI agents can connect from the next start".into()
+        }
     }
 
     /// Whether clip waveforms are coloured by frequency: the UI prefs' choice, or the active

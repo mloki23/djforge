@@ -93,6 +93,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("ui.theme", "Appearance", "", None),
     ("ui.waveform_bands", "Colour Waveforms by Frequency", "", None),
     ("ui.deck_colours", "Deck Colours", "", None),
+    ("ui.agents", "Allow AI Agents (MCP)", "", None),
+    ("ui.agents_play_decks", "Let Agents Change Playing Decks", "", None),
 ];
 
 /// Extra catalog mappings handled by the UI layer.
@@ -121,6 +123,8 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
     ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
+    ("DJ > Allow AI Agents (MCP)", "ui.agents"),
+    ("DJ > Let Agents Change Playing Decks", "ui.agents_play_decks"),
 ];
 
 /// The Produce menu: parts over the set. The egui menu bar draws it itself ([`crate::produce::menu`]):
@@ -415,6 +419,8 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("window.mix") => app.ui.window == MainWindow::Mix,
         Some("window.edit") => app.ui.window == MainWindow::Edit,
         Some("window.decks") => app.ui.window == MainWindow::Decks,
+        Some("ui.agents") => app.ui.agents,
+        Some("ui.agents_play_decks") => app.ui.agents_play_decks,
         Some("window.track_list") => app.ui.show_tracks_list,
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
@@ -750,6 +756,25 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             };
             app.ui.theme = mode;
             json!({"mode": mode.id()})
+        }
+        "ui.agents" => {
+            let on = match p.get("value") {
+                None => !app.ui.agents,
+                Some(Value::Bool(on)) => *on,
+                Some(_) => return Some(Err("value: true or false".into())),
+            };
+            app.ui.status = app.set_agents(on);
+            json!({"value": app.ui.agents, "port": crate::AGENT_PORT})
+        }
+        "ui.agents_play_decks" => {
+            match p.get("value") {
+                None => app.ui.agents_play_decks = !app.ui.agents_play_decks,
+                Some(Value::Bool(on)) => app.ui.agents_play_decks = *on,
+                Some(_) => return Some(Err("value: true or false".into())),
+            }
+            app.ui.status =
+                if app.ui.agents_play_decks { "Agents may change playing decks".into() } else { "Agents may not change a playing deck".into() };
+            json!({"value": app.ui.agents_play_decks})
         }
         "ui.waveform_bands" => {
             match p.get("value") {

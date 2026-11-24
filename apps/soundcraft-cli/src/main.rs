@@ -8,14 +8,19 @@
 //! djforge-cli commands [FILTER]                  list commands
 //! djforge-cli describe ID                        one command's details
 //! djforge-cli app [--port P] METHOD [JSON]        call a running app's control channel
-//! djforge-cli mcp [--connect PORT] [--demo] [--library] [--automation-read-root DIR] [--automation-write-root DIR]
-//!   (--library: the in-process server reads the decks' library as the app does — mixforge's,
-//!   Mixed In Key's, the browser's folders — and runs mixforge for set planning and analysis)
-//!                                                 MCP server on stdio. The two roots confine every file the
+//! djforge-cli mcp [--connect PORT | --auto] [--demo] [--library] [--automation-read-root DIR] [--automation-write-root DIR]
+//!                                                 MCP server on stdio. --library: the in-process server reads
+//!                                                 the decks' library as the app does (mixforge's, Mixed In
+//!                                                 Key's, the browser's folders) and runs mixforge for set
+//!                                                 planning and analysis. --auto: the running app when it
+//!                                                 allows AI agents (DJ > Allow AI Agents), else in-process
+//!                                                 with --library. The two roots confine every file the
 //!                                                 agent's commands read (open, import, presets) and write
 //!                                                 (save, bounce, export) to those folders, links followed;
 //!                                                 a root left out grants none of its access. They run the
 //!                                                 in-process server, so they conflict with --connect.
+//! djforge-cli mcp-setup [--apply]                 the command that registers djforge's MCP server (--auto)
+//!                                                 with Claude Code; --apply runs it
 //! djforge-cli parity [--write PATH]               parity report (markdown)
 //! djforge-cli plugins                             list built-in plugins
 //! ```
@@ -83,6 +88,7 @@ fn main() -> ExitCode {
         "describe" => describe(&rest),
         "app" => app(&rest),
         "mcp" => mcp(&rest),
+        "mcp-setup" => mcp_setup(&rest),
         "parity" => parity(&rest),
         "plugins" => {
             for p in soundcraft_dsp::plugins() {
@@ -413,6 +419,7 @@ fn app(args: &[String]) -> ExitCode {
 /// What `mcp` was asked for.
 struct McpArgs {
     connect: Option<String>,
+    auto: bool,
     demo: bool,
     library: bool,
     roots: Option<std::sync::Arc<AutomationRoots>>,
@@ -424,6 +431,7 @@ fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
     let mut connect = None;
     let mut demo = false;
     let mut library = false;
+    let mut auto = false;
     let mut roots_args = automation_args::AutomationArgs::new(None, None);
     let mut it = args.iter().cloned();
     while let Some(a) = it.next() {
@@ -434,6 +442,7 @@ fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
             "--connect" => connect = Some(it.next().ok_or("--connect needs a port or host:port")?),
             "--demo" => demo = true,
             "--library" => library = true,
+            "--auto" => auto = true,
             other if other.starts_with("--automation-") => return Err(format!("unknown mcp option `{other}`")),
             _ => {}
         }
@@ -444,16 +453,36 @@ fn parse_mcp_args(args: &[String]) -> Result<McpArgs, String> {
 so drop --connect (or use --connect without the roots)"
             .into());
     }
+    if auto && (connect.is_some() || roots.is_some()) {
+        return Err("--auto picks the app or the in-process server itself: drop --connect and the automation roots".into());
+    }
     if library && connect.is_some() {
         return Err("--library sets up the in-process server's library; a running app has its own, so drop --library with --connect".into());
     }
-    Ok(McpArgs { connect, demo, library, roots })
+    Ok(McpArgs { connect, auto, demo, library, roots })
 }
 
 fn mcp(args: &[String]) -> ExitCode {
-    let McpArgs { connect, demo, library, roots } = match parse_mcp_args(args) {
+    let McpArgs { connect, auto, demo, library, roots } = match parse_mcp_args(args) {
         Ok(a) => a,
         Err(err) => return fail(err),
+    };
+    // --auto: the app when it answers on the agents' port, else in-process with the library.
+    let (connect, library) = if auto {
+        let port = soundcraft_engine::settings::AGENT_PORT;
+        let up =
+            std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(400)).is_ok();
+        eprintln!(
+            "djforge-cli: {}",
+            if up {
+                format!("using the running app on port {port}")
+            } else {
+                "the app isn't allowing agents: running in-process with the library".into()
+            }
+        );
+        (up.then(|| port.to_string()), !up)
+    } else {
+        (connect, library)
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -480,6 +509,33 @@ fn mcp(args: &[String]) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(e),
+    }
+}
+
+/// Prints (and with `--apply` runs) the Claude Code command that registers this CLI's MCP server
+/// for every project: `claude mcp add --scope user djforge -- <this exe> mcp --auto`.
+fn mcp_setup(args: &[String]) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return fail(format!("where is djforge-cli? {e}")),
+    };
+    let exe = exe.display().to_string();
+    let add = ["mcp", "add", "--scope", "user", "djforge", "--", exe.as_str(), "mcp", "--auto"];
+    let shown = add.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { (*a).to_string() }).collect::<Vec<_>>().join(" ");
+    outln!("claude {shown}");
+    outln!("(Other MCP clients: run `{exe} mcp --auto` over stdio.)");
+    outln!("In djforge, DJ > Allow AI Agents lets the server use the open app; without it the server reads the library itself.");
+    if !args.iter().any(|a| a == "--apply") {
+        outln!("Run again with --apply to register it with Claude Code now.");
+        return ExitCode::SUCCESS;
+    }
+    match std::process::Command::new("claude").args(add).status() {
+        Ok(s) if s.success() => {
+            outln!("Registered: restart Claude Code to use djforge's tools.");
+            ExitCode::SUCCESS
+        }
+        Ok(s) => fail(format!("claude mcp add failed ({s})")),
+        Err(e) => fail(format!("could not run `claude` (is Claude Code installed and on PATH?): {e}")),
     }
 }
 

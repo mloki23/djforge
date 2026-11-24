@@ -308,6 +308,23 @@ fn stray_chords_never_stop_the_decks_and_a_held_cue_always_lets_go() {
     assert!(!h.state().is_playing(), "the arrangement stayed stopped");
     assert_eq!(state(&mut h)["decks"][0]["playing"], true, "Deck A still plays");
 
+    // An agent may not change the playing deck (nor the mixer while a deck is heard); the
+    // stopped one is free, and the DJ can allow it.
+    use soundcraft_ui_egui::control::deck_guard;
+    let why = deck_guard(h.state(), "deck.pause", &json!({"deck": "a"})).expect("refused");
+    assert!(why.contains("Deck A is playing"), "{why}");
+    assert!(deck_guard(h.state(), "deck.xfader", &json!({"value": 0.5})).is_some());
+    assert!(deck_guard(h.state(), "deck.seek", &json!({"deck": "b", "at": 1.0})).is_none());
+    assert!(deck_guard(h.state(), "library.list", &json!({})).is_none());
+    let v = h.state_mut().run("ui.agents_play_decks", json!({"value": true})).unwrap();
+    assert_eq!(v["value"], true);
+    assert!(deck_guard(h.state(), "deck.pause", &json!({"deck": "a"})).is_none());
+    h.state_mut().run("ui.agents_play_decks", json!({"value": false})).unwrap();
+    // Allowing agents without a way to open the port (this harness) says when it will.
+    let v = h.state_mut().run("ui.agents", json!({"value": true})).unwrap();
+    assert_eq!(v["port"], soundcraft_ui_egui::AGENT_PORT);
+    assert!(h.state().ui.status.contains("next start"), "{}", h.state().ui.status);
+
     // W holds Deck B's CUE: a preview while held, back to the cue on release.
     h.key_down(Key::W);
     until(&mut h, "W previews B", |s| s["decks"][1]["previewing"] == true);

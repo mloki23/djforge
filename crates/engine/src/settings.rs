@@ -60,6 +60,10 @@ fn platform_dir(platform: Platform, env: &impl Fn(&str) -> Option<OsString>, [na
     }
 }
 
+/// The control port the app opens when the user allows AI agents (DJ › Allow AI Agents), where
+/// `djforge-cli mcp --auto` looks for it.
+pub const AGENT_PORT: u16 = 47417;
+
 /// Runs without preferences (`SOUNDCRAFT_NO_PREFS`, agents' test runs) neither read nor write them,
 /// and keep out of the settings folder entirely.
 pub fn prefs_enabled() -> bool {
