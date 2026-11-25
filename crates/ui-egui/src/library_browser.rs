@@ -338,6 +338,7 @@ enum Act {
     Page(isize),
     AddFolder,
     RemoveFolder(String),
+    Analyse(String),
 }
 
 /// Draws the browser in `ui`'s rect.
@@ -504,6 +505,15 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                         ui.close();
                     }
                 }
+                ui.separator();
+                if ui
+                    .button("Analyse with mixforge")
+                    .on_hover_text("Analyse it again: grid, key, loudness and sections (in the background)")
+                    .clicked()
+                {
+                    act = Some(Act::Analyse(path.clone()));
+                    ui.close();
+                }
             });
         }
     });
@@ -630,6 +640,11 @@ fn apply(app: &mut SoundApp, a: Act) {
         Act::AddFolder => {
             let _ = app.dialogs.open_for_command(&app.engine, "library.add_folder");
             reread(app);
+        }
+        Act::Analyse(path) => {
+            if let Err(e) = app.run("library.analyze", json!({"paths": [path]})) {
+                app.ui.status = e;
+            }
         }
         Act::RemoveFolder(path) => {
             if app.run("library.remove_folder", json!({"path": path})).is_ok() {

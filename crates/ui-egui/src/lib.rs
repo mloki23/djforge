@@ -473,6 +473,9 @@ pub struct SoundApp {
     /// Opens the control port when DJ › Allow AI Agents is switched on (the app's entry point
     /// gives it; without it the setting takes effect at the next start).
     control_starter: Option<Box<dyn Fn(u16) -> Receiver<ControlRequest>>>,
+    /// Background jobs started in the app (from a menu, or by an agent through it), followed so
+    /// their end shows in the status line: (job, kind, when last looked at).
+    jobs: Vec<(u64, String, f64)>,
     pending_shots: Vec<control::PendingShot>,
     last_rev: u64,
     fonts_ready: bool,
@@ -597,6 +600,7 @@ impl SoundApp {
             synthetic_grace: 0,
             control_rx: None,
             control_starter: None,
+            jobs: Vec::new(),
             pending_shots: Vec::new(),
             last_rev: 0,
             fonts_ready: false,
@@ -682,7 +686,62 @@ impl SoundApp {
 
     /// [`run`](Self::run), keeping the engine's own error, so a caller can tell a refusal to
     /// replace (`EngineError::WouldReplace`) from any other.
+    /// Follows a job a command started, when its result says it did.
+    fn follow_job(&mut self, v: &Value) {
+        if let (Some(id), Some(kind)) = (v.get("job").and_then(Value::as_u64), v.get("kind").and_then(Value::as_str)) {
+            self.jobs.push((id, kind.to_string(), f64::NEG_INFINITY));
+            self.ui.status = format!("{} running in the background (DJ > Cancel Running Jobs stops it)", job_name(kind));
+        }
+    }
+
+    /// Looks at the jobs followed (twice a second) and says in the status line how each ended.
+    fn step_jobs(&mut self, now: f64) {
+        let mut ended = Vec::new();
+        for (id, kind, seen) in &mut self.jobs {
+            if now - *seen < 0.5 {
+                continue;
+            }
+            *seen = now;
+            let Ok(s) = self.engine.execute("job.status", &serde_json::json!({"job": *id})) else {
+                ended.push((*id, format!("{} ended", job_name(kind))));
+                continue;
+            };
+            let state = s.get("state").and_then(Value::as_str).unwrap_or("");
+            let name = job_name(kind);
+            let note = match state {
+                "done" => Some(job_done(kind, s.get("result").unwrap_or(&Value::Null))),
+                "failed" => Some(format!("{name} failed: {}", s.get("error").and_then(Value::as_str).unwrap_or(""))),
+                "cancelled" => Some(format!("{name} cancelled")),
+                _ => None,
+            };
+            if let Some(n) = note {
+                ended.push((*id, n));
+            }
+        }
+        for (id, note) in ended {
+            self.jobs.retain(|j| j.0 != id);
+            self.ui.status = note;
+        }
+    }
+
+    /// DJ › Cancel Running Jobs: asks every job the app follows to stop.
+    pub(crate) fn cancel_jobs(&mut self) -> usize {
+        let ids: Vec<u64> = self.jobs.iter().map(|j| j.0).collect();
+        for id in &ids {
+            let _ = self.engine.execute("job.cancel", &serde_json::json!({"job": id}));
+        }
+        ids.len()
+    }
+
     pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, RunError> {
+        let r = self.run_command(id, params);
+        if let Ok(v) = &r {
+            self.follow_job(v);
+        }
+        r
+    }
+
+    fn run_command(&mut self, id: &str, params: Value) -> Result<Value, RunError> {
         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
             return Err(RunError::App(self.ui.status.clone()));
         }
@@ -1545,6 +1604,10 @@ impl SoundApp {
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
+        if !self.jobs.is_empty() {
+            self.step_jobs(now);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         control::drain(self, ctx);
         midi_input::frame(self, now);
         midi_learn::frame(self, now);
@@ -1748,6 +1811,39 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
     let ins = if slot == soundcraft_mix::INSTRUMENT_INSTANCE { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
     let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
     Some(format!("{name} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", t.name))
+}
+
+/// A job's kind, for the status line.
+fn job_name(kind: &str) -> &'static str {
+    match kind {
+        "plan" => "Set planning",
+        "suggest" => "Track suggestions",
+        "analyze" => "mixforge analysis",
+        "health" => "Library health check",
+        "prep" => "Track prep",
+        "export" => "Set export",
+        _ => "A job",
+    }
+}
+
+/// The status line when a job is done.
+fn job_done(kind: &str, r: &Value) -> String {
+    match kind {
+        "plan" => format!(
+            "Planned {} tracks into {} (DJ > Import mixforge Set... builds it)",
+            r.get("tracks").and_then(Value::as_array).map_or(0, Vec::len),
+            r.get("plan").and_then(Value::as_str).unwrap_or("")
+        ),
+        "analyze" => {
+            let failed = r.get("failed").and_then(Value::as_array).map_or(0, Vec::len);
+            format!(
+                "mixforge analysed {} track(s){}",
+                r.get("analysed").and_then(Value::as_u64).unwrap_or(0),
+                if failed > 0 { format!(", {failed} failed") } else { String::new() }
+            )
+        }
+        other => format!("{} finished", job_name(other)),
+    }
 }
 
 #[cfg(test)]

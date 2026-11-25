@@ -147,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Plan DJ Set",
             [],
             None,
-            "{tracks?: [paths], source?: path or [paths] (playlists .m3u/.m3u8, folders, files), out: path for plan.json, order?: keep|harmonic|rising (default keep: the order given), tempo?: ramp|master (default ramp: each track at its own tempo, gliding through transitions), bpm? (one master tempo), bars? (transition length), minutes_per_track? (play about this much of each), style?: auto|blend|quick|long|filter|echo (default auto), keep_variable?: bool} — a background job (returns {job}; see job.status): mixforge's set planner, as `mixforge plan` (tracks not yet analysed are analysed first, into mixforge's cache). Writes the plan to `out` (load it with dj.import_set) and returns {plan, master_bpm, tempo_mode, tracks: [{path, title, artist, camelot, bpm, play_bpm, mix_in_s, mix_out_s (in the track's file), transition_out: {style, bars, notes}}], warnings (clashes, same songs, off-grid outros, journey notes), failed (files mixforge couldn't analyse), left_out (tracks not planned: tempo not steady)}",
+            "{tracks?: [paths], source?: path or [paths] (playlists .m3u/.m3u8, folders, files), out?: path for plan.json (default Music/djforge-plans/<first source's name>.plan.json), order?: keep|harmonic|rising (default keep: the order given), tempo?: ramp|master (default ramp: each track at its own tempo, gliding through transitions), bpm? (one master tempo), bars? (transition length), minutes_per_track? (play about this much of each), style?: auto|blend|quick|long|filter|echo (default auto), keep_variable?: bool} — a background job (returns {job}; see job.status): mixforge's set planner, as `mixforge plan` (tracks not yet analysed are analysed first, into mixforge's cache). Writes the plan to `out` (load it with dj.import_set) and returns {plan, master_bpm, tempo_mode, tracks: [{path, title, artist, camelot, bpm, play_bpm, mix_in_s, mix_out_s (in the track's file), transition_out: {style, bars, notes}}], warnings (clashes, same songs, off-grid outros, journey notes), failed (files mixforge couldn't analyse), left_out (tracks not planned: tempo not steady)}",
             always,
             plan_set
         ),
@@ -233,8 +233,11 @@ fn plan_set(e: &mut Engine, p: &Value) -> Result<Value> {
     for s in &sources {
         crate::file_access::check_read(s).map_err(|why| bad(PLAN, why))?;
     }
-    let out = str_param(p, "out").filter(|s| !s.trim().is_empty()).ok_or_else(|| bad(PLAN, "`out` required: where to write plan.json"))?;
-    crate::file_access::check_write(out).map_err(|why| bad(PLAN, why))?;
+    let out = match str_param(p, "out").filter(|s| !s.trim().is_empty()) {
+        Some(o) => o.to_string(),
+        None => default_plan_path(sources.first().map(String::as_str))?,
+    };
+    crate::file_access::check_write(&out).map_err(|why| bad(PLAN, why))?;
     let pick = |key: &str, allowed: &[&str], default: &str| -> Result<String> {
         match str_param(p, key) {
             None => Ok(default.to_string()),
@@ -255,6 +258,20 @@ fn plan_set(e: &mut Engine, p: &Value) -> Result<Value> {
     let args = json!({"sources": sources, "out": out, "order": order, "tempo": tempo, "style": style, "bpm": bpm, "bars": bars,
         "minutes_per_track": minutes, "keep_variable": keep_variable});
     start_op(e, PLAN, "plan", "plan", args)
+}
+
+/// Where a plan goes without `out`: `Music/djforge-plans/<source name>.plan.json` (beside prep's
+/// folder), a number added when that file is there already.
+fn default_plan_path(source: Option<&str>) -> Result<String> {
+    let dir = super::prep::default_root().map_err(|_| bad(PLAN, "no Music folder known: give `out`"))?.with_file_name("djforge-plans");
+    let stem = source.and_then(|s| std::path::Path::new(s).file_stem()).map_or_else(|| "set".to_string(), |s| s.to_string_lossy().into_owned());
+    let mut path = dir.join(format!("{stem}.plan.json"));
+    let mut n = 2;
+    while crate::io::size_and_mtime(&*path.to_string_lossy()).is_some() && n < 1000 {
+        path = dir.join(format!("{stem} {n}.plan.json"));
+        n += 1;
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn analyze(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -330,7 +347,6 @@ mod tests {
         // Bad parameters never reach mixforge.
         assert!(e.execute("library.suggest", &json!({"from": track, "direction": "sideways"})).is_err());
         assert!(e.execute("library.suggest", &json!({"from": dir.join("none.wav").to_string_lossy()})).is_err());
-        assert!(e.execute("dj.plan_set", &json!({"tracks": [track]})).is_err(), "out required");
         assert!(e.execute("library.analyze", &json!({})).is_err());
         assert_eq!(seen.lock().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);

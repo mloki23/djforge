@@ -109,11 +109,11 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "plan_set",
             "DJ. Plan a set with mixforge's planner from tracks, a playlist (.m3u/.m3u8) or a folder: order (keep, harmonic, rising), tempo (ramp or one master bpm), transitions. Analyses tracks mixforge hasn't yet. Writes plan.json to `out` and returns the running order, transitions and warnings (key clashes, same songs, off-grid outros).",
-            json!({"tracks": {"type": "array", "items": {"type": "string"}}, "source": {"type": "string", "description": "a playlist, folder or file"}, "out": {"type": "string", "description": "where to write plan.json"},
+            json!({"tracks": {"type": "array", "items": {"type": "string"}}, "source": {"type": "string", "description": "a playlist, folder or file"}, "out": {"type": "string", "description": "where to write plan.json (default Music/djforge-plans/<name>.plan.json)"},
                 "order": {"type": "string", "enum": ["keep", "harmonic", "rising"]}, "tempo": {"type": "string", "enum": ["ramp", "master"]}, "bpm": {"type": "number"},
                 "bars": {"type": "integer"}, "minutes_per_track": {"type": "number"}, "style": {"type": "string", "enum": ["auto", "blend", "quick", "long", "filter", "echo"]},
                 "keep_variable": {"type": "boolean"}, "wait_seconds": {"type": "number"}}),
-            &["out"],
+            &[],
         ),
         tool(
             "import_set",

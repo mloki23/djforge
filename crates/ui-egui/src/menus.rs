@@ -94,6 +94,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("ui.waveform_bands", "Colour Waveforms by Frequency", "", None),
     ("ui.deck_colours", "Deck Colours", "", None),
     ("ui.agents", "Allow AI Agents (MCP)", "", None),
+    ("ui.cancel_jobs", "Cancel Running Jobs", "", None),
     ("ui.agents_play_decks", "Let Agents Change Playing Decks", "", None),
 ];
 
@@ -123,6 +124,8 @@ const DJ_MENU: &[(&str, &str)] = &[
     ("DJ > Crossfade Selected Clips", "dj.crossfade"),
     ("DJ > Tempo Ramp over Selection...", "dj.tempo_ramp"),
     ("DJ > Clear Stem Cache...", "dj.clear_stem_cache"),
+    ("DJ > Plan Set with mixforge...", "dj.plan_set"),
+    ("DJ > Cancel Running Jobs", "ui.cancel_jobs"),
     ("DJ > Allow AI Agents (MCP)", "ui.agents"),
     ("DJ > Let Agents Change Playing Decks", "ui.agents_play_decks"),
 ];
@@ -765,6 +768,11 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             };
             app.ui.status = app.set_agents(on);
             json!({"value": app.ui.agents, "port": crate::AGENT_PORT})
+        }
+        "ui.cancel_jobs" => {
+            let n = app.cancel_jobs();
+            app.ui.status = if n == 0 { "No jobs are running".into() } else { format!("Cancelling {n} job(s)") };
+            json!({"cancelling": n})
         }
         "ui.agents_play_decks" => {
             match p.get("value") {

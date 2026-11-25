@@ -143,6 +143,12 @@ impl Dialogs {
             "prep.tracks" => {
                 Dialog::PathPrompt { cmd: id.into(), title: "Prep Tracks (plan.json or folder)".into(), path: home, key: "source".into() }
             }
+            "dj.plan_set" => Dialog::PathPrompt {
+                cmd: id.into(),
+                title: "Plan Set with mixforge (a playlist or folder; the plan goes to Music/djforge-plans)".into(),
+                path: home,
+                key: "source".into(),
+            },
             "dj.export_set" => Dialog::ExportSet {
                 rekordbox: true,
                 mixxx: true,
