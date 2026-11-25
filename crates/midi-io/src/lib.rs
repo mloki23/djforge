@@ -6,6 +6,9 @@
 //! - [`MidiSource`]: a set of input ports opened by name. [`MidiInputs`] is the real one (`midir`:
 //!   WinMM, CoreMIDI, ALSA); `FakeSource` (the `testing` feature, for tests only) simulates
 //!   devices and lets tests inject events at chosen times.
+//! - [`MidiOutputs`]: output ports (a controller's lights), opened by the same identity as inputs.
+//!   [`SystemOutputs`] is the real one: a sender thread owns the connections, so sending never
+//!   blocks the caller; `FakeOutputs` (the `testing` feature) records what was sent.
 //! - [`Subscriber`]: one consumer's bounded, wait-free queue. Every open port's events fan out to
 //!   every subscriber through a router thread (see the `queue` module). Full queues drop and count;
 //!   [`HopStats`] measures the router's delay.
@@ -21,9 +24,13 @@
 
 #[cfg(any(test, feature = "testing"))]
 mod fake;
+#[cfg(any(test, feature = "testing"))]
+mod fake_out;
 #[cfg(not(target_arch = "wasm32"))]
 mod inputs;
 mod message;
+#[cfg(not(target_arch = "wasm32"))]
+mod outputs;
 mod ports;
 mod queue;
 
@@ -31,9 +38,13 @@ use std::time::Instant;
 
 #[cfg(any(test, feature = "testing"))]
 pub use fake::FakeSource;
+#[cfg(any(test, feature = "testing"))]
+pub use fake_out::FakeOutputs;
 #[cfg(not(target_arch = "wasm32"))]
 pub use inputs::MidiInputs;
 pub use message::{MidiMessage, MidiParser, parse_all};
+#[cfg(not(target_arch = "wasm32"))]
+pub use outputs::SystemOutputs;
 pub use ports::PortChange;
 pub use queue::{HOP_BUCKETS, HopStats, MAX_CAPACITY, PORT_CAPACITY, Subscriber};
 
@@ -42,6 +53,8 @@ pub use queue::{HOP_BUCKETS, HopStats, MAX_CAPACITY, PORT_CAPACITY, Subscriber};
 pub enum MidiIoError {
     #[error("no MIDI input named \"{0}\"")]
     NoSuchPort(String),
+    #[error("no MIDI output named \"{0}\"")]
+    NoSuchOutput(String),
     #[error("MIDI input \"{port}\": {reason}")]
     Backend { port: String, reason: String },
     #[error("MIDI router: {0}")]
@@ -173,6 +186,51 @@ pub trait MidiSource {
     fn open_all(&mut self) -> Vec<Result<PortId, MidiIoError>> {
         let closed: Vec<PortInfo> = self.list().into_iter().filter(|p| !self.is_open(&p.name)).collect();
         closed.into_iter().map(|p| self.open(&p.name)).collect()
+    }
+}
+
+/// Messages queued for an output port but not yet sent before new ones are dropped (and counted).
+/// A controller's full set of lights is about 200 messages.
+pub const OUT_CAPACITY: usize = 1024;
+
+/// A set of MIDI output ports, opened and closed by name like [`MidiSource`]'s inputs and
+/// identified the same way: (backend id, raw name), with [`PortId`]s that are stable for the
+/// life of the set. The input and output halves of one controller are separate ports; match them
+/// by raw name (on Windows a Pioneer DDJ-FLX4 lists "DDJ-FLX4" as both).
+///
+/// [`MidiOutputs::send`] never blocks: messages go into a bounded queue that a thread of the
+/// implementation drains, in order, per set. Never call it from the audio thread.
+pub trait MidiOutputs {
+    /// The output ports present now. Creates a backend client on real hardware: poll at about
+    /// 1 Hz, off the audio thread.
+    fn list(&self) -> Vec<PortInfo>;
+    /// Opens an output by its listed name; an already open port returns its id.
+    fn open(&mut self, name: &str) -> Result<PortId, MidiIoError>;
+    /// Closes an output after the messages already queued for it are sent; false if not open.
+    fn close(&mut self, name: &str) -> bool;
+    /// Whether an output is open under this name.
+    fn is_open(&self, name: &str) -> bool;
+    /// Whether the output with this id is open.
+    fn is_open_id(&self, id: PortId) -> bool;
+    /// Queues `msg` for the open port `id`. False (nothing queued) when the port isn't open or
+    /// the queue is full; the latter is counted in [`MidiOutputs::dropped`].
+    fn send(&mut self, id: PortId, msg: MidiMessage) -> bool;
+    /// Re-lists the outputs, closes open ones whose device went away, and returns the changes
+    /// since the last call, as [`MidiSource::refresh`] does for inputs.
+    fn refresh(&mut self) -> Vec<PortChange>;
+    /// A port id's current listed name.
+    fn port_name(&self, id: PortId) -> Option<&str>;
+    /// A port id's raw (unsuffixed) name.
+    fn raw_name(&self, id: PortId) -> Option<&str>;
+    /// A port id's backend id.
+    fn backend_id(&self, id: PortId) -> Option<&str>;
+    /// Messages dropped so far because the queue was full or the backend refused them.
+    fn dropped(&self) -> u64;
+
+    /// The simulated outputs behind this one (`None` for real hardware). Tests only.
+    #[cfg(any(test, feature = "testing"))]
+    fn as_fake_mut(&mut self) -> Option<&mut FakeOutputs> {
+        None
     }
 }
 

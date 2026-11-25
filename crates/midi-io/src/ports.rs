@@ -219,6 +219,11 @@ impl<C> PortTable<C> {
         self.open.clear();
     }
 
+    /// The open port with id `id`.
+    pub(crate) fn by_id(&self, id: PortId) -> Option<&OpenPort<C>> {
+        self.open.iter().find(|p| p.id == id)
+    }
+
     pub(crate) fn is_open(&self, name: &str) -> bool {
         self.open.iter().any(|p| p.info.name == name)
     }

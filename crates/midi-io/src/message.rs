@@ -34,23 +34,30 @@ impl MidiMessage {
         }
     }
 
-    /// The wire bytes, always with an explicit status byte (no running status). Out-of-range fields
-    /// are masked to 4 / 7 / 14 bits. Allocates: tests only (the `testing` feature).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The wire bytes and how many of them count (2 or 3), always with an explicit status byte (no
+    /// running status). Out-of-range fields are masked to 4 / 7 / 14 bits. Never allocates: MIDI
+    /// output sends this.
+    pub fn wire(&self) -> ([u8; 3], usize) {
         let st = |kind: u8, ch: u8| kind | (ch & 0x0F);
         match *self {
-            MidiMessage::NoteOff { ch, note, vel } => vec![st(0x80, ch), note & 0x7F, vel & 0x7F],
-            MidiMessage::NoteOn { ch, note, vel } => vec![st(0x90, ch), note & 0x7F, vel & 0x7F],
-            MidiMessage::PolyPressure { ch, note, pressure } => vec![st(0xA0, ch), note & 0x7F, pressure & 0x7F],
-            MidiMessage::ControlChange { ch, cc, value } => vec![st(0xB0, ch), cc & 0x7F, value & 0x7F],
-            MidiMessage::ProgramChange { ch, program } => vec![st(0xC0, ch), program & 0x7F],
-            MidiMessage::ChannelPressure { ch, pressure } => vec![st(0xD0, ch), pressure & 0x7F],
+            MidiMessage::NoteOff { ch, note, vel } => ([st(0x80, ch), note & 0x7F, vel & 0x7F], 3),
+            MidiMessage::NoteOn { ch, note, vel } => ([st(0x90, ch), note & 0x7F, vel & 0x7F], 3),
+            MidiMessage::PolyPressure { ch, note, pressure } => ([st(0xA0, ch), note & 0x7F, pressure & 0x7F], 3),
+            MidiMessage::ControlChange { ch, cc, value } => ([st(0xB0, ch), cc & 0x7F, value & 0x7F], 3),
+            MidiMessage::ProgramChange { ch, program } => ([st(0xC0, ch), program & 0x7F, 0], 2),
+            MidiMessage::ChannelPressure { ch, pressure } => ([st(0xD0, ch), pressure & 0x7F, 0], 2),
             MidiMessage::PitchBend { ch, value } => {
-                let raw = (i32::from(value).clamp(-8192, 8191) + 8192) as u16;
-                vec![st(0xE0, ch), (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8]
+                let raw = u16::try_from(i32::from(value).clamp(-8192, 8191) + 8192).unwrap_or(8192);
+                ([st(0xE0, ch), (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8], 3)
             }
         }
+    }
+
+    /// [`MidiMessage::wire`] as a vector. Allocates: tests only (the `testing` feature).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let (bytes, n) = self.wire();
+        bytes.get(..n).map(<[u8]>::to_vec).unwrap_or_default()
     }
 }
 

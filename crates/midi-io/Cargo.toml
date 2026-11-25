@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-midi-io"
-description = "SoundCraft MIDI input: live MIDI message parsing, input devices (midir) and a lock-free event queue with fan-out to the audio and UI threads"
+description = "SoundCraft MIDI input and output: live MIDI message parsing, input and output devices (midir), a lock-free event queue with fan-out to the audio and UI threads, and a non-blocking output sender"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
