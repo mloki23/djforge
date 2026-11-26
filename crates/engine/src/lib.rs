@@ -221,6 +221,9 @@ pub struct Engine {
     analyse: Option<cmd::PrepAnalyse>,
     /// What the live decks play, as the host's audio engine last reported it.
     pub deck_status: soundcraft_mix::DecksState,
+    /// Where the host's audio device plays the decks' headphone output ("outputs 3-4", "split"),
+    /// or `None` without one; the host sets it, `decks.state` reports it.
+    pub headphone_output: Option<String>,
     /// The track each deck was last given (`deck.load`), for `decks.state`.
     pub deck_tracks: [Option<Arc<soundcraft_mix::DeckTrack>>; 2],
     /// Tracks loaded for the decks, prepared off the UI thread, for the host to hand to its
@@ -292,6 +295,7 @@ impl Engine {
             ffmpeg: None,
             analyse: None,
             deck_status: Default::default(),
+            headphone_output: None,
             deck_tracks: [None, None],
             deck_loads: Vec::new(),
             deck_jobs: Vec::new(),

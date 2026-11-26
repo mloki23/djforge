@@ -102,9 +102,36 @@ pub fn specs() -> Vec<CommandSpec> {
             "Deck Headphone Cue",
             [],
             None,
-            "{deck: a|b, on?: bool (default: toggles)} — the channel's headphone CUE button (the headphone output, once set up, plays the cued decks pre-fader). Reported as `channel.headphone_cue` in decks.state",
+            "{deck: a|b, on?: bool (default: toggles)} — the channel's headphone CUE button: the deck goes to the cue bus, pre-fader (after trim, EQ and filter; the channel fader, crossfader and master volume don't change it). Reported as `channel.headphone_cue` in decks.state",
             always,
             |e, p| mixer(e, p, "deck.headphone_cue")
+        ),
+        cmd!(
+            noundo "deck.headphone_mix",
+            "Headphone Mix",
+            [],
+            None,
+            "{value: 0..=1} — the headphone mix: 0 the cue bus only, 1 the master only, between an equal-power blend (½: both at -3 dB). Reported as `headphones.mix` in decks.state",
+            always,
+            |e, p| mixer(e, p, "deck.headphone_mix")
+        ),
+        cmd!(
+            noundo "deck.headphone_level",
+            "Headphone Level",
+            [],
+            None,
+            "{db: -60..=0} — the headphone level (-60 is silence); the headphone output then goes through its own limiter at -1 dBTP. Reported as `headphones.level_db` in decks.state",
+            always,
+            |e, p| mixer(e, p, "deck.headphone_level")
+        ),
+        cmd!(
+            noundo "deck.master_cue",
+            "Master Cue",
+            [],
+            None,
+            "{on?: bool (default: toggles)} — master cue: the master (after the master faders) joins the cue bus, as the mixer's MASTER CUE button. Reported as `headphones.master_cue` in decks.state",
+            always,
+            |e, p| mixer(e, p, "deck.master_cue")
         ),
         cmd!(noundo "deck.master_volume", "Deck Master Volume", [], None, "{db: -60..=0} — the decks' master volume, into the Maximizer at -1 dBTP and the master bus", always, |e, p| mixer(e, p, "deck.master_volume")),
         cmd!(noundo "deck.quantise", "Deck Quantise", [], None, "{on: bool} — quantise for cues, hot cues and loops (on by default)", always, |e, p| mixer(e, p, "deck.quantise")),
@@ -113,7 +140,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Decks State",
             [],
             None,
-            "{} — per deck: its track (title, artist, path, key, bpm, grid, length, sections), playing, previewing, position (seconds and samples), bpm now, rate, pitch and range (percent), master tempo, synced, master, phase error (beats and ms), cue, hot cues, loop and levels, plus its mixer channel; and the crossfader, master volume, master level and quantise, as the audio engine last reported",
+            "{} — per deck: its track (title, artist, path, key, bpm, grid, length, sections), playing, previewing, position (seconds and samples), bpm now, rate, pitch and range (percent), master tempo, synced, master, phase error (beats and ms), cue, hot cues, loop and levels, plus its mixer channel; and the crossfader, master volume, master level and quantise; and `headphones` {mix, level_db, master_cue, level: the headphone output's peaks (L, R), output: where the headphones play (e.g. \"outputs 3-4\", \"split\"), or null with no headphone output}, as the audio engine last reported",
             always,
             state
         ),
@@ -347,6 +374,12 @@ fn mixer(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
             DeckCmd::HeadphoneCue { deck, on: bool_param(cmd, p, "on", Some(!now))? }
         }
         "deck.master_volume" => DeckCmd::Master { db: need_num(cmd, p, "db", -60.0..=0.0)? as f32 },
+        "deck.headphone_mix" => DeckCmd::HeadphoneMix { value: need_num(cmd, p, "value", 0.0..=1.0)? as f32 },
+        "deck.headphone_level" => {
+            let (lo, hi) = soundcraft_mix::HEADPHONE_DB;
+            DeckCmd::HeadphoneLevel { db: need_num(cmd, p, "db", f64::from(lo)..=f64::from(hi))? as f32 }
+        }
+        "deck.master_cue" => DeckCmd::MasterCue { on: bool_param(cmd, p, "on", Some(!e.deck_status.master_cue))? },
         "deck.quantise" => DeckCmd::Quantise(bool_param(cmd, p, "on", None)?),
         _ => return Err(bad(cmd, "not a deck mixer command")),
     };
@@ -717,5 +750,6 @@ fn state(e: &mut Engine, _: &Value) -> Result<Value> {
         })
         .collect();
     Ok(json!({"audio": e.live_audio, "decks": decks, "xfader": st.xfader, "xfader_curve": st.xfader_curve.id(), "master_db": st.master_db,
-        "master_level": st.master_level, "quantise": st.quantise, "arrangement_playing": e.transport.playing}))
+        "master_level": st.master_level, "quantise": st.quantise, "arrangement_playing": e.transport.playing,
+        "headphones": {"mix": st.headphone_mix, "level_db": st.headphone_db, "master_cue": st.master_cue, "level": st.cue_level, "output": e.headphone_output}}))
 }

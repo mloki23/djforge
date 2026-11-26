@@ -68,8 +68,8 @@ mod live;
 mod live_in;
 mod warp;
 pub use decks::{
-    BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HOT_CUES, HotCueAction, JogMode, LoopAction, PITCH_RANGES, PreparedDeck,
-    Section,
+    BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HEADPHONE_DB, HOT_CUES, HotCueAction, JogMode, LoopAction, PITCH_RANGES,
+    PreparedDeck, Section, headphone_gains,
 };
 pub use dj_strip::{EqBand, FaderCurve, XfadeCurve, XfadeSide};
 pub use live::{
@@ -568,6 +568,19 @@ impl MixEngine {
     /// True while a deck plays or rings out, so the host keeps rendering.
     pub fn decks_awake(&self) -> bool {
         self.decks.as_ref().is_some_and(|d| d.awake())
+    }
+
+    /// Wants the decks' headphone output ([`Decks::set_headphones`]); no decks: nothing.
+    pub fn set_headphones(&mut self, on: bool) {
+        if let Some(d) = self.decks.as_mut() {
+            d.set_headphones(on);
+        }
+    }
+
+    /// The decks' headphone output (L, R) of the last render (its first `frames`); empty without
+    /// decks.
+    pub fn headphones(&self) -> &[Vec<f32>] {
+        self.decks.as_ref().map_or(&[][..], |d| d.phones())
     }
 
     /// True while a deck plays.
@@ -1441,6 +1454,10 @@ impl MixEngine {
         // start of the same beat would repeat every block as a buzz.
         if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
             click::render(s, pos, frames, &mut self.main);
+        }
+        // The decks' headphone output, from the main output as it leaves.
+        if let Some(d) = self.decks.as_mut() {
+            d.headphones(&self.main, frames);
         }
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {

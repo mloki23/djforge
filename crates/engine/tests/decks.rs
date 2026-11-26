@@ -592,3 +592,47 @@ fn the_headphone_cue_button_toggles_from_what_the_deck_reports_or_takes_a_state(
     assert_eq!(run(&mut e, "decks.state", json!({}))["decks"][1]["channel"]["headphone_cue"], true);
     assert!(err(&mut e, "deck.headphone_cue", json!({"deck": "a", "on": 1})).contains("`on`"));
 }
+
+#[test]
+fn headphone_commands_queue_the_mix_level_and_master_cue_and_decks_state_reports_them() {
+    let mut e = engine();
+    run(&mut e, "deck.headphone_mix", json!({"value": 0.25}));
+    run(&mut e, "deck.headphone_level", json!({"db": -12}));
+    run(&mut e, "deck.master_cue", json!({}));
+    run(&mut e, "deck.master_cue", json!({"on": false}));
+    run(&mut e, "deck.headphone_cue", json!({"deck": "b"}));
+    assert_eq!(
+        deck_cmds(&mut e),
+        [
+            DeckCmd::HeadphoneMix { value: 0.25 },
+            DeckCmd::HeadphoneLevel { db: -12.0 },
+            DeckCmd::MasterCue { on: true },
+            DeckCmd::MasterCue { on: false },
+            DeckCmd::HeadphoneCue { deck: DeckId::B, on: true },
+        ]
+    );
+    for (cmd, p, why) in [
+        ("deck.headphone_mix", json!({"value": 1.5}), "`value`"),
+        ("deck.headphone_mix", json!({}), "`value`"),
+        ("deck.headphone_level", json!({"db": 3}), "`db`"),
+        ("deck.master_cue", json!({"on": "yes"}), "`on`"),
+    ] {
+        assert!(err(&mut e, cmd, p.clone()).contains(why), "{cmd} {p}");
+    }
+    assert!(deck_cmds(&mut e).is_empty(), "refusals queue nothing");
+    assert!(err(&mut Engine::default(), "deck.headphone_mix", json!({"value": 0.5})).contains("audio engine"));
+    // What the audio engine reported, and where the host plays the headphones.
+    let mut st = e.deck_status;
+    st.headphone_mix = 0.25;
+    st.headphone_db = -12.0;
+    st.master_cue = true;
+    st.cue_level = [0.5, 0.25];
+    e.set_deck_status(st);
+    let h = &run(&mut e, "decks.state", json!({}))["headphones"];
+    assert_eq!(h, &json!({"mix": 0.25, "level_db": -12.0, "master_cue": true, "level": [0.5, 0.25], "output": null}));
+    // Toggling master cue goes from what was reported.
+    run(&mut e, "deck.master_cue", json!({}));
+    assert_eq!(deck_cmds(&mut e), [DeckCmd::MasterCue { on: false }]);
+    e.headphone_output = Some("outputs 3-4".into());
+    assert_eq!(run(&mut e, "decks.state", json!({}))["headphones"]["output"], "outputs 3-4");
+}

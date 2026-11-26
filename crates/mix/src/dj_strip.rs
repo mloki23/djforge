@@ -317,8 +317,8 @@ pub struct DjStrip {
     pub fader: f32,
     pub curve: FaderCurve,
     pub side: XfadeSide,
-    /// The headphone CUE button: the channel is sent to the headphones (pre-fader). Kept here;
-    /// the cue mix itself is the headphone output's.
+    /// The headphone CUE button: the channel is sent to the headphones, pre-fader (the decks sum
+    /// it into their cue bus between [`DjStrip::process_pre`] and [`DjStrip::apply_fader`]).
     pub headphone_cue: bool,
     xo: [Crossover; 2],
     filt: [[Svf; 2]; 2],
@@ -391,13 +391,35 @@ impl DjStrip {
 
     /// Runs `frames` of the deck's stereo audio in `buf` through the strip, in place.
     pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        self.process_pre(buf, frames);
+        self.apply_fader(buf, frames);
+    }
+
+    /// The channel fader's part of [`DjStrip::process`]: its gain, ramped over the block from the
+    /// last block's.
+    pub fn apply_fader(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        let n = buf.iter().map(Vec::len).min().unwrap_or(0).min(frames);
+        if n == 0 {
+            return;
+        }
+        let t_fader = self.fader_gain();
+        let ramp = |a: f32, b: f32, i: usize| a + (b - a) * (i + 1) as f32 / n as f32;
+        for b in buf.iter_mut().take(2) {
+            for (k, x) in b.iter_mut().take(n).enumerate() {
+                *x *= ramp(self.g_fader, t_fader, k);
+            }
+        }
+        self.g_fader = t_fader;
+    }
+
+    /// The strip before its fader (trim, EQ, filter), in place: what the headphone cue hears.
+    pub fn process_pre(&mut self, buf: &mut [Vec<f32>], frames: usize) {
         let n = buf.iter().map(Vec::len).min().unwrap_or(0).min(frames);
         if n == 0 {
             return;
         }
         let t_trim = db_to_gain(self.trim_db.clamp(TRIM_DB.0, TRIM_DB.1));
         let t_eq = self.eq_db.map(eq_gain);
-        let t_fader = self.fader_gain();
         let ramp = |a: f32, b: f32, i: usize| a + (b - a) * (i + 1) as f32 / n as f32;
         let target_filter = if self.filter.is_finite() { self.filter.clamp(-1.0, 1.0) } else { 0.0 };
         let start_filter = self.filt_at;
@@ -442,7 +464,7 @@ impl DjStrip {
                         let yf = fb.process_sample(fa.process_sample(y));
                         y += (yf - y) * wet;
                     }
-                    *x = y * ramp(self.g_fader, t_fader, k);
+                    *x = y;
                 }
             }
             let moved = (target_wet - wet0).clamp(-step * len as f32, step * len as f32);
@@ -451,7 +473,6 @@ impl DjStrip {
         }
         self.g_trim = t_trim;
         self.g_eq = t_eq;
-        self.g_fader = t_fader;
     }
 }
 

@@ -54,6 +54,16 @@
 //! (true peak), into the main bus before the master faders; while the decks sound, the output
 //! after the master faders goes through a second one ([`Decks::limit_output`]).
 //!
+//! **Headphones.** A second stereo bus, the cue bus, sums every deck whose headphone CUE button
+//! is on, taken pre-fader: after trim, EQ and filter, before the channel fader, the crossfader
+//! and the master volume (as a DJ mixer's). Master cue adds the master (the main output, after
+//! the master faders) to it. The cue bus is delayed by the master path's limiters' lookahead, so
+//! a deck heard in both lines up. The headphone output ([`Decks::headphones`]) blends cue and
+//! master by the headphone mix with equal power (0: cue only; 1: master only; ½: both at
+//! −3 dB), takes the headphone level (−60..0 dB; −60 is silence) and goes through its own
+//! Maximizer at −1 dBTP, so nothing can blast the headphones. Cue settings never touch the
+//! master.
+//!
 //! Nothing here allocates, locks or frees on the audio thread: the heads' buffers and
 //! stretchers come with the [`PreparedDeck`], and one taken off a deck goes back to the host to
 //! be dropped ([`Decks::load`], [`Decks::take_retired`], [`Decks::drain`]).
@@ -110,6 +120,10 @@ const QUIET_S: f64 = 0.5;
 pub const MAX_GRID_BEATS: usize = 200_000;
 /// The Maximizers' ceiling over the decks (dBTP).
 pub const CEILING_DB: f32 = -1.0;
+/// The headphone level's range (dB); the bottom is silence.
+pub const HEADPHONE_DB: (f32, f32) = (-60.0, 0.0);
+/// The longest delay the cue bus takes to line up with the master (frames).
+const MAX_CUE_DELAY: usize = 2048;
 
 /// A deck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -739,6 +753,18 @@ pub enum DeckCmd {
     Master {
         db: f32,
     },
+    /// The headphone mix: 0 cue only .. 1 master only.
+    HeadphoneMix {
+        value: f32,
+    },
+    /// The headphone level (dB, [`HEADPHONE_DB`]).
+    HeadphoneLevel {
+        db: f32,
+    },
+    /// Master cue: the master joins the cue bus.
+    MasterCue {
+        on: bool,
+    },
     Quantise(bool),
     /// Pauses both decks (the arrangement started).
     StopAll,
@@ -796,12 +822,18 @@ pub struct DecksState {
     /// Master peaks (L, R) after the Maximizer, of the last block.
     pub master_level: [f32; 2],
     pub quantise: bool,
+    /// The headphone mix (0 cue .. 1 master), level (dB) and master cue.
+    pub headphone_mix: f32,
+    pub headphone_db: f32,
+    pub master_cue: bool,
+    /// Headphone output peaks (L, R) after its limiter, of the last block.
+    pub cue_level: [f32; 2],
 }
 
 /// Words per deck in a [`DecksState`]'s encoding.
 const DECK_WORDS: usize = 28;
 /// Words in a [`DecksState`]'s encoding (for lock-free publishing).
-pub const STATE_WORDS: usize = DECKS * DECK_WORDS + 5;
+pub const STATE_WORDS: usize = DECKS * DECK_WORDS + 9;
 
 fn opt(v: Option<f64>) -> u64 {
     v.unwrap_or(f64::NAN).to_bits()
@@ -868,8 +900,11 @@ impl DecksState {
             put(f32w(d.filter));
             put(f32w(d.fader));
         }
-        let mixer = u64::from(self.quantise) | u64::from(self.xfader_curve == XfadeCurve::Sharp) << 1;
+        let mixer = u64::from(self.quantise) | u64::from(self.xfader_curve == XfadeCurve::Sharp) << 1 | u64::from(self.master_cue) << 2;
         for v in [f32w(self.xfader), mixer, f32w(self.master_db), f32w(self.master_level[0]), f32w(self.master_level[1])] {
+            put(v);
+        }
+        for v in [f32w(self.headphone_mix), f32w(self.headphone_db), f32w(self.cue_level[0]), f32w(self.cue_level[1])] {
             put(v);
         }
         w
@@ -925,8 +960,12 @@ impl DecksState {
         let mixer = get();
         out.quantise = mixer & 1 != 0;
         out.xfader_curve = if mixer & 2 != 0 { XfadeCurve::Sharp } else { XfadeCurve::Smooth };
+        out.master_cue = mixer & 4 != 0;
         out.master_db = wf32(get());
         out.master_level = [wf32(get()), wf32(get())];
+        out.headphone_mix = wf32(get());
+        out.headphone_db = wf32(get());
+        out.cue_level = [wf32(get()), wf32(get())];
         out
     }
 }
@@ -1703,6 +1742,72 @@ pub struct Decks {
     quiet: usize,
     levels: [[f32; 2]; DECKS],
     master_level: [f32; 2],
+    /// The headphone output is wanted ([`Decks::set_headphones`]): the cue bus is summed and
+    /// the headphone mix made.
+    phones_on: bool,
+    /// The cue bus of the last block (pre-fader decks with CUE on) and the headphone output.
+    cue: Vec<Vec<f32>>,
+    phones: Vec<Vec<f32>>,
+    cue_delay: CueDelay,
+    phones_limiter: Option<Box<dyn Plugin>>,
+    hp_mix: f32,
+    hp_db: f32,
+    master_cue: bool,
+    /// The headphone gains (cue, master) as of the end of the last block.
+    g_phones: (f32, f32),
+    /// Frames of silence the headphone output has run on (past its limiter's delay it rests).
+    phones_idle: usize,
+    cue_level: [f32; 2],
+}
+
+/// The headphone mix's gains (cue, master) for mix `mix` (0 cue only .. 1 master only, equal
+/// power) and level `db` ([`HEADPHONE_DB`]; its bottom, or below, is silence).
+pub fn headphone_gains(mix: f32, db: f32) -> (f32, f32) {
+    let mix = if mix.is_finite() { mix.clamp(0.0, 1.0) } else { 0.0 };
+    let level = if !db.is_finite() || db <= HEADPHONE_DB.0 { 0.0 } else { db_to_gain(db.min(HEADPHONE_DB.1)) };
+    let (c, m) = if mix <= 0.0 {
+        (1.0, 0.0)
+    } else if mix >= 1.0 {
+        (0.0, 1.0)
+    } else {
+        let a = mix * std::f32::consts::FRAC_PI_2;
+        (a.cos(), a.sin())
+    };
+    (c * level, m * level)
+}
+
+/// A fixed stereo delay (a ring, preallocated): lines the cue bus up with the master.
+struct CueDelay {
+    ring: [Vec<f32>; 2],
+    at: usize,
+    delay: usize,
+}
+
+impl CueDelay {
+    fn new(delay: usize) -> CueDelay {
+        CueDelay { ring: [vec![0.0; MAX_CUE_DELAY], vec![0.0; MAX_CUE_DELAY]], at: 0, delay: delay.min(MAX_CUE_DELAY - 1) }
+    }
+
+    /// Delays the first `n` frames of `io`'s first two channels, in place.
+    fn process(&mut self, io: &mut [Vec<f32>], n: usize) {
+        if self.delay == 0 {
+            return;
+        }
+        let len = MAX_CUE_DELAY;
+        let start = self.at;
+        for (ch, ring) in io.iter_mut().zip(self.ring.iter_mut()) {
+            let mut w = start;
+            for x in ch.iter_mut().take(n) {
+                let r = (w + len - self.delay) % len;
+                if let Some(slot) = ring.get_mut(w) {
+                    *slot = *x;
+                }
+                *x = ring.get(r).copied().unwrap_or(0.0);
+                w = (w + 1) % len;
+            }
+        }
+        self.at = (start + n) % len;
+    }
 }
 
 /// Adds the first `n` frames of `src` into `main`, channel for channel (non-finite as silence).
@@ -1731,6 +1836,9 @@ impl Decks {
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { sample_rate } else { 48_000.0 };
         let max_block = max_block.clamp(16, 16_384);
         let buf = || vec![vec![0.0f32; max_block]; 2];
+        let (limiter, out_limiter) = (ceiling_limiter(sr, max_block), ceiling_limiter(sr, max_block));
+        // The master path's delay: both limiters' lookahead.
+        let master_delay = limiter.as_ref().map_or(0, |l| l.latency()) + out_limiter.as_ref().map_or(0, |l| l.latency());
         Decks {
             sr: f64::from(sr),
             max_block,
@@ -1744,8 +1852,8 @@ impl Decks {
             xg: [std::f32::consts::FRAC_1_SQRT_2; DECKS],
             master_db: 0.0,
             g_master: 1.0,
-            limiter: ceiling_limiter(sr, max_block),
-            out_limiter: ceiling_limiter(sr, max_block),
+            limiter,
+            out_limiter,
             out_active: false,
             out_drain: 0,
             held: false,
@@ -1754,7 +1862,24 @@ impl Decks {
             quiet: 0,
             levels: [[0.0; 2]; DECKS],
             master_level: [0.0; 2],
+            phones_on: false,
+            cue: buf(),
+            phones: buf(),
+            cue_delay: CueDelay::new(master_delay),
+            phones_limiter: ceiling_limiter(sr, max_block),
+            hp_mix: 0.0,
+            hp_db: 0.0,
+            master_cue: false,
+            g_phones: headphone_gains(0.0, 0.0),
+            phones_idle: usize::MAX,
+            cue_level: [0.0; 2],
         }
+    }
+
+    /// Wants the headphone output or not (off by default: nothing is summed or limited for it).
+    /// Neither allocates nor frees.
+    pub fn set_headphones(&mut self, on: bool) {
+        self.phones_on = on;
     }
 
     /// Puts `deck` on deck `id`, stopped at its first downbeat. While the deck sounds, the new
@@ -2022,6 +2147,17 @@ impl Decks {
                     self.master_db = db.clamp(-60.0, 0.0);
                 }
             }
+            DeckCmd::HeadphoneMix { value } => {
+                if value.is_finite() {
+                    self.hp_mix = value.clamp(0.0, 1.0);
+                }
+            }
+            DeckCmd::HeadphoneLevel { db } => {
+                if db.is_finite() {
+                    self.hp_db = db.clamp(HEADPHONE_DB.0, HEADPHONE_DB.1);
+                }
+            }
+            DeckCmd::MasterCue { on } => self.master_cue = on,
             DeckCmd::Quantise(on) => self.quantise = on,
             DeckCmd::StopAll => {
                 for d in self.decks.iter_mut() {
@@ -2136,6 +2272,9 @@ impl Decks {
     pub fn render_with(&mut self, main: &mut [Vec<f32>], frames: usize, arrangement: bool) {
         let n = frames.min(self.max_block);
         self.held = false;
+        for c in self.cue.iter_mut() {
+            c.iter_mut().take(n).for_each(|x| *x = 0.0);
+        }
         if n == 0 || !(self.awake() || self.decks.iter().any(|d| d.next.is_some())) {
             // Nothing to hear, but the rates still follow the faders and sync, so a stopped deck
             // shows the tempo it will play at.
@@ -2154,7 +2293,11 @@ impl Decks {
                 c.iter_mut().take(n).for_each(|x| *x = 0.0);
             }
             deck.render(buf, n, xf);
-            strip.process(buf, n);
+            strip.process_pre(buf, n);
+            if self.phones_on && strip.headphone_cue {
+                add_into(&mut self.cue, buf, n);
+            }
+            strip.apply_fader(buf, n);
             let peaks: [f32; 2] = [0, 1].map(|c| buf.get(c).map_or(0.0, |b| b.iter().take(n).fold(0.0f32, |m, v| m.max(v.abs()))));
             if let Some(l) = self.levels.get_mut(k) {
                 *l = peaks;
@@ -2238,6 +2381,69 @@ impl Decks {
         }
     }
 
+    /// The headphone output for the block [`Decks::render_with`] just rendered, from `main` (the
+    /// main output, after the master faders and the output stage): the cue bus, delayed to line up
+    /// with the master (plus the master with master cue), blended with the master by the
+    /// headphone mix, at the headphone level, through its own Maximizer at −1 dBTP. Read it with
+    /// [`Decks::phones`]. Silent unless [`Decks::set_headphones`] is on. No allocation.
+    pub fn headphones(&mut self, main: &[Vec<f32>], frames: usize) {
+        let n = frames.min(self.max_block);
+        for c in self.phones.iter_mut() {
+            c.iter_mut().take(n).for_each(|x| *x = 0.0);
+        }
+        if n == 0 || !self.phones_on {
+            self.cue_level = [0.0; 2];
+            return;
+        }
+        self.cue_delay.process(&mut self.cue, n);
+        let master = |c: usize, i: usize| {
+            let v = main.get(c).or_else(|| main.first()).and_then(|m| m.get(i)).copied().unwrap_or(0.0);
+            if v.is_finite() { v } else { 0.0 }
+        };
+        let (c1, m1) = headphone_gains(self.hp_mix, self.hp_db);
+        let (c0, m0) = self.g_phones;
+        let mc = self.master_cue;
+        let mut heard = false;
+        for (ch, (out, cue)) in self.phones.iter_mut().zip(self.cue.iter()).enumerate() {
+            for (i, (o, q)) in out.iter_mut().zip(cue.iter()).take(n).enumerate() {
+                let t = (i + 1) as f32 / n as f32;
+                let m = master(ch, i);
+                let q = if q.is_finite() { *q } else { 0.0 } + if mc { m } else { 0.0 };
+                *o = q * (c0 + (c1 - c0) * t) + m * (m0 + (m1 - m0) * t);
+                heard |= *o != 0.0;
+            }
+        }
+        self.g_phones = (c1, m1);
+        let peaks = |p: &[Vec<f32>]| [0, 1].map(|c| p.get(c).map_or(0.0, |b| b.iter().take(n).fold(0.0f32, |m, v| m.max(v.abs()))));
+        let Some(l) = self.phones_limiter.as_mut() else {
+            // No limiter (the Maximizer is missing): a hard clip at the ceiling instead.
+            let cap = db_to_gain(CEILING_DB);
+            for c in self.phones.iter_mut() {
+                c.iter_mut().take(n).for_each(|x| *x = x.clamp(-cap, cap));
+            }
+            self.cue_level = peaks(&self.phones);
+            return;
+        };
+        // At rest once its delay has played out on silence: nothing to limit.
+        let was_idle = self.phones_idle;
+        self.phones_idle = if heard { 0 } else { self.phones_idle.saturating_add(n) };
+        let rest = l.latency() + n;
+        if self.phones_idle > rest {
+            if was_idle <= rest {
+                l.reset();
+            }
+            self.cue_level = [0.0; 2];
+            return;
+        }
+        l.process(&mut self.phones, n);
+        self.cue_level = peaks(&self.phones);
+    }
+
+    /// The headphone output (L, R) of the last [`Decks::headphones`] (its first `frames`).
+    pub fn phones(&self) -> &[Vec<f32>] {
+        &self.phones
+    }
+
     /// Frames the decks' stretchers produced since last asked, per deck.
     pub fn take_stretched(&mut self) -> [usize; DECKS] {
         let mut out = [0; DECKS];
@@ -2257,6 +2463,10 @@ impl Decks {
             master_db: self.master_db,
             master_level: self.master_level,
             quantise: self.quantise,
+            headphone_mix: self.hp_mix,
+            headphone_db: self.hp_db,
+            master_cue: self.master_cue,
+            cue_level: self.cue_level,
             ..DecksState::default()
         };
         for (k, o) in out.decks.iter_mut().enumerate() {
@@ -2280,10 +2490,11 @@ impl Decks {
     #[doc(hidden)]
     pub fn storage(&self) -> Vec<(usize, usize)> {
         let mut v = Vec::new();
-        for b in self.bufs.iter().chain(std::iter::once(&self.mix)) {
+        for b in self.bufs.iter().chain([&self.mix, &self.cue, &self.phones]) {
             v.push((b.len(), b.capacity()));
             v.extend(b.iter().map(|c| (c.len(), c.capacity())));
         }
+        v.extend(self.cue_delay.ring.iter().map(|r| (r.len(), r.capacity())));
         v
     }
 
@@ -2995,6 +3206,176 @@ mod tests {
         assert_eq!(DecksState::decode(&st.encode()), st, "survives the lock-free publishing");
         d.apply(DeckCmd::HeadphoneCue { deck: DeckId::B, on: false });
         assert!(!d.state().decks[1].headphone_cue);
+    }
+
+    /// One block of `d`: the main output (after the headphone mix is made from it), the cue bus
+    /// as it left the mixer (before its delay) and the headphone output.
+    fn phones_block(d: &mut Decks) -> ([Vec<f32>; 2], Vec<f32>, [Vec<f32>; 2]) {
+        let mut main = vec![vec![0.0f32; BLOCK]; 2];
+        d.render(&mut main, BLOCK);
+        let cue = d.cue[0].clone();
+        d.headphones(&main, BLOCK);
+        let phones = [d.phones()[0][..BLOCK].to_vec(), d.phones()[1][..BLOCK].to_vec()];
+        ([main[0].clone(), main[1].clone()], cue, phones)
+    }
+
+    fn peak(x: &[f32]) -> f32 {
+        x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn the_cue_bus_sums_only_cued_decks_pre_fader() {
+        let ta = track(5.0, 128.0, 0.0, |i| (i as f32 * 0.031).sin() * 0.2);
+        let tb = track(5.0, 128.0, 0.0, |i| (i as f32 * 0.007).sin() * 0.3);
+        // Both decks play, only A is cued, faders up and the crossfader on A.
+        let mut both = decks();
+        load(&mut both, DeckId::A, &ta);
+        load(&mut both, DeckId::B, &tb);
+        both.apply(DeckCmd::Crossfader { value: -1.0, curve: None });
+        // A alone, cued, its fader down, the crossfader on B, the master at the bottom.
+        let mut alone = decks();
+        load(&mut alone, DeckId::A, &ta);
+        alone.apply(DeckCmd::Fader { deck: DeckId::A, value: 0.0, curve: None });
+        alone.apply(DeckCmd::Crossfader { value: 1.0, curve: None });
+        alone.apply(DeckCmd::Master { db: -60.0 });
+        for d in [&mut both, &mut alone] {
+            d.set_headphones(true);
+            d.apply(DeckCmd::HeadphoneCue { deck: DeckId::A, on: true });
+            for id in DeckId::ALL {
+                d.apply(DeckCmd::Play(id));
+            }
+        }
+        let mut heard = 0.0f32;
+        for b in 0..20 {
+            let (_, cue_both, _) = phones_block(&mut both);
+            let (main_alone, cue_alone, _) = phones_block(&mut alone);
+            assert_eq!(cue_both, cue_alone, "block {b}: B (not cued) and the faders change nothing on the cue bus");
+            if b > 2 {
+                assert!(peak(&main_alone[0]) < 1e-3, "the fader down and the crossfader away: nothing on the master");
+            }
+            heard = heard.max(peak(&cue_alone));
+        }
+        assert!(heard > 0.15, "A is on the cue bus at its own level, pre-fader: {heard}");
+        // Cue off: the cue bus is empty, the master as before.
+        both.apply(DeckCmd::HeadphoneCue { deck: DeckId::A, on: false });
+        let (main, cue, _) = phones_block(&mut both);
+        assert!(peak(&cue) == 0.0 && peak(&main[0]) > 0.1);
+    }
+
+    #[test]
+    fn the_headphone_mix_is_equal_power_from_cue_to_master() {
+        assert_eq!(headphone_gains(0.0, 0.0), (1.0, 0.0), "0: cue only");
+        assert_eq!(headphone_gains(1.0, 0.0), (0.0, 1.0), "1: master only");
+        let (c, m) = headphone_gains(0.5, 0.0);
+        assert!((c - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6 && (m - c).abs() < 1e-6, "½: both at -3 dB");
+        let mut last = (2.0f32, -1.0f32);
+        for k in 0..=20 {
+            let (c, m) = headphone_gains(k as f32 / 20.0, 0.0);
+            assert!((c * c + m * m - 1.0).abs() < 1e-5, "equal power at {k}");
+            assert!(c <= last.0 && m >= last.1, "cue falls and master rises");
+            last = (c, m);
+        }
+        let (c, _) = headphone_gains(0.0, -6.0);
+        assert!((c - 0.501).abs() < 0.001);
+        assert_eq!(headphone_gains(0.3, -60.0), (0.0, 0.0), "the bottom of the level is silence");
+        assert_eq!(headphone_gains(f32::NAN, f32::NAN), (0.0, 0.0));
+        assert_eq!(headphone_gains(-1.0, 6.0), (1.0, 0.0), "clamped");
+    }
+
+    #[test]
+    fn the_headphone_output_blends_takes_its_level_and_is_limited() {
+        // Steady inputs: the cue bus at `cue` and the master at 0.2, for long enough to pass the
+        // cue bus's delay and the limiter's.
+        let steady = |d: &mut Decks, cue: f32| {
+            let main = vec![vec![0.2f32; BLOCK]; 2];
+            for _ in 0..20 {
+                d.cue.iter_mut().for_each(|c| c.fill(cue));
+                d.headphones(&main, BLOCK);
+            }
+            [d.phones()[0][BLOCK - 1], d.phones()[1][BLOCK - 1]]
+        };
+        let mut d = decks();
+        assert_eq!(steady(&mut d, 0.1), [0.0, 0.0], "off until wanted");
+        d.set_headphones(true);
+        let close = |x: [f32; 2], want: f32| x.iter().all(|v| (v - want).abs() < 1e-3);
+        assert!(close(steady(&mut d, 0.1), 0.1), "mix 0: cue only");
+        d.apply(DeckCmd::HeadphoneMix { value: 1.0 });
+        assert!(close(steady(&mut d, 0.1), 0.2), "mix 1: master only");
+        d.apply(DeckCmd::HeadphoneMix { value: 0.5 });
+        assert!(close(steady(&mut d, 0.1), 0.3 * std::f32::consts::FRAC_1_SQRT_2), "½: both at -3 dB");
+        d.apply(DeckCmd::HeadphoneMix { value: 0.0 });
+        d.apply(DeckCmd::HeadphoneLevel { db: -6.0 });
+        assert!(close(steady(&mut d, 0.1), 0.1 * db_to_gain(-6.0)), "the level");
+        d.apply(DeckCmd::HeadphoneLevel { db: -60.0 });
+        assert!(close(steady(&mut d, 0.1), 0.0), "the bottom of the level is silence");
+        d.apply(DeckCmd::HeadphoneLevel { db: 0.0 });
+        d.apply(DeckCmd::MasterCue { on: true });
+        assert!(close(steady(&mut d, 0.1), 0.3), "master cue: the master joins the cue bus");
+        d.apply(DeckCmd::MasterCue { on: false });
+        // A cue bus far over full scale stays under the ceiling.
+        let cap = db_to_gain(CEILING_DB);
+        let main = vec![vec![0.0f32; BLOCK]; 2];
+        let mut top = 0.0f32;
+        for k in 0..40 {
+            d.cue.iter_mut().for_each(|c| c.iter_mut().enumerate().for_each(|(i, x)| *x = 4.0 * (((k * BLOCK + i) as f32) * 0.05).sin()));
+            d.headphones(&main, BLOCK);
+            top = top.max(peak(&d.phones()[0][..BLOCK])).max(peak(&d.phones()[1][..BLOCK]));
+        }
+        assert!(top <= cap + 1e-3 && top > cap * 0.9, "limited to -1 dBFS: {top}");
+        assert!(d.state().cue_level[0] > cap * 0.9, "the cue meter reads the headphone output");
+    }
+
+    #[test]
+    fn cue_settings_never_touch_the_master_and_allocate_nothing() {
+        let ta = track(5.0, 128.0, 0.0, |i| (i as f32 * 0.031).sin() * 0.5);
+        let tb = track(5.0, 128.0, 0.0, |i| (i as f32 * 0.007).sin() * 0.5);
+        let mut plain = decks();
+        let mut cued = decks();
+        for d in [&mut plain, &mut cued] {
+            load(d, DeckId::A, &ta);
+            load(d, DeckId::B, &tb);
+            for id in DeckId::ALL {
+                d.apply(DeckCmd::Play(id));
+            }
+        }
+        cued.set_headphones(true);
+        let storage = cued.storage();
+        for (b, cmd) in [
+            DeckCmd::HeadphoneCue { deck: DeckId::A, on: true },
+            DeckCmd::HeadphoneCue { deck: DeckId::B, on: true },
+            DeckCmd::HeadphoneMix { value: 0.3 },
+            DeckCmd::HeadphoneLevel { db: -12.0 },
+            DeckCmd::MasterCue { on: true },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cued.apply(cmd);
+            for _ in 0..6 {
+                let (main_plain, _, _) = phones_block(&mut plain);
+                let (main_cued, _, phones) = phones_block(&mut cued);
+                assert_eq!(main_plain, main_cued, "step {b}: the master is the same");
+                assert!(peak(&phones[0]).is_finite());
+            }
+        }
+        assert!(cued.state().cue_level[0] > 0.0);
+        assert_eq!(cued.storage(), storage, "the cue bus, headphone output and delay never grow");
+    }
+
+    #[test]
+    fn the_headphone_settings_are_published() {
+        let mut d = decks();
+        d.apply(DeckCmd::HeadphoneMix { value: 0.25 });
+        d.apply(DeckCmd::HeadphoneLevel { db: -9.5 });
+        d.apply(DeckCmd::MasterCue { on: true });
+        d.apply(DeckCmd::HeadphoneLevel { db: f32::NAN });
+        d.apply(DeckCmd::HeadphoneMix { value: 3.0 });
+        let mut st = d.state();
+        assert_eq!((st.headphone_mix, st.headphone_db, st.master_cue), (1.0, -9.5, true));
+        st.cue_level = [0.5, 0.25];
+        assert_eq!(DecksState::decode(&st.encode()), st, "survives the lock-free publishing");
+        d.apply(DeckCmd::MasterCue { on: false });
+        assert!(!d.state().master_cue);
     }
 
     #[test]
