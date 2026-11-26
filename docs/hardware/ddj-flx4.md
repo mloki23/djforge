@@ -21,9 +21,15 @@ the Rust table has exactly the same messages, so keep them in step.
 - **Relative** controls send the change since the last message. The jogs are centred on `0x40`
   (clockwise counts up from `0x41`, anticlockwise down from `0x3F`); the browse knob is two's
   complement (clockwise up from `0x01`, anticlockwise down from `0x7F`).
-- **SHIFT** is handled in the hardware: holding it changes the message a control sends. The Shift
-  column says which message is listed. "either" means the control sends the same message with or
-  without SHIFT.
+- **SHIFT** is handled in the hardware: holding it changes the message a control sends. The
+  Shift column says which layer a row's message belongs to: `no`, sent without SHIFT; `yes`, sent
+  with SHIFT held; `either`, the same message with or without SHIFT. A knob or fader whose row says
+  `no` has no SHIFT message in the list.
+- **SHIFT + a channel fader or the crossfader** sends only the fader-start notes (below), not
+  its controller, so the fader's movement while SHIFT is held is not followed. When SHIFT is let
+  go, the fader's next message applies as it is: a small jump is possible.
+- **MIDI Learn** takes precedence over the layout. A mapping learned on either half of a 14-bit
+  control covers both halves: the other half no longer reaches the layout.
 - "Deck 1" is djforge's Deck A, "Deck 2" Deck B.
 - In the djforge column, `(unmapped)` means djforge does nothing with the message yet. The layout
   still claims it, so it never plays the live instrument; MIDI Learn can map it.
@@ -162,6 +168,14 @@ FX CH SELECT is a three-position switch reported as four notes, Note On `0x7F` o
 | CH2 | 0x00 | 0x00 | 0x00 | 0x7F |
 | CH1&CH2 | 0x7F | 0x00 | 0x00 | 0x7F |
 
+LEVEL/DEPTH is listed with channel 6 in the "MIDI Channel" column but status byte `0xB4`
+(channel 5) and controllers 2 / 34. djforge reads the status byte: channel 5.
+
+FX ON/OFF: footnote \*4 of the list says the button blinks when it receives a Note On and lights
+when it receives a Note Off. The list gives it no MIDI-OUT row and djforge doesn't drive it; it
+sends it `0x00` (a Note On with velocity 0) with the other lights when the layout stops. Whether
+that darkens it or lights it is to be checked on the hardware.
+
 The crossfader's fader-start messages (SHIFT + crossfader) are listed with channel 7 in the
 "MIDI Channel" column but status bytes `0x90` / `0x91` (channels 1 and 2) and notes 102 / 82: the
 same messages as the channel faders' fader start. djforge reads the status byte, so they are the
@@ -172,7 +186,11 @@ same messages as the channel faders' fader start. djforge reads the status byte,
 Each deck has 8 pads (pad 1–4 on the top row, 5–8 below). The pad mode is kept in the hardware
 (the mode buttons switch it); a pad sends a note on the deck's pad channel, `base + pad − 1`, so
 the note says the mode. SHIFT + pad sends the same note on the next channel. Press `0x7F`,
-release `0x00`.
+release `0x00`. A held pad's release may come on the other channel (SHIFT pressed or let go while
+it was held); djforge lets go of it either way.
+
+djforge can't read the hardware's pad mode: it assumes hot cue until a mode button or a pad says
+otherwise, and lights the HOT CUE mode LED when the output opens, so the two agree from the start.
 
 | Mode | Shift | Deck | Ch | Pad 1 note | djforge |
 |---|---|---|---|---|---|
@@ -243,6 +261,7 @@ are on or off, and djforge blinks a LED by switching it.
 | SMART FADER | — | 7 | Note 1 (0x01) | off / on | off (unmapped) |
 | LOADED (track load illumination) | 1 / 2 | 16 | Note 0 / 1 (0x00 / 0x01) | 0x7F | sent when a track lands on the deck |
 | VINYL MODE (setting) | 1 / 2 | 1 / 2 | Note 23 (0x17) | off / on (default on) | not sent: the hardware keeps its default |
+| FX ON/OFF (not in the list's outputs; footnote \*4) | — | 5 / 6 | Note 71 / 67 (0x47 / 0x43) | Note On blinks, Note Off lights | not driven; `0x00` sent when the layout stops |
 
 Pads, in the mode the deck is in (on both the plain and the SHIFT channel):
 
@@ -255,8 +274,19 @@ The level meter takes the peak in dB: below −24 dB nothing is lit; −24 dB is
 (0x26), −12 dB the second green (0x41), −6 dB the first orange (0x57), −3 dB the second orange
 (0x65) and 0 dB red (0x77), linear in dB between; the reading falls at 30 dB a second. Only
 changes are sent. When the controller's output opens (or reopens) every LED is sent; when the
-layout stops (the device is disabled, its layout turned off, or djforge quits) every LED is
-turned off.
+layout stops (the device is disabled or unplugged, its layout turned off, or djforge quits)
+every LED is turned off, and a held CUE or hot cue preview is let go (also when MIDI Learn
+starts). A light counts as sent only once the output took it; if the output's queue dropped
+messages, every light is sent again. An output that won't open is tried again after 1 s, then
+less often, up to every 30 s.
+
+The controller acts and its lights change in UI frames: while it is connected djforge keeps
+the UI running at 30 frames a second while a deck plays (so the meters reach 30 Hz), at 60 while
+a nudge is held on the platter, and at 8 for blinking otherwise. If the OS throttles a
+minimised window, the lights lag until it is shown again.
+
+Toggles (PLAY, BEAT SYNC, CH CUE) remember the state they asked for until the deck reports it,
+so a quick double press sends on then off rather than on twice.
 
 ## Device identity
 
@@ -277,5 +307,6 @@ the output with the same name at the same position among same-named ports (the s
 - The tempo slider maps 0..16383 onto −range..+range of the deck's pitch range (8, 16 or 50 %),
   with ±32 counts around the centre read as 0. Pioneer's "+" end is the end toward the DJ.
   Soft takeover: after the deck's tempo moved elsewhere (a click, sync, a load), the slider does
-  nothing until it reaches or crosses the deck's pitch. A synced deck takes the slider straight
-  away: the engine's own takeover applies (it turns sync off on a following deck).
+  nothing until it reaches or crosses the deck's pitch. A deck synced to a master on the other
+  deck takes the slider straight away: the engine's own takeover applies (it turns sync off and
+  waits for the tempo held). A synced deck that is itself the master waits like any other.

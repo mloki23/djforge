@@ -1619,7 +1619,7 @@ impl SoundApp {
         }
         control::drain(self, ctx);
         midi_input::frame(self, now);
-        controller_layouts::sync(self);
+        controller_layouts::sync(self, now);
         midi_learn::frame(self, now);
         controller_layouts::frame(self, now);
         midi_learn::wake_on_midi(self, ctx);

@@ -114,6 +114,13 @@ pub trait Controller {
     fn events(&mut self, ctx: &Ctx) -> Vec<MidiMessage>;
     /// True when the lights should all be sent again (the pads changed mode).
     fn take_resend(&mut self) -> bool;
+    /// The other half of a 14-bit control `msg` belongs to (its LSB for an MSB, and back), so
+    /// a MIDI Learn mapping of either half covers both.
+    fn twin(&self, msg: &MidiMessage) -> Option<MidiControl>;
+    /// Lets go of everything held (a CUE preview, a hot cue preview): the commands that do it.
+    fn release_all(&mut self, ctx: &Ctx) -> Vec<Action>;
+    /// Whether a jog nudge is held now (the UI then runs at a full frame rate).
+    fn held(&self, ctx: &Ctx) -> bool;
     /// The messages that turn every light off.
     fn dark(&self) -> Vec<MidiMessage>;
 }
@@ -153,9 +160,10 @@ impl Mirror {
         self.meters_at = None;
     }
 
-    /// The messages that bring the controller from what was sent to `lights`, at `now`
-    /// (seconds); meters wait until [`METER_HZ`] allows.
-    pub fn diff(&mut self, lights: &[Light], now: f64) -> Vec<MidiMessage> {
+    /// Sends (through `send`) what brings the controller from what was sent to `lights`, at
+    /// `now` (seconds); meters wait until [`METER_HZ`] allows. A light counts as sent only when
+    /// `send` took it. Returns what was sent.
+    pub fn diff(&mut self, lights: &[Light], now: f64, mut send: impl FnMut(MidiMessage) -> bool) -> Vec<MidiMessage> {
         let meters_due = self.meters_at.is_none_or(|at| now - at >= 1.0 / METER_HZ || now < at);
         let mut out = Vec::new();
         let mut meters_sent = false;
@@ -171,8 +179,10 @@ impl Mirror {
                 }
                 meters_sent = true;
             }
-            self.sent.insert((status, data1), value);
-            out.push(l.msg);
+            if send(l.msg) {
+                self.sent.insert((status, data1), value);
+                out.push(l.msg);
+            }
         }
         if meters_sent {
             self.meters_at = Some(now);
@@ -193,7 +203,14 @@ struct Device {
     out_name: Option<String>,
     out_error: Option<String>,
     mirror: Mirror,
+    /// When to try opening its output again, and the wait after the next failure (1 s, doubling
+    /// to 30 s).
+    retry_at: f64,
+    backoff: f64,
 }
+
+/// The longest wait between tries at an output that won't open (seconds).
+const MAX_BACKOFF_S: f64 = 30.0;
 
 /// The devices using a built-in layout, and their upkeep.
 #[derive(Default)]
@@ -202,6 +219,8 @@ pub struct Controllers {
     /// When outputs were last looked for (UI seconds).
     looked: Option<f64>,
     last_frame: Option<f64>,
+    /// The outputs' dropped count last seen: a rise means lights were lost, so all are resent.
+    dropped: u64,
 }
 
 impl Controllers {
@@ -214,6 +233,28 @@ impl Controllers {
     pub fn lit(&self) -> bool {
         self.devices.iter().any(|d| d.out.is_some())
     }
+}
+
+/// How often the UI should run for the controllers, which act and light up only in UI frames:
+/// a full frame rate (60 Hz) while a jog nudge is held, so nudges don't pulse; 30 Hz while a
+/// deck plays, so the meters reach their rate; 8 Hz while lights blink; else nothing. An OS
+/// that throttles a minimised window slows this down too (acceptable: the lights lag then).
+pub fn repaint_every(app: &SoundApp) -> Option<std::time::Duration> {
+    let c = &app.controllers;
+    if c.devices.is_empty() {
+        return None;
+    }
+    let ctx = Ctx::of(app, app.midi_learn.now);
+    let ms = if c.devices.iter().any(|d| d.logic.held(&ctx)) {
+        16
+    } else if ctx.decks.iter().any(|d| d.state.playing || d.state.previewing) {
+        33
+    } else if c.lit() {
+        125
+    } else {
+        return None;
+    };
+    Some(std::time::Duration::from_millis(ms))
 }
 
 /// Whether the device (raw name, backend id) has its built-in layout turned off.
@@ -236,9 +277,14 @@ fn wanted(app: &SoundApp) -> Vec<(PortId, String, String, &'static LayoutInfo)> 
         .collect()
 }
 
-/// Turns the device's lights off and closes its output (queued behind the lights).
-fn stop(host: Option<&mut MidiHost>, dev: &Device) {
-    let (Some(h), Some(out)) = (host, dev.out) else { return };
+/// Stops a device's layout: lets go of what it holds (a CUE preview must not keep playing),
+/// turns its lights off and closes its output (queued behind the lights).
+fn stop(app: &mut SoundApp, mut dev: Device, now: f64) {
+    let ctx = Ctx::of(app, now);
+    for a in dev.logic.release_all(&ctx) {
+        perform(app, dev.layout.name, a);
+    }
+    let (Some(h), Some(out)) = (app.midi_host.as_mut(), dev.out) else { return };
     let Some(o) = h.outputs_mut() else { return };
     for m in dev.logic.dark() {
         o.send(out, m);
@@ -250,16 +296,16 @@ fn stop(host: Option<&mut MidiHost>, dev: &Device) {
 
 /// Every UI frame, before MIDI learn's: starts the layouts of devices that opened (or whose
 /// layout was turned on) and stops the others, so the frame's events find their layout.
-pub fn sync(app: &mut SoundApp) {
+pub fn sync(app: &mut SoundApp, now: f64) {
     let wanted = wanted(app);
     // Devices that stopped: lights off, output closed.
     let (keep, gone): (Vec<Device>, Vec<Device>) = std::mem::take(&mut app.controllers.devices)
         .into_iter()
         .partition(|d| wanted.iter().any(|w| w.0 == d.input && w.1 == d.raw_name && w.2 == d.backend_id));
-    for d in &gone {
-        stop(app.midi_host.as_mut(), d);
-    }
     app.controllers.devices = keep;
+    for d in gone {
+        stop(app, d, now);
+    }
     for (input, raw_name, backend_id, layout) in wanted {
         if !app.controllers.devices.iter().any(|d| d.input == input) {
             log::info!("{raw_name}: built-in layout {}", layout.name);
@@ -273,6 +319,8 @@ pub fn sync(app: &mut SoundApp) {
                 out_name: None,
                 out_error: None,
                 mirror: Mirror::default(),
+                retry_at: 0.0,
+                backoff: REFRESH_S,
             });
             // Look for its output now, not at the next refresh.
             app.controllers.looked = None;
@@ -296,20 +344,22 @@ pub fn frame(app: &mut SoundApp, now: f64) {
             perform(app, name, a);
         }
     }
+    // Lights lost to a full queue: send them all again.
+    let dropped = app.midi_host.as_ref().and_then(MidiHost::outputs).map_or(0, |o| o.dropped());
+    let lost = dropped > app.controllers.dropped;
+    app.controllers.dropped = dropped;
     // The commands just run change the state only once the audio engine reports back.
+    let Some(o) = app.midi_host.as_mut().and_then(MidiHost::outputs_mut) else { return };
     for d in &mut app.controllers.devices {
         let Some(out) = d.out else { continue };
-        if d.logic.take_resend() {
+        if d.logic.take_resend() || lost {
             d.mirror.reset();
         }
         let lights = d.logic.lights(&ctx);
-        let mut msgs = d.logic.events(&ctx);
-        msgs.extend(d.mirror.diff(&lights, now));
-        if let Some(o) = app.midi_host.as_mut().and_then(MidiHost::outputs_mut) {
-            for m in msgs {
-                o.send(out, m);
-            }
+        for m in d.logic.events(&ctx) {
+            o.send(out, m);
         }
+        d.mirror.diff(&lights, now, |m| o.send(out, m));
     }
 }
 
@@ -342,6 +392,12 @@ fn upkeep_outputs(app: &mut SoundApp, now: f64) {
     for i in closed {
         let Some(d) = app.controllers.devices.get_mut(i) else { continue };
         d.out = None;
+        if now < d.retry_at {
+            continue;
+        }
+        // Tried again after 1 s, then less and less often, up to every 30 s.
+        d.retry_at = now + d.backoff;
+        d.backoff = (d.backoff * 2.0).min(MAX_BACKOFF_S);
         let Some(port) = h.paired_output(d.input) else {
             d.out_error = Some(if h.outputs().is_some() { "no output of that name".into() } else { "no MIDI output on this system".into() });
             continue;
@@ -352,6 +408,7 @@ fn upkeep_outputs(app: &mut SoundApp, now: f64) {
                 d.out = Some(id);
                 d.out_name = Some(port.name.clone());
                 d.out_error = None;
+                d.backoff = REFRESH_S;
                 // A new connection: every light again.
                 d.mirror.reset();
             }
@@ -404,11 +461,32 @@ pub fn controls(app: &SoundApp) -> Vec<(PortId, MidiControl)> {
     app.controllers.devices.iter().flat_map(|d| d.logic.controls().into_iter().map(move |c| (d.input, c))).collect()
 }
 
-/// Turns every layout's lights off and closes their outputs: the app is quitting.
+/// Lets go of everything the layouts hold, and turns their lights off and closes their outputs:
+/// the app is quitting.
 pub fn shutdown(app: &mut SoundApp) {
+    let now = app.midi_learn.now;
     for d in std::mem::take(&mut app.controllers.devices) {
-        stop(app.midi_host.as_mut(), &d);
+        stop(app, d, now);
     }
+}
+
+/// Lets go of everything the layouts hold (a CUE or hot cue preview): MIDI Learn starts, so the
+/// release may never reach the layout.
+pub fn release_holds(app: &mut SoundApp) {
+    let ctx = Ctx::of(app, app.midi_learn.now);
+    let mut actions = Vec::new();
+    for d in &mut app.controllers.devices {
+        let name = d.layout.name;
+        actions.extend(d.logic.release_all(&ctx).into_iter().map(|a| (name, a)));
+    }
+    for (name, a) in actions {
+        perform(app, name, a);
+    }
+}
+
+/// The other half of the 14-bit control `msg` belongs to, on a device using a layout.
+pub fn twin(app: &SoundApp, port: PortId, msg: &MidiMessage) -> Option<MidiControl> {
+    app.controllers.devices.iter().find(|d| d.input == port)?.logic.twin(msg)
 }
 
 /// The layout of the input (raw name, backend id) for MIDI Devices and `midi.inputs`: its
@@ -467,14 +545,18 @@ mod tests {
     #[test]
     fn the_mirror_sends_changes_only_meters_at_most_30_times_a_second_and_all_after_a_reset() {
         let mut m = Mirror::default();
-        let first = m.diff(&[led(1, true), led(2, false), meter(40)], 0.0);
+        let ok = |_| true;
+        let first = m.diff(&[led(1, true), led(2, false), meter(40)], 0.0, ok);
         assert_eq!(first.len(), 3, "everything at first");
-        assert!(m.diff(&[led(1, true), led(2, false), meter(40)], 0.01).is_empty());
-        let next = m.diff(&[led(1, false), led(2, false), meter(50)], 0.02);
+        assert!(m.diff(&[led(1, true), led(2, false), meter(40)], 0.01, ok).is_empty());
+        let next = m.diff(&[led(1, false), led(2, false), meter(50)], 0.02, ok);
         assert_eq!(next, vec![led(1, false).msg], "the meter waits");
-        assert_eq!(m.diff(&[led(1, false), led(2, false), meter(50)], 0.04), vec![meter(50).msg]);
+        assert_eq!(m.diff(&[led(1, false), led(2, false), meter(50)], 0.04, ok), vec![meter(50).msg]);
         m.reset();
-        assert_eq!(m.diff(&[led(1, false), led(2, false), meter(50)], 0.05).len(), 3);
+        assert_eq!(m.diff(&[led(1, false), led(2, false), meter(50)], 0.05, ok).len(), 3);
+        // A light the output refused isn't counted as sent: it goes again next time.
+        assert!(m.diff(&[led(1, true), led(2, false), meter(50)], 0.06, |_| false).is_empty());
+        assert_eq!(m.diff(&[led(1, true), led(2, false), meter(50)], 0.07, ok), vec![led(1, true).msg]);
     }
 
     #[test]

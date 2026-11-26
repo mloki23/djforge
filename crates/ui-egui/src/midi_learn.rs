@@ -515,6 +515,8 @@ pub struct LearnState {
 /// Starts learning `target`: the next note-on or controller binds it.
 pub fn start(app: &mut SoundApp, target: Target) {
     app.ui.status = format!("Learn MIDI for {}: move a control (Esc cancels)", target.label());
+    // A controller's held CUE or pad would never hear its release while learning.
+    crate::controller_layouts::release_holds(app);
     app.midi_learn.learning = Some(target);
     app.midi_learn.conflict = None;
     app.midi_learn.overlay = None;
@@ -712,9 +714,9 @@ pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
     if s.gesture.is_some() || !s.touch.is_empty() || s.detect.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
-    if app.controllers.lit() {
-        // A controller's lights blink and follow the decks: a few frames a second.
-        ctx.request_repaint_after(std::time::Duration::from_millis(125));
+    if let Some(every) = crate::controller_layouts::repaint_every(app) {
+        // A controller acts and lights up in UI frames (see `repaint_every`).
+        ctx.request_repaint_after(every);
     }
 }
 
@@ -793,6 +795,13 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
     }
     let hits: Vec<String> = app.ui.midi_mappings.iter().filter(|m| m.device.same(&device) && m.matcher == matcher).map(Mapping::key).collect();
     if hits.is_empty() {
+        // The other half of a learned 14-bit control: the mapping covers it and the layout
+        // doesn't get it (the learned half drives the target).
+        if let Some(t) = crate::controller_layouts::twin(app, e.port, &e.msg)
+            && app.ui.midi_mappings.iter().any(|m| m.device.same(&device) && m.matcher.control() == t)
+        {
+            return;
+        }
         // Not mapped: the device's built-in layout, if it has one, takes it.
         crate::controller_layouts::handle(app, e.port, &e.msg, now);
         return;

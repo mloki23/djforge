@@ -874,7 +874,9 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             for port in &mut ports {
                 let (raw, backend) =
                     (port["raw_name"].as_str().unwrap_or_default().to_string(), port["backend_id"].as_str().unwrap_or_default().to_string());
-                port["layout"] = crate::controller_layouts::describe(app, &raw, &backend).unwrap_or(Value::Null);
+                if let Some(o) = port.as_object_mut() {
+                    o.insert("layout".into(), crate::controller_layouts::describe(app, &raw, &backend).unwrap_or(Value::Null));
+                }
             }
             let mut v = status(app, app.midi_learn.now);
             v["ports"] = Value::Array(ports);

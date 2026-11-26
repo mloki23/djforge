@@ -361,7 +361,10 @@ pub struct Flx4 {
     /// The last MSB per (channel 0–15, controller).
     msb: HashMap<(u8, u8), u8>,
     shift: [bool; 2],
+    /// The platter touched (a nudge held: the UI then runs at a full frame rate).
     touch: [bool; 2],
+    /// The toggles last asked for, per deck: play, sync, headphone cue.
+    pending: [[Option<(bool, f64)>; 3]; 2],
     mode: [PadMode; 2],
     /// A hot cue pad held after a jump, which sends its release.
     held_pad: [Option<usize>; 2],
@@ -377,8 +380,29 @@ pub struct Flx4 {
 
 /// A deck command with its deck.
 fn run(id: &'static str, d: DeckId, mut p: serde_json::Value) -> Action {
-    p["deck"] = json!(d.id());
+    if let Some(o) = p.as_object_mut() {
+        o.insert("deck".into(), json!(d.id()));
+    }
     Action::Run(id, p)
+}
+
+/// How long a toggle's wanted state counts over what the deck reports (the report lags).
+const PENDING_S: f64 = 0.5;
+
+/// A toggle pressed: the new state, from the one asked for last if the deck hasn't reported it
+/// yet, else from the reported one, so a quick double press sends on then off, not on twice.
+fn toggle(pending: &mut Option<(bool, f64)>, reported: bool, now: f64) -> bool {
+    let base = match *pending {
+        Some((want, at)) if now - at < PENDING_S && (0.0..).contains(&(now - at)) && want != reported => want,
+        _ => reported,
+    };
+    *pending = Some((!base, now));
+    !base
+}
+
+/// Whether deck `d`'s fader follows the other deck's tempo: the engine's own takeover applies.
+fn follows(ctx: &Ctx, d: DeckId) -> bool {
+    ctx.deck(d).state.synced && ctx.deck(d.other()).state.master
 }
 
 /// The meter value for a peak (dB): see the hardware doc.
@@ -465,7 +489,8 @@ impl Flx4 {
                     *h = set.then_some(pad);
                 }
             }
-            (PadMode::HotCue, false, false) => {
+            // The release may come on the SHIFT channel: SHIFT pressed while the pad was held.
+            (PadMode::HotCue, _, false) => {
                 if let Some(h) = self.held_pad.get_mut(i)
                     && *h == Some(pad)
                 {
@@ -512,7 +537,7 @@ impl Flx4 {
         if !dc.loaded {
             return None;
         }
-        if !dc.state.synced && !p.picked {
+        if !follows(ctx, d) && !p.picked {
             let cur = dc.state.pitch * 100.0;
             let window = range * 2.0 * 1.5 / 127.0;
             let crossed = prev.is_some_and(|h| (h - cur).signum() != (pct - cur).signum());
@@ -589,7 +614,17 @@ impl Flx4 {
                     out.push(run("deck.fader", d, json!({"value": round(unit(v), 3)})));
                 }
             }
-            Ctl::HeadphoneCue if press => out.push(run("deck.headphone_cue", d, json!({"on": !s.headphone_cue}))),
+            Ctl::HeadphoneCue if press => {
+                let on = self.pending.get_mut(i).and_then(|p| p.get_mut(2)).map_or(!s.headphone_cue, |p| toggle(p, s.headphone_cue, ctx.now));
+                out.push(run("deck.headphone_cue", d, json!({"on": on})));
+            }
+            // A held CUE let go, also on SHIFT+CUE's note (SHIFT pressed while it was held).
+            Ctl::Cue | Ctl::ToStart if !down && self.cue_held.get(i).copied().unwrap_or(false) => {
+                if let Some(x) = self.cue_held.get_mut(i) {
+                    *x = false;
+                }
+                out.push(run("deck.cue", d, json!({"down": false})));
+            }
             Ctl::Tempo => {
                 if let Some(v) = wide {
                     out.extend(self.tempo(d, v, ctx));
@@ -597,16 +632,14 @@ impl Flx4 {
             }
             // The rest act on a loaded deck only.
             _ if !dc.loaded => {}
-            Ctl::Play if press => out.push(run(if s.playing { "deck.pause" } else { "deck.play" }, d, json!({}))),
-            Ctl::Cue => {
-                let held = self.cue_held.get(i).copied().unwrap_or(false);
-                if down && !held {
-                    out.push(run("deck.cue", d, json!({"down": true})));
-                } else if !down && held {
-                    out.push(run("deck.cue", d, json!({"down": false})));
-                }
+            Ctl::Play if press => {
+                let play = self.pending.get_mut(i).and_then(|p| p.first_mut()).map_or(!s.playing, |p| toggle(p, s.playing, ctx.now));
+                out.push(run(if play { "deck.play" } else { "deck.pause" }, d, json!({})));
+            }
+            Ctl::Cue if down && !self.cue_held.get(i).copied().unwrap_or(false) => {
+                out.push(run("deck.cue", d, json!({"down": true})));
                 if let Some(x) = self.cue_held.get_mut(i) {
-                    *x = down;
+                    *x = true;
                 }
             }
             Ctl::ToStart if press => out.push(run("deck.seek", d, json!({"at": 0.0}))),
@@ -638,7 +671,10 @@ impl Flx4 {
             }
             Ctl::Halve if press => out.push(run("deck.loop", d, json!({"action": "halve"}))),
             Ctl::Double if press => out.push(run("deck.loop", d, json!({"action": "double"}))),
-            Ctl::Sync if press => out.push(run("deck.sync", d, json!({"on": !s.synced}))),
+            Ctl::Sync if press => {
+                let on = self.pending.get_mut(i).and_then(|p| p.get_mut(1)).map_or(!s.synced, |p| toggle(p, s.synced, ctx.now));
+                out.push(run("deck.sync", d, json!({"on": on})));
+            }
             Ctl::SyncOff if press => out.push(run("deck.sync", d, json!({"on": false}))),
             Ctl::TempoRange if press => {
                 let now = s.range;
@@ -744,7 +780,7 @@ impl Controller for Flx4 {
             // A deck tempo moved elsewhere (a click, sync, a load) re-arms the soft takeover.
             if let Some(p) = self.tempo.get_mut(i)
                 && p.picked
-                && !dc.state.synced
+                && !follows(ctx, d)
                 && let Some((v, at)) = p.sent
             {
                 let range = if dc.state.range > 0.0 { dc.state.range } else { 0.08 } * 100.0;
@@ -832,6 +868,34 @@ impl Controller for Flx4 {
         out
     }
 
+    fn twin(&self, msg: &MidiMessage) -> Option<MidiControl> {
+        let MidiMessage::ControlChange { ch, cc, .. } = *msg else { return None };
+        let (def, lsb) = Self::find(Kind::Cc, ch + 1, cc)?;
+        let other = if lsb { def.num } else { def.lsb? };
+        Some(MidiControl::Cc { ch, cc: other })
+    }
+
+    fn release_all(&mut self, _ctx: &Ctx) -> Vec<Action> {
+        let mut out = Vec::new();
+        for d in DeckId::ALL {
+            let i = d.index();
+            if self.cue_held.get_mut(i).is_some_and(std::mem::take) {
+                out.push(run("deck.cue", d, json!({"down": false})));
+            }
+            if let Some(pad) = self.held_pad.get_mut(i).and_then(Option::take) {
+                out.push(run("deck.hotcue", d, json!({"n": pad + 1, "action": "release"})));
+            }
+            if let Some(t) = self.touch.get_mut(i) {
+                *t = false;
+            }
+        }
+        out
+    }
+
+    fn held(&self, ctx: &Ctx) -> bool {
+        DeckId::ALL.into_iter().any(|d| self.touch.get(d.index()).copied().unwrap_or(false) && ctx.deck(d).state.playing)
+    }
+
     fn take_resend(&mut self) -> bool {
         std::mem::take(&mut self.resend)
     }
@@ -855,6 +919,12 @@ impl Controller for Flx4 {
         }
         out.push(note_on(7, 0x00, false));
         out.push(note_on(7, 0x01, false));
+        // FX ON/OFF isn't driven, but goes dark too (see the doc's footnote *4).
+        for ch1 in [5, 6] {
+            for n in [0x47, 0x43] {
+                out.push(note_on(ch1, n, false));
+            }
+        }
         out
     }
 }
@@ -1095,11 +1165,20 @@ mod tests {
         // Deck B's slider is its own: at −8 % with the deck at 0, nothing until it gets there.
         assert!(wide(&mut f, &c, 2, 0x00, 0).is_empty());
         assert_eq!(wide(&mut f, &c, 2, 0x00, 8192).len(), 1, "reached the deck's pitch");
-        // A synced deck takes the slider straight away (the engine's own takeover).
+        // Synced to a master on the other deck: straight away (the engine's own takeover turns
+        // sync off and waits).
         let mut g = Flx4::new();
         let mut s = ctx();
         s.decks[0].state.synced = true;
+        s.decks[1].state.master = true;
         assert_eq!(wide(&mut g, &s, 1, 0x00, 0), vec![cmd("deck.pitch", json!({"deck": "a", "value": -8.0}))]);
+        // Synced but itself the master: the slider sets the tempo, so it must reach it first.
+        let mut h = Flx4::new();
+        let mut m = ctx();
+        m.decks[0].state.synced = true;
+        m.decks[0].state.master = true;
+        assert!(wide(&mut h, &m, 1, 0x00, 0).is_empty(), "no jump to −8 %");
+        assert_eq!(wide(&mut h, &m, 1, 0x00, 8192).len(), 1);
     }
 
     #[test]
@@ -1177,19 +1256,19 @@ mod tests {
         let mut m = Mirror::default();
         let mut c = ctx();
         c.now = 0.1;
-        let first = bytes(&m.diff(&f.lights(&c), c.now));
+        let first = bytes(&m.diff(&f.lights(&c), c.now, |_| true));
         assert!(first.len() > 50, "everything at first: {}", first.len());
         // Paused with a track at its cue: CUE lit, PLAY blinking (on in the first quarter second).
         assert!(first.contains(&[0x90, 0x0C, 0x7F]) && first.contains(&[0x90, 0x0B, 0x7F]), "{first:02X?}");
         // Nothing changed: nothing sent.
-        assert!(m.diff(&f.lights(&c), c.now + 0.01).is_empty());
+        assert!(m.diff(&f.lights(&c), c.now + 0.01, |_| true).is_empty());
         // Deck A plays, synced, in a loop, with hot cue C set and its channel cued.
         c.now = 0.2;
         let s = &mut c.decks[0].state;
         (s.playing, s.synced, s.loop_on, s.headphone_cue) = (true, true, true, true);
         s.position = 96_000.0;
         s.hot[2] = Some(1.0);
-        let sent = bytes(&m.diff(&f.lights(&c), c.now));
+        let sent = bytes(&m.diff(&f.lights(&c), c.now, |_| true));
         for want in [
             [0x90, 0x58, 0x7F],
             [0x90, 0x10, 0x7F],
@@ -1206,20 +1285,20 @@ mod tests {
         // A level: the meter (CC 2), at most 30 times a second.
         c.decks[0].state.level = [0.5, 0.25];
         c.now = 0.21;
-        let sent = bytes(&m.diff(&f.lights(&c), c.now));
+        let sent = bytes(&m.diff(&f.lights(&c), c.now, |_| true));
         let v = meter_value(20.0 * 0.5f32.log10());
         assert!(sent.contains(&[0xB0, 0x02, v]), "{sent:02X?}");
         assert!((0x57..=0x64).contains(&v), "−6 dB is orange 1: {v:#x}");
         c.now = 0.215;
         c.decks[0].state.level = [1.0, 1.0];
-        assert!(!bytes(&m.diff(&f.lights(&c), c.now)).iter().any(|b| b[0] == 0xB0), "too soon for the meter");
+        assert!(!bytes(&m.diff(&f.lights(&c), c.now, |_| true)).iter().any(|b| b[0] == 0xB0), "too soon for the meter");
         c.now = 0.26;
-        assert!(bytes(&m.diff(&f.lights(&c), c.now)).iter().any(|b| b[0] == 0xB0 && b[2] >= 0x77), "red at 0 dB");
+        assert!(bytes(&m.diff(&f.lights(&c), c.now, |_| true)).iter().any(|b| b[0] == 0xB0 && b[2] >= 0x77), "red at 0 dB");
         // Beat jump mode: the pads show it (all lit with a track), sent afresh on the switch.
         f.input(&on(1, 0x20), &c);
         assert!(f.take_resend());
         m.reset();
-        let sent = bytes(&m.diff(&f.lights(&c), c.now));
+        let sent = bytes(&m.diff(&f.lights(&c), c.now, |_| true));
         assert!((0x20..0x28).all(|n| sent.contains(&[0x97, n, 0x7F])));
         assert!(sent.contains(&[0x90, 0x20, 0x7F]) && sent.contains(&[0x90, 0x1B, 0x00]), "the mode LEDs");
     }
@@ -1258,6 +1337,134 @@ mod tests {
         let lit = bytes(&f.lights(&c).iter().map(|l| l.msg).collect::<Vec<_>>());
         for l in lit {
             assert!(dark.iter().any(|d| d[0] == l[0] && d[1] == l[1]), "{l:02X?} is never turned off");
+        }
+    }
+
+    #[test]
+    fn held_cues_are_let_go_on_the_shifted_note_and_by_release_all() {
+        let mut f = Flx4::new();
+        let mut c = ctx();
+        c.decks[0].state.hot[1] = Some(1.0);
+        // CUE held, SHIFT pressed mid-hold: the release comes as SHIFT+CUE's note-off.
+        f.input(&on(1, 0x0C), &c);
+        assert_eq!(f.input(&off(1, 0x48), &c), vec![cmd("deck.cue", json!({"deck": "a", "down": false}))]);
+        assert!(f.input(&off(1, 0x0C), &c).is_empty(), "let go once");
+        // A hot cue preview released on the SHIFT channel.
+        f.input(&on(8, 0x01), &c);
+        assert_eq!(f.input(&off(9, 0x01), &c), vec![cmd("deck.hotcue", json!({"deck": "a", "n": 2, "action": "release"}))]);
+        // Held on both decks, then everything let go at once (unplug, layout off, learn, quit).
+        f.input(&on(1, 0x0C), &c);
+        f.input(&on(8, 0x01), &c);
+        f.input(&on(2, 0x0C), &c);
+        let all = f.release_all(&c);
+        assert_eq!(
+            all,
+            vec![
+                cmd("deck.cue", json!({"deck": "a", "down": false})),
+                cmd("deck.hotcue", json!({"deck": "a", "n": 2, "action": "release"})),
+                cmd("deck.cue", json!({"deck": "b", "down": false})),
+            ]
+        );
+        assert!(f.release_all(&c).is_empty());
+        assert!(f.input(&off(1, 0x0C), &c).is_empty() && f.input(&off(8, 0x01), &c).is_empty(), "nothing left to let go");
+    }
+
+    #[test]
+    fn a_quick_double_press_of_a_toggle_sends_both_states() {
+        let mut f = Flx4::new();
+        let mut c = ctx();
+        // The deck hasn't reported the first press yet: the second still turns it back.
+        assert_eq!(f.input(&on(1, 0x0B), &c), vec![cmd("deck.play", json!({"deck": "a"}))]);
+        c.now += 0.05;
+        assert_eq!(f.input(&on(1, 0x0B), &c), vec![cmd("deck.pause", json!({"deck": "a"}))]);
+        assert_eq!(f.input(&on(1, 0x58), &c), vec![cmd("deck.sync", json!({"deck": "a", "on": true}))]);
+        assert_eq!(f.input(&on(1, 0x58), &c), vec![cmd("deck.sync", json!({"deck": "a", "on": false}))]);
+        assert_eq!(f.input(&on(2, 0x54), &c), vec![cmd("deck.headphone_cue", json!({"deck": "b", "on": true}))]);
+        assert_eq!(f.input(&on(2, 0x54), &c), vec![cmd("deck.headphone_cue", json!({"deck": "b", "on": false}))]);
+        // Long after, the reported state counts again.
+        c.now += 5.0;
+        c.decks[1].state.headphone_cue = true;
+        assert_eq!(f.input(&on(2, 0x54), &c), vec![cmd("deck.headphone_cue", json!({"deck": "b", "on": false}))]);
+    }
+
+    #[test]
+    fn each_half_of_a_14_bit_control_names_its_twin_and_a_touched_platter_is_held() {
+        let f = Flx4::new();
+        assert_eq!(f.twin(&cc(1, 0x07, 1)), Some(MidiControl::Cc { ch: 0, cc: 0x27 }));
+        assert_eq!(f.twin(&cc(1, 0x27, 1)), Some(MidiControl::Cc { ch: 0, cc: 0x07 }));
+        assert_eq!(f.twin(&cc(7, 0x17, 1)), Some(MidiControl::Cc { ch: 6, cc: 0x37 }));
+        assert_eq!(f.twin(&cc(1, 0x21, 0x41)), None, "the jog is 7-bit");
+        assert_eq!(f.twin(&on(1, 0x0B)), None);
+        let mut g = Flx4::new();
+        let mut c = ctx();
+        g.input(&on(1, 0x36), &c);
+        assert!(!g.held(&c), "touched, but paused: no nudge");
+        c.decks[0].state.playing = true;
+        assert!(g.held(&c));
+        g.input(&off(1, 0x36), &c);
+        assert!(!g.held(&c));
+    }
+
+    /// "Note 11 (0x0B)" / "Note 0 / 1 (0x00 / 0x01)" / "CC 2 (0x02)": the kind and numbers.
+    fn message(cell: &str) -> Option<(bool, Vec<u8>)> {
+        let (kind, rest) = cell.split_once(' ')?;
+        let note = match kind {
+            "Note" => true,
+            "CC" => false,
+            _ => return None,
+        };
+        let dec = rest.split('(').next()?;
+        Some((note, dec.split('/').map(|n| n.trim().parse().unwrap()).collect()))
+    }
+
+    #[test]
+    fn the_led_table_matches_what_the_layout_lights_and_darkens() {
+        // (status, data 1) of every LED the doc lists, but the pads (checked through `pads`)
+        // and the one-off messages.
+        let mut doc: Vec<(u8, u8)> = Vec::new();
+        let mut one_off: Vec<(u8, u8)> = Vec::new();
+        for r in table("Outputs (LEDs)") {
+            assert_eq!(r.len(), 6, "{r:?}");
+            let Some((note, nums)) = message(&r[3]) else {
+                assert_eq!(r[0], "Performance pads", "{r:?}");
+                continue;
+            };
+            let chans: Vec<u8> = r[2].split('/').map(|c| c.trim().parse().unwrap()).collect();
+            let keys = chans.iter().flat_map(|ch| nums.iter().map(move |n| (if note { 0x90 } else { 0xB0 } | (ch - 1), *n)));
+            if r[5].starts_with("sent when") || r[5].starts_with("not sent") {
+                one_off.extend(keys);
+            } else {
+                doc.extend(keys);
+            }
+        }
+        let pad = |b: u8| (0x97..=0x9A).contains(&b);
+        let key = |m: &MidiMessage| {
+            let (b, _) = m.wire();
+            (b[0], b[1])
+        };
+        let mut c = ctx();
+        c.decks[0].state.playing = true;
+        let mut f = Flx4::new();
+        let lit: Vec<(u8, u8)> = f.lights(&c).iter().map(|l| key(&l.msg)).filter(|k| !pad(k.0)).collect();
+        let dark: Vec<(u8, u8)> = f.dark().iter().map(key).filter(|k| !pad(k.0)).collect();
+        for k in &lit {
+            assert!(doc.contains(k), "lit but not in the doc: {k:02X?}");
+        }
+        for k in &dark {
+            assert!(doc.contains(k), "darkened but not in the doc: {k:02X?}");
+        }
+        for k in &doc {
+            assert!(dark.contains(k), "in the doc but never darkened: {k:02X?}");
+        }
+        assert!(one_off.contains(&(0x9F, 0)) && one_off.contains(&(0x9F, 1)) && one_off.contains(&(0x90, 0x17)), "{one_off:02X?}");
+        let flash: Vec<(u8, u8)> = f.events(&c).iter().map(key).collect();
+        assert!(flash.iter().all(|k| one_off.contains(k)), "{flash:02X?}");
+        // The pads: every block's notes on its channel are darkened.
+        let all: Vec<(u8, u8)> = f.dark().iter().map(key).collect();
+        for (m, _, _, ch) in pads() {
+            for k in 0..8 {
+                assert!(all.contains(&(0x90 | (ch - 1), m.base() + k)));
+            }
         }
     }
 }

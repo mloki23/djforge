@@ -243,3 +243,70 @@ fn flx4_messages_never_play_the_instrument_and_midi_learn_overrides_the_layout()
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn a_learned_14_bit_knob_drives_only_its_learned_target() {
+    let (engine, _) = synth();
+    let mut ui = Ui::new();
+    let mut app = app_with_flx4(engine);
+    ui.until(&mut app, "the layout starts", |a| a.controllers.active());
+    // EQ HI turned fully up through the layout first: it has seen the knob's MSB.
+    send(&mut app, [0xB0, 0x07, 0x7F]);
+    send(&mut app, [0xB0, 0x27, 0x7F]);
+    ui.until(&mut app, "EQ HI up", |a| a.engine.deck_status.decks[0].eq_db[2] > 3.0);
+    let hi = app.engine.deck_status.decks[0].eq_db[2];
+    // Then EQ HI learned (its MSB) to the synth's volume.
+    app.run(
+        "midi.map",
+        json!({"device": FLX4, "matcher": {"type": "cc", "ch": 0, "cc": 0x07}, "target": {"kind": "track_volume", "track": "Synth"}, "pickup": false}),
+    )
+    .unwrap();
+    ui.until(&mut app, "the layout starts", |a| a.controllers.active());
+    let before = app.engine.session().track_by_name("Synth").unwrap().mixer.volume_db;
+    // The knob turned down: MSB then LSB, then the unlearned EQ MID as a marker.
+    for bytes in [[0xB0, 0x07, 0x10], [0xB0, 0x27, 0x00], [0xB0, 0x0B, 0x7F], [0xB0, 0x2B, 0x7F]] {
+        send(&mut app, bytes);
+    }
+    ui.until(&mut app, "EQ MID moves (the layout still has the unlearned knob)", |a| a.engine.deck_status.decks[0].eq_db[1] > 0.5);
+    let after = app.engine.session().track_by_name("Synth").unwrap().mixer.volume_db;
+    assert!(after < before - 3.0, "the learned target moved: {before} → {after}");
+    assert_eq!(app.engine.deck_status.decks[0].eq_db[2], hi, "the LSB of the learned knob didn't reach the layout's EQ HI");
+}
+
+/// Deck A with a track, paused, its CUE held from the controller (previewing).
+fn hold_cue(ui: &mut Ui, app: &mut SoundApp, what: &str) {
+    send(app, [0x90, 0x0C, 0x7F]);
+    ui.until(app, &format!("the CUE preview ({what})"), |a| a.engine.deck_status.decks[0].previewing);
+}
+
+#[test]
+fn a_held_cue_is_let_go_when_learn_starts_the_layout_stops_the_app_quits_or_the_controller_goes() {
+    let mut ui = Ui::new();
+    let mut app = app_with_flx4(soundcraft_engine::Engine::default());
+    let (_dir, path) = track("release");
+    app.run("deck.load", json!({"path": path, "deck": "a", "bpm": 120})).unwrap();
+    ui.until(&mut app, "deck A loaded", |a| a.engine.deck_tracks[0].is_some() && a.engine.deck_status.decks[0].load != 0 && a.controllers.active());
+    let stopped = |a: &SoundApp| !a.engine.deck_status.decks[0].previewing;
+    // MIDI Learn starts: the release would never reach the layout.
+    hold_cue(&mut ui, &mut app, "learn");
+    app.run("midi.learn", json!({"target": {"kind": "command", "id": "window.transport"}})).unwrap();
+    ui.until(&mut app, "let go when learning starts", stopped);
+    app.run("midi.learn", json!({"cancel": true})).unwrap();
+    // The layout turned off.
+    hold_cue(&mut ui, &mut app, "layout off");
+    app.run("midi.layout", json!({"name": FLX4, "on": false})).unwrap();
+    ui.until(&mut app, "let go when the layout stops", stopped);
+    app.run("midi.layout", json!({"name": FLX4, "on": true})).unwrap();
+    ui.until(&mut app, "the layout again", |a| a.controllers.active());
+    // The app quits.
+    hold_cue(&mut ui, &mut app, "quit");
+    soundcraft_ui_egui::controller_layouts::shutdown(&mut app);
+    ui.until(&mut app, "let go at quit", stopped);
+    // The controller unplugged: noticed at the next device refresh.
+    ui.until(&mut app, "the layout again", |a| a.controllers.active());
+    hold_cue(&mut ui, &mut app, "unplug");
+    assert!(app.midi_host.as_mut().unwrap().source_mut().as_fake_mut().unwrap().unplug(FLX4));
+    ui.frame(&mut app, 1.1);
+    ui.until(&mut app, "let go when the controller goes", stopped);
+    assert!(!app.controllers.active());
+}
