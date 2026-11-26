@@ -120,7 +120,7 @@ the Rust table has exactly the same messages, so keep them in step.
 | fx_on_shift | FX ON/OFF (CH1, or CH1&CH2) | — | yes | Note | 5 | 67 (0x43) | — | press | (unmapped: beat FX) |
 | fx_on_shift | FX ON/OFF (CH2) | — | yes | Note | 6 | 67 (0x43) | — | press | (unmapped: beat FX) |
 | master_level | MASTER LEVEL | — | no | CC | 7 | 8 (0x08) | 40 (0x28) | 14-bit | `deck.master_volume` (−60..0 dB, as the on-screen knob) |
-| master_cue | MASTER CUE | — | no | Note | 7 | 99 (0x63) | — | press | (unmapped: headphone routing is stage 9b task 2) |
+| master_cue | MASTER CUE | — | no | Note | 7 | 99 (0x63) | — | press | `deck.master_cue` on / off (the master joins the headphones' cue bus) |
 | master_cue_shift | MASTER CUE | — | yes | Note | 7 | 120 (0x78) | — | press | (unmapped) |
 | trim | TRIM | 1 | no | CC | 1 | 4 (0x04) | 36 (0x24) | 14-bit | `deck.trim` (as the on-screen knob, 0 dB in the centre) |
 | trim | TRIM | 2 | no | CC | 2 | 4 (0x04) | 36 (0x24) | 14-bit | `deck.trim` (as the on-screen knob, 0 dB in the centre) |
@@ -146,8 +146,8 @@ the Rust table has exactly the same messages, so keep them in step.
 | mic_level | MIC LEVEL | — | no | CC | 7 | 5 (0x05) | 37 (0x25) | 14-bit | (unmapped) |
 | smart_cfx | SMART CFX | — | no | Note | 7 | 0 (0x00) | — | press | (unmapped) |
 | smart_cfx_shift | SMART CFX | — | yes | Note | 7 | 8 (0x08) | — | press | (unmapped) |
-| headphone_mix | HEADPHONE MIX | — | no | CC | 7 | 12 (0x0C) | 44 (0x2C) | 14-bit | (unmapped: headphone routing is stage 9b task 2) |
-| headphone_level | HEADPHONE LEVEL | — | no | CC | 7 | 13 (0x0D) | 45 (0x2D) | 14-bit | (unmapped: headphone routing is stage 9b task 2) |
+| headphone_mix | HEADPHONE MIX | — | no | CC | 7 | 12 (0x0C) | 44 (0x2C) | 14-bit | `deck.headphone_mix` 0 (cue) .. 1 (master) |
+| headphone_level | HEADPHONE LEVEL | — | no | CC | 7 | 13 (0x0D) | 45 (0x2D) | 14-bit | (unmapped: the knob is taken to set the headphone amp's own level; see below) |
 | smart_fader | SMART FADER | — | no | Note | 7 | 1 (0x01) | — | press | (unmapped) |
 | smart_fader_shift | SMART FADER | — | yes | Note | 7 | 9 (0x09) | — | press | (unmapped) |
 | android_mono_stereo | Android MONO/STEREO switch (rear) | — | no | Note | 7 | 109 (0x6D) | — | STEREO 0x00, MONO 0x7F | (unmapped) |
@@ -172,9 +172,17 @@ LEVEL/DEPTH is listed with channel 6 in the "MIDI Channel" column but status byt
 (channel 5) and controllers 2 / 34. djforge reads the status byte: channel 5.
 
 FX ON/OFF: footnote \*4 of the list says the button blinks when it receives a Note On and lights
-when it receives a Note Off. The list gives it no MIDI-OUT row and djforge doesn't drive it; it
-sends it `0x00` (a Note On with velocity 0) with the other lights when the layout stops. Whether
-that darkens it or lights it is to be checked on the hardware.
+when it receives a Note Off. The list gives it no MIDI-OUT row and djforge never sends it
+anything, not even when the layout stops (a Note Off, or a Note On with velocity 0, would light
+it).
+
+Headphones: djforge plays its headphone output on the controller's outputs 3–4 (master on 1–2)
+when the device opens with 4 outputs (Setup › Playback Engine › Headphones). HEADPHONE MIX drives
+djforge's mix; HEADPHONE LEVEL is left to the hardware, on the assumption that it sets the
+headphone amplifier's level itself (mapping it too would turn the level down twice). If the
+hardware's level turns out to do nothing to the sound, map it with MIDI Learn to
+`deck.headphone_level` (to be checked on the hardware). The MASTER CUE light isn't in the list's
+outputs, so djforge doesn't drive it.
 
 The crossfader's fader-start messages (SHIFT + crossfader) are listed with channel 7 in the
 "MIDI Channel" column but status bytes `0x90` / `0x91` (channels 1 and 2) and notes 102 / 82: the
@@ -261,7 +269,7 @@ are on or off, and djforge blinks a LED by switching it.
 | SMART FADER | — | 7 | Note 1 (0x01) | off / on | off (unmapped) |
 | LOADED (track load illumination) | 1 / 2 | 16 | Note 0 / 1 (0x00 / 0x01) | 0x7F | sent when a track lands on the deck |
 | VINYL MODE (setting) | 1 / 2 | 1 / 2 | Note 23 (0x17) | off / on (default on) | not sent: the hardware keeps its default |
-| FX ON/OFF (not in the list's outputs; footnote \*4) | — | 5 / 6 | Note 71 / 67 (0x47 / 0x43) | Note On blinks, Note Off lights | not driven; `0x00` sent when the layout stops |
+| FX ON/OFF (not in the list's outputs; footnote \*4) | — | 5 / 6 | Note 71 / 67 (0x47 / 0x43) | Note On blinks, Note Off lights | not sent: djforge never drives it, not even when the layout stops |
 
 Pads, in the mode the deck is in (on both the plain and the SHIFT channel):
 

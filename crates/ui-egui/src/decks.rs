@@ -66,5 +66,6 @@ impl SoundApp {
         if let Some(p) = &self.player {
             self.engine.set_deck_status(p.decks_state());
         }
+        self.engine.headphone_output = self.player.as_ref().and_then(soundcraft_playback::Player::headphone_output);
     }
 }

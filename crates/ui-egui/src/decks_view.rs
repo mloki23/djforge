@@ -146,8 +146,8 @@ pub struct DecksView {
     pub info: [Option<Value>; 2],
     pub load_error: [Option<String>; 2],
     pub browser: Browser,
-    /// Meter levels shown: A, B, master (L, R), falling smoothly.
-    meters: [[f32; 2]; 3],
+    /// Meter levels shown: A, B, master, headphones (L, R), falling smoothly.
+    meters: [[f32; 2]; 4],
     /// Values of the controls being dragged, until the decks report them.
     held: HashMap<Id, f32>,
     /// Columns the waveforms computed (for the timing harness).
@@ -487,7 +487,7 @@ fn phase_meter(app: &SoundApp, ui: &Ui, r: Rect) {
 fn feed_meters(app: &mut SoundApp, dt: f32) {
     let st = app.engine.deck_status;
     let fall = 10f32.powf(-26.0 * dt / 20.0);
-    let levels = [st.decks[0].level, st.decks[1].level, st.master_level];
+    let levels = [st.decks[0].level, st.decks[1].level, st.master_level, st.cue_level];
     for (shown, new) in app.decks_view.meters.iter_mut().zip(levels) {
         for (s, n) in shown.iter_mut().zip(new) {
             let n = if n.is_finite() { n.max(0.0) } else { 0.0 };
@@ -1241,10 +1241,11 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     if resp.changed() {
         run(app, "deck.master_volume", json!({"db": (db * 10.0).round() / 10.0}));
     }
-    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 66.0), vec2(18.0, (body.height() - 156.0).max(40.0)));
+    let mr = Rect::from_min_size(pos2(c.center().x - 9.0, c.min.y + 66.0), vec2(18.0, (body.height() - 156.0 - PHONES_H).max(30.0)));
     let [l, rgt] = app.decks_view.meters[2];
     meter(ui, Rect::from_min_size(mr.min, vec2(8.0, mr.height())), l, l, l >= 1.0);
     meter(ui, Rect::from_min_size(pos2(mr.min.x + 10.0, mr.min.y), vec2(8.0, mr.height())), rgt, rgt, rgt >= 1.0);
+    headphones(app, ui, Rect::from_min_size(pos2(c.min.x, mr.max.y + 4.0), vec2(centre_w, PHONES_H)));
     let curve = st.decks[0].fader_curve;
     let (next, text) = match curve {
         FaderCurve::Linear => (FaderCurve::Smooth, "CH: LIN"),
@@ -1307,6 +1308,83 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     if button(ui, cr, text, false, t.accent, "Crossfader Curve", 8.5).on_hover_text("Crossfader curve: smooth (constant power) or cut").clicked() {
         run(app, "deck.xfader", json!({"curve": next.id()}));
     }
+    // Where the headphones play.
+    let status = headphone_status(app);
+    let sr = Rect::from_min_max(pos2(r.min.x, r.max.y - 13.0), r.max);
+    let g = ui.painter().layout_no_wrap(status.clone(), regular(9.0), t.text_dim);
+    ui.painter().galley(pos2(sr.center().x - g.size().x / 2.0, sr.min.y), g, t.text_dim);
+    ui.interact(sr, Id::new("decks_phones_status"), Sense::hover()).widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &status));
+}
+
+/// The headphones section's height, in the mixer's centre.
+const PHONES_H: f32 = 84.0;
+
+/// "Headphones: outputs 3-4", or why there are none.
+pub fn headphone_status(app: &SoundApp) -> String {
+    match app.player.as_ref() {
+        None => "Headphones: no audio device".into(),
+        Some(p) if p.silent => "Headphones: no output (no audio device)".into(),
+        Some(p) => match p.headphones {
+            soundcraft_playback::HeadphoneRoute::None if p.device_channels <= 2 => {
+                format!("Headphones: no output ({}-channel device)", p.device_channels)
+            }
+            soundcraft_playback::HeadphoneRoute::None => "Headphones: no output (Setup › Playback Engine)".into(),
+            soundcraft_playback::HeadphoneRoute::Split => "Headphones: split (left phones, right master)".into(),
+            r => format!("Headphones: {}", r.label()),
+        },
+    }
+}
+
+/// The headphone controls: MIX and LEVEL, MASTER CUE and the headphone meter.
+fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
+    let t = Tokens::current();
+    let st = app.engine.deck_status;
+    ui.painter().text(pos2(r.center().x, r.min.y), Align2::CENTER_TOP, "PHONES", bold(9.0), t.text_dim);
+    let ks = 26.0;
+    let ky = r.min.y + 12.0;
+    let mix = if st.headphone_mix.is_finite() { st.headphone_mix.clamp(0.0, 1.0) } else { 0.0 };
+    deck_knob(
+        app,
+        ui,
+        Rect::from_min_size(pos2(r.center().x - ks - 3.0, ky), vec2(ks, ks)),
+        "Headphone Mix",
+        mix,
+        Knob { label: "", default: 0.5, detent: Some(0.5), origin: 0.0, colour: t.accent },
+        &format!("Headphone mix: {:.0} % master (left: cue only, right: master only). Double-click: centre", mix * 100.0),
+        |app, v| run(app, "deck.headphone_mix", json!({"value": (f64::from(v) * 1000.0).round() / 1000.0})),
+    );
+    let db = st.headphone_db;
+    let travel = if db.is_finite() { (db / 40.0 + 1.0).clamp(0.0, 1.0) } else { 1.0 };
+    let shown = if db <= soundcraft_mix::HEADPHONE_DB.0 { "off".to_string() } else { format!("{db:.1} dB") };
+    deck_knob(
+        app,
+        ui,
+        Rect::from_min_size(pos2(r.center().x + 3.0, ky), vec2(ks, ks)),
+        "Headphone Level",
+        travel,
+        Knob { label: "", default: 1.0, detent: None, origin: 0.0, colour: t.text },
+        &format!("Headphone level {shown}, into its own limiter at −1 dBTP. Double-click: 0 dB"),
+        |app, v| {
+            let db = if v <= 0.0 { -60.0 } else { ((v - 1.0) * 40.0).max(-60.0) };
+            run(app, "deck.headphone_level", json!({"db": (f64::from(db) * 10.0).round() / 10.0}));
+        },
+    );
+    let br = Rect::from_center_size(pos2(r.center().x, ky + ks + 14.0), vec2(r.width() - 10.0, 20.0));
+    let on = st.master_cue;
+    if button(ui, br, "MASTER CUE", on, t.accent, "Master Cue", 8.0).on_hover_text("Master cue: the master joins the headphones' cue bus").clicked() {
+        run(app, "deck.master_cue", json!({"on": !on}));
+    }
+    let [l, rr] = app.decks_view.meters.get(3).copied().unwrap_or_default();
+    let my = br.max.y + 4.0;
+    let w = r.width() - 14.0;
+    for (k, v) in [l, rr].into_iter().enumerate() {
+        let bar = Rect::from_min_size(pos2(r.min.x + 7.0, my + k as f32 * 5.0), vec2(w, 4.0));
+        ui.painter().rect_filled(bar, 1.0, t.fader_track);
+        let lit = Rect::from_min_size(bar.min, vec2(w * v.clamp(0.0, 1.0), 4.0));
+        ui.painter().rect_filled(lit, 1.0, if v >= 0.89 { t.rec } else { t.meter_green });
+    }
+    ui.interact(Rect::from_min_size(pos2(r.min.x + 7.0, my), vec2(w, 9.0)), Id::new("decks_phones_meter"), Sense::hover())
+        .on_hover_text("Headphone output level (after its limiter)");
 }
 
 /// A knob for deck `d`'s control, sending `cmd` with what `to_params` makes of its travel.
@@ -1395,7 +1473,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     );
     y += row_h + 2.0;
     // The channel fader and meter.
-    let fh = (r.max.y - y - 26.0).max(40.0);
+    let fh = (r.max.y - y - 50.0).max(40.0);
     let fx = if d == DeckId::A { r.min.x + 12.0 } else { r.max.x - 12.0 - 36.0 };
     let id = Id::new(("decks_fader", d.id()));
     let travel = shown_value(app, id, if s.fader.is_finite() { s.fader } else { 1.0 });
@@ -1408,6 +1486,14 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     let [l, rr] = app.decks_view.meters.get(d.index()).copied().unwrap_or_default();
     meter(ui, Rect::from_min_size(pos2(mx, y), vec2(8.0, fh)), l, l, l >= 1.0);
     meter(ui, Rect::from_min_size(pos2(mx + 10.0, y), vec2(8.0, fh)), rr, rr, rr >= 1.0);
+    // The headphone CUE button, under the fader.
+    let cr = Rect::from_min_size(pos2(fx - 2.0, y + fh + 3.0), vec2(40.0, 20.0));
+    if button(ui, cr, "CUE", s.headphone_cue, t.accent, &format!("Deck {n} Headphone Cue"), 9.0)
+        .on_hover_text("Headphone cue: this channel in the headphones, pre-fader")
+        .clicked()
+    {
+        run(app, "deck.headphone_cue", json!({"deck": d.id(), "on": !s.headphone_cue}));
+    }
     // Crossfader assign.
     let ay = r.max.y - 20.0;
     let aw = 26.0;

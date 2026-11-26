@@ -419,7 +419,19 @@ fn upkeep_outputs(app: &mut SoundApp, now: f64) {
 
 /// Commands that move continuously: a refusal (no track) isn't worth the status line.
 fn quiet(id: &str) -> bool {
-    matches!(id, "deck.pitch" | "deck.jog" | "deck.fader" | "deck.xfader" | "deck.eq" | "deck.trim" | "deck.filter" | "deck.master_volume")
+    matches!(
+        id,
+        "deck.pitch"
+            | "deck.jog"
+            | "deck.fader"
+            | "deck.xfader"
+            | "deck.eq"
+            | "deck.trim"
+            | "deck.filter"
+            | "deck.master_volume"
+            | "deck.headphone_mix"
+            | "deck.headphone_level"
+    )
 }
 
 fn perform(app: &mut SoundApp, layout: &str, a: Action) {

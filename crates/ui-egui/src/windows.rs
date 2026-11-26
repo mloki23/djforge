@@ -6,8 +6,8 @@ use egui::{Color32, Sense, vec2};
 use serde_json::json;
 use soundcraft_midi_io::MidiMessage;
 use soundcraft_model::{AutomationMode, ClipContent};
-use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{AudioSystem, DeviceInfo};
+use soundcraft_playback::{AudioConfig, HeadphoneRoute};
 use std::sync::Arc;
 
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
@@ -548,6 +548,45 @@ fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices
     });
 }
 
+/// The words for a headphone route in Setup › Playback Engine.
+fn route_text(r: HeadphoneRoute) -> String {
+    match r {
+        HeadphoneRoute::None => "none".into(),
+        HeadphoneRoute::Outputs(n) => format!("{n}–{}", n.saturating_add(1)),
+        HeadphoneRoute::Split => "split (left phones, right master; mono)".into(),
+    }
+}
+
+/// Where the decks' headphones play on output device `dev`: kept per device in `cfg`.
+fn headphone_combo(ui: &mut egui::Ui, cfg: &mut AudioConfig, dev: &DeviceInfo) {
+    let default = soundcraft_playback::devices::default_headphones(&dev.name, dev.max_channels);
+    let now = cfg.headphones_for(&dev.name, dev.max_channels);
+    let mut pick = cfg.headphones.get(&dev.name).copied();
+    egui::ComboBox::from_id_salt("pe-phones")
+        .width(300.0)
+        .selected_text(pick.map_or_else(|| format!("Default ({})", route_text(default)), route_text))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut pick, None, format!("Default ({})", route_text(default)));
+            for r in HeadphoneRoute::choices(dev.max_channels) {
+                ui.selectable_value(&mut pick, Some(r), route_text(r));
+            }
+        })
+        .response
+        .on_hover_text(format!(
+            "Where the decks' headphone output plays on {} (now {}). Outputs 3–4 open the device with 4 channels; the master stays on 1–2",
+            dev.name,
+            route_text(now)
+        ));
+    match pick {
+        Some(r) => {
+            cfg.headphones.insert(dev.name.clone(), r);
+        }
+        None => {
+            cfg.headphones.remove(&dev.name);
+        }
+    }
+}
+
 fn number_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<u32>, options: &[u32], unit: &str) {
     let shown = value.map_or("Device default".to_string(), |v| format!("{v} {unit}"));
     egui::ComboBox::from_id_salt(id).width(300.0).selected_text(shown).show_ui(ui, |ui| {
@@ -602,6 +641,14 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             ui.label("Buffer size");
             let buffers = out.map(DeviceInfo::buffer_sizes).unwrap_or_else(|| soundcraft_playback::devices::STANDARD_BUFFERS.to_vec());
             number_combo(ui, "pe-buffer", &mut draft.buffer_size, &buffers, "samples");
+            ui.end_row();
+            ui.label("Headphones on outputs");
+            match out {
+                Some(dev) => headphone_combo(ui, &mut draft, dev),
+                None => {
+                    ui.label("no output device");
+                }
+            }
             ui.end_row();
         });
         ui.add_space(4.0);

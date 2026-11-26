@@ -410,3 +410,42 @@ fn decks_tab_frame_cost_with_two_ten_minute_tracks_playing() {
         cols as f64 / frames as f64
     );
 }
+
+#[test]
+fn the_headphone_controls_drive_the_cue_mix_and_say_where_the_headphones_play() {
+    let dir = Scratch::new("phones");
+    let mut h = harness(&dir.0, 10.0);
+    // The silent clock has no headphone output, and says so.
+    assert!(h.query_by_label("Headphones: no output (no audio device)").is_some());
+    assert_eq!(state(&mut h)["headphones"]["output"], Value::Null);
+    // Each channel's CUE button toggles its headphone cue.
+    click(&mut h, "Deck A Headphone Cue");
+    until(&mut h, "A cued", |s| s["decks"][0]["channel"]["headphone_cue"] == true && s["decks"][1]["channel"]["headphone_cue"] == false);
+    click(&mut h, "Deck B Headphone Cue");
+    until(&mut h, "B cued", |s| s["decks"][1]["channel"]["headphone_cue"] == true);
+    click(&mut h, "Deck A Headphone Cue");
+    until(&mut h, "A uncued", |s| s["decks"][0]["channel"]["headphone_cue"] == false);
+    // MASTER CUE toggles.
+    click(&mut h, "Master Cue");
+    until(&mut h, "master cue on", |s| s["headphones"]["master_cue"] == true);
+    click(&mut h, "Master Cue");
+    until(&mut h, "master cue off", |s| s["headphones"]["master_cue"] == false);
+    // MIX turned right goes toward the master; LEVEL turned down lowers the level.
+    drag_by(&mut h, "Headphone Mix", -60.0);
+    until(&mut h, "mix toward master", |s| s["headphones"]["mix"].as_f64().unwrap() > 0.2);
+    drag_by(&mut h, "Headphone Level", 60.0);
+    until(&mut h, "level down", |s| s["headphones"]["level_db"].as_f64().unwrap() < -3.0);
+    drag_by(&mut h, "Headphone Level", -300.0);
+    until(&mut h, "level back up to 0 dB", |s| s["headphones"]["level_db"].as_f64().unwrap() == 0.0);
+}
+
+#[test]
+fn the_headphone_route_is_kept_per_device_with_the_preferences() {
+    let mut ui = soundcraft_ui_egui::UiState::default();
+    ui.audio.headphones.insert("Speakers (DDJ-FLX4)".into(), soundcraft_playback::HeadphoneRoute::Split);
+    ui.audio.headphones.insert("MOTU".into(), soundcraft_playback::HeadphoneRoute::Outputs(5));
+    let back: soundcraft_ui_egui::UiState = serde_json::from_value(serde_json::to_value(&ui).unwrap()).unwrap();
+    assert_eq!(back.audio, ui.audio);
+    assert_eq!(back.audio.headphones_for("Speakers (DDJ-FLX4)", 4), soundcraft_playback::HeadphoneRoute::Split);
+    assert_eq!(back.audio.headphones_for("Other DDJ-FLX4", 4), soundcraft_playback::HeadphoneRoute::Outputs(3));
+}

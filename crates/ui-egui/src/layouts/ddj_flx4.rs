@@ -158,6 +158,10 @@ pub enum Ctl {
     Eq(EqBand),
     Cfx,
     HeadphoneCue,
+    /// MASTER CUE: the master joins the cue bus (toggles).
+    MasterCue,
+    /// HEADPHONE MIX: cue ↔ master.
+    HeadphoneMix,
     Fader,
     Crossfader,
     /// The browse knob, rows per click.
@@ -282,13 +286,13 @@ const SHARED: [InputDef; 31] = [
     note("fx_on_shift", None, Yes, 5, 0x43, Ctl::Unmapped),
     note("fx_on_shift", None, Yes, 6, 0x43, Ctl::Unmapped),
     wide("master_level", None, No, 7, 0x08, Ctl::MasterLevel),
-    note("master_cue", None, No, 7, 0x63, Ctl::Unmapped),
+    note("master_cue", None, No, 7, 0x63, Ctl::MasterCue),
     note("master_cue_shift", None, Yes, 7, 0x78, Ctl::Unmapped),
     wide("crossfader", None, No, 7, 0x1F, Ctl::Crossfader),
     wide("mic_level", None, No, 7, 0x05, Ctl::Unmapped),
     note("smart_cfx", None, No, 7, 0x00, Ctl::Unmapped),
     note("smart_cfx_shift", None, Yes, 7, 0x08, Ctl::Unmapped),
-    wide("headphone_mix", None, No, 7, 0x0C, Ctl::Unmapped),
+    wide("headphone_mix", None, No, 7, 0x0C, Ctl::HeadphoneMix),
     wide("headphone_level", None, No, 7, 0x0D, Ctl::Unmapped),
     note("smart_fader", None, No, 7, 0x01, Ctl::Unmapped),
     note("smart_fader_shift", None, Yes, 7, 0x09, Ctl::Unmapped),
@@ -582,6 +586,12 @@ impl Flx4 {
                     let t = unit(v);
                     let db = if t <= 0.0 { -60.0 } else { ((t - 1.0) * 40.0).max(-60.0) };
                     out.push(Action::Run("deck.master_volume", json!({"db": round(db, 1)})));
+                }
+            }
+            Ctl::MasterCue if press => out.push(Action::Run("deck.master_cue", json!({}))),
+            Ctl::HeadphoneMix => {
+                if let Some(v) = wide {
+                    out.push(Action::Run("deck.headphone_mix", json!({"value": round(unit(v), 3)})));
                 }
             }
             Ctl::Crossfader => {
@@ -919,12 +929,8 @@ impl Controller for Flx4 {
         }
         out.push(note_on(7, 0x00, false));
         out.push(note_on(7, 0x01, false));
-        // FX ON/OFF isn't driven, but goes dark too (see the doc's footnote *4).
-        for ch1 in [5, 6] {
-            for n in [0x47, 0x43] {
-                out.push(note_on(ch1, n, false));
-            }
-        }
+        // Not FX ON/OFF: djforge never drives it, and it lights on a Note Off (the doc's
+        // footnote *4).
         out
     }
 }
@@ -1130,6 +1136,13 @@ mod tests {
         let mut cued = c;
         cued.decks[0].state.headphone_cue = true;
         assert_eq!(f.input(&on(1, 0x54), &cued), vec![cmd("deck.headphone_cue", json!({"deck": "a", "on": false}))]);
+        // MASTER CUE toggles (from what the decks report); HEADPHONE MIX sets the mix, LEVEL is
+        // the hardware's own.
+        assert_eq!(f.input(&on(7, 0x63), &c), vec![cmd("deck.master_cue", json!({}))]);
+        assert!(f.input(&off(7, 0x63), &c).is_empty());
+        assert_eq!(wide(&mut f, &c, 7, 0x0C, 16383), vec![cmd("deck.headphone_mix", json!({"value": 1.0}))]);
+        assert_eq!(wide(&mut f, &c, 7, 0x0C, 0), vec![cmd("deck.headphone_mix", json!({"value": 0.0}))]);
+        assert!(wide(&mut f, &c, 7, 0x0D, 8192).is_empty() && f.claims(&cc(7, 0x0D, 0)), "HEADPHONE LEVEL is claimed, unmapped");
         // Browse: two's complement clicks, SHIFT pages by 8; press and LOAD.
         assert_eq!(f.input(&cc(7, 0x40, 0x01), &c), vec![Action::Browse(1)]);
         assert_eq!(f.input(&cc(7, 0x40, 0x7E), &c), vec![Action::Browse(-2)]);
@@ -1455,6 +1468,10 @@ mod tests {
         }
         for k in &doc {
             assert!(dark.contains(k), "in the doc but never darkened: {k:02X?}");
+        }
+        // FX ON/OFF lights on a Note Off: never sent, not even at the end.
+        for k in [(0x94, 0x47), (0x95, 0x47), (0x94, 0x43), (0x95, 0x43)] {
+            assert!(one_off.contains(&k) && !dark.contains(&k) && !lit.contains(&k), "{k:02X?}");
         }
         assert!(one_off.contains(&(0x9F, 0)) && one_off.contains(&(0x9F, 1)) && one_off.contains(&(0x90, 0x17)), "{one_off:02X?}");
         let flash: Vec<(u8, u8)> = f.events(&c).iter().map(key).collect();
