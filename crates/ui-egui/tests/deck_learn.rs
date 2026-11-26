@@ -138,7 +138,12 @@ fn each_kind_of_deck_mixer_and_library_control_learns_from_the_decks_tab() {
     let cases: Vec<(&str, Vec<&str>, Value, Vec<MidiMessage>)> = vec![
         ("Deck A Cue", vec!["Learn MIDI"], json!({"kind": "deck", "deck": "a", "control": "cue"}), vec![on(36), off(36)]),
         ("Deck B Play", vec!["Learn MIDI"], json!({"kind": "deck", "deck": "b", "control": "play"}), vec![on(37)]),
-        ("Deck A Hot Cue C", vec!["Learn MIDI for Clear"], json!({"kind": "deck", "deck": "a", "control": "hot_cue_clear", "n": 3}), vec![on(38)]),
+        (
+            "Deck A Hot Cue C",
+            vec!["Learn MIDI for Clear Hot Cue C"],
+            json!({"kind": "deck", "deck": "a", "control": "hot_cue_clear", "n": 3}),
+            vec![on(38)],
+        ),
         ("Deck B Hot Cue H", vec!["Learn MIDI"], json!({"kind": "deck", "deck": "b", "control": "hot_cue", "n": 8}), vec![on(39)]),
         ("Deck A Loop Exit", vec!["Learn MIDI"], json!({"kind": "deck", "deck": "a", "control": "reloop"}), vec![on(40)]),
         ("Deck B Beat Jump Forward", vec!["Learn MIDI"], json!({"kind": "deck", "deck": "b", "control": "jump_forward"}), vec![on(41)]),
@@ -241,8 +246,10 @@ fn learned_cue_and_hot_cue_play_the_deck_and_let_go_on_learn_quit_and_unplug() {
     let mut ui = Ui::new();
     let mut app = app(engine);
     let (_dir, path) = track("hold");
-    app.run("deck.load", json!({"path": path, "deck": "a", "bpm": 120})).unwrap();
-    ui.until(&mut app, "deck A loaded", |a| a.engine.deck_tracks[0].is_some() && a.engine.deck_status.decks[0].load != 0);
+    for d in ["a", "b"] {
+        app.run("deck.load", json!({"path": path, "deck": d, "bpm": 120})).unwrap();
+    }
+    ui.until(&mut app, "both decks loaded", |a| (0..2).all(|i| a.engine.deck_tracks[i].is_some() && a.engine.deck_status.decks[i].load != 0));
     map(&mut app, PADS, json!({"type": "note", "ch": 0, "note": 36}), json!({"kind": "deck", "deck": "a", "control": "cue"}));
     map(&mut app, PADS, json!({"type": "note", "ch": 0, "note": 37}), json!({"kind": "deck", "deck": "a", "control": "hot_cue", "n": 1}));
     ui.frame(&mut app, 0.02);
@@ -278,12 +285,21 @@ fn learned_cue_and_hot_cue_play_the_deck_and_let_go_on_learn_quit_and_unplug() {
     ui.until(&mut app, "let go at quit", stopped);
     inject(&mut app, PADS, off(37));
     // Held, then the device is unplugged (noticed at the next device refresh): its release
-    // never comes, so the hold is let go.
+    // never comes, so the hold is let go; Deck B's CUE, held from the other device, stays.
+    map(&mut app, FLX4, json!({"type": "note", "ch": 1, "note": 0x0C}), json!({"kind": "deck", "deck": "b", "control": "cue"}));
     inject(&mut app, PADS, on(36));
-    ui.until(&mut app, "held (unplug)", previewing);
+    inject(&mut app, FLX4, MidiMessage::NoteOn { ch: 1, note: 0x0C, vel: 0x7F });
+    ui.until(&mut app, "held (unplug)", |a| previewing(a) && a.engine.deck_status.decks[1].previewing);
     assert!(app.midi_host.as_mut().unwrap().source_mut().as_fake_mut().unwrap().unplug(PADS));
     ui.frame(&mut app, 1.1);
     ui.until(&mut app, "let go when the device goes", stopped);
+    for _ in 0..10 {
+        ui.frame(&mut app, 0.02);
+    }
+    assert!(app.engine.deck_status.decks[1].previewing, "the other device's hold stays");
+    // Removing its mapping lets go of what it holds.
+    app.run("midi.unmap", json!({"target": {"kind": "deck", "deck": "b", "control": "cue"}})).unwrap();
+    ui.until(&mut app, "let go when its mapping goes", |a| !a.engine.deck_status.decks[1].previewing);
 }
 
 #[test]

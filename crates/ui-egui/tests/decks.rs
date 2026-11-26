@@ -15,8 +15,9 @@ impl Drop for Scratch {
     }
 }
 
-fn app() -> (SoundApp, Scratch, String) {
-    let dir = std::env::temp_dir().join(format!("djforge-ui-decks-{}", std::process::id()));
+fn app(tag: &str) -> (SoundApp, Scratch, String) {
+    // Its own folder per test: tests run in parallel.
+    let dir = std::env::temp_dir().join(format!("djforge-ui-decks-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.1; 8 * 48_000]; 2] };
@@ -42,7 +43,7 @@ fn until(app: &mut SoundApp, done: impl Fn(&SoundApp, &Value) -> bool) -> Value 
 
 #[test]
 fn a_deck_starting_stops_the_half_speed_arrangement_and_plays_at_its_own_rate() {
-    let (mut app, _dir, path) = app();
+    let (mut app, _dir, path) = app("half-speed");
     app.engine.execute("deck.load", &json!({"path": path, "deck": "a", "bpm": 120})).unwrap();
     let st = until(&mut app, |_, s| {
         s["decks"][0]["track"].is_object() && s["decks"][0]["position"].as_f64() == Some(0.0) && !s["decks"][0]["loading"].as_bool().unwrap()
@@ -65,7 +66,7 @@ fn a_deck_starting_stops_the_half_speed_arrangement_and_plays_at_its_own_rate() 
 }
 
 #[test]
-fn the_deck_search_entries_run_real_commands_with_valid_parameters() {
+fn every_deck_search_entry_runs_on_loaded_decks() {
     let palette = soundcraft_ui_egui::decks::palette();
     for (label, id, params) in &palette {
         let spec = soundcraft_engine::find_command(id).unwrap_or_else(|| panic!("{label}: {id} is not a command"));
@@ -75,6 +76,18 @@ fn the_deck_search_entries_run_real_commands_with_valid_parameters() {
     assert!(palette.iter().filter(|e| e.1 == "deck.jog").all(|e| e.2["mode"] == "search"), "no nudge from Search: it would bend for a moment only");
     assert!(palette.iter().any(|e| e.1 == "deck.cue" && e.2["tap"] == true), "the cue is a tap");
     assert!(!palette.iter().any(|e| e.1 == "deck.hotcue" && e.2["action"] == "jump"), "no jump: stopped, it would play until a release");
+    // Each entry with parameters runs on loaded decks (the ones without open a dialog).
+    let (mut app, _dir, path) = app("search");
+    for d in ["a", "b"] {
+        app.engine.execute("deck.load", &json!({"path": path, "deck": d, "bpm": 120})).unwrap();
+    }
+    until(&mut app, |_, s| (0..2).all(|i| s["decks"][i]["track"].is_object() && !s["decks"][i]["loading"].as_bool().unwrap_or(true)));
+    for (label, id, params) in palette.iter().filter(|e| !e.2.is_null()) {
+        if let Err(e) = app.run(id, params.clone()) {
+            panic!("{label}: {id} {params}: {e}");
+        }
+        app.handle_transport(0.01);
+    }
     let mut labels: Vec<&String> = palette.iter().map(|e| &e.0).collect();
     labels.sort();
     let n = labels.len();

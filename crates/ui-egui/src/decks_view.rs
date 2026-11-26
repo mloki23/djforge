@@ -581,10 +581,12 @@ fn dropped(ui: &Ui, r: Rect) -> Option<String> {
 /// The jog disc dragged: a nudge as strong as the drag is fast while the deck is heard, else a
 /// search of a beat per [`JOG_PX`] points (none lost to a fast flick).
 fn jog_drag(app: &mut SoundApp, ui: &Ui, resp: &Response, d: DeckId, s: &DeckState) {
-    if !resp.dragged() {
+    // Held down on the disc: from the first movement, not after a click's drag threshold (its
+    // sense takes clicks too, for the right-click menu).
+    if !(resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down())) {
         return;
     }
-    let dx = resp.drag_delta().x;
+    let dx = ui.input(|i| i.pointer.delta().x);
     if dx.abs() < 0.5 {
         return;
     }
@@ -1083,21 +1085,22 @@ fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot:
     let resp = resp.on_hover_text(tip);
     // The right-click menu: Clear, and MIDI Learn of the pad and of its clear.
     let n = u8::try_from(slot + 1).unwrap_or(1);
-    let targets = [(deck_target(d, DeckControl::HotCue { n }), ""), (deck_target(d, DeckControl::HotCueClear { n }), "Clear")];
+    let clear = format!("Clear Hot Cue {letter}");
+    let targets = [(deck_target(d, DeckControl::HotCue { n }), ""), (deck_target(d, DeckControl::HotCueClear { n }), clear.as_str())];
     if let Some(l) = &app.midi_learn.learning
         && targets.iter().any(|(t, _)| t == l)
     {
         ui.painter().rect_stroke(r.expand(2.0), 4.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Outside);
     }
     resp.context_menu(|ui| {
-        if set && track.is_some() && ui.button("Clear Hot Cue").clicked() {
-            run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "clear"}));
-            ui.close();
-        }
+        learn_menu(app, ui, &targets);
         if set && track.is_some() {
             ui.separator();
+            if ui.button(&clear).clicked() {
+                run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "clear"}));
+                ui.close();
+            }
         }
-        learn_menu(app, ui, &targets);
     });
     if track.is_none() {
         return;

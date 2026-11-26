@@ -575,6 +575,7 @@ mod config_tests {
                 sensitivity: 0.01,
                 pickup: false,
                 lsb: None,
+                invert: false,
             },
             Mapping {
                 device: device.clone(),
@@ -584,6 +585,7 @@ mod config_tests {
                 sensitivity: 0.05,
                 pickup: true,
                 lsb: None,
+                invert: false,
             },
             // A deck control, 14-bit.
             Mapping {
@@ -591,6 +593,7 @@ mod config_tests {
                 matcher: Matcher::Cc { ch: 0, cc: 0 },
                 target: serde_json::from_value(serde_json::json!({"kind": "deck", "deck": "b", "control": "pitch"})).unwrap(),
                 lsb: Some(32),
+                invert: true,
                 ..Mapping::default()
             },
             Mapping {
