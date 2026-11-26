@@ -97,6 +97,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "deck.fader", "Deck Channel Fader", [], None, "{deck: a|b, value?: 0..=1, curve?: linear|smooth|sharp} — the channel fader and its curve", always, |e, p| mixer(e, p, "deck.fader")),
         cmd!(noundo "deck.xfader", "Crossfader", [], None, "{value?: -1 (A)..=1 (B), curve?: smooth|sharp} — the crossfader: smooth is constant power, sharp cuts at the ends", always, |e, p| mixer(e, p, "deck.xfader")),
         cmd!(noundo "deck.assign", "Deck Crossfader Assign", [], None, "{deck: a|b, side: a|b|thru} — which side of the crossfader the deck plays through (thru: always heard)", always, |e, p| mixer(e, p, "deck.assign")),
+        cmd!(
+            noundo "deck.headphone_cue",
+            "Deck Headphone Cue",
+            [],
+            None,
+            "{deck: a|b, on?: bool (default: toggles)} — the channel's headphone CUE button (the headphone output, once set up, plays the cued decks pre-fader). Reported as `channel.headphone_cue` in decks.state",
+            always,
+            |e, p| mixer(e, p, "deck.headphone_cue")
+        ),
         cmd!(noundo "deck.master_volume", "Deck Master Volume", [], None, "{db: -60..=0} — the decks' master volume, into the Maximizer at -1 dBTP and the master bus", always, |e, p| mixer(e, p, "deck.master_volume")),
         cmd!(noundo "deck.quantise", "Deck Quantise", [], None, "{on: bool} — quantise for cues, hot cues and loops (on by default)", always, |e, p| mixer(e, p, "deck.quantise")),
         cmd!(
@@ -332,6 +341,11 @@ fn mixer(e: &mut Engine, p: &Value, cmd: &str) -> Result<Value> {
             deck: deck_param(cmd, p)?,
             side: str_param(p, "side").and_then(XfadeSide::parse).ok_or_else(|| bad(cmd, "`side` must be a, b or thru"))?,
         },
+        "deck.headphone_cue" => {
+            let deck = deck_param(cmd, p)?;
+            let now = e.deck_status.decks.get(deck.index()).is_some_and(|s| s.headphone_cue);
+            DeckCmd::HeadphoneCue { deck, on: bool_param(cmd, p, "on", Some(!now))? }
+        }
         "deck.master_volume" => DeckCmd::Master { db: need_num(cmd, p, "db", -60.0..=0.0)? as f32 },
         "deck.quantise" => DeckCmd::Quantise(bool_param(cmd, p, "on", None)?),
         _ => return Err(bad(cmd, "not a deck mixer command")),
@@ -698,7 +712,7 @@ fn state(e: &mut Engine, _: &Value) -> Result<Value> {
                 "cue": secs(s.cue), "hot_cues": hot,
                 "loop": {"in": s.loop_in.map(secs), "out": s.loop_out.map(secs), "on": s.loop_on},
                 "level": s.level,
-                "channel": {"trim_db": s.trim_db, "eq_db": s.eq_db, "filter": s.filter, "fader": s.fader, "curve": s.fader_curve.id(), "side": s.side.id()},
+                "channel": {"trim_db": s.trim_db, "eq_db": s.eq_db, "filter": s.filter, "fader": s.fader, "curve": s.fader_curve.id(), "side": s.side.id(), "headphone_cue": s.headphone_cue},
             })
         })
         .collect();

@@ -578,3 +578,17 @@ fn another_decoders_last_bits_keep_the_cues() {
     assert_ne!(after["fp"], before["fp"], "the hash was brought up to date");
     assert_eq!((after["cues"].clone(), after.get("previous")), (json!({"1": 1.5}), None), "nothing demoted");
 }
+
+#[test]
+fn the_headphone_cue_button_toggles_from_what_the_deck_reports_or_takes_a_state() {
+    let mut e = engine();
+    // No track needed: it is a mixer button.
+    run(&mut e, "deck.headphone_cue", json!({"deck": "b"}));
+    assert_eq!(deck_cmds(&mut e), vec![DeckCmd::HeadphoneCue { deck: DeckId::B, on: true }]);
+    e.deck_status.decks[1].headphone_cue = true;
+    run(&mut e, "deck.headphone_cue", json!({"deck": "b"}));
+    run(&mut e, "deck.headphone_cue", json!({"deck": "a", "on": true}));
+    assert_eq!(deck_cmds(&mut e), vec![DeckCmd::HeadphoneCue { deck: DeckId::B, on: false }, DeckCmd::HeadphoneCue { deck: DeckId::A, on: true }]);
+    assert_eq!(run(&mut e, "decks.state", json!({}))["decks"][1]["channel"]["headphone_cue"], true);
+    assert!(err(&mut e, "deck.headphone_cue", json!({"deck": "a", "on": 1})).contains("`on`"));
+}

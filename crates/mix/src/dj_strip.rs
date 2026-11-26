@@ -317,6 +317,9 @@ pub struct DjStrip {
     pub fader: f32,
     pub curve: FaderCurve,
     pub side: XfadeSide,
+    /// The headphone CUE button: the channel is sent to the headphones (pre-fader). Kept here;
+    /// the cue mix itself is the headphone output's.
+    pub headphone_cue: bool,
     xo: [Crossover; 2],
     filt: [[Svf; 2]; 2],
     /// The filter's kind last designed (a change of kind resets its state).
@@ -343,6 +346,7 @@ impl DjStrip {
             fader: 1.0,
             curve: FaderCurve::Linear,
             side,
+            headphone_cue: false,
             xo: [Crossover::new(sr); 2],
             filt: [[Svf::default(); 2]; 2],
             filt_kind: None,

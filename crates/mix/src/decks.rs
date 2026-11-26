@@ -730,6 +730,11 @@ pub enum DeckCmd {
         deck: DeckId,
         side: XfadeSide,
     },
+    /// The channel's headphone CUE button on or off.
+    HeadphoneCue {
+        deck: DeckId,
+        on: bool,
+    },
     /// Master volume (dB, at most 0).
     Master {
         db: f32,
@@ -777,6 +782,8 @@ pub struct DeckState {
     pub fader: f32,
     pub fader_curve: FaderCurve,
     pub side: XfadeSide,
+    /// The channel's headphone CUE button.
+    pub headphone_cue: bool,
 }
 
 /// The decks and the mixer, as published for the UI.
@@ -840,7 +847,8 @@ impl DecksState {
                 | u64::from(d.master) << 4
                 | u64::from(d.loop_on) << 5
                 | fader_code(d.fader_curve) << 6
-                | d.side.code() << 8;
+                | d.side.code() << 8
+                | u64::from(d.headphone_cue) << 10;
             for v in
                 [d.load, flags, d.position.to_bits(), d.rate.to_bits(), d.pitch.to_bits(), d.range.to_bits(), d.bpm.to_bits(), opt(d.phase_error)]
             {
@@ -891,6 +899,7 @@ impl DecksState {
                 _ => FaderCurve::Linear,
             };
             d.side = XfadeSide::from_code((flags >> 8) & 3);
+            d.headphone_cue = flags & (1 << 10) != 0;
             d.position = f64::from_bits(get());
             d.rate = f64::from_bits(get());
             d.pitch = f64::from_bits(get());
@@ -2003,6 +2012,11 @@ impl Decks {
                     s.side = side;
                 }
             }
+            DeckCmd::HeadphoneCue { deck, on } => {
+                if let Some(s) = self.strip(deck) {
+                    s.headphone_cue = on;
+                }
+            }
             DeckCmd::Master { db } => {
                 if db.is_finite() {
                     self.master_db = db.clamp(-60.0, 0.0);
@@ -2255,6 +2269,7 @@ impl Decks {
                 fader: s.fader,
                 fader_curve: s.curve,
                 side: s.side,
+                headphone_cue: s.headphone_cue,
                 ..d.state(self.sr)
             };
         }
@@ -2968,6 +2983,18 @@ mod tests {
         assert!(!d.state().decks[0].playing);
         assert_eq!(d.take_retired().map(|r| r.load()), Some(id_a));
         assert!(d.take_retired().is_none());
+    }
+
+    #[test]
+    fn the_headphone_cue_buttons_are_kept_and_published() {
+        let mut d = decks();
+        assert!(!d.state().decks[0].headphone_cue);
+        d.apply(DeckCmd::HeadphoneCue { deck: DeckId::B, on: true });
+        let st = d.state();
+        assert!(!st.decks[0].headphone_cue && st.decks[1].headphone_cue);
+        assert_eq!(DecksState::decode(&st.encode()), st, "survives the lock-free publishing");
+        d.apply(DeckCmd::HeadphoneCue { deck: DeckId::B, on: false });
+        assert!(!d.state().decks[1].headphone_cue);
     }
 
     #[test]
