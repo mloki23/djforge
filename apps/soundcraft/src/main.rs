@@ -90,6 +90,9 @@ impl eframe::App for App {
         self.0.guarded(|app| app.ui(ui));
     }
     fn on_exit(&mut self) {
+        // The controller's lights go out (queued to the MIDI output thread, sent before it ends).
+        soundcraft_ui_egui::controller_layouts::shutdown(&mut self.0);
+        self.0.midi_host = None;
         self.0.close_autosave();
         save_prefs(&self.0.ui);
         if let Some(logger) = self.1 {

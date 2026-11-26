@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-11-11 · **Last updated:** 2026-11-11 · **Change:** minor (stage 7b: MIDI input, live play, recording, MIDI learn; review fixes: a device on another USB port keeps its settings, the input filter applies to takes) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-11-26 · **Last updated:** 2026-11-26 · **Change:** minor (stage 9b: MIDI output ports; a built-in Pioneer DDJ-FLX4 layout with LED feedback) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
 SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal), `crates/midi-io`
@@ -33,7 +33,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 | Feature | Pro Tools | SoundCraft (all platforms) |
 |---|---|---|
 | MIDI input devices (keyboards, pads) | ✅ | ✅ live play to the target instrument, recording into the arrangement and slots; Setup › MIDI › MIDI Input Devices enables ports, shows activity and the last messages, reconnects, and reopens replugged ports |
-| MIDI output to external gear | ✅ | ❌ |
+| MIDI output to external gear | ✅ | 🟡 output ports (a non-blocking sender thread) drive a controller's lights; no notes or clock to external gear yet |
 | MIDI Thru, input filter | ✅ | 🟡 the input filter leaves its kinds out of takes (live play unfiltered); no Thru |
 | MIDI Beat Clock out, MTC generate/chase | ✅ | ❌ |
 | MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ✅ MIDI learn: notes and controllers to slots, scenes, faders, pans, stems, parameters and commands (Setup › MIDI › MIDI Mappings) |
@@ -46,7 +46,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 | EUCON (S1/S3/S4/S6, Dock, Control app) | ✅ | ❌ Avid-proprietary SDK; owner decision |
 | HUI | ✅ | ❌ |
 | Mackie Control Universal | ✅ (via HUI emulation and personalities) | ❌ |
-| Generic MIDI controller personalities | ✅ | 🟡 any controller through MIDI learn; no ready-made personalities |
+| Generic MIDI controller personalities | ✅ | 🟡 any controller through MIDI learn; a built-in Pioneer DDJ-FLX4 layout for the live decks (transport, jog, tempo, pads, loops, mixer, browse/load) with its LEDs and level meters, from Pioneer's MIDI message list (`docs/hardware/ddj-flx4.md`) |
 
 ## Sync and video hardware
 
@@ -73,6 +73,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-26 | minor | Stage 9b: MIDI output ports and a built-in DDJ-FLX4 layout with LED feedback |
 | 2026-11-11 | minor | Stage 7b review fixes: a device on another USB port keeps its settings; the input filter applies to takes |
 | 2026-11-11 | major | MIDI input (stage 7b): live play, keyboard Play mode, recording, MIDI learn, and MIDI Devices with reconnect; MIDI out, Thru and clock out still missing |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |

@@ -73,6 +73,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("midi.inputs", "MIDI Inputs", "", None),
     ("midi.input_enable", "Enable MIDI Input", "", None),
     ("midi.reconnect", "Reconnect MIDI Input", "", None),
+    ("midi.layout", "Built-in Controller Layout", "", None),
     ("midi.move_settings", "Move MIDI Input Settings", "", None),
     ("midi.target", "Live MIDI Target", "", None),
     ("midi.panic", "Live MIDI Panic", "", None),

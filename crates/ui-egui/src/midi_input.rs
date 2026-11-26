@@ -24,7 +24,7 @@
 
 use crate::SoundApp;
 use serde_json::{Value, json};
-use soundcraft_midi_io::{MidiEvent, MidiMessage, MidiSource, PortChange, PortId, PortInfo, Subscriber};
+use soundcraft_midi_io::{MidiEvent, MidiMessage, MidiOutputs, MidiSource, PortChange, PortId, PortInfo, Subscriber};
 use soundcraft_model::{Session, Track, TrackId, TrackKind};
 use soundcraft_playback::Player;
 
@@ -105,7 +105,17 @@ pub fn system_host() -> Option<MidiHost> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         match soundcraft_midi_io::MidiInputs::new(soundcraft_midi_io::MidiClock::new()) {
-            Ok(m) => Some(MidiHost::new(Box::new(m))),
+            Ok(m) => {
+                let host = MidiHost::new(Box::new(m));
+                // Outputs light controllers (the built-in layouts); inputs work without them.
+                Some(match soundcraft_midi_io::SystemOutputs::new() {
+                    Ok(o) => host.with_outputs(Box::new(o)),
+                    Err(e) => {
+                        log::warn!("no MIDI output: {e}");
+                        host
+                    }
+                })
+            }
             Err(e) => {
                 log::warn!("no MIDI input: {e}");
                 None
@@ -121,6 +131,8 @@ pub fn system_host() -> Option<MidiHost> {
 /// The MIDI input devices and their upkeep (see the module docs).
 pub struct MidiHost {
     source: Box<dyn MidiSource>,
+    /// The output ports (controller lights), when the system has them.
+    outputs: Option<Box<dyn MidiOutputs>>,
     /// When the device list was last refreshed (UI time, seconds); `None` before the first frame.
     last_refresh: Option<f64>,
     /// The UI thread's own queue of every event, for MIDI learn and mapped controls
@@ -210,6 +222,7 @@ impl MidiHost {
     pub fn new(source: Box<dyn MidiSource>) -> MidiHost {
         MidiHost {
             source,
+            outputs: None,
             last_refresh: None,
             control: None,
             opened: Vec::new(),
@@ -225,6 +238,44 @@ impl MidiHost {
             subscribe_waits: false,
             subscribe_logged: false,
         }
+    }
+
+    /// With MIDI outputs (for controller lights).
+    pub fn with_outputs(mut self, outputs: Box<dyn MidiOutputs>) -> MidiHost {
+        self.outputs = Some(outputs);
+        self
+    }
+
+    /// The output ports, if any.
+    pub fn outputs(&self) -> Option<&dyn MidiOutputs> {
+        self.outputs.as_deref()
+    }
+
+    /// The output ports, for opening, sending and tests.
+    pub fn outputs_mut(&mut self) -> Option<&mut (dyn MidiOutputs + 'static)> {
+        self.outputs.as_deref_mut()
+    }
+
+    /// Whether the input `id` is open now (ids outlive a close).
+    pub fn input_open(&self, id: PortId) -> bool {
+        self.source.port_name(id).is_some_and(|n| self.source.is_open(n))
+    }
+
+    /// The output port that is the other half of input `id`'s device: the output with the same
+    /// raw name and backend id, else the one with the same raw name at the same position among
+    /// the ports of that name (the second "X" input pairs with the second "X" output). On
+    /// Windows a controller's input and output are listed under one name with different backend
+    /// ids. Lists the devices (a backend client): not every frame.
+    pub fn paired_output(&self, id: PortId) -> Option<PortInfo> {
+        let outputs = self.outputs.as_ref()?;
+        let (raw, backend) = (self.source.raw_name(id)?, self.source.backend_id(id)?);
+        let listed = outputs.list();
+        let same: Vec<&PortInfo> = listed.iter().filter(|p| p.raw_name == raw).collect();
+        if let Some(p) = same.iter().find(|p| p.backend_id == backend) {
+            return Some((*p).clone());
+        }
+        let nth = self.source.list().iter().filter(|p| p.raw_name == raw).position(|p| p.backend_id == backend)?;
+        same.get(nth).map(|p| (*p).clone())
     }
 
     /// The events that arrived since the last call, oldest first (subscribing on the first call:
@@ -617,6 +668,9 @@ pub fn params_doc(id: &str) -> Option<&'static str> {
             "{name} — closes the listed input and opens it again (a device replugged between two listings can keep a silent connection)"
         }
         "midi.target" => "{track?: id | name | null}",
+        "midi.layout" => {
+            "{name, on?: bool (default: toggles)} — turns the listed input's built-in controller layout (DDJ-FLX4) on or off; kept per device in the preferences. `midi.inputs` shows each port's `layout`: {name, on, output}"
+        }
         "window.midi_devices" => "{value?: bool}",
         "ui.theme" => "{mode?: dark | light | system | classic} — dark is djforge Dark, classic SoundCraft Classic; without mode, reports {mode}",
         "ui.waveform_bands" => {
@@ -765,6 +819,11 @@ pub fn status(app: &SoundApp, now: f64) -> Value {
 
 /// The mappings of a device that moved to a new port follow it (the enabled input already has).
 fn settings_moved(app: &mut SoundApp, m: &Moved) {
+    for x in &mut app.ui.midi_layouts_off {
+        if x.raw_name == m.raw_name && x.backend_id == m.from {
+            (x.backend_id, x.name) = (m.to.clone(), m.name.clone());
+        }
+    }
     for x in &mut app.ui.midi_mappings {
         if x.device.raw_name == m.raw_name && x.device.backend_id == m.from {
             (x.device.backend_id, x.device.name) = (m.to.clone(), m.name.clone());
@@ -811,7 +870,12 @@ pub fn frame(app: &mut SoundApp, now: f64) {
 pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     Some(match id {
         "midi.inputs" => {
-            let ports = app.midi_host.as_ref().map(|h| h.inputs(&app.ui.midi_inputs)).unwrap_or_default();
+            let mut ports = app.midi_host.as_ref().map(|h| h.inputs(&app.ui.midi_inputs)).unwrap_or_default();
+            for port in &mut ports {
+                let (raw, backend) =
+                    (port["raw_name"].as_str().unwrap_or_default().to_string(), port["backend_id"].as_str().unwrap_or_default().to_string());
+                port["layout"] = crate::controller_layouts::describe(app, &raw, &backend).unwrap_or(Value::Null);
+            }
             let mut v = status(app, app.midi_learn.now);
             v["ports"] = Value::Array(ports);
             // The player's figure, as before.
@@ -858,6 +922,7 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             Ok(json!({"override": app.midi_target.map(|t| t.0), "target": target.map(|t| t.0)}))
         })(),
         "midi.recover_take" => crate::midi_record::recover(app, p),
+        "midi.layout" => crate::controller_layouts::command(app, p),
         "midi.move_settings" => (|| {
             let raw = p.get("raw_name").and_then(Value::as_str).ok_or("`raw_name` required")?;
             let from = p.get("backend_id").and_then(Value::as_str).ok_or("`backend_id` (the enabled input's old one) required")?;

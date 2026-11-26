@@ -7,6 +7,7 @@
 pub mod band_jobs;
 pub mod bounce;
 pub mod control;
+pub mod controller_layouts;
 pub mod credits;
 pub mod deck_wave;
 pub mod decks;
@@ -20,6 +21,7 @@ pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
 pub mod knob;
+pub mod layouts;
 pub mod library_browser;
 mod live_transport;
 pub mod menus;
@@ -246,6 +248,9 @@ pub struct UiState {
     pub midi_mappings_backup: Vec<midi_learn::Mapping>,
     /// Setup › MIDI › MIDI Mappings.
     pub show_midi_mappings: bool,
+    /// Devices whose built-in controller layout is turned off (`midi.layout`); a recognised
+    /// device uses its layout unless listed here.
+    pub midi_layouts_off: Vec<midi_input::MidiInputPref>,
 }
 
 impl Default for UiState {
@@ -313,6 +318,7 @@ impl Default for UiState {
             midi_mappings: Vec::new(),
             midi_mappings_backup: Vec::new(),
             show_midi_mappings: false,
+            midi_layouts_off: Vec::new(),
             waveform_bands: None,
             deck_colours: None,
             agents: false,
@@ -441,6 +447,8 @@ pub struct SoundApp {
     pub midi_target: Option<TrackId>,
     /// MIDI learn and the mapped controls' state (see [`midi_learn`]).
     pub midi_learn: midi_learn::LearnState,
+    /// The MIDI devices using a built-in controller layout (see [`controller_layouts`]).
+    pub controllers: controller_layouts::Controllers,
     /// The live MIDI the target plays, captured for recording (see [`midi_record`]).
     pub midi_capture: Option<soundcraft_playback::MidiCapture>,
     /// The arrangement MIDI take being recorded.
@@ -581,6 +589,7 @@ impl SoundApp {
             midi_host: None,
             midi_target: None,
             midi_learn: midi_learn::LearnState::default(),
+            controllers: controller_layouts::Controllers::default(),
             midi_capture: None,
             midi_take: None,
             slot_recording: None,
@@ -1610,7 +1619,9 @@ impl SoundApp {
         }
         control::drain(self, ctx);
         midi_input::frame(self, now);
+        controller_layouts::sync(self);
         midi_learn::frame(self, now);
+        controller_layouts::frame(self, now);
         midi_learn::wake_on_midi(self, ctx);
         self.note_recent_session();
         self.apply_editor_edits();

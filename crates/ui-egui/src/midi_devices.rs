@@ -121,6 +121,43 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     run(app, "midi.reconnect", json!({"name": name}));
                 }
                 ui.end_row();
+                // A controller with a built-in layout: its toggle and its lights' output.
+                // Read live (the port list is cached): the output opens after the input.
+                let live = crate::controller_layouts::describe(app, raw, backend);
+                if let Some(layout) = live.as_ref().and_then(Value::as_object) {
+                    let lname = layout.get("name").and_then(Value::as_str).unwrap_or("?");
+                    ui.label("");
+                    let was = layout.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    let mut use_it = was;
+                    let text = format!("Layout: {lname} (built-in)");
+                    if ui
+                        .checkbox(&mut use_it, text)
+                        .on_hover_text("Use built-in layout: the controller plays the decks and the mixer, and its lights follow them. MIDI Learn mappings still take precedence.")
+                        .changed()
+                    {
+                        if state == "disconnected" {
+                            app.ui.midi_layouts_off.retain(|p| !(p.raw_name == raw && p.backend_id == backend));
+                            if !use_it {
+                                app.ui.midi_layouts_off.push(crate::midi_input::MidiInputPref { name: name.clone(), raw_name: raw.to_string(), backend_id: backend.to_string() });
+                            }
+                            app.mark_prefs_changed();
+                        } else {
+                            run(app, "midi.layout", json!({"name": name, "on": use_it}));
+                        }
+                        stale = true;
+                    }
+                    let (out_text, colour) = match layout.get("output").and_then(Value::as_str) {
+                        Some("open") => (format!("lights: {}", layout.get("output_name").and_then(Value::as_str).unwrap_or("output open")), t.meter_green),
+                        Some("not open") => (
+                            format!("lights: no output ({})", layout.get("output_error").and_then(Value::as_str).unwrap_or("not found")),
+                            t.meter_red,
+                        ),
+                        _ => ("lights: off".to_string(), t.text_dim),
+                    };
+                    ui.label(egui::RichText::new(out_text).color(colour));
+                    ui.label("");
+                    ui.end_row();
+                }
             }
         });
         // Enabled inputs not listed whose name several ports have: Marty picks which is his.

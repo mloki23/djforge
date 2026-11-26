@@ -1,9 +1,12 @@
 //! Per-user settings and automation profile directories.
 
+#[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use soundcraft_engine::settings::{Platform, config_dir_with, legacy_config_dir_with, platform};
+#[cfg(test)]
+use soundcraft_engine::settings::Platform;
+use soundcraft_engine::settings::{config_dir_with, legacy_config_dir_with, platform};
 
 /// djforge's settings folder ([`soundcraft_engine::settings::config_dir`]).
 pub fn config_dir() -> Option<PathBuf> {

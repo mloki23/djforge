@@ -673,14 +673,15 @@ pub fn frame(app: &mut SoundApp, now: f64) {
         app.midi_learn.runtime.retain(|k, _| keys.contains(k));
     }
     use crate::midi_input::{WAKE_DISPLAY, WAKE_OFF, WAKE_URGENT};
-    let wanted = if !app.ui.midi_mappings.is_empty() || app.midi_learn.learning.is_some() || app.midi_learn.detect.is_some() {
-        WAKE_URGENT
-    } else if crate::midi_devices::lights_shown(app) {
-        // Activity lights only: a capped repaint rate is enough.
-        WAKE_DISPLAY
-    } else {
-        WAKE_OFF
-    };
+    let wanted =
+        if !app.ui.midi_mappings.is_empty() || app.midi_learn.learning.is_some() || app.midi_learn.detect.is_some() || app.controllers.active() {
+            WAKE_URGENT
+        } else if crate::midi_devices::lights_shown(app) {
+            // Activity lights only: a capped repaint rate is enough.
+            WAKE_DISPLAY
+        } else {
+            WAKE_OFF
+        };
     app.midi_learn.wake_wanted.store(wanted, std::sync::atomic::Ordering::Relaxed);
     sync_controls(app);
 }
@@ -711,6 +712,10 @@ pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
     if s.gesture.is_some() || !s.touch.is_empty() || s.detect.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
+    if app.controllers.lit() {
+        // A controller's lights blink and follow the decks: a few frames a second.
+        ctx.request_repaint_after(std::time::Duration::from_millis(125));
+    }
 }
 
 /// Whether MIDI moved `param` of `track` within the last [`GESTURE_S`] (Touch/Latch writing).
@@ -734,6 +739,7 @@ fn controls(app: &SoundApp) -> Vec<(PortId, MidiControl)> {
             out.push((port, m.matcher.control()));
         }
     }
+    out.extend(crate::controller_layouts::controls(app));
     out
 }
 
@@ -786,6 +792,11 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
         return;
     }
     let hits: Vec<String> = app.ui.midi_mappings.iter().filter(|m| m.device.same(&device) && m.matcher == matcher).map(Mapping::key).collect();
+    if hits.is_empty() {
+        // Not mapped: the device's built-in layout, if it has one, takes it.
+        crate::controller_layouts::handle(app, e.port, &e.msg, now);
+        return;
+    }
     for key in hits {
         // Found again by key: a command run by an earlier hit may have changed the list.
         if let Some(m) = app.ui.midi_mappings.iter().find(|m| m.key() == key).cloned() {
