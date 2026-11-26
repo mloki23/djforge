@@ -1637,6 +1637,9 @@ impl SoundApp {
         midi_learn::frame(self, now);
         controller_layouts::frame(self, now);
         midi_learn::wake_on_midi(self, ctx);
+        // A held CUE or pad (pointer or key) is let go here, whatever the window shows: also
+        // while ui() doesn't run (a covered or minimised window).
+        decks_view::release_holds(self, ctx);
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
@@ -1731,8 +1734,6 @@ impl SoundApp {
         }
         midi_learn::keys(self, &ctx);
         shortcuts::handle(self, &ctx);
-        // A held CUE or pad is let go here, whatever the window shows.
-        decks_view::release_holds(self, &ctx);
         self.sample_drop_targets.clear();
         self.session_view.drop_targets.clear();
         if !self.native_menu_bar {

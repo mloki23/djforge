@@ -42,9 +42,9 @@ fn entries() -> Vec<Entry> {
             params: None,
         });
     }
-    for (label, id, params) in crate::decks::PALETTE {
-        let params = (!params.is_empty()).then(|| serde_json::from_str(params).ok()).flatten();
-        v.push(Entry { id: id.to_string(), label: label.to_string(), path: "Decks".into(), shortcut: String::new(), params });
+    for (label, id, params) in crate::decks::palette() {
+        let params = (!params.is_null()).then_some(params);
+        v.push(Entry { id: id.to_string(), label, path: "Decks".into(), shortcut: String::new(), params });
     }
     v
 }

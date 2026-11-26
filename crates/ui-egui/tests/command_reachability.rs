@@ -120,3 +120,18 @@ fn new_midi_clip_is_in_the_clip_menu() {
     let clip = tree.iter().find(|n| n.label == "Clip").unwrap();
     assert_eq!(clip.children[0].label, "New MIDI Clip", "creates rather than edits, so it comes first");
 }
+
+#[test]
+fn every_deck_command_is_in_search_for_each_deck() {
+    // Search (the command palette) runs deck commands with their parameters: an entry without
+    // a deck would only fail. Every deck.* command is there, for both decks when it is per deck.
+    let palette = soundcraft_ui_egui::decks::palette();
+    for c in command_specs().iter().filter(|c| c.id.starts_with("deck.")) {
+        let entries: Vec<_> = palette.iter().filter(|e| e.1 == c.id).collect();
+        assert!(!entries.is_empty(), "{} is not in Search", c.id);
+        let per_deck = c.params.starts_with("{deck: a|b");
+        for d in ["a", "b"] {
+            assert!(!per_deck || entries.iter().any(|e| e.2["deck"] == d), "{} has no Search entry for deck {d}", c.id);
+        }
+    }
+}

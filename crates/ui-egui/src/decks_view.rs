@@ -20,8 +20,9 @@
 //! here, and of the Cmd shortcuts only windows, Search, Save and Quit work
 //! ([`crate::shortcuts`]): none can start the arrangement, which would stop the decks.
 //!
-//! A held CUE or pad (pointer or key) is let go by [`release_holds`] every frame, whatever the
-//! window: when the button or key comes up, the tab is left or the app loses focus.
+//! A held CUE or pad (pointer or key) is let go by [`release_holds`] every frame (in the app's
+//! logic, so also while the tab isn't drawn), whatever the window: when the button or key comes
+//! up, the tab is left or the app loses focus.
 //!
 //! Right-click a deck, mixer or library control for MIDI Learn ([`crate::midi_learn`]): Learn
 //! MIDI, then move a hardware control; the control is outlined while it waits. A hot cue pad's
@@ -174,9 +175,10 @@ impl DecksView {
     }
 }
 
-/// Whether a deck plays, so the tab needs frames at the display's rate.
+/// Whether a deck is heard (its waveform scrolls), so the tab needs frames at the display's rate.
+/// A load in progress animates nothing: the app's slower poll for it is enough.
 pub fn moving(app: &SoundApp) -> bool {
-    app.engine.deck_status.decks.iter().any(|d| d.playing || d.previewing) || app.engine.deck_loading()
+    app.engine.deck_status.decks.iter().any(|d| d.playing || d.previewing)
 }
 
 fn deck_of(i: usize) -> DeckId {

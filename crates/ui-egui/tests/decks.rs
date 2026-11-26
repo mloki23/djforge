@@ -66,17 +66,18 @@ fn a_deck_starting_stops_the_half_speed_arrangement_and_plays_at_its_own_rate() 
 
 #[test]
 fn the_deck_search_entries_run_real_commands_with_valid_parameters() {
-    for (label, id, params) in soundcraft_ui_egui::decks::PALETTE {
+    let palette = soundcraft_ui_egui::decks::palette();
+    for (label, id, params) in &palette {
         let spec = soundcraft_engine::find_command(id).unwrap_or_else(|| panic!("{label}: {id} is not a command"));
         assert!(spec.id.starts_with("deck.") || spec.id.starts_with("library."), "{label}");
-        if !params.is_empty() {
-            let v: Value = serde_json::from_str(params).unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert!(v.is_object(), "{label}");
-        }
+        assert!(params.is_null() || params.is_object(), "{label}");
     }
-    assert!(
-        soundcraft_ui_egui::decks::PALETTE.iter().filter(|e| e.1 == "deck.jog").all(|e| e.2.contains("\"search\"")),
-        "no nudge from Search: it would bend for a moment only"
-    );
-    assert!(soundcraft_ui_egui::decks::PALETTE.iter().any(|e| e.2.contains("\"tap\":true")), "the cue is a tap");
+    assert!(palette.iter().filter(|e| e.1 == "deck.jog").all(|e| e.2["mode"] == "search"), "no nudge from Search: it would bend for a moment only");
+    assert!(palette.iter().any(|e| e.1 == "deck.cue" && e.2["tap"] == true), "the cue is a tap");
+    assert!(!palette.iter().any(|e| e.1 == "deck.hotcue" && e.2["action"] == "jump"), "no jump: stopped, it would play until a release");
+    let mut labels: Vec<&String> = palette.iter().map(|e| &e.0).collect();
+    labels.sort();
+    let n = labels.len();
+    labels.dedup();
+    assert_eq!(labels.len(), n, "every label once");
 }

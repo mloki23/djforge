@@ -324,3 +324,48 @@ fn a_learned_deck_control_overrides_the_flx4_layout_on_the_same_message() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn a_cue_held_by_a_key_is_let_go_by_the_logic_alone_with_the_decks_tab_not_drawn() {
+    let mut ui = Ui::new();
+    let mut app = app(soundcraft_engine::Engine::default());
+    let (_dir, path) = track("keys");
+    app.run("deck.load", json!({"path": path, "deck": "a", "bpm": 120})).unwrap();
+    ui.until(&mut app, "deck A loaded", |a| a.engine.deck_tracks[0].is_some() && a.engine.deck_status.decks[0].load != 0);
+    app.run("window.decks", json!({})).unwrap();
+    let frame = |ui: &mut Ui, app: &mut SoundApp, events: Vec<egui::Event>, draw: bool| {
+        ui.t += 0.02;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))),
+            time: Some(ui.t),
+            events,
+            ..Default::default()
+        };
+        ui.ctx
+            .run_ui(raw, |u| {
+                app.logic(u.ctx());
+                if draw {
+                    app.ui(u);
+                }
+            })
+            .textures_delta
+            .clear();
+    };
+    let key = |pressed: bool| egui::Event::Key {
+        key: egui::Key::Q,
+        physical_key: Some(egui::Key::Q),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    frame(&mut ui, &mut app, vec![key(true)], true);
+    ui.until(&mut app, "Q holds Deck A's CUE", |a| a.engine.deck_status.decks[0].previewing);
+    // Q comes up while only the logic runs (a covered window, or the tab not drawn).
+    frame(&mut ui, &mut app, vec![key(false)], false);
+    let start = Instant::now();
+    while app.engine.deck_status.decks[0].previewing {
+        assert!(start.elapsed() < Duration::from_secs(8), "never let go");
+        frame(&mut ui, &mut app, vec![], false);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

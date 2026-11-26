@@ -1,28 +1,108 @@
 //! The host side of the live decks (stage 9): deck commands go to the player, loaded tracks are
 //! handed over, and what the decks play comes back to the engine for `decks.state`.
 //!
-//! The Decks tab ([`crate::decks_view`]) shows and plays them; a few deck commands are also in
-//! Search (the command palette), through [`PALETTE`].
+//! The Decks tab ([`crate::decks_view`]) shows and plays them; every deck command is also in
+//! Search (the command palette), through [`palette`].
 
 use crate::SoundApp;
 use soundcraft_engine::DeckRequest;
 use soundcraft_mix::{DeckCmd, HotCueAction};
 
-/// Search entries for the decks: (label, command, parameters). The Decks tab (Window › Decks)
-/// has every deck control; these few stay so the decks can be played from Search too.
-pub const PALETTE: &[(&str, &str, &str)] = &[
-    ("Load Track to Deck...", "deck.load", ""),
-    ("Deck A: Play", "deck.play", r#"{"deck":"a"}"#),
-    ("Deck B: Play", "deck.play", r#"{"deck":"b"}"#),
-    ("Deck A: Pause", "deck.pause", r#"{"deck":"a"}"#),
-    ("Deck B: Pause", "deck.pause", r#"{"deck":"b"}"#),
-    ("Deck A: Cue", "deck.cue", r#"{"deck":"a","tap":true}"#),
-    ("Deck B: Cue", "deck.cue", r#"{"deck":"b","tap":true}"#),
-    ("Deck A: Sync", "deck.sync", r#"{"deck":"a","on":true}"#),
-    ("Deck B: Sync", "deck.sync", r#"{"deck":"b","on":true}"#),
-    ("Add Library Folder...", "library.add_folder", ""),
-    ("Remove Library Folder...", "library.remove_folder", ""),
-];
+/// A Search entry for the decks: (label, command, parameters; null: the menu's own).
+pub type PaletteEntry = (String, &'static str, serde_json::Value);
+
+/// Search entries for the decks: every deck command, for each deck where it is per deck, with
+/// the parameters of its everyday uses. The Decks tab (Window › Decks) has every deck control;
+/// these let the decks be played from Search too. No nudge (it bends for a moment only) and no
+/// hot cue jump (stopped, it plays until a release Search can't send).
+pub fn palette() -> Vec<PaletteEntry> {
+    use serde_json::json;
+    let mut v: Vec<PaletteEntry> = vec![
+        ("Load Track to Deck...".into(), "deck.load", serde_json::Value::Null),
+        ("Add Library Folder...".into(), "library.add_folder", serde_json::Value::Null),
+        ("Remove Library Folder...".into(), "library.remove_folder", serde_json::Value::Null),
+        ("Crossfader: Centre".into(), "deck.xfader", json!({"value": 0.0})),
+        ("Crossfader: Full A".into(), "deck.xfader", json!({"value": -1.0})),
+        ("Crossfader: Full B".into(), "deck.xfader", json!({"value": 1.0})),
+        ("Crossfader Curve: Smooth".into(), "deck.xfader", json!({"curve": "smooth"})),
+        ("Crossfader Curve: Cut".into(), "deck.xfader", json!({"curve": "sharp"})),
+        ("Deck Master Volume: 0 dB".into(), "deck.master_volume", json!({"db": 0.0})),
+        ("Headphone Mix: Cue".into(), "deck.headphone_mix", json!({"value": 0.0})),
+        ("Headphone Mix: Half".into(), "deck.headphone_mix", json!({"value": 0.5})),
+        ("Headphone Mix: Master".into(), "deck.headphone_mix", json!({"value": 1.0})),
+        (
+            format!("Headphone Level: {} dB", soundcraft_mix::HEADPHONE_DEFAULT_DB),
+            "deck.headphone_level",
+            json!({"db": soundcraft_mix::HEADPHONE_DEFAULT_DB}),
+        ),
+        ("Master Cue (toggle)".into(), "deck.master_cue", json!({})),
+        ("Deck Quantise: On".into(), "deck.quantise", json!({"on": true})),
+        ("Deck Quantise: Off".into(), "deck.quantise", json!({"on": false})),
+    ];
+    for d in soundcraft_mix::DeckId::ALL {
+        let n = d.id().to_uppercase();
+        let mut add = |label: String, id: &'static str, mut p: serde_json::Value| {
+            if let Some(o) = p.as_object_mut() {
+                o.insert("deck".into(), json!(d.id()));
+            }
+            v.push((format!("Deck {n}: {label}"), id, p));
+        };
+        add("Play".into(), "deck.play", json!({}));
+        add("Pause".into(), "deck.pause", json!({}));
+        add("Cue".into(), "deck.cue", json!({"tap": true}));
+        add("Back to Start".into(), "deck.seek", json!({"at": 0.0}));
+        add("Search Back 1 Beat".into(), "deck.jog", json!({"delta": -1.0, "mode": "search"}));
+        add("Search Forward 1 Beat".into(), "deck.jog", json!({"delta": 1.0, "mode": "search"}));
+        add("Sync".into(), "deck.sync", json!({"on": true}));
+        add("Sync Off".into(), "deck.sync", json!({"on": false}));
+        add("Master Tempo On".into(), "deck.master_tempo", json!({"on": true}));
+        add("Master Tempo Off".into(), "deck.master_tempo", json!({"on": false}));
+        add("Pitch 0 %".into(), "deck.pitch", json!({"value": 0.0}));
+        for r in [8, 16, 50] {
+            add(format!("Pitch Range ±{r} %"), "deck.pitch", json!({"range": r}));
+        }
+        for k in 1..=8u8 {
+            let letter = char::from(b'A'.saturating_add(k - 1));
+            add(format!("Set Hot Cue {letter}"), "deck.hotcue", json!({"n": k, "action": "set"}));
+            add(format!("Clear Hot Cue {letter}"), "deck.hotcue", json!({"n": k, "action": "clear"}));
+        }
+        for (label, beats) in [
+            ("1/4 Beat", json!("1/4")),
+            ("1/2 Beat", json!("1/2")),
+            ("1 Beat", json!(1)),
+            ("2 Beats", json!(2)),
+            ("4 Beats", json!(4)),
+            ("8 Beats", json!(8)),
+            ("16 Beats", json!(16)),
+            ("32 Beats", json!(32)),
+        ] {
+            add(format!("Loop {label}"), "deck.loop", json!({"beats": beats}));
+        }
+        for (label, action) in
+            [("Loop In", "in"), ("Loop Out", "out"), ("Loop Halve", "halve"), ("Loop Double", "double"), ("Loop Exit", "exit"), ("Reloop", "reloop")]
+        {
+            add(label.into(), "deck.loop", json!({"action": action}));
+        }
+        for b in [1, 4, 16, 32] {
+            add(format!("Beat Jump Back {b}"), "deck.beatjump", json!({"beats": -b}));
+            add(format!("Beat Jump Forward {b}"), "deck.beatjump", json!({"beats": b}));
+        }
+        for (label, band) in [("HI", "high"), ("MID", "mid"), ("LOW", "low")] {
+            add(format!("EQ {label} Kill"), "deck.eq", json!({"band": band, "db": "kill"}));
+            add(format!("EQ {label} 0 dB"), "deck.eq", json!({"band": band, "db": 0.0}));
+        }
+        add("Filter Off".into(), "deck.filter", json!({"value": 0.0}));
+        add("Trim 0 dB".into(), "deck.trim", json!({"db": 0.0}));
+        add("Channel Fader Up".into(), "deck.fader", json!({"value": 1.0}));
+        add("Channel Fader Down".into(), "deck.fader", json!({"value": 0.0}));
+        for (label, side) in [("A", "a"), ("Thru", "thru"), ("B", "b")] {
+            add(format!("Crossfader Assign {label}"), "deck.assign", json!({"side": side}));
+        }
+        add("Headphone Cue On".into(), "deck.headphone_cue", json!({"on": true}));
+        add("Headphone Cue Off".into(), "deck.headphone_cue", json!({"on": false}));
+    }
+    v
+}
 
 impl SoundApp {
     /// Carries a deck command to the audio engine. A deck that starts while the arrangement plays
