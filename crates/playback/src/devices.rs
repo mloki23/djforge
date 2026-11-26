@@ -32,6 +32,83 @@ pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
+    /// Where each output device (by name) plays the decks' headphone output, as chosen; a
+    /// device not listed takes [`default_headphones`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headphones: std::collections::BTreeMap<String, HeadphoneRoute>,
+}
+
+impl AudioConfig {
+    /// Where the headphones play on output device `device` with `max_channels` outputs: the
+    /// choice kept for it, else [`default_headphones`].
+    pub fn headphones_for(&self, device: &str, max_channels: u16) -> HeadphoneRoute {
+        self.headphones.get(device).copied().unwrap_or_else(|| default_headphones(device, max_channels))
+    }
+}
+
+/// DJ controllers whose built-in sound card has the headphones on outputs 3–4 (matched in the
+/// output device's name, any case).
+pub const DJ_CONTROLLERS: [&str; 1] = ["DDJ-FLX4"];
+
+/// Where the decks' headphone output (the cue mix) plays on the output device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadphoneRoute {
+    /// No headphone output.
+    None,
+    /// A pair of the device's outputs: `n` and `n + 1` (1-based, from 3: outputs 1–2 are the
+    /// master's).
+    Outputs(u16),
+    /// A 2-channel device split for a splitter cable: the left plays the headphone mix in mono,
+    /// the right the master in mono.
+    Split,
+}
+
+impl HeadphoneRoute {
+    /// The route on a device opened with `channels` outputs: a pair it doesn't have (or one
+    /// over the master's outputs) is none, and so is a split without two outputs.
+    pub fn fit(self, channels: u16) -> HeadphoneRoute {
+        match self {
+            HeadphoneRoute::Outputs(n) if n >= 3 && u32::from(n) < u32::from(channels) => self,
+            HeadphoneRoute::Split if channels >= 2 => self,
+            _ => HeadphoneRoute::None,
+        }
+    }
+
+    /// Output channels the route needs the device opened with (0: no more than the mix needs).
+    pub fn channels(self) -> u16 {
+        match self {
+            HeadphoneRoute::Outputs(n) => n.saturating_add(1),
+            HeadphoneRoute::None | HeadphoneRoute::Split => 0,
+        }
+    }
+
+    /// The routes a device with `max_channels` outputs offers: none, split, then each pair from
+    /// outputs 3–4 on.
+    pub fn choices(max_channels: u16) -> Vec<HeadphoneRoute> {
+        let mut v = vec![HeadphoneRoute::None];
+        if max_channels >= 2 {
+            v.push(HeadphoneRoute::Split);
+        }
+        v.extend((3..max_channels).step_by(2).map(HeadphoneRoute::Outputs));
+        v
+    }
+
+    /// The route in words, for the UI and `decks.state`: "outputs 3-4", "split", "none".
+    pub fn label(self) -> String {
+        match self {
+            HeadphoneRoute::None => "none".into(),
+            HeadphoneRoute::Outputs(n) => format!("outputs {n}-{}", n.saturating_add(1)),
+            HeadphoneRoute::Split => "split".into(),
+        }
+    }
+}
+
+/// The headphone route a device takes until one is chosen for it: outputs 3–4 on a known DJ
+/// controller ([`DJ_CONTROLLERS`]) with at least 4 outputs, else none.
+pub fn default_headphones(device: &str, max_channels: u16) -> HeadphoneRoute {
+    let name = device.to_ascii_uppercase();
+    if max_channels >= 4 && DJ_CONTROLLERS.iter().any(|c| name.contains(c)) { HeadphoneRoute::Outputs(3) } else { HeadphoneRoute::None }
 }
 
 /// One device as the settings window lists it.
@@ -217,11 +294,41 @@ mod tests {
             input: None,
             sample_rate: Some(48_000),
             buffer_size: Some(256),
+            headphones: Default::default(),
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);
         assert_eq!(serde_json::from_str::<AudioConfig>("{}").unwrap(), AudioConfig::default());
         assert_eq!(serde_json::from_str::<AudioConfig>(r#"{"output":"X","unknown":1}"#).unwrap().output.as_deref(), Some("X"));
+    }
+
+    #[test]
+    fn headphone_routes_are_kept_per_device_and_default_to_3_4_on_a_dj_controller() {
+        let mut c = AudioConfig::default();
+        assert_eq!(c.headphones_for("Speakers (DDJ-FLX4)", 4), HeadphoneRoute::Outputs(3), "WASAPI's name for it");
+        assert_eq!(c.headphones_for("ddj-flx4", 4), HeadphoneRoute::Outputs(3), "any case");
+        assert_eq!(c.headphones_for("DDJ-FLX4", 2), HeadphoneRoute::None, "set to stereo: no outputs 3-4");
+        assert_eq!(c.headphones_for("Scarlett 4i4", 4), HeadphoneRoute::None, "not a known DJ controller");
+        c.headphones.insert("Speakers (DDJ-FLX4)".into(), HeadphoneRoute::None);
+        c.headphones.insert("Realtek".into(), HeadphoneRoute::Split);
+        c.headphones.insert("MOTU".into(), HeadphoneRoute::Outputs(5));
+        assert_eq!(c.headphones_for("Speakers (DDJ-FLX4)", 4), HeadphoneRoute::None, "the choice kept wins");
+        assert_eq!(c.headphones_for("MOTU", 8), HeadphoneRoute::Outputs(5));
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains(r#""MOTU":{"outputs":5}"#) && s.contains(r#""Realtek":"split""#), "{s}");
+        assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c, "round-trips");
+        assert!(!serde_json::to_string(&AudioConfig::default()).unwrap().contains("headphones"), "nothing written until chosen");
+        // What a device can take.
+        assert_eq!(HeadphoneRoute::Outputs(3).fit(4), HeadphoneRoute::Outputs(3));
+        assert_eq!(HeadphoneRoute::Outputs(3).fit(2), HeadphoneRoute::None);
+        assert_eq!(HeadphoneRoute::Outputs(1).fit(4), HeadphoneRoute::None, "never over the master");
+        assert_eq!(HeadphoneRoute::Split.fit(2), HeadphoneRoute::Split);
+        assert_eq!(HeadphoneRoute::Split.fit(1), HeadphoneRoute::None);
+        assert_eq!((HeadphoneRoute::Outputs(3).channels(), HeadphoneRoute::Split.channels()), (4, 0));
+        assert_eq!(HeadphoneRoute::choices(2), [HeadphoneRoute::None, HeadphoneRoute::Split]);
+        assert_eq!(HeadphoneRoute::choices(6), [HeadphoneRoute::None, HeadphoneRoute::Split, HeadphoneRoute::Outputs(3), HeadphoneRoute::Outputs(5)]);
+        assert_eq!(HeadphoneRoute::choices(5).len(), 3, "an odd output out has no pair");
+        assert_eq!(HeadphoneRoute::Outputs(3).label(), "outputs 3-4");
     }
 
     #[test]

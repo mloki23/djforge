@@ -12,6 +12,12 @@
 //! the device has fewer channels than the main mix, the mix is folded down to stereo (ITU-R
 //! BS.775) on the first two device channels.
 //!
+//! Headphones: the live decks' headphone output (their cue mix) plays on a pair of the device's
+//! outputs ([`HeadphoneRoute`], chosen per device in [`AudioConfig`]; outputs 3–4 by default on a
+//! known DJ controller with 4 outputs, which the device is then opened with). The main mix keeps
+//! the outputs below the pair (folded down to stereo when it is wider). On a 2-channel device a
+//! split route plays the headphone mix in mono on the left and the master in mono on the right.
+//!
 //! Plugins and threads: hosted third-party plugins (CLAP/VST3) are created, given their stored
 //! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
 //! travel to the audio thread together with the session snapshot that needs them; the mix
@@ -32,7 +38,7 @@ pub mod midi_in;
 pub mod record;
 
 pub use capture::{CAPTURE_CAPACITY, CaptureEvent, Captured, MidiCapture, TakePass, passes as take_passes};
-pub use devices::AudioConfig;
+pub use devices::{AudioConfig, HeadphoneRoute};
 pub use midi_in::{CONTROL_PORTS, Control as MidiControl, KEYBOARD_SOURCE, MIDI_SLACK_NS, MidiControls, PENDING as MIDI_PENDING};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
@@ -420,6 +426,33 @@ struct AudioState {
     capture_backlog: Option<rtrb::Producer<Captured>>,
     /// A replaced deck the full `decks` channel refused, sent again on the next callback.
     deck_backlog: Option<Box<PreparedDeck>>,
+    /// Where the decks' headphone output plays on the device (fitted to its channels).
+    phones_route: HeadphoneRoute,
+    /// The headphone output rendered with `pending` (L, R; planar).
+    pending_phones: Vec<Vec<f32>>,
+}
+
+/// How a device frame of `channels` is shared out for `route`: the main mix takes the first
+/// `main` outputs; the headphones, the pair from output index `pair` (0-based), or a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameLayout {
+    main: usize,
+    pair: Option<usize>,
+    split: bool,
+}
+
+impl FrameLayout {
+    fn new(route: HeadphoneRoute, channels: usize) -> FrameLayout {
+        let ch = u16::try_from(channels).unwrap_or(u16::MAX);
+        match route.fit(ch) {
+            HeadphoneRoute::Outputs(n) => {
+                let first = usize::from(n.saturating_sub(1));
+                FrameLayout { main: first, pair: Some(first), split: false }
+            }
+            HeadphoneRoute::Split => FrameLayout { main: channels, pair: None, split: true },
+            HeadphoneRoute::None => FrameLayout { main: channels, pair: None, split: false },
+        }
+    }
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -544,7 +577,15 @@ impl AudioState {
             capture_pass: 0,
             capture_backlog: None,
             deck_backlog: None,
+            phones_route: HeadphoneRoute::None,
+            pending_phones: vec![vec![0.0; BLOCK]; 2],
         }
+    }
+
+    /// Plays the decks' headphone output on `route` (none: the headphone mix isn't made).
+    fn set_headphones(&mut self, route: HeadphoneRoute) {
+        self.phones_route = route;
+        self.mix.set_headphones(route != HeadphoneRoute::None);
     }
 
     fn drain(&mut self) {
@@ -557,6 +598,7 @@ impl AudioState {
                     changed = true;
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
+                        self.mix.set_headphones(self.phones_route != HeadphoneRoute::None);
                         let _ = self.garbage.plugins.send(old.drain_plugins());
                         let _ = self.garbage.warps.send(old.drain_warps());
                         // The decks' tracks go back to be dropped on the UI thread (they were at the
@@ -898,7 +940,7 @@ impl AudioState {
             }
         }
         if n == 0 {
-            for c in &mut self.pending {
+            for c in self.pending.iter_mut().chain(self.pending_phones.iter_mut()) {
                 c.iter_mut().for_each(|x| *x = 0.0);
             }
             self.pending_len = BLOCK;
@@ -920,6 +962,15 @@ impl AudioState {
         }
         self.capture_live(n);
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        if self.phones_route != HeadphoneRoute::None {
+            let phones = self.mix.headphones();
+            for (c, dst) in self.pending_phones.iter_mut().enumerate() {
+                let src = phones.get(c).and_then(|p| p.get(..n));
+                for (i, d) in dst.iter_mut().take(n).enumerate() {
+                    *d = src.and_then(|p| p.get(i)).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
+                }
+            }
+        }
         self.shared.midi.dropped.store(self.midi.dropped.saturating_add(self.mix.live_dropped()), Ordering::Relaxed);
         self.send_garbage();
         self.pending_len = n;
@@ -1007,6 +1058,7 @@ impl AudioState {
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
+        let layout = FrameLayout::new(self.phones_route, channels);
         for frame in out.chunks_mut(channels) {
             while self.read >= self.pending_len as f64 {
                 self.read -= self.pending_len as f64;
@@ -1022,12 +1074,15 @@ impl AudioState {
             let fr = (self.read - i0 as f64) as f32;
             let sounding = self.playing || monitoring;
             let nch = self.pending.len();
-            let sample = |c: usize| {
-                let ch = self.pending.get(c);
+            let at = |ch: Option<&Vec<f32>>| {
                 let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
                 let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
                 a + (b - a) * fr
             };
+            let sample = |c: usize| at(self.pending.get(c));
+            let phone = |c: usize| if sounding { at(self.pending_phones.get(c)).clamp(-1.0, 1.0) } else { 0.0 };
+            let (frame, rest) = frame.split_at_mut(layout.main.min(frame.len()));
+            let channels = frame.len();
             if nch > 2 && channels < nch {
                 // Fewer device channels than the main mix: ITU fold-down to stereo.
                 let (mut l, mut r) = (0.0f32, 0.0f32);
@@ -1050,6 +1105,19 @@ impl AudioState {
                     // Stereo mixes on a mono device play the left channel (as before).
                     *o = if c < nch.max(1) && sounding { sample(c).clamp(-1.0, 1.0) } else { 0.0 };
                 }
+            }
+            // The headphones: their pair after the main outputs, or a split of the two.
+            rest.iter_mut().for_each(|x| *x = 0.0);
+            if let Some(p) = layout.pair {
+                for (k, o) in rest.iter_mut().skip(p.saturating_sub(layout.main)).take(2).enumerate() {
+                    *o = phone(k);
+                }
+            } else if layout.split
+                && let [l, r, ..] = frame
+            {
+                let master = 0.5 * (*l + *r);
+                *l = 0.5 * (phone(0) + phone(1));
+                *r = master;
             }
             self.read += step;
         }
@@ -1186,9 +1254,17 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+    /// Where the decks' headphone output plays on the device opened (none: no headphone output).
+    pub headphones: HeadphoneRoute,
 }
 
 impl Player {
+    /// Where the decks' headphone output plays, in words ("outputs 3-4", "split"), or `None`
+    /// without a headphone output (for `decks.state`).
+    pub fn headphone_output(&self) -> Option<String> {
+        (self.headphones != HeadphoneRoute::None).then(|| self.headphones.label())
+    }
+
     /// Open the default output device. Never fails: without a device it runs a silent clock.
     pub fn new(session: Arc<Session>) -> Player {
         Player::with_config(session, &AudioConfig::default())
@@ -1235,7 +1311,7 @@ impl Player {
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: BinRx| Mutex::new(Side::new(side_rate, garbage));
         match open_device(want, want_ch, cfg) {
-            Ok((device, config, format, name)) => {
+            Ok((device, config, format, name, route)) => {
                 // The chosen buffer size first; if the device refuses it, its default.
                 let mut attempts = vec![config.clone()];
                 if config.buffer_size != cpal::BufferSize::Default {
@@ -1246,7 +1322,8 @@ impl Player {
                     let channels = usize::from(config.channels);
                     let (tx, rx) = channel();
                     let (gtx, grx) = bin();
-                    let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                    let mut state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                    state.set_headphones(route);
                     let fault = Arc::new(Fault::default());
                     use cpal::traits::StreamTrait;
                     let built = match format {
@@ -1264,8 +1341,9 @@ impl Player {
                                 cpal::BufferSize::Default => None,
                             };
                             log::info!(
-                                "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}",
-                                buffer.map_or("default".to_string(), |n| n.to_string())
+                                "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}, headphones {}",
+                                buffer.map_or("default".to_string(), |n| n.to_string()),
+                                route.label()
                             );
                             return Player {
                                 shared,
@@ -1280,6 +1358,7 @@ impl Player {
                                 device_channels: config.channels,
                                 device_buffer: buffer,
                                 silent: false,
+                                headphones: route,
                             };
                         }
                         Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
@@ -1362,6 +1441,7 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            headphones: HeadphoneRoute::None,
         }
     }
 
@@ -1378,6 +1458,7 @@ impl Player {
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            headphones: HeadphoneRoute::None,
         }
     }
 
@@ -1887,15 +1968,24 @@ where
 /// Open the output device `cfg` chooses (else the default) at the chosen rate (else the session
 /// rate) if possible, in the best sample format it offers (f32, else 32- or 16-bit integers),
 /// with as many channels as it offers up to `want_ch` (at least stereo when available), and the
-/// chosen buffer size when the device allows it.
-fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal::Device, cpal::StreamConfig, cpal::SampleFormat, String), String> {
+/// chosen buffer size when the device allows it. The headphone route kept for the device (see
+/// [`AudioConfig::headphones_for`]) can ask for more channels (outputs 3–4: 4); the route comes
+/// back fitted to the channels opened.
+type Opened = (cpal::Device, cpal::StreamConfig, cpal::SampleFormat, String, HeadphoneRoute);
+
+fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<Opened, String> {
     use cpal::traits::DeviceTrait;
     let host = devices::host(cfg);
     let device = devices::device(&host, cfg.output.as_deref(), true).ok_or_else(|| "no output device".to_string())?;
     #[allow(deprecated)]
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
+    let max_ch = device
+        .supported_output_configs()
+        .map(|cs| cs.filter(|c| devices::format_rank(c.sample_format()).is_some()).map(|c| c.channels()).max().unwrap_or(0))
+        .unwrap_or(0);
+    let route = cfg.headphones_for(&name, max_ch);
     // Prefer a config at the chosen (else session) rate; else the device default (we resample).
-    let want_ch = want_ch.max(2);
+    let want_ch = want_ch.max(2).max(route.channels());
     let rates: Vec<u32> = cfg.sample_rate.into_iter().chain(Some(want_rate)).collect();
     let mut chosen: Option<(cpal::StreamConfig, cpal::SupportedBufferSize, cpal::SampleFormat)> = None;
     // Better: a preferred format first, then more channels.
@@ -1939,7 +2029,8 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
             (c, format)
         }
     };
-    Ok((device, config, format, name))
+    let route = route.fit(config.channels);
+    Ok((device, config, format, name, route))
 }
 
 #[cfg(test)]
@@ -3625,6 +3716,77 @@ mod deck_tests {
         assert_eq!((s.decks[0].load, s.decks[0].playing), (load, true));
         assert!(s.decks[0].position >= 4.0 * 512.0);
         assert!((s.decks[0].bpm - 128.0).abs() < 1e-6);
+    }
+
+    /// Deck A playing its tone, cued, its fader at `fader`, through a device of `channels` with
+    /// the headphones on `route`; the last callback's frames.
+    fn cued(route: HeadphoneRoute, channels: usize, fader: f32) -> Vec<f32> {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, bin().0);
+        st.set_headphones(route);
+        tx.send(Cmd::DeckLoad(DeckId::A, deck())).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Fader { deck: DeckId::A, value: fader, curve: None })).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::HeadphoneCue { deck: DeckId::A, on: true })).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::Play(DeckId::A))).unwrap();
+        let mut out = vec![0.0f32; channels * 512];
+        let storage = st.mix.decks_storage();
+        for _ in 0..12 {
+            st.fill(&mut out, channels);
+        }
+        assert_eq!(st.mix.decks_storage(), storage, "nothing grows");
+        assert_eq!(st.pending_phones.iter().map(Vec::capacity).collect::<Vec<_>>(), [BLOCK, BLOCK]);
+        out
+    }
+
+    fn channel_peak(out: &[f32], channels: usize, c: usize) -> f32 {
+        out.chunks(channels).fold(0.0f32, |m, f| m.max(f.get(c).copied().unwrap_or(0.0).abs()))
+    }
+
+    #[test]
+    fn a_4_channel_device_plays_the_master_on_1_2_and_the_headphones_on_3_4() {
+        // Fader down: nothing on the master, the cued deck in the headphones.
+        let out = cued(HeadphoneRoute::Outputs(3), 4, 0.0);
+        let p = |c| channel_peak(&out, 4, c);
+        assert!(p(0) < 1e-4 && p(1) < 1e-4, "master silent: {} {}", p(0), p(1));
+        assert!(p(2) > 0.2 && p(3) > 0.2, "headphones hear the cued deck pre-fader: {} {}", p(2), p(3));
+        // Fader up, the headphone mix on cue: both.
+        let out = cued(HeadphoneRoute::Outputs(3), 4, 1.0);
+        assert!(channel_peak(&out, 4, 0) > 0.1 && channel_peak(&out, 4, 2) > 0.2);
+        // Outputs 3-4 asked of a 6-channel device: 5 and 6 stay silent.
+        let out = cued(HeadphoneRoute::Outputs(3), 6, 0.0);
+        assert!(channel_peak(&out, 6, 2) > 0.2 && channel_peak(&out, 6, 4) == 0.0 && channel_peak(&out, 6, 5) == 0.0);
+        // Outputs 5-6 on a 6-channel device: the master keeps 1-4.
+        let out = cued(HeadphoneRoute::Outputs(5), 6, 1.0);
+        assert!(channel_peak(&out, 6, 0) > 0.1 && channel_peak(&out, 6, 2) == 0.0 && channel_peak(&out, 6, 4) > 0.2);
+    }
+
+    #[test]
+    fn without_a_headphone_route_or_on_2_channels_the_output_is_as_before() {
+        // No route: a 4-channel device plays the master on 1-2 and silence on 3-4, as before.
+        let out = cued(HeadphoneRoute::None, 4, 1.0);
+        assert!(channel_peak(&out, 4, 0) > 0.1 && channel_peak(&out, 4, 2) == 0.0 && channel_peak(&out, 4, 3) == 0.0);
+        // Outputs 3-4 asked of a 2-channel device: no headphones, the master as with none.
+        let none = cued(HeadphoneRoute::None, 2, 1.0);
+        assert_eq!(cued(HeadphoneRoute::Outputs(3), 2, 1.0), none);
+        assert!(channel_peak(&none, 2, 0) > 0.1 && channel_peak(&none, 2, 1) > 0.1);
+    }
+
+    #[test]
+    fn split_plays_the_headphones_left_and_the_master_right_in_mono() {
+        let out = cued(HeadphoneRoute::Split, 2, 0.0);
+        assert!(channel_peak(&out, 2, 0) > 0.2, "left: the headphones");
+        assert!(channel_peak(&out, 2, 1) < 1e-4, "right: the master, its fader down");
+        let out = cued(HeadphoneRoute::Split, 2, 1.0);
+        assert!(channel_peak(&out, 2, 1) > 0.1);
+    }
+
+    #[test]
+    fn the_frame_layout_follows_the_route() {
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 4), FrameLayout { main: 2, pair: Some(2), split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 2), FrameLayout { main: 2, pair: None, split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Split, 2), FrameLayout { main: 2, pair: None, split: true });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::None, 8), FrameLayout { main: 8, pair: None, split: false });
     }
 
     #[test]
