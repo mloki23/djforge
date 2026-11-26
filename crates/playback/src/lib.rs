@@ -433,11 +433,12 @@ struct AudioState {
 }
 
 /// How a device frame of `channels` is shared out for `route`: the main mix takes the first
-/// `main` outputs; the headphones, the pair from output index `pair` (0-based), or a split.
+/// `main` outputs; with `pair` the headphones take the two after them, with `split` the main's
+/// two are split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FrameLayout {
     main: usize,
-    pair: Option<usize>,
+    pair: bool,
     split: bool,
 }
 
@@ -445,14 +446,18 @@ impl FrameLayout {
     fn new(route: HeadphoneRoute, channels: usize) -> FrameLayout {
         let ch = u16::try_from(channels).unwrap_or(u16::MAX);
         match route.fit(ch) {
-            HeadphoneRoute::Outputs(n) => {
-                let first = usize::from(n.saturating_sub(1));
-                FrameLayout { main: first, pair: Some(first), split: false }
-            }
-            HeadphoneRoute::Split => FrameLayout { main: channels, pair: None, split: true },
-            HeadphoneRoute::None => FrameLayout { main: channels, pair: None, split: false },
+            HeadphoneRoute::Outputs(n) => FrameLayout { main: usize::from(n.saturating_sub(1)), pair: true, split: false },
+            HeadphoneRoute::Split => FrameLayout { main: channels, pair: false, split: true },
+            HeadphoneRoute::None => FrameLayout { main: channels, pair: false, split: false },
         }
     }
+}
+
+/// When a device opened with more channels for the headphones (`route`, the mix needing
+/// `want_ch`) won't open: the note to show, and the open is tried again without headphones.
+fn headphones_fallback(route: HeadphoneRoute, want_ch: u16) -> Option<String> {
+    let need = route.channels();
+    (need > want_ch.max(2)).then(|| format!("Headphones off: the device wouldn't open with {need} channels"))
 }
 
 /// Return channels for what the audio thread takes out of service, to be dropped on the UI thread.
@@ -599,6 +604,15 @@ impl AudioState {
                     if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
                         self.mix.set_headphones(self.phones_route != HeadphoneRoute::None);
+                        // The headphone settings carry over (the hardware's knobs stay where they are).
+                        let was = old.decks_state();
+                        for c in [
+                            DeckCmd::HeadphoneMix { value: was.headphone_mix },
+                            DeckCmd::HeadphoneLevel { db: was.headphone_db },
+                            DeckCmd::MasterCue { on: was.master_cue },
+                        ] {
+                            self.mix.deck(c);
+                        }
                         let _ = self.garbage.plugins.send(old.drain_plugins());
                         let _ = self.garbage.warps.send(old.drain_warps());
                         // The decks' tracks go back to be dropped on the UI thread (they were at the
@@ -1074,9 +1088,11 @@ impl AudioState {
             let fr = (self.read - i0 as f64) as f32;
             let sounding = self.playing || monitoring;
             let nch = self.pending.len();
+            let len = self.pending_len;
             let at = |ch: Option<&Vec<f32>>| {
                 let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
-                let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
+                // The block's last frame holds (past it is stale or the next block's to come).
+                let b = if i0 + 1 < len { ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a) } else { a };
                 a + (b - a) * fr
             };
             let sample = |c: usize| at(self.pending.get(c));
@@ -1108,8 +1124,8 @@ impl AudioState {
             }
             // The headphones: their pair after the main outputs, or a split of the two.
             rest.iter_mut().for_each(|x| *x = 0.0);
-            if let Some(p) = layout.pair {
-                for (k, o) in rest.iter_mut().skip(p.saturating_sub(layout.main)).take(2).enumerate() {
+            if layout.pair {
+                for (k, o) in rest.iter_mut().take(2).enumerate() {
                     *o = phone(k);
                 }
             } else if layout.split
@@ -1256,6 +1272,9 @@ pub struct Player {
     pub silent: bool,
     /// Where the decks' headphone output plays on the device opened (none: no headphone output).
     pub headphones: HeadphoneRoute,
+    /// Why the headphones are off when they were asked for ("Headphones off: the device wouldn't
+    /// open with 4 channels").
+    pub headphone_note: Option<String>,
 }
 
 impl Player {
@@ -1310,8 +1329,18 @@ impl Player {
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: BinRx| Mutex::new(Side::new(side_rate, garbage));
-        match open_device(want, want_ch, cfg) {
-            Ok((device, config, format, name, route)) => {
+        let mut note = None;
+        for headphones in [true, false] {
+            let (device, config, format, name, route) = match open_device(want, want_ch, cfg, headphones) {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!("no audio output: {e}; using a silent clock");
+                    let (tx, rx) = channel();
+                    let (gtx, grx) = bin();
+                    return Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx);
+                }
+            };
+            {
                 // The chosen buffer size first; if the device refuses it, its default.
                 let mut attempts = vec![config.clone()];
                 if config.buffer_size != cpal::BufferSize::Default {
@@ -1359,23 +1388,25 @@ impl Player {
                                 device_buffer: buffer,
                                 silent: false,
                                 headphones: route,
+                                headphone_note: note,
                             };
                         }
                         Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
                     }
                 }
-                log::warn!("no usable audio stream; using a silent clock");
-                let (tx, rx) = channel();
-                let (gtx, grx) = bin();
-                Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
-            }
-            Err(e) => {
-                log::warn!("no audio output: {e}; using a silent clock");
-                let (tx, rx) = channel();
-                let (gtx, grx) = bin();
-                Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
+                // Widened for the headphones and refused: the DJ loses only the headphones.
+                if headphones && let Some(n) = headphones_fallback(route, want_ch) {
+                    log::warn!("{n}; opening it without headphones");
+                    note = Some(n);
+                    continue;
+                }
+                break;
             }
         }
+        log::warn!("no usable audio stream; using a silent clock");
+        let (tx, rx) = channel();
+        let (gtx, grx) = bin();
+        Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
     }
 
     /// A player on the silent clock, without opening any audio device (headless runs, tests).
@@ -1442,6 +1473,7 @@ impl Player {
             device_buffer: None,
             silent: true,
             headphones: HeadphoneRoute::None,
+            headphone_note: None,
         }
     }
 
@@ -1459,6 +1491,7 @@ impl Player {
             device_buffer: None,
             silent: true,
             headphones: HeadphoneRoute::None,
+            headphone_note: None,
         }
     }
 
@@ -1970,10 +2003,10 @@ where
 /// with as many channels as it offers up to `want_ch` (at least stereo when available), and the
 /// chosen buffer size when the device allows it. The headphone route kept for the device (see
 /// [`AudioConfig::headphones_for`]) can ask for more channels (outputs 3–4: 4); the route comes
-/// back fitted to the channels opened.
+/// back fitted to the channels opened. Without `headphones` the route is none.
 type Opened = (cpal::Device, cpal::StreamConfig, cpal::SampleFormat, String, HeadphoneRoute);
 
-fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<Opened, String> {
+fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig, headphones: bool) -> Result<Opened, String> {
     use cpal::traits::DeviceTrait;
     let host = devices::host(cfg);
     let device = devices::device(&host, cfg.output.as_deref(), true).ok_or_else(|| "no output device".to_string())?;
@@ -1983,7 +2016,7 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<Opened
         .supported_output_configs()
         .map(|cs| cs.filter(|c| devices::format_rank(c.sample_format()).is_some()).map(|c| c.channels()).max().unwrap_or(0))
         .unwrap_or(0);
-    let route = cfg.headphones_for(&name, max_ch);
+    let route = if headphones { cfg.headphones_for(&name, max_ch).fit(max_ch) } else { HeadphoneRoute::None };
     // Prefer a config at the chosen (else session) rate; else the device default (we resample).
     let want_ch = want_ch.max(2).max(route.channels());
     let rates: Vec<u32> = cfg.sample_rate.into_iter().chain(Some(want_rate)).collect();
@@ -3726,6 +3759,7 @@ mod deck_tests {
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, bin().0);
         st.set_headphones(route);
         tx.send(Cmd::DeckLoad(DeckId::A, deck())).unwrap();
+        tx.send(Cmd::Deck(DeckCmd::HeadphoneLevel { db: 0.0 })).unwrap();
         tx.send(Cmd::Deck(DeckCmd::Fader { deck: DeckId::A, value: fader, curve: None })).unwrap();
         tx.send(Cmd::Deck(DeckCmd::HeadphoneCue { deck: DeckId::A, on: true })).unwrap();
         tx.send(Cmd::Deck(DeckCmd::Play(DeckId::A))).unwrap();
@@ -3783,10 +3817,47 @@ mod deck_tests {
 
     #[test]
     fn the_frame_layout_follows_the_route() {
-        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 4), FrameLayout { main: 2, pair: Some(2), split: false });
-        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 2), FrameLayout { main: 2, pair: None, split: false });
-        assert_eq!(FrameLayout::new(HeadphoneRoute::Split, 2), FrameLayout { main: 2, pair: None, split: true });
-        assert_eq!(FrameLayout::new(HeadphoneRoute::None, 8), FrameLayout { main: 8, pair: None, split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 4), FrameLayout { main: 2, pair: true, split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(5), 6), FrameLayout { main: 4, pair: true, split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Outputs(3), 2), FrameLayout { main: 2, pair: false, split: false });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::Split, 2), FrameLayout { main: 2, pair: false, split: true });
+        assert_eq!(FrameLayout::new(HeadphoneRoute::None, 8), FrameLayout { main: 8, pair: false, split: false });
+    }
+
+    #[test]
+    fn outputs_1_2_are_bit_identical_with_and_without_the_headphones() {
+        let none = cued(HeadphoneRoute::None, 4, 0.7);
+        let phones = cued(HeadphoneRoute::Outputs(3), 4, 0.7);
+        let main = |o: &[f32]| o.chunks(4).flat_map(|f| [f[0].to_bits(), f[1].to_bits()]).collect::<Vec<_>>();
+        assert_eq!(main(&none), main(&phones));
+        assert!(channel_peak(&phones, 4, 0) > 0.05);
+    }
+
+    #[test]
+    fn a_device_that_wont_open_wider_loses_only_the_headphones() {
+        assert_eq!(headphones_fallback(HeadphoneRoute::Outputs(3), 2).as_deref(), Some("Headphones off: the device wouldn't open with 4 channels"));
+        assert_eq!(headphones_fallback(HeadphoneRoute::Outputs(5), 4).as_deref(), Some("Headphones off: the device wouldn't open with 6 channels"));
+        assert_eq!(headphones_fallback(HeadphoneRoute::Outputs(3), 6), None, "the mix needed those channels anyway");
+        assert_eq!(headphones_fallback(HeadphoneRoute::Split, 2), None);
+        assert_eq!(headphones_fallback(HeadphoneRoute::None, 2), None);
+    }
+
+    #[test]
+    fn a_rate_change_keeps_the_headphone_settings() {
+        let shared = shared();
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, bin().0);
+        st.set_headphones(HeadphoneRoute::Outputs(3));
+        for c in [DeckCmd::HeadphoneMix { value: 0.4 }, DeckCmd::HeadphoneLevel { db: -3.0 }, DeckCmd::MasterCue { on: true }] {
+            tx.send(Cmd::Deck(c)).unwrap();
+        }
+        let mut out = vec![0.0f32; 4 * 512];
+        st.fill(&mut out, 4);
+        let s96 = Session::new("96k", soundcraft_time::SampleRate::new(96_000).unwrap());
+        tx.send(session_cmd(Arc::new(s96), Vec::new(), Vec::new())).unwrap();
+        st.fill(&mut out, 4);
+        let s = shared.live.decks.read();
+        assert_eq!((s.headphone_mix, s.headphone_db, s.master_cue), (0.4, -3.0, true));
     }
 
     #[test]

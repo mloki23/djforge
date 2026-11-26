@@ -146,6 +146,21 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         }
                         stale = true;
                     }
+                    if lname == "DDJ-FLX4" {
+                        let mut knob = layout.get("headphone_level").and_then(Value::as_bool).unwrap_or(false);
+                        if ui
+                            .checkbox(&mut knob, "FLX4 headphone knob controls djforge's level")
+                            .on_hover_text(
+                                "Off (default): the HEADPHONES LEVEL knob is the controller's own headphone amp. On: it also sets djforge's headphone level (−60..0 dB). Turn it on only if the knob alone doesn't change the level (a hardware check).",
+                            )
+                            .changed()
+                        {
+                            crate::controller_layouts::set_headphone_knob(app, &name, raw, backend, knob);
+                            stale = true;
+                        }
+                        ui.end_row();
+                        ui.label("");
+                    }
                     let (out_text, colour) = match layout.get("output").and_then(Value::as_str) {
                         Some("open") => (format!("lights: {}", layout.get("output_name").and_then(Value::as_str).unwrap_or("output open")), t.meter_green),
                         Some("not open") => (

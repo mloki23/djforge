@@ -49,6 +49,9 @@ pub struct DeckCtx {
 pub struct Ctx {
     pub decks: [DeckCtx; 2],
     pub now: f64,
+    /// The controller's headphone level knob drives djforge's headphone level (an option per
+    /// device, `UiState::layout_headphone_level`; off: the knob is the hardware's own).
+    pub headphone_knob: bool,
 }
 
 impl Ctx {
@@ -455,7 +458,10 @@ fn perform(app: &mut SoundApp, layout: &str, a: Action) {
 /// it. True when the layout claims it (whatever it did).
 pub fn handle(app: &mut SoundApp, port: PortId, msg: &MidiMessage, now: f64) -> bool {
     let Some(i) = app.controllers.devices.iter().position(|d| d.input == port) else { return false };
-    let ctx = Ctx::of(app, now);
+    let mut ctx = Ctx::of(app, now);
+    if let Some(d) = app.controllers.devices.get(i) {
+        ctx.headphone_knob = layout_off(&app.ui.layout_headphone_level, &d.raw_name, &d.backend_id);
+    }
     let Some(d) = app.controllers.devices.get_mut(i) else { return false };
     if !d.logic.claims(msg) {
         return false;
@@ -515,19 +521,29 @@ pub fn describe(app: &SoundApp, raw_name: &str, backend_id: &str) -> Option<Valu
     Some(json!({
         "name": layout.name,
         "on": on,
+        "headphone_level": layout_off(&app.ui.layout_headphone_level, raw_name, backend_id),
         "output": output,
         "output_name": dev.and_then(|d| d.out_name.clone()),
         "output_error": dev.and_then(|d| d.out_error.clone()),
     }))
 }
 
-/// `midi.layout {name, on?}`: turns the built-in layout of the input listed as `name` on or off
-/// (default: toggles), kept in the preferences.
+/// `midi.layout {name, on?, headphone_level?}`: turns the built-in layout of the input listed as
+/// `name` on or off (default: toggles), and with `headphone_level` whether its headphone level
+/// knob drives djforge's headphone level; kept in the preferences.
 pub fn command(app: &mut SoundApp, p: &Value) -> Result<Value, String> {
     let name = p.get("name").and_then(Value::as_str).ok_or("`name` required")?;
     let host = app.midi_host.as_ref().ok_or("no MIDI input on this system")?;
     let port = host.source().list().into_iter().find(|x| x.name == name).ok_or_else(|| format!("no MIDI input named \"{name}\""))?;
     let layout = layout_for(&port.raw_name).ok_or_else(|| format!("{name} has no built-in layout"))?;
+    if let Some(v) = p.get("headphone_level") {
+        let knob = v.as_bool().ok_or("`headphone_level` must be true or false")?;
+        set_headphone_knob(app, &port.name, &port.raw_name, &port.backend_id, knob);
+        if p.get("on").is_none() {
+            app.ui.status = format!("{name}: headphone level knob {}", if knob { "drives djforge's level" } else { "is the hardware's own" });
+            return Ok(json!({"name": name, "layout": layout.name, "headphone_level": knob}));
+        }
+    }
     let was = !layout_off(&app.ui.midi_layouts_off, &port.raw_name, &port.backend_id);
     let on = match p.get("on") {
         None | Some(Value::Null) => !was,
@@ -540,6 +556,20 @@ pub fn command(app: &mut SoundApp, p: &Value) -> Result<Value, String> {
     app.mark_prefs_changed();
     app.ui.status = format!("{name}: built-in {} layout {}", layout.name, if on { "on" } else { "off" });
     Ok(json!({"name": name, "layout": layout.name, "on": on}))
+}
+
+/// Whether the device's headphone level knob drives djforge's headphone level (kept in the
+/// preferences, `UiState::layout_headphone_level`).
+pub fn set_headphone_knob(app: &mut SoundApp, name: &str, raw_name: &str, backend_id: &str, on: bool) {
+    app.ui.layout_headphone_level.retain(|x| !(x.raw_name == raw_name && x.backend_id == backend_id));
+    if on {
+        app.ui.layout_headphone_level.push(MidiInputPref {
+            name: name.to_string(),
+            raw_name: raw_name.to_string(),
+            backend_id: backend_id.to_string(),
+        });
+    }
+    app.mark_prefs_changed();
 }
 
 #[cfg(test)]

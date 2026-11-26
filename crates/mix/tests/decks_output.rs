@@ -117,3 +117,69 @@ fn arrangement_play_after_the_decks_hands_over_without_a_click() {
     let want: Vec<f32> = (0..512).map(|i| (std::f64::consts::TAU * 440.0 * (at + i as f64) / SR).sin() as f32 * 0.5).collect();
     assert!(tail.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-4));
 }
+
+/// A deck of one click (0.5) at 1 s, cued and on the master.
+fn click() -> Box<PreparedDeck> {
+    let n = (5.0 * SR) as usize;
+    let ch: Vec<f32> = (0..n).map(|i| if i == 48_000 { 0.5 } else { 0.0 }).collect();
+    let source = Arc::new(SourceAudio::new(AudioBuffer { sample_rate: SR as u32, channels: vec![ch.clone(), ch] }));
+    let track = DeckTrack {
+        source,
+        grid: BeatGrid::constant(0.0, 22_500.0, n as f64),
+        bpm: Some(128.0),
+        key: None,
+        cues: [None; HOT_CUES],
+        title: String::new(),
+        artist: String::new(),
+        path: String::new(),
+        grid_from: None,
+        sections: Vec::new(),
+    };
+    Box::new(PreparedDeck::new(Arc::new(track), SR as f32))
+}
+
+/// The headphone output (left) of the click deck through the whole engine at headphone mix `mix`.
+fn phones_at(s: &Session, mix: f32) -> Vec<f32> {
+    let mut eng = MixEngine::new(SR as f32, 512);
+    eng.enable_decks();
+    eng.set_headphones(true);
+    eng.monitor_only = true;
+    assert!(eng.deck_load(DeckId::A, click()).is_none());
+    eng.deck(DeckCmd::Assign { deck: DeckId::A, side: XfadeSide::Thru });
+    eng.deck(DeckCmd::HeadphoneCue { deck: DeckId::A, on: true });
+    eng.deck(DeckCmd::HeadphoneMix { value: mix });
+    eng.deck(DeckCmd::HeadphoneLevel { db: 0.0 });
+    eng.deck(DeckCmd::Play(DeckId::A));
+    let mut out = vec![vec![0.0f32; 512]; 2];
+    let mut heard = Vec::new();
+    for b in 0..150 {
+        eng.render(s, b * 512, 512, &mut out);
+        heard.extend_from_slice(&eng.headphones()[0][..512]);
+    }
+    heard
+}
+
+fn loudest(x: &[f32]) -> (usize, f32) {
+    x.iter().enumerate().map(|(i, v)| (i, v.abs())).fold((0, 0.0), |m, (i, v)| if v > m.1 { (i, v) } else { m })
+}
+
+#[test]
+fn cue_and_master_line_up_in_the_headphones_through_a_lookahead_master_insert() {
+    let mut s = Session::default();
+    let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
+    let mut maximizer = soundcraft_model::Insert::new("maximizer");
+    maximizer.params.insert("ceiling".into(), 0.0);
+    s.track_mut(m).unwrap().mixer.inserts[0] = Some(maximizer);
+    let (cue, master, both) = (phones_at(&s, 0.0), phones_at(&s, 1.0), phones_at(&s, 0.5));
+    let (at_cue, _) = loudest(&cue);
+    let (at_master, _) = loudest(&master);
+    assert!(at_cue > 48_000, "the click came through: {at_cue}");
+    assert_eq!(at_cue, at_master, "the cue bus is delayed as the master is");
+    // Half way: the two coincide, so the sum is one click at √2 × each, not two at 0.7 each.
+    let (at_both, peak) = loudest(&both);
+    assert_eq!(at_both, at_cue);
+    let one = loudest(&cue).1;
+    assert!((peak / one - std::f32::consts::SQRT_2).abs() < 0.05, "{peak} vs {one}");
+    let echo = both.iter().enumerate().filter(|(i, v)| i.abs_diff(at_both) > 8 && v.abs() > one * 0.3).count();
+    assert_eq!(echo, 0, "no second click (comb)");
+}

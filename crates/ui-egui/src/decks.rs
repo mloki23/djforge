@@ -66,6 +66,11 @@ impl SoundApp {
         if let Some(p) = &self.player {
             self.engine.set_deck_status(p.decks_state());
         }
-        self.engine.headphone_output = self.player.as_ref().and_then(soundcraft_playback::Player::headphone_output);
+        // Set only when it changes (no allocation per frame).
+        let route = self.player.as_ref().map(|p| p.headphones);
+        if self.decks_view.phones_route != route {
+            self.decks_view.phones_route = route;
+            self.engine.headphone_output = self.player.as_ref().and_then(soundcraft_playback::Player::headphone_output);
+        }
     }
 }

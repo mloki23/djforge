@@ -122,8 +122,11 @@ pub const MAX_GRID_BEATS: usize = 200_000;
 pub const CEILING_DB: f32 = -1.0;
 /// The headphone level's range (dB); the bottom is silence.
 pub const HEADPHONE_DB: (f32, f32) = (-60.0, 0.0);
-/// The longest delay the cue bus takes to line up with the master (frames).
-const MAX_CUE_DELAY: usize = 2048;
+/// The headphone level the decks start at (dB): safe in any headphones.
+pub const HEADPHONE_DEFAULT_DB: f32 = -12.0;
+/// The longest delay the cue bus takes to line up with the master (frames): the decks' limiters
+/// and the master track's inserts.
+const MAX_CUE_DELAY: usize = 16_384;
 
 /// A deck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1749,6 +1752,8 @@ pub struct Decks {
     cue: Vec<Vec<f32>>,
     phones: Vec<Vec<f32>>,
     cue_delay: CueDelay,
+    /// The decks' own master path's delay (both limiters' lookahead), before the master track's.
+    master_delay: usize,
     phones_limiter: Option<Box<dyn Plugin>>,
     hp_mix: f32,
     hp_db: f32,
@@ -1786,6 +1791,16 @@ struct CueDelay {
 impl CueDelay {
     fn new(delay: usize) -> CueDelay {
         CueDelay { ring: [vec![0.0; MAX_CUE_DELAY], vec![0.0; MAX_CUE_DELAY]], at: 0, delay: delay.min(MAX_CUE_DELAY - 1) }
+    }
+
+    /// A new delay (frames, at most the ring's), without allocating.
+    fn set_delay(&mut self, delay: usize) {
+        self.delay = delay.min(MAX_CUE_DELAY - 1);
+    }
+
+    /// Silence in the ring (nothing old plays when the headphones come on).
+    fn clear(&mut self) {
+        self.ring.iter_mut().for_each(|r| r.iter_mut().for_each(|x| *x = 0.0));
     }
 
     /// Delays the first `n` frames of `io`'s first two channels, in place.
@@ -1866,11 +1881,12 @@ impl Decks {
             cue: buf(),
             phones: buf(),
             cue_delay: CueDelay::new(master_delay),
+            master_delay,
             phones_limiter: ceiling_limiter(sr, max_block),
             hp_mix: 0.0,
-            hp_db: 0.0,
+            hp_db: HEADPHONE_DEFAULT_DB,
             master_cue: false,
-            g_phones: headphone_gains(0.0, 0.0),
+            g_phones: headphone_gains(0.0, HEADPHONE_DEFAULT_DB),
             phones_idle: usize::MAX,
             cue_level: [0.0; 2],
         }
@@ -1879,7 +1895,22 @@ impl Decks {
     /// Wants the headphone output or not (off by default: nothing is summed or limited for it).
     /// Neither allocates nor frees.
     pub fn set_headphones(&mut self, on: bool) {
+        if on && !self.phones_on {
+            // Coming on: nothing old in the delay or the limiter, and no ramp from stale gains.
+            self.cue_delay.clear();
+            if let Some(l) = self.phones_limiter.as_mut() {
+                l.reset();
+            }
+            self.phones_idle = usize::MAX;
+            self.g_phones = headphone_gains(self.hp_mix, self.hp_db);
+        }
         self.phones_on = on;
+    }
+
+    /// The master track's inserts' latency (frames) this block: the cue bus is delayed by it too,
+    /// so cue and master line up in the headphones. No allocation.
+    pub fn set_master_latency(&mut self, frames: usize) {
+        self.cue_delay.set_delay(self.master_delay.saturating_add(frames));
     }
 
     /// Puts `deck` on deck `id`, stopped at its first downbeat. While the deck sounds, the new
@@ -3296,7 +3327,10 @@ mod tests {
         };
         let mut d = decks();
         assert_eq!(steady(&mut d, 0.1), [0.0, 0.0], "off until wanted");
+        assert_eq!(d.state().headphone_db, HEADPHONE_DEFAULT_DB, "the level starts safe");
         d.set_headphones(true);
+        assert!(steady(&mut d, 0.1).iter().all(|v| (v - 0.1 * db_to_gain(HEADPHONE_DEFAULT_DB)).abs() < 1e-3));
+        d.apply(DeckCmd::HeadphoneLevel { db: 0.0 });
         let close = |x: [f32; 2], want: f32| x.iter().all(|v| (v - want).abs() < 1e-3);
         assert!(close(steady(&mut d, 0.1), 0.1), "mix 0: cue only");
         d.apply(DeckCmd::HeadphoneMix { value: 1.0 });

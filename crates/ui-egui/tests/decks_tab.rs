@@ -433,8 +433,9 @@ fn the_headphone_controls_drive_the_cue_mix_and_say_where_the_headphones_play() 
     // MIX turned right goes toward the master; LEVEL turned down lowers the level.
     drag_by(&mut h, "Headphone Mix", -60.0);
     until(&mut h, "mix toward master", |s| s["headphones"]["mix"].as_f64().unwrap() > 0.2);
+    assert_eq!(state(&mut h)["headphones"]["level_db"], -12.0, "the level starts safe");
     drag_by(&mut h, "Headphone Level", 60.0);
-    until(&mut h, "level down", |s| s["headphones"]["level_db"].as_f64().unwrap() < -3.0);
+    until(&mut h, "level down", |s| s["headphones"]["level_db"].as_f64().unwrap() < -15.0);
     drag_by(&mut h, "Headphone Level", -300.0);
     until(&mut h, "level back up to 0 dB", |s| s["headphones"]["level_db"].as_f64().unwrap() == 0.0);
 }

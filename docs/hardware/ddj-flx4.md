@@ -147,7 +147,7 @@ the Rust table has exactly the same messages, so keep them in step.
 | smart_cfx | SMART CFX | — | no | Note | 7 | 0 (0x00) | — | press | (unmapped) |
 | smart_cfx_shift | SMART CFX | — | yes | Note | 7 | 8 (0x08) | — | press | (unmapped) |
 | headphone_mix | HEADPHONE MIX | — | no | CC | 7 | 12 (0x0C) | 44 (0x2C) | 14-bit | `deck.headphone_mix` 0 (cue) .. 1 (master) |
-| headphone_level | HEADPHONE LEVEL | — | no | CC | 7 | 13 (0x0D) | 45 (0x2D) | 14-bit | (unmapped: the knob is taken to set the headphone amp's own level; see below) |
+| headphone_level | HEADPHONE LEVEL | — | no | CC | 7 | 13 (0x0D) | 45 (0x2D) | 14-bit | unmapped by default (the hardware's own level); with the device's option "FLX4 headphone knob controls djforge's level", `deck.headphone_level` −60..0 dB |
 | smart_fader | SMART FADER | — | no | Note | 7 | 1 (0x01) | — | press | (unmapped) |
 | smart_fader_shift | SMART FADER | — | yes | Note | 7 | 9 (0x09) | — | press | (unmapped) |
 | android_mono_stereo | Android MONO/STEREO switch (rear) | — | no | Note | 7 | 109 (0x6D) | — | STEREO 0x00, MONO 0x7F | (unmapped) |
@@ -177,12 +177,13 @@ anything, not even when the layout stops (a Note Off, or a Note On with velocity
 it).
 
 Headphones: djforge plays its headphone output on the controller's outputs 3–4 (master on 1–2)
-when the device opens with 4 outputs (Setup › Playback Engine › Headphones). HEADPHONE MIX drives
-djforge's mix; HEADPHONE LEVEL is left to the hardware, on the assumption that it sets the
-headphone amplifier's level itself (mapping it too would turn the level down twice). If the
-hardware's level turns out to do nothing to the sound, map it with MIDI Learn to
-`deck.headphone_level` (to be checked on the hardware). The MASTER CUE light isn't in the list's
-outputs, so djforge doesn't drive it.
+when the device opens with 4 outputs (Setup › Playback Engine › Headphones on outputs). HEADPHONE
+MIX drives djforge's mix. HEADPHONE LEVEL is left to the hardware by default, on the assumption
+that it sets the headphone amplifier's level itself (mapping it too would turn the level down
+twice); djforge's own headphone level starts at −12 dB. MIDI Devices has a per-device option,
+"FLX4 headphone knob controls djforge's level" (off by default), that maps it to
+`deck.headphone_level`. The MASTER CUE light isn't in the list's outputs, so djforge doesn't
+drive it.
 
 The crossfader's fader-start messages (SHIFT + crossfader) are listed with channel 7 in the
 "MIDI Channel" column but status bytes `0x90` / `0x91` (channels 1 and 2) and notes 102 / 82: the
@@ -318,3 +319,19 @@ the output with the same name at the same position among same-named ports (the s
   nothing until it reaches or crosses the deck's pitch. A deck synced to a master on the other
   deck takes the slider straight away: the engine's own takeover applies (it turns sync off and
   waits for the tempo held). A synced deck that is itself the master waits like any other.
+
+## Hardware checklist
+
+To check on the controller itself:
+
+- **Outputs:** Windows lists the FLX4 with 4 output channels (Sound settings › the FLX4 ›
+  speaker setup Quadraphonic if it shows Stereo); djforge's Decks tab then reads
+  "Headphones: outputs 3-4". If the device refuses 4 channels djforge opens it in stereo and says
+  "Headphones off: the device wouldn't open with 4 channels".
+- **HEADPHONE LEVEL:** turning it changes the headphone volume with the option off. If it
+  doesn't, turn the option on.
+- **HEADPHONE MIX:** it blends cue and master once, not twice (the hardware doesn't also mix
+  outputs 1–2 into the headphones).
+- **FX ON/OFF:** its light stays as it was when the layout stops (djforge sends it nothing).
+- **Latency:** the headphones are about 3 ms behind the master outputs (their limiter's
+  lookahead).

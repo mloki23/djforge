@@ -148,6 +148,8 @@ pub struct DecksView {
     pub browser: Browser,
     /// Meter levels shown: A, B, master, headphones (L, R), falling smoothly.
     meters: [[f32; 2]; 4],
+    /// The headphone route `Engine::headphone_output` was last set for (`None`: no player yet).
+    pub(crate) phones_route: Option<soundcraft_playback::HeadphoneRoute>,
     /// Values of the controls being dragged, until the decks report them.
     held: HashMap<Id, f32>,
     /// Columns the waveforms computed (for the timing harness).
@@ -1325,8 +1327,9 @@ pub fn headphone_status(app: &SoundApp) -> String {
         None => "Headphones: no audio device".into(),
         Some(p) if p.silent => "Headphones: no output (no audio device)".into(),
         Some(p) => match p.headphones {
+            soundcraft_playback::HeadphoneRoute::None if p.headphone_note.is_some() => p.headphone_note.clone().unwrap_or_default(),
             soundcraft_playback::HeadphoneRoute::None if p.device_channels <= 2 => {
-                format!("Headphones: no output ({}-channel device)", p.device_channels)
+                format!("Headphones: no output ({}-channel device; choose Split in Setup to cue in one ear)", p.device_channels)
             }
             soundcraft_playback::HeadphoneRoute::None => "Headphones: no output (Setup › Playback Engine)".into(),
             soundcraft_playback::HeadphoneRoute::Split => "Headphones: split (left phones, right master)".into(),
@@ -1349,23 +1352,26 @@ fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
         Rect::from_min_size(pos2(r.center().x - ks - 3.0, ky), vec2(ks, ks)),
         "Headphone Mix",
         mix,
-        Knob { label: "", default: 0.5, detent: Some(0.5), origin: 0.0, colour: t.accent },
-        &format!("Headphone mix: {:.0} % master (left: cue only, right: master only). Double-click: centre", mix * 100.0),
+        Knob { label: "", default: 0.0, detent: Some(0.5), origin: 0.0, colour: t.accent },
+        &format!("Headphone mix: {:.0} % master (left: cue only, right: master only). Double-click: cue only", mix * 100.0),
         |app, v| run(app, "deck.headphone_mix", json!({"value": (f64::from(v) * 1000.0).round() / 1000.0})),
     );
+    // The level's knob spans −60..0 dB evenly; all the way down is off.
+    let (lo, hi) = soundcraft_mix::HEADPHONE_DB;
+    let to_travel = |db: f32| ((db - lo) / (hi - lo)).clamp(0.0, 1.0);
     let db = st.headphone_db;
-    let travel = if db.is_finite() { (db / 40.0 + 1.0).clamp(0.0, 1.0) } else { 1.0 };
-    let shown = if db <= soundcraft_mix::HEADPHONE_DB.0 { "off".to_string() } else { format!("{db:.1} dB") };
+    let travel = if db.is_finite() { to_travel(db) } else { to_travel(soundcraft_mix::HEADPHONE_DEFAULT_DB) };
+    let shown = if db <= lo { "off".to_string() } else { format!("{db:.1} dB") };
     deck_knob(
         app,
         ui,
         Rect::from_min_size(pos2(r.center().x + 3.0, ky), vec2(ks, ks)),
         "Headphone Level",
         travel,
-        Knob { label: "", default: 1.0, detent: None, origin: 0.0, colour: t.text },
-        &format!("Headphone level {shown}, into its own limiter at −1 dBTP. Double-click: 0 dB"),
+        Knob { label: "", default: to_travel(soundcraft_mix::HEADPHONE_DEFAULT_DB), detent: None, origin: 0.0, colour: t.text },
+        &format!("Headphone level {shown}, into its own limiter at −1 dBTP. Double-click: {} dB", soundcraft_mix::HEADPHONE_DEFAULT_DB),
         |app, v| {
-            let db = if v <= 0.0 { -60.0 } else { ((v - 1.0) * 40.0).max(-60.0) };
+            let db = lo + v * (hi - lo);
             run(app, "deck.headphone_level", json!({"db": (f64::from(db) * 10.0).round() / 10.0}));
         },
     );

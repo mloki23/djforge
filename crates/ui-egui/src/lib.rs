@@ -251,6 +251,9 @@ pub struct UiState {
     /// Devices whose built-in controller layout is turned off (`midi.layout`); a recognised
     /// device uses its layout unless listed here.
     pub midi_layouts_off: Vec<midi_input::MidiInputPref>,
+    /// Devices whose layout's headphone level knob drives djforge's headphone level (off by
+    /// default: the knob is the controller's own headphone amp).
+    pub layout_headphone_level: Vec<midi_input::MidiInputPref>,
 }
 
 impl Default for UiState {
@@ -319,6 +322,7 @@ impl Default for UiState {
             midi_mappings_backup: Vec::new(),
             show_midi_mappings: false,
             midi_layouts_off: Vec::new(),
+            layout_headphone_level: Vec::new(),
             waveform_bands: None,
             deck_colours: None,
             agents: false,
@@ -1205,6 +1209,15 @@ impl SoundApp {
         self.recorder_failed = false;
         let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
         player.locate(at);
+        // The headphone settings carry over to the new device (the hardware's knobs stay put).
+        let was = self.engine.deck_status;
+        for c in [
+            soundcraft_mix::DeckCmd::HeadphoneMix { value: was.headphone_mix },
+            soundcraft_mix::DeckCmd::HeadphoneLevel { db: was.headphone_db },
+            soundcraft_mix::DeckCmd::MasterCue { on: was.master_cue },
+        ] {
+            player.deck(c);
+        }
         self.player = Some(player);
         Ok(())
     }

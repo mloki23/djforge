@@ -120,7 +120,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Headphone Level",
             [],
             None,
-            "{db: -60..=0} — the headphone level (-60 is silence); the headphone output then goes through its own limiter at -1 dBTP. Reported as `headphones.level_db` in decks.state",
+            "{db: -60..=0} — the headphone level (-60 is silence; it starts at -12 dB); the headphone output then goes through its own limiter at -1 dBTP. Reported as `headphones.level_db` in decks.state",
             always,
             |e, p| mixer(e, p, "deck.headphone_level")
         ),

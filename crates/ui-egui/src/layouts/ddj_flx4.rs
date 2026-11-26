@@ -162,6 +162,9 @@ pub enum Ctl {
     MasterCue,
     /// HEADPHONE MIX: cue ↔ master.
     HeadphoneMix,
+    /// HEADPHONE LEVEL: djforge's headphone level, only with the device's option on
+    /// ([`Ctx::headphone_knob`]); else the hardware's own.
+    HeadphoneLevel,
     Fader,
     Crossfader,
     /// The browse knob, rows per click.
@@ -293,7 +296,7 @@ const SHARED: [InputDef; 31] = [
     note("smart_cfx", None, No, 7, 0x00, Ctl::Unmapped),
     note("smart_cfx_shift", None, Yes, 7, 0x08, Ctl::Unmapped),
     wide("headphone_mix", None, No, 7, 0x0C, Ctl::HeadphoneMix),
-    wide("headphone_level", None, No, 7, 0x0D, Ctl::Unmapped),
+    wide("headphone_level", None, No, 7, 0x0D, Ctl::HeadphoneLevel),
     note("smart_fader", None, No, 7, 0x01, Ctl::Unmapped),
     note("smart_fader_shift", None, Yes, 7, 0x09, Ctl::Unmapped),
     note("android_mono_stereo", None, No, 7, 0x6D, Ctl::Unmapped),
@@ -592,6 +595,13 @@ impl Flx4 {
             Ctl::HeadphoneMix => {
                 if let Some(v) = wide {
                     out.push(Action::Run("deck.headphone_mix", json!({"value": round(unit(v), 3)})));
+                }
+            }
+            Ctl::HeadphoneLevel => {
+                if let Some(v) = wide.filter(|_| ctx.headphone_knob) {
+                    let (lo, hi) = soundcraft_mix::HEADPHONE_DB;
+                    let db = f64::from(lo) + unit(v) * f64::from(hi - lo);
+                    out.push(Action::Run("deck.headphone_level", json!({"db": round(db, 1)})));
                 }
             }
             Ctl::Crossfader => {
@@ -1041,7 +1051,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { decks: [loaded(), loaded()], now: 10.0 }
+        Ctx { decks: [loaded(), loaded()], now: 10.0, headphone_knob: false }
     }
 
     fn on(ch1: u8, note: u8) -> MidiMessage {
@@ -1142,7 +1152,10 @@ mod tests {
         assert!(f.input(&off(7, 0x63), &c).is_empty());
         assert_eq!(wide(&mut f, &c, 7, 0x0C, 16383), vec![cmd("deck.headphone_mix", json!({"value": 1.0}))]);
         assert_eq!(wide(&mut f, &c, 7, 0x0C, 0), vec![cmd("deck.headphone_mix", json!({"value": 0.0}))]);
-        assert!(wide(&mut f, &c, 7, 0x0D, 8192).is_empty() && f.claims(&cc(7, 0x0D, 0)), "HEADPHONE LEVEL is claimed, unmapped");
+        assert!(wide(&mut f, &c, 7, 0x0D, 8192).is_empty() && f.claims(&cc(7, 0x0D, 0)), "HEADPHONE LEVEL is claimed, unmapped by default");
+        let knob = Ctx { headphone_knob: true, ..c };
+        assert_eq!(wide(&mut f, &knob, 7, 0x0D, 16383), vec![cmd("deck.headphone_level", json!({"db": 0.0}))], "with the option: djforge's level");
+        assert_eq!(wide(&mut f, &knob, 7, 0x0D, 0), vec![cmd("deck.headphone_level", json!({"db": -60.0}))]);
         // Browse: two's complement clicks, SHIFT pages by 8; press and LOAD.
         assert_eq!(f.input(&cc(7, 0x40, 0x01), &c), vec![Action::Browse(1)]);
         assert_eq!(f.input(&cc(7, 0x40, 0x7E), &c), vec![Action::Browse(-2)]);

@@ -34,8 +34,36 @@ pub struct AudioConfig {
     pub buffer_size: Option<u32>,
     /// Where each output device (by name) plays the decks' headphone output, as chosen; a
     /// device not listed takes [`default_headphones`].
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "lenient_routes")]
     pub headphones: std::collections::BTreeMap<String, HeadphoneRoute>,
+}
+
+/// The kept headphone routes, dropping any entry that isn't one (a malformed or newer
+/// preference never loses the rest of the audio choice).
+fn lenient_routes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, HeadphoneRoute>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Route(HeadphoneRoute),
+        Other(serde::de::IgnoredAny),
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Routes {
+        Map(std::collections::BTreeMap<String, Entry>),
+        Other(serde::de::IgnoredAny),
+    }
+    let all = match <Routes as serde::Deserialize>::deserialize(d)? {
+        Routes::Map(m) => m,
+        Routes::Other(_) => Default::default(),
+    };
+    Ok(all
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            Entry::Route(r) => Some((k, r)),
+            Entry::Other(_) => None,
+        })
+        .collect())
 }
 
 impl AudioConfig {
@@ -318,6 +346,13 @@ mod tests {
         assert!(s.contains(r#""MOTU":{"outputs":5}"#) && s.contains(r#""Realtek":"split""#), "{s}");
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c, "round-trips");
         assert!(!serde_json::to_string(&AudioConfig::default()).unwrap().contains("headphones"), "nothing written until chosen");
+        // A malformed entry is dropped, the rest kept.
+        let odd: AudioConfig =
+            serde_json::from_str(r#"{"output":"X","headphones":{"A":{"outputs":3},"B":"sideways","C":{"outputs":-1},"D":7}}"#).unwrap();
+        assert_eq!(odd.output.as_deref(), Some("X"));
+        assert_eq!(odd.headphones.into_iter().collect::<Vec<_>>(), [("A".to_string(), HeadphoneRoute::Outputs(3))]);
+        let not_a_map: AudioConfig = serde_json::from_str(r#"{"output":"X","headphones":[1,2]}"#).unwrap();
+        assert!(not_a_map.headphones.is_empty() && not_a_map.output.as_deref() == Some("X"));
         // What a device can take.
         assert_eq!(HeadphoneRoute::Outputs(3).fit(4), HeadphoneRoute::Outputs(3));
         assert_eq!(HeadphoneRoute::Outputs(3).fit(2), HeadphoneRoute::None);

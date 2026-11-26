@@ -68,8 +68,8 @@ mod live;
 mod live_in;
 mod warp;
 pub use decks::{
-    BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HEADPHONE_DB, HOT_CUES, HotCueAction, JogMode, LoopAction, PITCH_RANGES,
-    PreparedDeck, Section, headphone_gains,
+    BeatGrid, DeckCmd, DeckId, DeckState, DeckTrack, Decks, DecksState, HEADPHONE_DB, HEADPHONE_DEFAULT_DB, HOT_CUES, HotCueAction, JogMode,
+    LoopAction, PITCH_RANGES, PreparedDeck, Section, headphone_gains,
 };
 pub use dj_strip::{EqBand, FaderCurve, XfadeCurve, XfadeSide};
 pub use live::{
@@ -1405,6 +1405,7 @@ impl MixEngine {
         }
         // Master faders process the main mix.
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);
+        let mut master_latency = 0usize;
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
                 for (dst, src) in strip.buf.iter_mut().zip(self.main.iter()) {
@@ -1421,6 +1422,7 @@ impl MixEngine {
                         apply_params(slot, ins, t, i, pos);
                         slot.plugin.set_transport(&transport);
                         slot.plugin.process(&mut strip.buf, frames);
+                        master_latency = master_latency.saturating_add(slot.plugin.latency());
                         if contain_failure(slot, &mut strip.buf, frames) {
                             strip.failures.record(i);
                         }
@@ -1455,8 +1457,10 @@ impl MixEngine {
         if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
             click::render(s, pos, frames, &mut self.main);
         }
-        // The decks' headphone output, from the main output as it leaves.
+        // The decks' headphone output, from the main output as it leaves (the cue bus delayed as
+        // the master inserts delay the master).
         if let Some(d) = self.decks.as_mut() {
+            d.set_master_latency(master_latency);
             d.headphones(&self.main, frames);
         }
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
