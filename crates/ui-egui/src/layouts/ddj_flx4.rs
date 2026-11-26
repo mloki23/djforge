@@ -5,18 +5,20 @@
 //!
 //! The layout reads the controller's messages and turns them into deck and mixer commands
 //! ([`Action`]s), and mirrors the decks' state onto the controller's lights ([`Light`]s). It holds
-//! no app state of its own besides what the hardware needs remembered: the 14-bit MSBs, the
-//! pad mode, held pads and cues, jog counts waiting for the frame, and the tempo slider's soft
-//! takeover.
+//! no app state of its own besides what the hardware needs remembered: the 14-bit MSBs, SHIFT,
+//! the pad mode, and what its deck controls remember (held pads and cues, toggles asked for, jog
+//! counts waiting for the frame, the tempo slider's soft takeover), which is
+//! [`crate::deck_controls`]'s, shared with MIDI Learn's deck targets.
 
 use std::collections::HashMap;
 
 use serde_json::json;
 use soundcraft_midi_io::MidiMessage;
-use soundcraft_mix::{DeckId, EqBand, PITCH_RANGES};
+use soundcraft_mix::{DeckId, EqBand};
 use soundcraft_playback::MidiControl;
 
 use crate::controller_layouts::{Action, Controller, Ctx, DeckCtx, Light};
+use crate::deck_controls::{Button, Continuous, DeckControls, centred, range_pct, round, run};
 
 /// The layout's name, as the MIDI Devices window shows it.
 pub const NAME: &str = "DDJ-FLX4";
@@ -323,44 +325,14 @@ fn unit(v: u16) -> f64 {
     f64::from(v.min(16383)) / 16383.0
 }
 
-/// A bipolar 14-bit value as −1..=1, with ±32 counts around the centre read as 0.
-fn bipolar(v: u16) -> f64 {
-    let x = (f64::from(v.min(16383)) - 8191.5) / 8191.5;
-    if x.abs() < 32.0 / 8191.5 { 0.0 } else { x.clamp(-1.0, 1.0) }
-}
-
-fn round(x: f64, places: i32) -> f64 {
-    let k = 10f64.powi(places);
-    (x * k).round() / k
-}
-
-/// Jog counts per revolution (assumed: the list doesn't say).
-pub const JOG_TICKS: f64 = 720.0;
-/// Beats a full platter turn searches, paused.
-pub const SEARCH_BEATS_PER_TURN: f64 = 2.0;
-/// Beats a full turn searches with SHIFT.
-pub const FAST_BEATS_PER_TURN: f64 = 32.0;
-/// Jog counts a second for a full nudge (10 % bend), as the on-screen jog's drag speed.
-pub const NUDGE_TICKS_S: f64 = 1000.0;
-/// Seconds after a tempo move before a deck pitch elsewhere re-arms the soft takeover (the
-/// published state lags the command).
-const TAKEOVER_SETTLE_S: f64 = 0.3;
+/// A bipolar 14-bit control's dead zone around the centre: ±32 counts read as 0.
+const DEAD_14: f64 = 32.0 / 8191.5;
 /// Below this the level meter is dark.
 const METER_FLOOR_DB: f32 = -24.0;
 /// How fast the meter falls, dB a second.
 const METER_FALL_DB_S: f32 = 30.0;
 /// Positions (samples) this close to the cue point count as at it.
 const AT_CUE: f64 = 256.0;
-
-/// The tempo slider's soft takeover for one deck.
-#[derive(Debug, Default, Clone, Copy)]
-struct Pickup {
-    picked: bool,
-    /// The slider's last reading (percent).
-    hw: Option<f64>,
-    /// The last pitch sent (percent) and when.
-    sent: Option<(f64, f64)>,
-}
 
 /// The DDJ-FLX4's layout state (see the module docs).
 #[derive(Debug, Default)]
@@ -370,46 +342,14 @@ pub struct Flx4 {
     shift: [bool; 2],
     /// The platter touched (a nudge held: the UI then runs at a full frame rate).
     touch: [bool; 2],
-    /// The toggles last asked for, per deck: play, sync, headphone cue.
-    pending: [[Option<(bool, f64)>; 3]; 2],
     mode: [PadMode; 2],
-    /// A hot cue pad held after a jump, which sends its release.
-    held_pad: [Option<usize>; 2],
-    cue_held: [bool; 2],
-    search: [f64; 2],
-    nudge: [i64; 2],
-    tempo: [Pickup; 2],
+    /// What the deck controls remember: toggles asked for, held cues and pads, jog counts
+    /// waiting for the frame, the tempo slider's soft takeover.
+    decks: DeckControls,
     meter_db: [f32; 2],
     meter_at: Option<f64>,
     loads: [u64; 2],
     resend: bool,
-}
-
-/// A deck command with its deck.
-fn run(id: &'static str, d: DeckId, mut p: serde_json::Value) -> Action {
-    if let Some(o) = p.as_object_mut() {
-        o.insert("deck".into(), json!(d.id()));
-    }
-    Action::Run(id, p)
-}
-
-/// How long a toggle's wanted state counts over what the deck reports (the report lags).
-const PENDING_S: f64 = 0.5;
-
-/// A toggle pressed: the new state, from the one asked for last if the deck hasn't reported it
-/// yet, else from the reported one, so a quick double press sends on then off, not on twice.
-fn toggle(pending: &mut Option<(bool, f64)>, reported: bool, now: f64) -> bool {
-    let base = match *pending {
-        Some((want, at)) if now - at < PENDING_S && (0.0..).contains(&(now - at)) && want != reported => want,
-        _ => reported,
-    };
-    *pending = Some((!base, now));
-    !base
-}
-
-/// Whether deck `d`'s fader follows the other deck's tempo: the engine's own takeover applies.
-fn follows(ctx: &Ctx, d: DeckId) -> bool {
-    ctx.deck(d).state.synced && ctx.deck(d.other()).state.master
 }
 
 /// The meter value for a peak (dB): see the hardware doc.
@@ -484,31 +424,14 @@ impl Flx4 {
             self.set_mode(d, mode);
         }
         let dc = ctx.deck(d);
-        if !dc.loaded {
-            return Some(out);
-        }
-        let i = d.index();
         match (mode, shift, down) {
-            (PadMode::HotCue, false, true) => {
-                let set = dc.state.hot.get(pad).copied().flatten().is_some();
-                out.push(run("deck.hotcue", d, json!({"n": pad + 1, "action": if set { "jump" } else { "set" }})));
-                if let Some(h) = self.held_pad.get_mut(i) {
-                    *h = set.then_some(pad);
-                }
-            }
             // The release may come on the SHIFT channel: SHIFT pressed while the pad was held.
-            (PadMode::HotCue, _, false) => {
-                if let Some(h) = self.held_pad.get_mut(i)
-                    && *h == Some(pad)
-                {
-                    *h = None;
-                    out.push(run("deck.hotcue", d, json!({"n": pad + 1, "action": "release"})));
-                }
-            }
-            (PadMode::HotCue, true, true) => out.push(run("deck.hotcue", d, json!({"n": pad + 1, "action": "clear"}))),
+            (PadMode::HotCue, _, false) | (PadMode::HotCue, false, true) => out.extend(self.decks.button(d, Button::HotCue(pad), down, ctx)),
+            (PadMode::HotCue, true, true) => out.extend(self.decks.button(d, Button::HotCueClear(pad), true, ctx)),
+            _ if !dc.loaded => {}
             (PadMode::BeatJump, _, true) => {
                 if let Some(b) = JUMP_PADS.get(pad) {
-                    out.push(run("deck.beatjump", d, json!({"beats": b})));
+                    out.extend(self.decks.button(d, Button::BeatJump(*b), true, ctx));
                 }
             }
             (PadMode::BeatLoop, _, true) => {
@@ -536,36 +459,18 @@ impl Flx4 {
     }
 
     fn tempo(&mut self, d: DeckId, v: u16, ctx: &Ctx) -> Option<Action> {
-        let dc = ctx.deck(d);
-        let range = if dc.state.range > 0.0 { dc.state.range } else { 0.08 } * 100.0;
-        let pct = round(bipolar(v) * range, 3);
-        let p = self.tempo.get_mut(d.index())?;
-        let prev = p.hw.replace(pct);
-        if !dc.loaded {
-            return None;
-        }
-        if !follows(ctx, d) && !p.picked {
-            let cur = dc.state.pitch * 100.0;
-            let window = range * 2.0 * 1.5 / 127.0;
-            let crossed = prev.is_some_and(|h| (h - cur).signum() != (pct - cur).signum());
-            if (pct - cur).abs() > window && !crossed {
-                return None;
-            }
-            p.picked = true;
-        }
-        p.sent = Some((pct, ctx.now));
-        Some(run("deck.pitch", d, json!({"value": pct})))
+        let pct = round(centred(unit(v), DEAD_14) * range_pct(ctx, d), 3);
+        self.decks.tempo(d, pct, true, ctx)
     }
 
     fn act(&mut self, def: &InputDef, down: bool, value: u8, wide: Option<u16>, ctx: &Ctx) -> Vec<Action> {
         // The shared controls (browse, master, crossfader) read no deck: A stands in.
         let d = def.deck.unwrap_or(DeckId::A);
-        let dc = ctx.deck(d);
-        let s = &dc.state;
         let i = d.index();
-        let ticks = i64::from(value) - 64;
+        let ticks = f64::from(value) - 64.0;
         let mut out = Vec::new();
         let press = down && def.kind == Kind::Note;
+        let level = |c: Continuous| wide.and_then(|v| c.action(d, unit(v), DEAD_14));
         match def.ctl {
             Ctl::Shift => {
                 if let Some(x) = self.shift.get_mut(i) {
@@ -583,130 +488,54 @@ impl Flx4 {
                 out.push(Action::Browse(isize::try_from(delta).unwrap_or(0).saturating_mul(rows)));
             }
             Ctl::BrowsePress if press => out.push(Action::Load(None)),
-            Ctl::Load if press => out.push(Action::Load(def.deck)),
-            Ctl::MasterLevel => {
-                if let Some(v) = wide {
-                    let t = unit(v);
-                    let db = if t <= 0.0 { -60.0 } else { ((t - 1.0) * 40.0).max(-60.0) };
-                    out.push(Action::Run("deck.master_volume", json!({"db": round(db, 1)})));
-                }
-            }
-            Ctl::MasterCue if press => out.push(Action::Run("deck.master_cue", json!({}))),
-            Ctl::HeadphoneMix => {
-                if let Some(v) = wide {
-                    out.push(Action::Run("deck.headphone_mix", json!({"value": round(unit(v), 3)})));
-                }
-            }
-            Ctl::HeadphoneLevel => {
-                if let Some(v) = wide.filter(|_| ctx.headphone_knob) {
-                    let (lo, hi) = soundcraft_mix::HEADPHONE_DB;
-                    let db = f64::from(lo) + unit(v) * f64::from(hi - lo);
-                    out.push(Action::Run("deck.headphone_level", json!({"db": round(db, 1)})));
-                }
-            }
-            Ctl::Crossfader => {
-                if let Some(v) = wide {
-                    out.push(Action::Run("deck.xfader", json!({"value": round(unit(v) * 2.0 - 1.0, 3)})));
-                }
-            }
-            Ctl::Trim => {
-                if let Some(v) = wide {
-                    out.push(run("deck.trim", d, json!({"db": round(f64::from(crate::knob::trim_db(unit(v) as f32)), 1)})));
-                }
-            }
-            Ctl::Eq(band) => {
-                if let Some(v) = wide {
-                    let id = match band {
-                        EqBand::Low => "low",
-                        EqBand::Mid => "mid",
-                        EqBand::High => "high",
-                    };
-                    out.push(run("deck.eq", d, json!({"band": id, "db": round(f64::from(crate::knob::eq_db(unit(v) as f32)), 1)})));
-                }
-            }
-            Ctl::Cfx => {
-                if let Some(v) = wide {
-                    out.push(run("deck.filter", d, json!({"value": round(bipolar(v), 3)})));
-                }
-            }
-            Ctl::Fader => {
-                if let Some(v) = wide {
-                    out.push(run("deck.fader", d, json!({"value": round(unit(v), 3)})));
-                }
-            }
-            Ctl::HeadphoneCue if press => {
-                let on = self.pending.get_mut(i).and_then(|p| p.get_mut(2)).map_or(!s.headphone_cue, |p| toggle(p, s.headphone_cue, ctx.now));
-                out.push(run("deck.headphone_cue", d, json!({"on": on})));
-            }
-            // A held CUE let go, also on SHIFT+CUE's note (SHIFT pressed while it was held).
-            Ctl::Cue | Ctl::ToStart if !down && self.cue_held.get(i).copied().unwrap_or(false) => {
-                if let Some(x) = self.cue_held.get_mut(i) {
-                    *x = false;
-                }
-                out.push(run("deck.cue", d, json!({"down": false})));
-            }
+            Ctl::MasterLevel => out.extend(level(Continuous::MasterVolume)),
+            Ctl::MasterCue if press => out.push(crate::deck_controls::master_cue()),
+            Ctl::HeadphoneMix => out.extend(level(Continuous::HeadphoneMix)),
+            Ctl::HeadphoneLevel if ctx.headphone_knob => out.extend(level(Continuous::HeadphoneLevel)),
+            Ctl::Crossfader => out.extend(level(Continuous::Crossfader)),
+            Ctl::Trim => out.extend(level(Continuous::Trim)),
+            Ctl::Eq(band) => out.extend(level(Continuous::Eq(band))),
+            Ctl::Cfx => out.extend(level(Continuous::Filter)),
+            Ctl::Fader => out.extend(level(Continuous::Fader)),
             Ctl::Tempo => {
                 if let Some(v) = wide {
                     out.extend(self.tempo(d, v, ctx));
                 }
             }
-            // The rest act on a loaded deck only.
-            _ if !dc.loaded => {}
-            Ctl::Play if press => {
-                let play = self.pending.get_mut(i).and_then(|p| p.first_mut()).map_or(!s.playing, |p| toggle(p, s.playing, ctx.now));
-                out.push(run(if play { "deck.play" } else { "deck.pause" }, d, json!({})));
-            }
-            Ctl::Cue if down && !self.cue_held.get(i).copied().unwrap_or(false) => {
-                out.push(run("deck.cue", d, json!({"down": true})));
-                if let Some(x) = self.cue_held.get_mut(i) {
-                    *x = true;
-                }
-            }
-            Ctl::ToStart if press => out.push(run("deck.seek", d, json!({"at": 0.0}))),
-            Ctl::JogTop | Ctl::JogSide if def.kind == Kind::Cc => {
-                if s.playing || s.previewing {
-                    if let Some(n) = self.nudge.get_mut(i) {
-                        *n = n.saturating_add(ticks);
-                    }
-                } else if let Some(b) = self.search.get_mut(i) {
-                    *b += ticks as f64 * SEARCH_BEATS_PER_TURN / JOG_TICKS;
-                }
-            }
-            Ctl::JogFast if def.kind == Kind::Cc => {
-                if let Some(b) = self.search.get_mut(i) {
-                    *b += ticks as f64 * FAST_BEATS_PER_TURN / JOG_TICKS;
-                }
-            }
-            Ctl::LoopIn if press => out.push(run("deck.loop", d, json!({"action": "in"}))),
-            Ctl::LoopOut if press => out.push(run("deck.loop", d, json!({"action": "out"}))),
-            Ctl::Loop4 if press => {
-                out.push(if s.loop_on { run("deck.loop", d, json!({"action": "exit"})) } else { run("deck.loop", d, json!({"beats": 4})) })
-            }
-            Ctl::Reloop if press => out.push(run("deck.loop", d, json!({"action": "reloop"}))),
-            Ctl::CallBack if press => {
-                out.push(if s.loop_on { run("deck.loop", d, json!({"action": "halve"})) } else { run("deck.beatjump", d, json!({"beats": -4})) })
-            }
-            Ctl::CallFwd if press => {
-                out.push(if s.loop_on { run("deck.loop", d, json!({"action": "double"})) } else { run("deck.beatjump", d, json!({"beats": 4})) })
-            }
-            Ctl::Halve if press => out.push(run("deck.loop", d, json!({"action": "halve"}))),
-            Ctl::Double if press => out.push(run("deck.loop", d, json!({"action": "double"}))),
-            Ctl::Sync if press => {
-                let on = self.pending.get_mut(i).and_then(|p| p.get_mut(1)).map_or(!s.synced, |p| toggle(p, s.synced, ctx.now));
-                out.push(run("deck.sync", d, json!({"on": on})));
-            }
-            Ctl::SyncOff if press => out.push(run("deck.sync", d, json!({"on": false}))),
-            Ctl::TempoRange if press => {
-                let now = s.range;
-                let next = PITCH_RANGES.iter().position(|r| (r - now).abs() < 1e-6).and_then(|k| PITCH_RANGES.get(k + 1)).or(PITCH_RANGES.first());
-                if let Some(r) = next {
-                    out.push(run("deck.pitch", d, json!({"range": round(r * 100.0, 0)})));
+            Ctl::JogTop | Ctl::JogSide if def.kind == Kind::Cc => self.decks.jog(d, ticks, false, 1.0, ctx),
+            Ctl::JogFast if def.kind == Kind::Cc => self.decks.jog(d, ticks, true, 1.0, ctx),
+            c if def.kind == Kind::Note => {
+                if let Some(b) = button(c) {
+                    out.extend(self.decks.button(d, b, down, ctx));
                 }
             }
             _ => {}
         }
         out
     }
+}
+
+/// The deck button a control is.
+fn button(c: Ctl) -> Option<Button> {
+    Some(match c {
+        Ctl::Play => Button::Play,
+        Ctl::Cue => Button::Cue,
+        Ctl::ToStart => Button::ToStart,
+        Ctl::LoopIn => Button::LoopIn,
+        Ctl::LoopOut => Button::LoopOut,
+        Ctl::Loop4 => Button::Loop4,
+        Ctl::Reloop => Button::Reloop,
+        Ctl::CallBack => Button::CallBack,
+        Ctl::CallFwd => Button::CallFwd,
+        Ctl::Halve => Button::Halve,
+        Ctl::Double => Button::Double,
+        Ctl::Sync => Button::Sync,
+        Ctl::SyncOff => Button::SyncOff,
+        Ctl::TempoRange => Button::TempoRange,
+        Ctl::HeadphoneCue => Button::HeadphoneCue,
+        Ctl::Load => Button::Load,
+        _ => return None,
+    })
 }
 
 impl Controller for Flx4 {
@@ -775,41 +604,7 @@ impl Controller for Flx4 {
     }
 
     fn tick(&mut self, ctx: &Ctx, dt: f64) -> Vec<Action> {
-        let mut out = Vec::new();
-        let dt = dt.clamp(1.0 / 240.0, 0.1);
-        for d in DeckId::ALL {
-            let i = d.index();
-            let dc = ctx.deck(d);
-            let beats = self.search.get_mut(i).map(std::mem::take).unwrap_or(0.0);
-            let ticks = self.nudge.get_mut(i).map(std::mem::take).unwrap_or(0);
-            if dc.loaded {
-                let mut left = beats;
-                for _ in 0..64 {
-                    if left.abs() < 1e-4 {
-                        break;
-                    }
-                    let step = left.clamp(-1.0, 1.0);
-                    out.push(run("deck.jog", d, json!({"delta": round(step, 4), "mode": "search"})));
-                    left -= step;
-                }
-                if ticks != 0 {
-                    let delta = (ticks as f64 / dt / NUDGE_TICKS_S).clamp(-1.0, 1.0);
-                    out.push(run("deck.jog", d, json!({"delta": round(delta, 4), "mode": "nudge"})));
-                }
-            }
-            // A deck tempo moved elsewhere (a click, sync, a load) re-arms the soft takeover.
-            if let Some(p) = self.tempo.get_mut(i)
-                && p.picked
-                && !follows(ctx, d)
-                && let Some((v, at)) = p.sent
-            {
-                let range = if dc.state.range > 0.0 { dc.state.range } else { 0.08 } * 100.0;
-                if ctx.now - at > TAKEOVER_SETTLE_S && (dc.state.pitch * 100.0 - v).abs() > range * 2.0 * 1.5 / 127.0 {
-                    p.picked = false;
-                }
-            }
-        }
-        out
+        self.decks.tick(ctx, dt)
     }
 
     fn lights(&mut self, ctx: &Ctx) -> Vec<Light> {
@@ -896,24 +691,12 @@ impl Controller for Flx4 {
     }
 
     fn release_all(&mut self, _ctx: &Ctx) -> Vec<Action> {
-        let mut out = Vec::new();
-        for d in DeckId::ALL {
-            let i = d.index();
-            if self.cue_held.get_mut(i).is_some_and(std::mem::take) {
-                out.push(run("deck.cue", d, json!({"down": false})));
-            }
-            if let Some(pad) = self.held_pad.get_mut(i).and_then(Option::take) {
-                out.push(run("deck.hotcue", d, json!({"n": pad + 1, "action": "release"})));
-            }
-            if let Some(t) = self.touch.get_mut(i) {
-                *t = false;
-            }
-        }
-        out
+        self.touch = [false; 2];
+        self.decks.release_all()
     }
 
     fn held(&self, ctx: &Ctx) -> bool {
-        DeckId::ALL.into_iter().any(|d| self.touch.get(d.index()).copied().unwrap_or(false) && ctx.deck(d).state.playing)
+        DeckId::ALL.into_iter().any(|d| self.touch.get(d.index()).copied().unwrap_or(false) && ctx.deck(d).state.playing) || self.decks.bending(ctx)
     }
 
     fn take_resend(&mut self) -> bool {

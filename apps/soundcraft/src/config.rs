@@ -574,6 +574,7 @@ mod config_tests {
                 mode: Mode::Absolute,
                 sensitivity: 0.01,
                 pickup: false,
+                lsb: None,
             },
             Mapping {
                 device: device.clone(),
@@ -582,6 +583,15 @@ mod config_tests {
                 mode: Mode::RelTwos,
                 sensitivity: 0.05,
                 pickup: true,
+                lsb: None,
+            },
+            // A deck control, 14-bit.
+            Mapping {
+                device: device.clone(),
+                matcher: Matcher::Cc { ch: 0, cc: 0 },
+                target: serde_json::from_value(serde_json::json!({"kind": "deck", "deck": "b", "control": "pitch"})).unwrap(),
+                lsb: Some(32),
+                ..Mapping::default()
             },
             Mapping {
                 device,

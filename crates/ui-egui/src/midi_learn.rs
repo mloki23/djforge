@@ -1,6 +1,21 @@
 //! MIDI learn: notes and controllers of the MIDI inputs mapped to the app's controls (Session
 //! view slots, scenes and stops, mixer faders and pans, stem faders, instrument and insert
-//! parameters, and any command).
+//! parameters, any command, and the Decks tab's deck, DJ mixer and library controls).
+//!
+//! **Deck controls** ([`Target::Deck`], [`Target::Mixer`], [`Target::Library`]) act as the same
+//! control of a built-in controller layout does: the code is shared ([`crate::deck_controls`]).
+//! CUE is the CDJ cue (press and release), a hot cue pad jumps to a set cue (its release ends
+//! the preview) or sets an empty one, PLAY, SYNC, MASTER TEMPO and the headphone CUE toggle from
+//! the state asked for last while the deck hasn't reported it (a quick double press sends on
+//! then off), the jog's ticks add up and go once a frame (a nudge while the deck is heard, a
+//! search while paused), pitch bend nudges while held, and the knobs and faders follow an
+//! absolute controller (7-bit, or 14-bit with its LSB: [`Mapping::lsb`], from the device's layout
+//! or seen while learning) with soft takeover; the pitch's takeover is bypassed only while its
+//! deck follows a master on the other deck. What a learned deck control holds (a CUE or hot cue
+//! preview, a bend) is let go when learning starts, the device holding it goes and the app quits
+//! ([`release_holds`]). Right-click a Decks tab control for Learn MIDI and Remove MIDI Mapping.
+//! Deck mappings are kept with the others, in the preferences per device: performance setup,
+//! not session content.
 //!
 //! **Model.** A [`Mapping`] binds a device ([`DeviceKey`]: backend id and raw name, as the
 //! enabled inputs are kept, plus the name it was listed under) and a [`Matcher`] (a note or a
@@ -62,9 +77,12 @@
 //! `midi.restore_mappings`, `midi.learn`, `midi.learn_command` and `window.midi_mappings`.
 
 use crate::SoundApp;
+use crate::controller_layouts::{Action, Ctx};
+use crate::deck_controls::{Button, Continuous, DeckControl, DeckControls, LibraryControl, MixerControl, Takeover};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soundcraft_midi_io::{MidiEvent, MidiMessage, PortId};
+use soundcraft_mix::DeckId;
 use soundcraft_model::{STEMS, Session, Track, TrackId};
 use soundcraft_playback::MidiControl;
 use std::collections::HashMap;
@@ -298,12 +316,93 @@ pub enum Target {
         #[serde(default)]
         params: Value,
     },
+    /// A control of deck A or B (its buttons, pitch, jog, pads, loops, and its mixer channel):
+    /// as the built-in layouts drive it ([`crate::deck_controls`]).
+    Deck {
+        #[serde(with = "crate::deck_controls::deck_id")]
+        deck: DeckId,
+        #[serde(flatten)]
+        control: DeckControl,
+    },
+    /// A DJ mixer control that isn't per deck: crossfader, master, headphones.
+    Mixer {
+        control: MixerControl,
+    },
+    /// The Decks tab's library browser.
+    Library {
+        control: LibraryControl,
+    },
+}
+
+/// What a deck, mixer or library target is to its mapping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeckTarget {
+    Button(DeckId, Button),
+    /// A beat jump of the Decks tab's size: back (false) or on.
+    Jump(DeckId, bool),
+    Continuous(DeckId, Continuous),
+    Jog(DeckId),
+    MasterCue,
+    Browse,
+    /// The library's previous (−1) or next row.
+    Step(isize),
+    LoadEmpty,
 }
 
 impl Target {
-    /// Acts on a press rather than over a range.
+    /// A button (acts on presses, and a deck's CUE, pads and pitch bend on releases too) rather
+    /// than a range.
     pub fn is_trigger(&self) -> bool {
-        matches!(self, Target::SlotLaunch { .. } | Target::Scene { .. } | Target::StopColumn { .. } | Target::StopAll | Target::Command { .. })
+        match self.deck_target() {
+            Some(DeckTarget::Continuous(..) | DeckTarget::Jog(_) | DeckTarget::Browse) => false,
+            Some(_) => true,
+            None => matches!(
+                self,
+                Target::SlotLaunch { .. } | Target::Scene { .. } | Target::StopColumn { .. } | Target::StopAll | Target::Command { .. }
+            ),
+        }
+    }
+
+    /// A deck, mixer or library control (see [`crate::deck_controls`]).
+    pub fn is_deck(&self) -> bool {
+        matches!(self, Target::Deck { .. } | Target::Mixer { .. } | Target::Library { .. })
+    }
+
+    /// Moves over a range an absolute controller spans (not a button, the jog or the browse
+    /// knob, which only step).
+    pub fn ranged(&self) -> bool {
+        !self.is_trigger() && !matches!(self.deck_target(), Some(DeckTarget::Jog(_) | DeckTarget::Browse))
+    }
+
+    fn deck_target(&self) -> Option<DeckTarget> {
+        use crate::deck_controls::Kind;
+        Some(match self {
+            Target::Deck { deck, control } => match control.kind() {
+                Kind::Button(b) => DeckTarget::Button(*deck, b),
+                Kind::Continuous(c) => DeckTarget::Continuous(*deck, c),
+                Kind::Jog => DeckTarget::Jog(*deck),
+                Kind::Jump(on) => DeckTarget::Jump(*deck, on),
+            },
+            Target::Mixer { control } => match control.continuous() {
+                Some(c) => DeckTarget::Continuous(DeckId::A, c),
+                None => DeckTarget::MasterCue,
+            },
+            Target::Library { control } => match control {
+                LibraryControl::Browse => DeckTarget::Browse,
+                LibraryControl::Previous => DeckTarget::Step(-1),
+                LibraryControl::Next => DeckTarget::Step(1),
+                LibraryControl::Load => DeckTarget::LoadEmpty,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Whether its parameters are in range (a deck's hot cue 1..=8, a beat jump ±1..=64).
+    fn valid(&self) -> bool {
+        match self {
+            Target::Deck { control, .. } => control.valid(),
+            _ => true,
+        }
     }
 
     /// "Live 1 slot 3", "Kick volume", "Command transport.play".
@@ -321,6 +420,9 @@ impl Target {
                 format!("{} insert {} {param}", track.name, char::from(b'a'.saturating_add(u8::try_from(*slot).unwrap_or(25))))
             }
             Target::Command { id, .. } => format!("Command {id}"),
+            Target::Deck { deck, control } => format!("Deck {} {}", deck.id().to_uppercase(), control.label()),
+            Target::Mixer { control } => control.label().into(),
+            Target::Library { control } => format!("Library {}", control.label()),
         }
     }
 }
@@ -337,6 +439,9 @@ pub struct Mapping {
     pub sensitivity: f32,
     /// Soft takeover for an absolute controller on a continuous target.
     pub pickup: bool,
+    /// The LSB controller of a 14-bit control whose MSB is `matcher` (a deck or mixer control).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsb: Option<u8>,
 }
 
 impl Default for Mapping {
@@ -348,6 +453,7 @@ impl Default for Mapping {
             mode: Mode::Absolute,
             sensitivity: DEFAULT_SENSITIVITY,
             pickup: true,
+            lsb: None,
         }
     }
 }
@@ -359,14 +465,17 @@ impl Mapping {
     }
 
     fn uses_pickup(&self) -> bool {
-        !self.target.is_trigger() && !self.matcher.is_note() && self.mode == Mode::Absolute
+        self.target.ranged() && !self.matcher.is_note() && self.mode == Mode::Absolute
     }
 
     /// Itself with its sensitivity in range and a mode its message can use (`None`: the message is
     /// out of range).
     pub fn normalised(mut self) -> Option<Mapping> {
-        if !self.matcher.valid() {
+        if !self.matcher.valid() || !self.target.valid() {
             return None;
+        }
+        if self.lsb.is_some_and(|l| l > 127 || self.matcher.is_note()) {
+            self.lsb = None;
         }
         self.sensitivity = clamp_sensitivity(self.sensitivity);
         if !self.mode.fits(&self.matcher) {
@@ -385,6 +494,7 @@ impl Mapping {
             "mode": self.mode.id(),
             "sensitivity": self.sensitivity,
             "pickup": self.pickup,
+            "lsb": self.lsb,
         })
     }
 }
@@ -471,6 +581,12 @@ struct Runtime {
     mode: Option<Mode>,
     /// When it last received something (UI time), and what.
     activity: Option<(f64, String)>,
+    /// A 14-bit control's last MSB, waiting for its LSB.
+    msb: Option<u8>,
+    /// A deck or mixer control's soft takeover.
+    takeover: Takeover,
+    /// The last value of an absolute controller on a stepping target (jog, browse).
+    last_abs: Option<u8>,
 }
 
 /// MIDI learn's state (not saved).
@@ -510,6 +626,16 @@ pub struct LearnState {
     pub(crate) now: f64,
     /// Remove All asks first: the question is up.
     pub confirm_remove_all: bool,
+    /// What the learned deck controls remember (toggles asked for, held cues and pads, jog
+    /// counts, the pitch's takeover), as a built-in layout does.
+    pub(crate) decks: DeckControls,
+    /// The devices holding a learned deck control (a CUE, a pad, a bend): one going away lets go.
+    holders: Vec<DeviceKey>,
+    /// The UI time the deck controls last ticked.
+    tick_at: Option<f64>,
+    /// The deck actions learned mappings asked for (for tests).
+    #[cfg(test)]
+    pub(crate) actions: Vec<Action>,
 }
 
 /// Starts learning `target`: the next note-on or controller binds it.
@@ -517,6 +643,7 @@ pub fn start(app: &mut SoundApp, target: Target) {
     app.ui.status = format!("Learn MIDI for {}: move a control (Esc cancels)", target.label());
     // A controller's held CUE or pad would never hear its release while learning.
     crate::controller_layouts::release_holds(app);
+    release_holds(app);
     app.midi_learn.learning = Some(target);
     app.midi_learn.conflict = None;
     app.midi_learn.overlay = None;
@@ -555,14 +682,27 @@ pub fn commit(app: &mut SoundApp, m: Mapping, replace: bool) -> usize {
 }
 
 /// Binds the learned target to `matcher` of `device`, or asks first when another target uses it.
-fn bind(app: &mut SoundApp, device: DeviceKey, matcher: Matcher, input: Input, target: Target) {
+/// `twin`: the other half of the 14-bit control the device's layout says the message is.
+fn bind(app: &mut SoundApp, device: DeviceKey, matcher: Matcher, input: Input, target: Target, twin: Option<MidiControl>) {
     let mode = default_mode(&matcher, &target);
-    let m = Mapping { device, matcher, target, mode, ..Mapping::default() };
-    let other = app.ui.midi_mappings.iter().find(|o| o.device.same(&m.device) && o.matcher == m.matcher && o.target != m.target);
-    let first = match input {
+    let mut m = Mapping { device, matcher, target, mode, ..Mapping::default() };
+    let mut first = match input {
         Input::Cc(v) if !m.target.is_trigger() => Some(v),
         _ => None,
     };
+    // A 14-bit knob or fader the layout knows, on a deck or mixer control: both halves, absolute.
+    if m.target.is_deck()
+        && m.target.ranged()
+        && let (Matcher::Cc { ch, cc }, Some(MidiControl::Cc { ch: twin_ch, cc: other })) = (m.matcher, twin)
+        && twin_ch == ch
+    {
+        if other < cc {
+            m.matcher = Matcher::Cc { ch, cc: other };
+        }
+        m.lsb = Some(other.max(cc));
+        first = None;
+    }
+    let other = app.ui.midi_mappings.iter().find(|o| o.device.same(&m.device) && o.matcher == m.matcher && o.target != m.target);
     if let Some(o) = other {
         app.midi_learn.conflict = Some(Conflict { other: o.target.label(), mapping: m, first });
         return;
@@ -581,7 +721,9 @@ fn learned(app: &mut SoundApp, m: Mapping, replace: bool, first: Option<u8>) {
 /// Ends encoder detection: the mapping takes the mode its values suggest.
 fn finish_detect(app: &mut SoundApp) {
     let Some(d) = app.midi_learn.detect.take() else { return };
-    let mode = classify(&d.values);
+    // A 14-bit control's MSB repeats while its LSB moves: absolute, whatever it looks like.
+    let wide = app.ui.midi_mappings.iter().any(|m| m.key() == d.key && m.lsb.is_some());
+    let mode = if wide { Mode::Absolute } else { classify(&d.values) };
     app.midi_learn.check_direction = match mode {
         Mode::RelOffset => d.values.iter().all(|v| *v > 64),
         Mode::RelTwos => d.values.iter().all(|v| (1..=63).contains(v)),
@@ -658,6 +800,7 @@ pub fn frame(app: &mut SoundApp, now: f64) {
     for e in events {
         handle(app, &e, now);
     }
+    deck_frame(app, now);
     if app.midi_learn.detect.as_ref().is_some_and(|d| now - d.started > DETECT_S) {
         finish_detect(app);
     }
@@ -714,6 +857,10 @@ pub fn wake_on_midi(app: &mut SoundApp, ctx: &egui::Context) {
     if s.gesture.is_some() || !s.touch.is_empty() || s.detect.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
+    if app.midi_learn.decks.bending(&Ctx::of(app, s.now)) {
+        // A held pitch bend nudges every frame.
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
     if let Some(every) = crate::controller_layouts::repaint_every(app) {
         // A controller acts and lights up in UI frames (see `repaint_every`).
         ctx.request_repaint_after(every);
@@ -739,6 +886,9 @@ fn controls(app: &SoundApp) -> Vec<(PortId, MidiControl)> {
         let (Some(raw), Some(backend)) = (src.raw_name(port), src.backend_id(port)) else { continue };
         for m in app.ui.midi_mappings.iter().filter(|m| m.device.is(raw, backend)) {
             out.push((port, m.matcher.control()));
+            if let (Matcher::Cc { ch, .. }, Some(cc)) = (m.matcher, m.lsb) {
+                out.push((port, MidiControl::Cc { ch, cc }));
+            }
         }
     }
     out.extend(crate::controller_layouts::controls(app));
@@ -778,7 +928,24 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
         if input != Input::Note(false)
             && let Some(target) = app.midi_learn.learning.take()
         {
-            bind(app, device, matcher, input, target);
+            let twin = crate::controller_layouts::twin(app, e.port, &e.msg);
+            bind(app, device, matcher, input, target, twin);
+        }
+        return;
+    }
+    // A learned deck or mixer controller's LSB (its controller + 32) while it is watched: a
+    // 14-bit control.
+    if let (Some(d), Matcher::Cc { ch, cc }) = (&app.midi_learn.detect, matcher)
+        && let Matcher::Cc { ch: dch, cc: dcc } = d.matcher
+        && d.device.same(&device)
+        && dch == ch
+        && dcc < 32
+        && cc == dcc + 32
+        && let Some(m) = app.ui.midi_mappings.iter_mut().find(|m| m.key() == d.key && m.target.is_deck() && m.target.ranged())
+    {
+        if m.lsb != Some(cc) {
+            m.lsb = Some(cc);
+            app.mark_prefs_changed();
         }
         return;
     }
@@ -793,7 +960,15 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
         }
         return;
     }
-    let hits: Vec<String> = app.ui.midi_mappings.iter().filter(|m| m.device.same(&device) && m.matcher == matcher).map(Mapping::key).collect();
+    // A 14-bit mapping's LSB counts as its message too.
+    let lsb_of = |m: &Mapping| matches!((m.matcher, matcher), (Matcher::Cc { ch: a, .. }, Matcher::Cc { ch: b, cc }) if a == b && m.lsb == Some(cc));
+    let hits: Vec<(String, bool)> = app
+        .ui
+        .midi_mappings
+        .iter()
+        .filter(|m| m.device.same(&device) && (m.matcher == matcher || lsb_of(m)))
+        .map(|m| (m.key(), m.matcher != matcher))
+        .collect();
     if hits.is_empty() {
         // The other half of a learned 14-bit control: the mapping covers it and the layout
         // doesn't get it (the learned half drives the target).
@@ -806,10 +981,13 @@ pub fn handle(app: &mut SoundApp, e: &MidiEvent, now: f64) {
         crate::controller_layouts::handle(app, e.port, &e.msg, now);
         return;
     }
-    for key in hits {
+    for (key, lsb) in hits {
         // Found again by key: a command run by an earlier hit may have changed the list.
         if let Some(m) = app.ui.midi_mappings.iter().find(|m| m.key() == key).cloned() {
-            apply(app, &m, input, now);
+            if m.target.is_deck() {
+                remember_holder(app, &m, input);
+            }
+            apply(app, &m, input, lsb, now);
         }
     }
 }
@@ -836,7 +1014,7 @@ fn edge(m: &Mapping, rt: &mut Runtime, input: Input) -> Option<bool> {
     Some(down)
 }
 
-fn apply(app: &mut SoundApp, m: &Mapping, input: Input, now: f64) {
+fn apply(app: &mut SoundApp, m: &Mapping, input: Input, lsb: bool, now: f64) {
     let key = m.key();
     let mut rt = app.midi_learn.runtime.remove(&key).unwrap_or_default();
     if rt.mode != Some(m.mode) {
@@ -851,7 +1029,9 @@ fn apply(app: &mut SoundApp, m: &Mapping, input: Input, now: f64) {
             Input::Cc(v) => v.to_string(),
         },
     ));
-    if m.target.is_trigger() {
+    if m.target.is_deck() {
+        deck_input(app, m, &mut rt, input, lsb, now);
+    } else if m.target.is_trigger() {
         if edge(m, &mut rt, input) == Some(true) {
             trigger(app, m);
         }
@@ -890,6 +1070,220 @@ fn trigger(app: &mut SoundApp, m: &Mapping) {
 fn skipped(app: &mut SoundApp, m: &Mapping, why: &str) {
     app.ui.status = format!("MIDI {} on {} → {}: {why}", m.matcher.label(), m.device.name, m.target.label());
     log::info!("{}", app.ui.status);
+}
+
+/// A 7-bit bipolar control's dead zone around the centre (64 and 63 read as the centre).
+const DEAD_7: f64 = 1.5 / 127.0;
+/// A 14-bit one's: ±32 counts, as the built-in layouts read it.
+const DEAD_14: f64 = 32.0 / 8191.5;
+
+/// A deck, mixer or library mapping's message: what the same control of a built-in layout does
+/// ([`crate::deck_controls`]). Buttons act on their edges (a deck's CUE, hot cues and pitch bend
+/// on the release too; Toggle and Momentary read alike, the control's own behaviour decides),
+/// the jog and the browse knob step (an absolute controller by its change), and the knobs and
+/// faders take an absolute controller (7- or 14-bit, soft takeover), a relative one or a button.
+fn deck_input(app: &mut SoundApp, m: &Mapping, rt: &mut Runtime, input: Input, lsb: bool, now: f64) {
+    let Some(target) = m.target.deck_target() else { return };
+    let ctx = Ctx::of(app, now);
+    let mut out = Vec::new();
+    match target {
+        DeckTarget::Button(d, b) => {
+            if let Some(down) = edge(m, rt, input) {
+                out = app.midi_learn.decks.button(d, b, down, &ctx);
+            }
+        }
+        DeckTarget::Jump(d, on) => {
+            if edge(m, rt, input) == Some(true) {
+                let beats = crate::decks_view::jump_beats(app, d);
+                out = app.midi_learn.decks.button(d, Button::BeatJump(if on { beats } else { -beats }), true, &ctx);
+            }
+        }
+        DeckTarget::MasterCue => {
+            if edge(m, rt, input) == Some(true) {
+                out.push(crate::deck_controls::master_cue());
+            }
+        }
+        DeckTarget::Step(n) => {
+            if edge(m, rt, input) == Some(true) {
+                out.push(Action::Browse(n));
+            }
+        }
+        DeckTarget::LoadEmpty => {
+            if edge(m, rt, input) == Some(true) {
+                out.push(Action::Load(None));
+            }
+        }
+        DeckTarget::Jog(d) => {
+            let ticks = steps(m, rt, input);
+            if ticks != 0 {
+                let scale = f64::from(m.sensitivity / DEFAULT_SENSITIVITY);
+                app.midi_learn.decks.jog(d, f64::from(ticks), false, scale, &ctx);
+            }
+        }
+        DeckTarget::Browse => {
+            let ticks = steps(m, rt, input);
+            if ticks != 0 {
+                out.push(Action::Browse(isize::try_from(ticks).unwrap_or(0)));
+            }
+        }
+        DeckTarget::Continuous(d, c) => out.extend(ranged(app, m, rt, input, lsb, (d, c), &ctx)),
+    }
+    #[cfg(test)]
+    app.midi_learn.actions.extend(out.iter().cloned());
+    for a in out {
+        crate::controller_layouts::perform(app, "MIDI", a);
+    }
+}
+
+/// The steps a jog or browse mapping's message makes: a relative controller's ticks, an absolute
+/// one's change since its last value, a button's press.
+fn steps(m: &Mapping, rt: &mut Runtime, input: Input) -> i32 {
+    match input {
+        Input::Cc(v) if m.mode.relative() => m.mode.delta(v),
+        Input::Cc(v) if m.mode == Mode::Absolute => {
+            let d = rt.last_abs.map_or(0, |l| i32::from(v) - i32::from(l));
+            rt.last_abs = Some(v);
+            d
+        }
+        _ => i32::from(edge(m, rt, input) == Some(true)),
+    }
+}
+
+/// A deck or mixer control's travel for a button: ("on", "off"), the centre and the bottom for a
+/// bipolar control, else the top and the bottom.
+fn deck_on_off(c: Continuous) -> (f64, f64) {
+    match c {
+        Continuous::Pitch | Continuous::Trim | Continuous::Eq(_) | Continuous::Filter | Continuous::Crossfader => (0.5, 0.0),
+        _ => (1.0, 0.0),
+    }
+}
+
+/// A knob or fader of deck `d` (or the mixer): the command its message asks for.
+fn ranged(app: &mut SoundApp, m: &Mapping, rt: &mut Runtime, input: Input, lsb: bool, (d, c): (DeckId, Continuous), ctx: &Ctx) -> Option<Action> {
+    let cur = c.travel(d, ctx, &app.engine.deck_status);
+    let now = ctx.now;
+    let button = m.matcher.is_note() || matches!(m.mode, Mode::Momentary | Mode::Toggle);
+    // The travel asked for, the centre's dead zone, and whether it acts at once (no takeover).
+    let (to, dead, at_once) = if button {
+        let (on, off) = deck_on_off(c);
+        let to = match (edge(m, rt, input)?, m.mode) {
+            (true, Mode::Toggle) => {
+                if (cur - on).abs() <= (cur - off).abs() {
+                    off
+                } else {
+                    on
+                }
+            }
+            (true, _) => on,
+            (false, Mode::Momentary) => off,
+            (false, _) => return None,
+        };
+        (to, 0.0, true)
+    } else if m.mode.relative() {
+        let Input::Cc(v) = input else { return None };
+        // From the value sent last while the deck hasn't reported it yet: no tick is lost.
+        let base = rt.takeover.recent(now).unwrap_or(cur);
+        ((base + f64::from(m.mode.delta(v)) * f64::from(m.sensitivity)).clamp(0.0, 1.0), 0.0, true)
+    } else {
+        let Input::Cc(v) = input else { return None };
+        let (t, dead) = if m.lsb.is_some() {
+            if !lsb {
+                // The MSB waits for its LSB.
+                rt.msb = Some(v);
+                return None;
+            }
+            let msb = rt.msb?;
+            (f64::from(u16::from(msb & 0x7F) << 7 | u16::from(v & 0x7F)) / 16383.0, DEAD_14)
+        } else {
+            (f64::from(v) / 127.0, DEAD_7)
+        };
+        (t, dead, !m.pickup)
+    };
+    let window = f64::from(PICKUP_WINDOW);
+    if c == Continuous::Pitch {
+        // The pitch's takeover is the deck's, as a layout's tempo slider: bypassed only while
+        // the deck follows a master on the other deck.
+        rt.takeover.admit(to, cur, window, true, now);
+        let pct = crate::deck_controls::round(crate::deck_controls::centred(to, dead) * crate::deck_controls::range_pct(ctx, d), 3);
+        let a = app.midi_learn.decks.tempo(d, pct, !at_once, ctx);
+        if a.is_none() && ctx.deck(d).loaded {
+            pickup_hint(app, m, cur);
+        }
+        return a;
+    }
+    rt.takeover.rearm(cur, window, at_once, now);
+    if !rt.takeover.admit(to, cur, window, at_once, now) {
+        pickup_hint(app, m, cur);
+        return None;
+    }
+    rt.picked = true;
+    c.action(d, to, dead)
+}
+
+fn pickup_hint(app: &mut SoundApp, m: &Mapping, cur: f64) {
+    app.ui.status = format!("{}: move {} to {:.0} to pick it up", m.target.label(), m.matcher.label(), cur * 127.0);
+}
+
+/// A press of a deck control that holds (a CUE, a hot cue, a pitch bend): its device is
+/// remembered, so the hold is let go if it goes away.
+fn remember_holder(app: &mut SoundApp, m: &Mapping, input: Input) {
+    let press = match input {
+        Input::Note(on) => on,
+        Input::Cc(v) => v >= 64,
+    };
+    if press
+        && matches!(m.target.deck_target(), Some(DeckTarget::Button(_, b)) if b.momentary())
+        && !app.midi_learn.holders.iter().any(|h| h.same(&m.device))
+    {
+        app.midi_learn.holders.push(m.device.clone());
+    }
+}
+
+/// Lets go of everything the learned deck controls hold (a CUE or hot cue preview, a pitch
+/// bend): learning starts, a device holding one goes away, the app quits.
+pub fn release_holds(app: &mut SoundApp) {
+    app.midi_learn.holders.clear();
+    for a in app.midi_learn.decks.release_all() {
+        crate::controller_layouts::perform(app, "MIDI", a);
+    }
+}
+
+/// The inputs open now: (raw name, backend id).
+fn open_devices(app: &SoundApp) -> Vec<(String, String)> {
+    let Some(h) = &app.midi_host else { return Vec::new() };
+    let src = h.source();
+    h.opened().iter().filter(|p| h.input_open(**p)).filter_map(|p| Some((src.raw_name(*p)?.to_string(), src.backend_id(*p)?.to_string()))).collect()
+}
+
+/// Once a frame: a device holding a learned deck control went away lets go; the jog's counts
+/// and a held pitch bend are sent.
+fn deck_frame(app: &mut SoundApp, now: f64) {
+    let dt = app.midi_learn.tick_at.replace(now).map_or(1.0 / 60.0, |t| now - t);
+    if !app.midi_learn.holders.is_empty() {
+        if !app.midi_learn.decks.holding() {
+            app.midi_learn.holders.clear();
+        } else {
+            let open = open_devices(app);
+            if app.midi_learn.holders.iter().any(|h| !open.iter().any(|(raw, backend)| h.is(raw, backend))) {
+                release_holds(app);
+            }
+        }
+    }
+    if !app.ui.midi_mappings.iter().any(|m| m.target.is_deck()) {
+        return;
+    }
+    let ctx = Ctx::of(app, now);
+    let out = app.midi_learn.decks.tick(&ctx, dt);
+    #[cfg(test)]
+    app.midi_learn.actions.extend(out.iter().cloned());
+    for a in out {
+        crate::controller_layouts::perform(app, "MIDI", a);
+    }
+}
+
+/// Whether a mapping's target is there to act on.
+fn resolved(app: &SoundApp, t: &Target) -> bool {
+    t.is_trigger() || t.is_deck() || travel(app, t).is_ok()
 }
 
 /// A continuous target's travel ("on", "off") for buttons.
@@ -1072,13 +1466,18 @@ pub fn activity(app: &SoundApp, m: &Mapping) -> Option<(f64, String)> {
 /// The params of the MIDI learn commands, as `engine.commands` advertises them.
 pub fn params_doc(id: &str) -> Option<&'static str> {
     Some(match id {
-        "midi.mappings" | "window.midi_mappings" | "midi.learn_command" => "{}",
+        "midi.mappings" => {
+            "{kind?: deck|mixer|library|… (only mappings of targets of that kind)} — every mapping: {index, device, matcher, message, target, label, mode, sensitivity, pickup, lsb, resolved, activity_s}"
+        }
+        "window.midi_mappings" | "midi.learn_command" => "{}",
         "midi.map" => {
-            "{device: listed input name | {backend_id, raw_name, name}, matcher: {type: note|cc, ch, note|cc}, target: {kind: slot_launch {column, slot} | scene {row} | stop_column {column} | stop_all | track_volume {track} | track_pan {track} | stem_fader {track, stem} | instrument_param {track, param} | insert_param {track, slot, param} | command {id, params}}, mode?: momentary|toggle|absolute|rel_twos|rel_offset|rel_sign_mag, sensitivity?, pickup?: bool, replace?: bool} — track: id | name | {id, name}; replace also removes another target's mapping of the same message"
+            "{device: listed input name | {backend_id, raw_name, name}, matcher: {type: note|cc, ch, note|cc}, target: TARGET, mode?: momentary|toggle|absolute|rel_twos|rel_offset|rel_sign_mag, sensitivity?, pickup?: bool, lsb?: cc (a 14-bit control's LSB, for a deck or mixer knob or fader), replace?: bool} — TARGET: {kind: slot_launch {column, slot} | scene {row} | stop_column {column} | stop_all | track_volume {track} | track_pan {track} | stem_fader {track, stem} | instrument_param {track, param} | insert_param {track, slot, param} | command {id, params} | deck {deck: a|b, control: DECK} | mixer {control: crossfader|master_volume|headphone_mix|headphone_level|master_cue} | library {control: browse|previous|next|load}}; DECK: play|cue|sync|master_tempo|pitch|pitch_range|pitch_bend_up|pitch_bend_down|jog|hot_cue {n: 1..=8}|hot_cue_clear {n}|loop4|loop_in|loop_out|loop_halve|loop_double|reloop|jump_back|jump_forward|beat_jump {beats: ±1..=64}|load|trim|eq_high|eq_mid|eq_low|filter|fader|headphone_cue; track: id | name | {id, name}; replace also removes another target's mapping of the same message. Deck controls act as a built-in controller layout's (CUE press and release, hot cue set/jump/release, toggles, jog nudge or search, pitch soft takeover); a learned message overrides the device's layout"
         }
         "midi.unmap" => "{index} | {target} | {device, matcher} | {all: true} — what it removes is kept for midi.restore_mappings (one level)",
         "midi.restore_mappings" => "{} — the mappings removed last (Delete, Remove All, midi.unmap) come back",
-        "midi.learn" => "{target} | {cancel: true} — the next note-on or controller from an enabled input binds target",
+        "midi.learn" => {
+            "{target} | {cancel: true} — the next note-on or controller from an enabled input binds target (as midi.map's, deck and mixer controls too: {kind: deck, deck: a, control: cue}); a knob a device's layout knows as 14-bit is learned with both halves"
+        }
         _ => return None,
     })
 }
@@ -1102,6 +1501,9 @@ fn parse_target(s: &Session, v: &Value) -> Result<Target, String> {
     let target: Target = serde_json::from_value(v).map_err(|e| format!("bad `target`: {e}"))?;
     if let Target::StemFader { stem, .. } = &target {
         stem_index(stem)?;
+    }
+    if !target.valid() {
+        return Err(format!("bad `target`: {} is out of range (hot cues 1..=8, beat jumps ±1..=64)", target.label()));
     }
     Ok(target)
 }
@@ -1129,15 +1531,17 @@ fn parse_device(app: &SoundApp, v: &Value) -> Result<DeviceKey, String> {
 pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     Some(match id {
         "midi.mappings" => {
+            let kind = p.get("kind").and_then(Value::as_str);
             let list: Vec<Value> = app
                 .ui
                 .midi_mappings
                 .iter()
                 .enumerate()
+                .filter(|(_, m)| kind.is_none_or(|k| serde_json::to_value(&m.target).ok().is_some_and(|t| t["kind"] == k)))
                 .map(|(i, m)| {
                     let mut v = m.json();
                     v["index"] = json!(i);
-                    v["resolved"] = json!(m.target.is_trigger() || travel(app, &m.target).is_ok());
+                    v["resolved"] = json!(resolved(app, &m.target));
                     v["activity_s"] = json!(activity(app, m).map(|a| a.0));
                     v
                 })
@@ -1162,7 +1566,17 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
             let sensitivity = clamp_sensitivity(p.get("sensitivity").and_then(Value::as_f64).map_or(DEFAULT_SENSITIVITY, |s| s as f32));
             let pickup = p.get("pickup").and_then(Value::as_bool).unwrap_or(true);
             let replace = p.get("replace").and_then(Value::as_bool).unwrap_or(false);
-            let m = Mapping { device, matcher, target, mode, sensitivity, pickup };
+            let lsb = match p.get("lsb") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let cc = v.as_u64().and_then(|n| u8::try_from(n).ok()).filter(|n| *n <= 127).ok_or("`lsb` is a controller 0..=127")?;
+                    if matcher.is_note() {
+                        return Err("`lsb` is for a controller (a 14-bit control's LSB)".into());
+                    }
+                    Some(cc)
+                }
+            };
+            let m = Mapping { device, matcher, target, mode, sensitivity, pickup, lsb };
             let i = commit(app, m, replace);
             app.midi_learn.overlay_mapping = None;
             Ok(json!({"index": i, "mapping": app.ui.midi_mappings.get(i).map(Mapping::json)}))
@@ -1215,12 +1629,23 @@ pub fn command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<Value, 
 
 /// A control's right-click menu items: Learn MIDI, and Remove MIDI Mapping when it has one.
 pub fn menu_items(app: &mut SoundApp, ui: &mut egui::Ui, target: Target) {
+    menu_items_for(app, ui, target, "");
+}
+
+/// [`menu_items`] for one of a control's several targets, named `what` ("Learn MIDI for Pitch
+/// Bend +"); an empty `what` is the control's own.
+pub fn menu_items_for(app: &mut SoundApp, ui: &mut egui::Ui, target: Target, what: &str) {
     let n = mapped(app, &target);
-    if ui.button("Learn MIDI").clicked() {
+    let (learn, remove) = if what.is_empty() {
+        ("Learn MIDI".to_string(), "Remove MIDI Mapping".to_string())
+    } else {
+        (format!("Learn MIDI for {what}"), format!("Remove MIDI Mapping for {what}"))
+    };
+    if ui.button(learn).clicked() {
         start(app, target.clone());
         ui.close();
     }
-    if n > 0 && ui.button("Remove MIDI Mapping").clicked() {
+    if n > 0 && ui.button(remove).clicked() {
         remove_where(app, |m| m.target == target);
         ui.close();
     }
@@ -1349,7 +1774,7 @@ fn mappings_window(app: &mut SoundApp, ctx: &egui::Context) {
                 ui.label("No MIDI mappings. Right-click a slot, fader, knob or parameter and choose Learn MIDI.");
             }
             let rows: Vec<(Mapping, Option<(f64, String)>, bool)> =
-                app.ui.midi_mappings.iter().map(|m| (m.clone(), activity(app, m), m.target.is_trigger() || travel(app, &m.target).is_ok())).collect();
+                app.ui.midi_mappings.iter().map(|m| (m.clone(), activity(app, m), resolved(app, &m.target))).collect();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("midi_mappings_grid").num_columns(7).striped(true).show(ui, |ui| {
                     for h in ["", "Device", "Message", "Target", "Mode", "Settings", ""] {
@@ -1382,7 +1807,7 @@ fn mappings_window(app: &mut SoundApp, ctx: &egui::Context) {
                             if mode.relative() {
                                 ui.add(egui::DragValue::new(&mut sens).range(MIN_SENSITIVITY..=MAX_SENSITIVITY).speed(0.0005).prefix("step "));
                             }
-                            if !m.target.is_trigger() && !m.matcher.is_note() && mode == Mode::Absolute {
+                            if m.target.ranged() && !m.matcher.is_note() && mode == Mode::Absolute {
                                 ui.checkbox(&mut pickup, "Pickup");
                             }
                         });
@@ -1912,6 +2337,251 @@ mod tests {
         restore(&mut app);
         assert_eq!(app.ui.midi_mappings.len(), 2);
         assert!(app.ui.midi_mappings_backup.is_empty());
+    }
+
+    /// Both decks with a (silent) track, at ±8 %, as the audio engine would report them.
+    fn load_decks(app: &mut SoundApp) {
+        for i in 0..2 {
+            let buf = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 4800]; 2] };
+            let track = soundcraft_mix::DeckTrack {
+                source: std::sync::Arc::new(soundcraft_model::SourceAudio::new(buf)),
+                grid: None,
+                bpm: Some(128.0),
+                key: None,
+                cues: [None; soundcraft_mix::HOT_CUES],
+                title: String::new(),
+                artist: String::new(),
+                path: String::new(),
+                grid_from: None,
+                sections: Vec::new(),
+            };
+            app.engine.deck_tracks[i] = Some(std::sync::Arc::new(track));
+            app.engine.deck_status.decks[i].load = 1;
+            app.engine.deck_status.decks[i].range = 0.08;
+        }
+    }
+
+    fn deck(d: &str, control: Value) -> Value {
+        let mut t = json!({"kind": "deck", "deck": d});
+        if let (Some(o), Some(c)) = (t.as_object_mut(), control.as_object()) {
+            o.extend(c.clone());
+        }
+        t
+    }
+
+    fn run_(id: &'static str, p: Value) -> Action {
+        Action::Run(id, p)
+    }
+
+    fn taken(app: &mut SoundApp) -> Vec<Action> {
+        std::mem::take(&mut app.midi_learn.actions)
+    }
+
+    #[test]
+    fn deck_buttons_act_as_the_layout_cue_press_release_hot_cues_and_toggles() {
+        let (mut app, ddj, _) = app();
+        load_decks(&mut app);
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 12}), deck("a", json!({"control": "cue"})), json!({}));
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 11}), deck("a", json!({"control": "play"})), json!({}));
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 20}), deck("b", json!({"control": "hot_cue", "n": 3})), json!({}));
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 21}), deck("b", json!({"control": "hot_cue_clear", "n": 3})), json!({}));
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 30}), deck("b", json!({"control": "sync"})), json!({}));
+        assert_eq!(app.ui.midi_mappings[0].mode, Mode::Momentary, "a button");
+        // CUE: press and release (CDJ); a second release sends nothing.
+        handle(&mut app, &note(ddj, 12, true), 1.0);
+        handle(&mut app, &note(ddj, 12, false), 1.0);
+        handle(&mut app, &note(ddj, 12, false), 1.0);
+        assert_eq!(
+            taken(&mut app),
+            vec![run_("deck.cue", json!({"deck": "a", "down": true})), run_("deck.cue", json!({"deck": "a", "down": false}))]
+        );
+        // PLAY toggles from the state asked for while the deck hasn't reported it.
+        handle(&mut app, &note(ddj, 11, true), 1.0);
+        handle(&mut app, &note(ddj, 11, false), 1.0);
+        handle(&mut app, &note(ddj, 11, true), 1.05);
+        assert_eq!(taken(&mut app), vec![run_("deck.play", json!({"deck": "a"})), run_("deck.pause", json!({"deck": "a"}))], "a quick double press");
+        // A hot cue: empty sets (no release), set jumps and its release ends the preview.
+        handle(&mut app, &note(ddj, 20, true), 1.0);
+        handle(&mut app, &note(ddj, 20, false), 1.0);
+        app.engine.deck_status.decks[1].hot[2] = Some(1000.0);
+        handle(&mut app, &note(ddj, 20, true), 1.0);
+        handle(&mut app, &note(ddj, 20, false), 1.0);
+        handle(&mut app, &note(ddj, 21, true), 1.0);
+        assert_eq!(
+            taken(&mut app),
+            vec![
+                run_("deck.hotcue", json!({"deck": "b", "n": 3, "action": "set"})),
+                run_("deck.hotcue", json!({"deck": "b", "n": 3, "action": "jump"})),
+                run_("deck.hotcue", json!({"deck": "b", "n": 3, "action": "release"})),
+                run_("deck.hotcue", json!({"deck": "b", "n": 3, "action": "clear"})),
+            ]
+        );
+        // A controller button: on its way up only; the double press sends on then off.
+        for v in [127, 0, 127, 0] {
+            handle(&mut app, &cc(ddj, 30, v), 2.0);
+        }
+        assert_eq!(taken(&mut app), vec![run_("deck.sync", json!({"deck": "b", "on": true})), run_("deck.sync", json!({"deck": "b", "on": false}))]);
+        // An empty deck plays nothing.
+        app.engine.deck_tracks[0] = None;
+        handle(&mut app, &note(ddj, 11, true), 9.0);
+        assert!(taken(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_learned_jog_adds_up_its_ticks_nudging_while_playing_and_searching_while_paused() {
+        let (mut app, ddj, _) = app();
+        load_decks(&mut app);
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 33}), deck("a", json!({"control": "jog"})), json!({"mode": "rel_offset"}));
+        // Paused: 360 counts of +1 (half a turn at the layout's 720) is a beat of search.
+        for _ in 0..360 {
+            handle(&mut app, &cc(ddj, 33, 65), 1.0);
+        }
+        assert!(taken(&mut app).is_empty(), "sent once a frame");
+        frame(&mut app, 1.016);
+        assert_eq!(taken(&mut app), vec![run_("deck.jog", json!({"deck": "a", "delta": 1.0, "mode": "search"}))]);
+        // Playing: a nudge as strong as the turn is fast.
+        app.engine.deck_status.decks[0].playing = true;
+        handle(&mut app, &cc(ddj, 33, 72), 1.02);
+        frame(&mut app, 1.032);
+        assert_eq!(taken(&mut app), vec![run_("deck.jog", json!({"deck": "a", "delta": 0.5, "mode": "nudge"}))]);
+        // Sensitivity scales the counts.
+        app.ui.midi_mappings[0].sensitivity = 0.02;
+        handle(&mut app, &cc(ddj, 33, 68), 1.04);
+        frame(&mut app, 1.048);
+        assert_eq!(taken(&mut app), vec![run_("deck.jog", json!({"deck": "a", "delta": 0.5, "mode": "nudge"}))]);
+        // A held pitch bend nudges every frame until let go.
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 40}), deck("a", json!({"control": "pitch_bend_up"})), json!({}));
+        handle(&mut app, &note(ddj, 40, true), 2.0);
+        frame(&mut app, 2.016);
+        frame(&mut app, 2.032);
+        handle(&mut app, &note(ddj, 40, false), 2.04);
+        frame(&mut app, 2.05);
+        let bend = run_("deck.jog", json!({"deck": "a", "delta": crate::deck_controls::BEND, "mode": "nudge"}));
+        assert_eq!(taken(&mut app), vec![bend.clone(), bend]);
+    }
+
+    #[test]
+    fn a_learned_pitch_waits_for_the_deck_tempo_and_a_14_bit_one_reads_both_halves() {
+        let (mut app, ddj, _) = app();
+        load_decks(&mut app);
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 9}), deck("a", json!({"control": "pitch"})), json!({}));
+        // At 0 % the centre (64): far below waits, crossing picks it up.
+        handle(&mut app, &cc(ddj, 9, 10), 1.0);
+        handle(&mut app, &cc(ddj, 9, 30), 1.0);
+        assert!(taken(&mut app).is_empty(), "not picked up");
+        assert!(app.ui.status.contains("pick it up"), "{}", app.ui.status);
+        handle(&mut app, &cc(ddj, 9, 100), 1.0);
+        let sent = taken(&mut app);
+        let Some(Action::Run("deck.pitch", p)) = sent.first() else { panic!("{sent:?}") };
+        assert!((p["value"].as_f64().unwrap() - (100.0 / 127.0 * 2.0 - 1.0) * 8.0).abs() < 0.01, "{p}");
+        // Synced to a master on the other deck: no takeover (the engine's own applies).
+        app.engine.deck_status.decks[1].synced = true;
+        app.engine.deck_status.decks[0].master = true;
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 10}), deck("b", json!({"control": "pitch"})), json!({}));
+        handle(&mut app, &cc(ddj, 10, 0), 1.0);
+        assert_eq!(taken(&mut app), vec![run_("deck.pitch", json!({"deck": "b", "value": -8.0}))]);
+        // 14 bits: the MSB waits, the LSB sends; one LSB count is a step.
+        map(&mut app, json!({"type": "cc", "ch": 1, "cc": 0}), deck("b", json!({"control": "fader"})), json!({"lsb": 32, "pickup": false}));
+        let wide = |app: &mut SoundApp, v: u16| {
+            for (cc_, x) in [(0u8, (v >> 7) as u8), (32, (v & 0x7F) as u8)] {
+                handle(app, &MidiEvent { port: ddj, msg: MidiMessage::ControlChange { ch: 1, cc: cc_, value: x }, time_ns: 0 }, 1.0);
+            }
+            taken(app)
+        };
+        assert_eq!(wide(&mut app, 16383), vec![run_("deck.fader", json!({"deck": "b", "value": 1.0}))]);
+        assert_eq!(wide(&mut app, 8192), vec![run_("deck.fader", json!({"deck": "b", "value": 0.5}))]);
+        assert_ne!(wide(&mut app, 12288), wide(&mut app, 12300));
+        // The mixer: a 7-bit crossfader with pickup from the centre.
+        map(&mut app, json!({"type": "cc", "ch": 0, "cc": 11}), json!({"kind": "mixer", "control": "crossfader"}), json!({}));
+        handle(&mut app, &cc(ddj, 11, 0), 1.0);
+        assert!(taken(&mut app).is_empty(), "waits for the centre");
+        handle(&mut app, &cc(ddj, 11, 64), 1.0);
+        handle(&mut app, &cc(ddj, 11, 127), 1.0);
+        assert_eq!(taken(&mut app).last(), Some(&Action::Run("deck.xfader", json!({"value": 1.0}))));
+    }
+
+    #[test]
+    fn a_learned_hold_is_let_go_when_learning_starts() {
+        let (mut app, ddj, _) = app();
+        load_decks(&mut app);
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 12}), deck("a", json!({"control": "cue"})), json!({}));
+        app.engine.deck_status.decks[0].hot[0] = Some(1.0);
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 13}), deck("a", json!({"control": "hot_cue", "n": 1})), json!({}));
+        handle(&mut app, &note(ddj, 12, true), 1.0);
+        handle(&mut app, &note(ddj, 13, true), 1.0);
+        taken(&mut app);
+        app.run("midi.learn", json!({"target": {"kind": "stop_all"}})).unwrap();
+        // Let go through the app (the player): nothing is left held.
+        assert!(!app.midi_learn.decks.holding());
+        app.run("midi.learn", json!({"cancel": true})).unwrap();
+        handle(&mut app, &note(ddj, 12, false), 1.1);
+        handle(&mut app, &note(ddj, 13, false), 1.1);
+        assert!(taken(&mut app).is_empty(), "the hardware's late releases send nothing more");
+    }
+
+    #[test]
+    fn deck_targets_round_trip_through_the_preferences_and_old_ones_still_load() {
+        let (mut app, _, _) = app();
+        map(&mut app, json!({"type": "note", "ch": 0, "note": 12}), deck("a", json!({"control": "hot_cue", "n": 8})), json!({}));
+        map(&mut app, json!({"type": "cc", "ch": 6, "cc": 31}), json!({"kind": "mixer", "control": "crossfader"}), json!({"lsb": 63}));
+        map(&mut app, json!({"type": "cc", "ch": 6, "cc": 64}), json!({"kind": "library", "control": "browse"}), json!({"mode": "rel_twos"}));
+        let saved = serde_json::to_value(&app.ui).unwrap();
+        assert_eq!(saved["midi_mappings"][0]["target"], json!({"kind": "deck", "deck": "a", "control": "hot_cue", "n": 8}));
+        assert!(saved["midi_mappings"][0].get("lsb").is_none(), "no LSB, not written");
+        let back: crate::UiState = serde_json::from_value(saved).unwrap();
+        assert_eq!(back.midi_mappings, app.ui.midi_mappings);
+        // Preferences from before deck targets (no `lsb`), with a deck target a later version
+        // might add and a hot cue out of range: the rest load.
+        let old: crate::UiState = serde_json::from_value(json!({"midi_mappings": [
+            {"device": {"backend_id": "b", "raw_name": "P", "name": "P"}, "matcher": {"type": "cc", "ch": 0, "cc": 7},
+             "target": {"kind": "track_volume", "track": {"id": 1, "name": "Kick"}}, "mode": "absolute", "sensitivity": 0.01, "pickup": true},
+            {"device": {"backend_id": "b", "raw_name": "P", "name": "P"}, "matcher": {"type": "note", "ch": 0, "note": 1},
+             "target": {"kind": "deck", "deck": "a", "control": "warp"}},
+            {"device": {"backend_id": "b", "raw_name": "P", "name": "P"}, "matcher": {"type": "note", "ch": 0, "note": 2},
+             "target": {"kind": "deck", "deck": "a", "control": "hot_cue", "n": 9}}
+        ]}))
+        .unwrap();
+        assert_eq!(old.midi_mappings.len(), 1);
+        assert_eq!(old.midi_mappings[0].lsb, None);
+        // The commands list, filter and forget deck targets.
+        let v = app.run("midi.mappings", json!({"kind": "deck"})).unwrap();
+        assert_eq!(v["mappings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["mappings"][0]["label"], "Deck A Hot Cue H");
+        assert_eq!(v["mappings"][0]["resolved"], true);
+        assert!(
+            app.run(
+                "midi.map",
+                json!({"device": "DDJ", "matcher": {"type": "note", "ch": 0, "note": 1}, "target": deck("c", json!({"control": "play"}))})
+            )
+            .is_err()
+        );
+        assert!(
+            app.run(
+                "midi.map",
+                json!({"device": "DDJ", "matcher": {"type": "note", "ch": 0, "note": 1}, "target": deck("a", json!({"control": "hot_cue", "n": 0}))})
+            )
+            .is_err()
+        );
+        let r = app.run("midi.unmap", json!({"target": deck("a", json!({"control": "hot_cue", "n": 8}))})).unwrap();
+        assert_eq!(r["removed"], 1);
+        assert!(params_doc("midi.map").is_some_and(|d| d.contains("hot_cue {n: 1..=8}") && d.contains("mixer {control")));
+    }
+
+    #[test]
+    fn learning_a_deck_knob_from_a_layout_knows_both_halves_and_a_generic_lsb_is_detected() {
+        let (mut app, ddj, _) = app();
+        // A device without a layout: the LSB (CC + 32) seen while the knob is watched.
+        app.run("midi.learn", json!({"target": deck("a", json!({"control": "eq_low"}))})).unwrap();
+        handle(&mut app, &cc(ddj, 15, 64), 1.0);
+        handle(&mut app, &cc(ddj, 47, 3), 1.0);
+        handle(&mut app, &cc(ddj, 15, 64), 1.0);
+        handle(&mut app, &cc(ddj, 47, 9), 1.0);
+        handle(&mut app, &cc(ddj, 15, 64), 1.0);
+        handle(&mut app, &cc(ddj, 15, 64), 1.0);
+        assert!(app.midi_learn.detect.is_none());
+        let m = &app.ui.midi_mappings[0];
+        assert_eq!((m.matcher, m.lsb, m.mode), (Matcher::Cc { ch: 0, cc: 15 }, Some(47), Mode::Absolute), "a repeated MSB isn't an encoder");
+        assert!(controls(&app).contains(&(ddj, MidiControl::Cc { ch: 0, cc: 47 })), "the LSB never plays the instrument");
     }
 
     #[test]

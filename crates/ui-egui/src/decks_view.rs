@@ -22,10 +22,16 @@
 //!
 //! A held CUE or pad (pointer or key) is let go by [`release_holds`] every frame, whatever the
 //! window: when the button or key comes up, the tab is left or the app loses focus.
+//!
+//! Right-click a deck, mixer or library control for MIDI Learn ([`crate::midi_learn`]): Learn
+//! MIDI, then move a hardware control; the control is outlined while it waits. A hot cue pad's
+//! menu also clears it (as Shift+click does).
 
+use crate::deck_controls::{DeckControl, MixerControl};
 use crate::deck_wave::{self, ColumnCache, OverviewCache, RateHold, Scrolling, hot_cue_colour, hot_cue_letter, steady_tempo};
 use crate::knob::{self, Knob};
 use crate::library_browser::{self, Browser, Dragged};
+use crate::midi_learn::Target;
 use crate::theme::{Tokens, bold, mono, regular};
 use crate::widgets::{elided_text, key as key_face, key_fill, meter, shade};
 use crate::{MainWindow, SoundApp};
@@ -190,6 +196,33 @@ fn run(app: &mut SoundApp, id: &str, p: Value) {
     let _ = app.run(id, p);
 }
 
+/// Deck `d`'s control as a MIDI Learn target.
+fn deck_target(d: DeckId, control: DeckControl) -> Target {
+    Target::Deck { deck: d, control }
+}
+
+/// A control's MIDI Learn: its right-click menu (Learn MIDI, Remove MIDI Mapping; with more than
+/// one target, one pair per target, named) and, while one of its targets is being learned, the
+/// learn highlight round it.
+fn learnable(app: &mut SoundApp, ui: &Ui, resp: &Response, targets: &[(Target, &str)]) {
+    if let Some(l) = &app.midi_learn.learning
+        && targets.iter().any(|(t, _)| t == l)
+    {
+        let t = Tokens::current();
+        ui.painter().rect_stroke(resp.rect.expand(2.0), 4.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Outside);
+    }
+    resp.context_menu(|ui| learn_menu(app, ui, targets));
+}
+
+fn learn_menu(app: &mut SoundApp, ui: &mut Ui, targets: &[(Target, &str)]) {
+    for (i, (target, what)) in targets.iter().enumerate() {
+        if i > 0 {
+            ui.separator();
+        }
+        crate::midi_learn::menu_items_for(app, ui, target.clone(), what);
+    }
+}
+
 /// The deck's state and track.
 fn deck(app: &SoundApp, d: DeckId) -> (DeckState, Option<Arc<DeckTrack>>) {
     (app.engine.deck_status.decks.get(d.index()).copied().unwrap_or_default(), app.engine.deck_tracks.get(d.index()).cloned().flatten())
@@ -312,7 +345,7 @@ pub fn key(app: &mut SoundApp, k: Key, physical: Key, m: Modifiers) -> bool {
 }
 
 /// The beats a beat jump on deck `d` moves.
-fn jump_beats(app: &SoundApp, d: DeckId) -> f64 {
+pub(crate) fn jump_beats(app: &SoundApp, d: DeckId) -> f64 {
     JUMPS.get(app.decks_view.jump.get(d.index()).copied().flatten().unwrap_or(DEFAULT_JUMP)).copied().unwrap_or(4.0)
 }
 
@@ -815,6 +848,7 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
             Stroke::NONE,
         ));
     }
+    learnable(app, ui, &play, &[(deck_target(d, DeckControl::Play), "")]);
     if play.on_hover_text(if s.playing { "Pause (Space when this deck is focused)" } else { "Play (Space when this deck is focused)" }).clicked()
         && loaded
     {
@@ -825,16 +859,18 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
         "Stopped: sets the cue here and plays while held. Playing: back to the cue, paused. Key: {}",
         if d == DeckId::A { "Q" } else { "W" }
     ));
+    learnable(app, ui, &cue, &[(deck_target(d, DeckControl::Cue), "")]);
     if loaded {
         pointer_hold(app, ui, &cue, d, Held::Cue, false);
     }
-    if button(ui, sync_r, "SYNC", s.synced, tint(d), &format!("Deck {n} Sync"), 11.0)
-        .on_hover_text("Beat sync to the other deck (tempo, then phase). Key: S on the focused deck")
-        .clicked()
-    {
+    let sync = button(ui, sync_r, "SYNC", s.synced, tint(d), &format!("Deck {n} Sync"), 11.0);
+    learnable(app, ui, &sync, &[(deck_target(d, DeckControl::Sync), "")]);
+    if sync.on_hover_text("Beat sync to the other deck (tempo, then phase). Key: S on the focused deck").clicked() {
         run(app, "deck.sync", json!({"deck": d.id(), "on": !s.synced}));
     }
-    if button(ui, mt_r, "MT", s.key_lock, t.accent, &format!("Deck {n} Master Tempo"), 11.0).on_hover_text("Master Tempo (key lock)").clicked() {
+    let mt = button(ui, mt_r, "MT", s.key_lock, t.accent, &format!("Deck {n} Master Tempo"), 11.0);
+    learnable(app, ui, &mt, &[(deck_target(d, DeckControl::MasterTempo), "")]);
+    if mt.on_hover_text("Master Tempo (key lock)").clicked() {
         run(app, "deck.master_tempo", json!({"deck": d.id(), "on": !s.key_lock}));
     }
     let load_r = Rect::from_min_max(pos2((row.max.x - 70.0).max(x), row.min.y + 7.0), pos2(row.max.x, row.max.y - 7.0));
@@ -842,6 +878,7 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     let locked = s.playing || s.previewing;
     let load_resp =
         button(ui, load_r, if locked { "LOCKED" } else { "LOAD" }, false, t.accent, &format!("Deck {n} Load"), if locked { 9.5 } else { 11.0 });
+    learnable(app, ui, &load_resp, &[(deck_target(d, DeckControl::Load), "")]);
     if locked {
         ui.painter().rect_stroke(load_r, 3.0, Stroke::new(2.0, t.rec), egui::StrokeKind::Inside);
     }
@@ -898,10 +935,12 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     for (k, beats) in LOOPS.iter().enumerate() {
         let on = loop_beats.is_some_and(|b| (b - beats).abs() < 0.01);
         let label = format!("{beats:.0}");
-        if button(ui, cell_at(k + 1, lr), &label, on, t.accent, &format!("Deck {n} Loop {beats:.0}"), 11.0)
-            .on_hover_text(format!("A {beats:.0}-beat loop"))
-            .clicked()
-        {
+        let lb = button(ui, cell_at(k + 1, lr), &label, on, t.accent, &format!("Deck {n} Loop {beats:.0}"), 11.0);
+        if (beats - 4.0).abs() < 1e-9 {
+            // 4 BEAT / EXIT, as on a controller.
+            learnable(app, ui, &lb, &[(deck_target(d, DeckControl::Loop4), "")]);
+        }
+        if lb.on_hover_text(format!("A {beats:.0}-beat loop")).clicked() {
             if on {
                 run(app, "deck.loop", json!({"deck": d.id(), "action": "exit"}));
             } else {
@@ -911,25 +950,34 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     }
     let hd = cell_at(7, lr);
     let (h1, h2) = (Rect::from_min_max(hd.min, pos2(hd.center().x - 1.0, hd.max.y)), Rect::from_min_max(pos2(hd.center().x + 1.0, hd.min.y), hd.max));
-    if button(ui, h1, "½", false, t.accent, &format!("Deck {n} Loop Halve"), 11.0).on_hover_text("Halve the loop").clicked() {
+    let halve = button(ui, h1, "½", false, t.accent, &format!("Deck {n} Loop Halve"), 11.0);
+    learnable(app, ui, &halve, &[(deck_target(d, DeckControl::LoopHalve), "")]);
+    if halve.on_hover_text("Halve the loop").clicked() {
         run(app, "deck.loop", json!({"deck": d.id(), "action": "halve"}));
     }
-    if button(ui, h2, "×2", false, t.accent, &format!("Deck {n} Loop Double"), 10.0).on_hover_text("Double the loop").clicked() {
+    let double = button(ui, h2, "×2", false, t.accent, &format!("Deck {n} Loop Double"), 10.0);
+    learnable(app, ui, &double, &[(deck_target(d, DeckControl::LoopDouble), "")]);
+    if double.on_hover_text("Double the loop").clicked() {
         run(app, "deck.loop", json!({"deck": d.id(), "action": "double"}));
     }
     // Row 4: loop in/out, exit or reloop, beat jump.
     let r4 = Rect::from_min_size(pos2(r.min.x, lr.max.y + 10.0), vec2(r.width(), row_h));
-    for (k, (text, action, tip)) in [("IN", "in", "Loop in here"), ("OUT", "out", "Loop out here: the loop starts")].into_iter().enumerate() {
-        if button(ui, cell_at(k, r4), text, false, t.accent, &format!("Deck {n} Loop {text}"), 10.5).on_hover_text(tip).clicked() {
+    for (k, (text, action, tip, control)) in
+        [("IN", "in", "Loop in here", DeckControl::LoopIn), ("OUT", "out", "Loop out here: the loop starts", DeckControl::LoopOut)]
+            .into_iter()
+            .enumerate()
+    {
+        let lb = button(ui, cell_at(k, r4), text, false, t.accent, &format!("Deck {n} Loop {text}"), 10.5);
+        learnable(app, ui, &lb, &[(deck_target(d, control), "")]);
+        if lb.on_hover_text(tip).clicked() {
             run(app, "deck.loop", json!({"deck": d.id(), "action": action}));
         }
     }
     let ex = Rect::from_min_max(cell_at(2, r4).min, cell_at(3, r4).max);
     let (text, action) = if s.loop_on { ("EXIT", "exit") } else { ("RELOOP", "reloop") };
-    if button(ui, ex, text, s.loop_on, Color32::from_rgb(255, 170, 40), &format!("Deck {n} Loop Exit"), 10.5)
-        .on_hover_text("Leave the loop, or go back into the last one")
-        .clicked()
-    {
+    let exit = button(ui, ex, text, s.loop_on, Color32::from_rgb(255, 170, 40), &format!("Deck {n} Loop Exit"), 10.5);
+    learnable(app, ui, &exit, &[(deck_target(d, DeckControl::Reloop), "")]);
+    if exit.on_hover_text("Leave the loop, or go back into the last one").clicked() {
         run(app, "deck.loop", json!({"deck": d.id(), "action": action}));
     }
     let jump = jump_beats(app, d);
@@ -937,10 +985,9 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
     let size = cell_at(6, r4);
     let fwd = cell_at(7, r4);
     ui.painter().text(pos2(cell_at(4, r4).max.x, r4.center().y), Align2::RIGHT_CENTER, "JUMP", bold(9.5), t.text_dim);
-    if button(ui, back, "◀", false, t.accent, &format!("Deck {n} Beat Jump Back"), 11.0)
-        .on_hover_text(format!("Jump {jump:.0} beats back (key: comma)"))
-        .clicked()
-    {
+    let jb = button(ui, back, "◀", false, t.accent, &format!("Deck {n} Beat Jump Back"), 11.0);
+    learnable(app, ui, &jb, &[(deck_target(d, DeckControl::JumpBack), "")]);
+    if jb.on_hover_text(format!("Jump {jump:.0} beats back (key: comma)")).clicked() {
         run(app, "deck.beatjump", json!({"deck": d.id(), "beats": -jump}));
     }
     if button(ui, size, &format!("{jump:.0}"), false, t.accent, &format!("Deck {n} Beat Jump Size"), 11.0)
@@ -952,10 +999,9 @@ fn transport(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState,
             *j = Some((k + 1) % JUMPS.len());
         }
     }
-    if button(ui, fwd, "▶", false, t.accent, &format!("Deck {n} Beat Jump Forward"), 11.0)
-        .on_hover_text(format!("Jump {jump:.0} beats on (key: full stop)"))
-        .clicked()
-    {
+    let jf = button(ui, fwd, "▶", false, t.accent, &format!("Deck {n} Beat Jump Forward"), 11.0);
+    learnable(app, ui, &jf, &[(deck_target(d, DeckControl::JumpForward), "")]);
+    if jf.on_hover_text(format!("Jump {jump:.0} beats on (key: full stop)")).clicked() {
         run(app, "deck.beatjump", json!({"deck": d.id(), "beats": jump}));
     }
 }
@@ -1029,18 +1075,33 @@ fn pad(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, slot:
     let on = set;
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, &label));
     let tip = match cue {
-        Some(n) => format!("{n}: jump (held while stopped: plays from it). Shift+click or right-click clears. Key: {}", slot + 1),
+        Some(n) => format!("{n}: jump (held while stopped: plays from it). Shift+click clears (or right-click, Clear Hot Cue). Key: {}", slot + 1),
         None => format!("Set a hot cue here. Key: {}", slot + 1),
     };
     let resp = resp.on_hover_text(tip);
+    // The right-click menu: Clear, and MIDI Learn of the pad and of its clear.
+    let n = u8::try_from(slot + 1).unwrap_or(1);
+    let targets = [(deck_target(d, DeckControl::HotCue { n }), ""), (deck_target(d, DeckControl::HotCueClear { n }), "Clear")];
+    if let Some(l) = &app.midi_learn.learning
+        && targets.iter().any(|(t, _)| t == l)
+    {
+        ui.painter().rect_stroke(r.expand(2.0), 4.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Outside);
+    }
+    resp.context_menu(|ui| {
+        if set && track.is_some() && ui.button("Clear Hot Cue").clicked() {
+            run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "clear"}));
+            ui.close();
+        }
+        if set && track.is_some() {
+            ui.separator();
+        }
+        learn_menu(app, ui, &targets);
+    });
     if track.is_none() {
         return;
     }
     let shift = ui.input(|inp| inp.modifiers.shift);
     pointer_hold(app, ui, &resp, d, Held::Pad { slot, release: set }, shift);
-    if resp.secondary_clicked() && set {
-        run(app, "deck.hotcue", json!({"deck": d.id(), "n": slot + 1, "action": "clear"}));
-    }
 }
 
 /// A vertical fader's travel (0 bottom, 1 top) from a drag in `r`, else `None`. Double-click
@@ -1131,6 +1192,16 @@ fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckStat
             ui.painter().hline(fr.min.x + 2.0..=fr.max.x - 2.0, y, Stroke::new(2.0, t.accent.gamma_multiply(0.8)));
         }
     }
+    learnable(
+        app,
+        ui,
+        &resp,
+        &[
+            (deck_target(d, DeckControl::Pitch), ""),
+            (deck_target(d, DeckControl::PitchBendUp), "Pitch Bend +"),
+            (deck_target(d, DeckControl::PitchBendDown), "Pitch Bend −"),
+        ],
+    );
     let resp = resp.on_hover_text(
         "Pitch (up is slower, as on a CDJ). The yellow line is the tempo now (sync): move the fader to it to take over. Double-click: 0 %",
     );
@@ -1144,11 +1215,9 @@ fn pitch_fader(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckStat
     }
     let rr = Rect::from_min_max(pos2(r.min.x, r.max.y - KEY_ROW), r.max);
     let label = format!("±{:.0}", range * 100.0);
-    if button(ui, rr, &label, false, t.accent, &format!("Deck {} Pitch Range", name(d)), 10.5)
-        .on_hover_text("Pitch range: ±8, ±16 or ±50 %")
-        .clicked()
-        && track.is_some()
-    {
+    let range_resp = button(ui, rr, &label, false, t.accent, &format!("Deck {} Pitch Range", name(d)), 10.5);
+    learnable(app, ui, &range_resp, &[(deck_target(d, DeckControl::PitchRange), "")]);
+    if range_resp.on_hover_text("Pitch range: ±8, ±16 or ±50 %").clicked() && track.is_some() {
         let k = PITCH_RANGES.iter().position(|x| (x - range).abs() < 1e-6).unwrap_or(0);
         let next = PITCH_RANGES.get((k + 1) % PITCH_RANGES.len()).copied().unwrap_or(0.08);
         run(app, "deck.pitch", json!({"deck": d.id(), "range": (next * 100.0).round()}));
@@ -1160,7 +1229,8 @@ fn jog(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, posit
     let size = r.width().min(r.height() - 10.0);
     let c = pos2(r.center().x, r.min.y + size / 2.0);
     let jr = Rect::from_center_size(c, vec2(size, size));
-    let resp = ui.interact(jr, Id::new(("decks_jog", d.id())), Sense::drag());
+    // Clicks too: its right-click menu learns MIDI.
+    let resp = ui.interact(jr, Id::new(("decks_jog", d.id())), Sense::click_and_drag());
     let label = format!("Deck {} Jog", name(d));
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &label));
     let p = ui.painter();
@@ -1211,6 +1281,7 @@ fn jog(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId, s: &DeckState, posit
         p.text(c + vec2(0.0, size * 0.75), Align2::CENTER_CENTER, pitch, mono((size * 0.45).max(9.0)), t.text_dim);
     }
     p.text(c + vec2(0.0, disc * 0.62), Align2::CENTER_CENTER, if live { "NUDGE" } else { "SEARCH" }, bold(8.0), t.text_dim.gamma_multiply(0.7));
+    learnable(app, ui, &resp, &[(deck_target(d, DeckControl::Jog), "")]);
     let resp = resp.on_hover_text("Drag sideways: nudge while playing, search while stopped");
     if track.is_some() {
         jog_drag(app, ui, &resp, d, s);
@@ -1238,6 +1309,7 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     let mut kui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_center_size(pos2(c.center().x, c.min.y + 36.0), vec2(40.0, 40.0))));
     let resp = knob::knob(&mut kui, 40.0, &mut travel, Knob { label: "Master Volume", default: 1.0, detent: None, origin: 0.0, colour: t.accent });
     let db = if travel <= 0.0 { -60.0 } else { ((travel - 1.0) * 40.0).max(-60.0) };
+    learnable(app, ui, &resp, &[(Target::Mixer { control: MixerControl::MasterVolume }, "")]);
     let resp = resp.on_hover_text(format!("Master volume {db:.1} dB, into the limiter at −1 dBTP. Double-click: 0 dB"));
     hold_value(app, id, &resp, Some(travel));
     if resp.changed() {
@@ -1296,6 +1368,7 @@ fn mixer(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     if resp.double_clicked() {
         new = Some(0.5);
     }
+    learnable(app, ui, &resp, &[(Target::Mixer { control: MixerControl::Crossfader }, "")]);
     let resp = resp.on_hover_text("Crossfader. Double-click: centre");
     hold_value(app, id, &resp, new);
     if let Some(v) = new {
@@ -1346,7 +1419,7 @@ fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
     let ks = 26.0;
     let ky = r.min.y + 12.0;
     let mix = if st.headphone_mix.is_finite() { st.headphone_mix.clamp(0.0, 1.0) } else { 0.0 };
-    deck_knob(
+    let mix_resp = deck_knob(
         app,
         ui,
         Rect::from_min_size(pos2(r.center().x - ks - 3.0, ky), vec2(ks, ks)),
@@ -1356,13 +1429,14 @@ fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
         &format!("Headphone mix: {:.0} % master (left: cue only, right: master only). Double-click: cue only", mix * 100.0),
         |app, v| run(app, "deck.headphone_mix", json!({"value": (f64::from(v) * 1000.0).round() / 1000.0})),
     );
+    learnable(app, ui, &mix_resp, &[(Target::Mixer { control: MixerControl::HeadphoneMix }, "")]);
     // The level's knob spans −60..0 dB evenly; all the way down is off.
     let (lo, hi) = soundcraft_mix::HEADPHONE_DB;
     let to_travel = |db: f32| ((db - lo) / (hi - lo)).clamp(0.0, 1.0);
     let db = st.headphone_db;
     let travel = if db.is_finite() { to_travel(db) } else { to_travel(soundcraft_mix::HEADPHONE_DEFAULT_DB) };
     let shown = if db <= lo { "off".to_string() } else { format!("{db:.1} dB") };
-    deck_knob(
+    let level_resp = deck_knob(
         app,
         ui,
         Rect::from_min_size(pos2(r.center().x + 3.0, ky), vec2(ks, ks)),
@@ -1375,9 +1449,12 @@ fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
             run(app, "deck.headphone_level", json!({"db": (f64::from(db) * 10.0).round() / 10.0}));
         },
     );
+    learnable(app, ui, &level_resp, &[(Target::Mixer { control: MixerControl::HeadphoneLevel }, "")]);
     let br = Rect::from_center_size(pos2(r.center().x, ky + ks + 14.0), vec2(r.width() - 10.0, 20.0));
     let on = st.master_cue;
-    if button(ui, br, "MASTER CUE", on, t.accent, "Master Cue", 8.0).on_hover_text("Master cue: the master joins the headphones' cue bus").clicked() {
+    let mc = button(ui, br, "MASTER CUE", on, t.accent, "Master Cue", 8.0);
+    learnable(app, ui, &mc, &[(Target::Mixer { control: MixerControl::MasterCue }, "")]);
+    if mc.on_hover_text("Master cue: the master joins the headphones' cue bus").clicked() {
         run(app, "deck.master_cue", json!({"on": !on}));
     }
     let [l, rr] = app.decks_view.meters.get(3).copied().unwrap_or_default();
@@ -1395,7 +1472,16 @@ fn headphones(app: &mut SoundApp, ui: &mut Ui, r: Rect) {
 
 /// A knob for deck `d`'s control, sending `cmd` with what `to_params` makes of its travel.
 #[allow(clippy::too_many_arguments)]
-fn deck_knob(app: &mut SoundApp, ui: &mut Ui, at: Rect, label: &str, reported: f32, k: Knob<'_>, tip: &str, send: impl FnOnce(&mut SoundApp, f32)) {
+fn deck_knob(
+    app: &mut SoundApp,
+    ui: &mut Ui,
+    at: Rect,
+    label: &str,
+    reported: f32,
+    k: Knob<'_>,
+    tip: &str,
+    send: impl FnOnce(&mut SoundApp, f32),
+) -> Response {
     let id = Id::new(("decks_knob", label));
     let mut travel = shown_value(app, id, reported);
     let mut kui = ui.new_child(egui::UiBuilder::new().max_rect(at));
@@ -1405,6 +1491,7 @@ fn deck_knob(app: &mut SoundApp, ui: &mut Ui, at: Rect, label: &str, reported: f
     if resp.changed() {
         send(app, travel);
     }
+    resp
 }
 
 fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
@@ -1423,7 +1510,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     let trim = s.trim_db;
     let tr = Rect::from_min_size(pos2(kx, y), vec2(ks, ks));
     ui.painter().text(pos2(killx + 15.0, y + ks / 2.0), Align2::CENTER_CENTER, "TRIM", bold(9.0), t.text_dim);
-    deck_knob(
+    let trim_resp = deck_knob(
         app,
         ui,
         tr,
@@ -1433,11 +1520,12 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
         &format!("Trim {trim:+.1} dB"),
         |app, v| run(app, "deck.trim", json!({"deck": d.id(), "db": (knob::trim_db(v) * 10.0).round() / 10.0})),
     );
+    learnable(app, ui, &trim_resp, &[(deck_target(d, DeckControl::Trim), "")]);
     y += row_h;
-    for (band, text, colour) in [
-        (EqBand::High, "HI", crate::theme::studio::HIGH),
-        (EqBand::Mid, "MID", crate::theme::studio::MID),
-        (EqBand::Low, "LOW", crate::theme::studio::LOW),
+    for (band, text, colour, control) in [
+        (EqBand::High, "HI", crate::theme::studio::HIGH, DeckControl::EqHigh),
+        (EqBand::Mid, "MID", crate::theme::studio::MID, DeckControl::EqMid),
+        (EqBand::Low, "LOW", crate::theme::studio::LOW, DeckControl::EqLow),
     ] {
         let db = s.eq_db.get(band.index()).copied().unwrap_or(0.0);
         let killed = db <= soundcraft_mix::dj_strip::EQ_KILL_DB;
@@ -1447,7 +1535,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
             EqBand::Mid => "mid",
             EqBand::High => "high",
         };
-        deck_knob(
+        let eq_resp = deck_knob(
             app,
             ui,
             kr,
@@ -1457,6 +1545,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
             &format!("{text} {} (−26..+6 dB). Double-click: 0 dB", if killed { "killed".to_string() } else { format!("{db:+.1} dB") }),
             |app, v| run(app, "deck.eq", json!({"deck": d.id(), "band": band_id, "db": (knob::eq_db(v) * 10.0).round() / 10.0})),
         );
+        learnable(app, ui, &eq_resp, &[(deck_target(d, control), "")]);
         let kb = Rect::from_min_size(pos2(killx, y + 6.0), vec2(30.0, 20.0));
         if button(ui, kb, text, killed, t.rec, &format!("Deck {n} EQ {text} Kill"), 9.0).on_hover_text(format!("Kill the {text} band")).clicked() {
             let p = if killed { json!({"deck": d.id(), "band": band_id, "db": 0}) } else { json!({"deck": d.id(), "band": band_id, "db": "kill"}) };
@@ -1467,7 +1556,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     let fr = Rect::from_min_size(pos2(kx, y), vec2(ks, ks));
     ui.painter().text(pos2(killx + 15.0, y + ks / 2.0), Align2::CENTER_CENTER, "FILTER", bold(8.5), t.text_dim);
     let filter = s.filter;
-    deck_knob(
+    let filter_resp = deck_knob(
         app,
         ui,
         fr,
@@ -1477,6 +1566,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
         "Filter: left low-pass, right high-pass, off in the centre",
         |app, v| run(app, "deck.filter", json!({"deck": d.id(), "value": ((v * 2.0 - 1.0) * 1000.0).round() / 1000.0})),
     );
+    learnable(app, ui, &filter_resp, &[(deck_target(d, DeckControl::Filter), "")]);
     y += row_h + 2.0;
     // The channel fader and meter.
     let fh = (r.max.y - y - 50.0).max(40.0);
@@ -1484,6 +1574,7 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     let id = Id::new(("decks_fader", d.id()));
     let travel = shown_value(app, id, if s.fader.is_finite() { s.fader } else { 1.0 });
     let (v, resp) = vfader(ui, Rect::from_min_size(pos2(fx, y), vec2(36.0, fh)), travel, id, &format!("Deck {n} Fader"), 1.0);
+    learnable(app, ui, &resp, &[(deck_target(d, DeckControl::Fader), "")]);
     hold_value(app, id, &resp, v);
     if let Some(v) = v {
         run(app, "deck.fader", json!({"deck": d.id(), "value": (f64::from(v) * 1000.0).round() / 1000.0}));
@@ -1494,10 +1585,9 @@ fn channel(app: &mut SoundApp, ui: &mut Ui, r: Rect, d: DeckId) {
     meter(ui, Rect::from_min_size(pos2(mx + 10.0, y), vec2(8.0, fh)), rr, rr, rr >= 1.0);
     // The headphone CUE button, under the fader.
     let cr = Rect::from_min_size(pos2(fx - 2.0, y + fh + 3.0), vec2(40.0, 20.0));
-    if button(ui, cr, "CUE", s.headphone_cue, t.accent, &format!("Deck {n} Headphone Cue"), 9.0)
-        .on_hover_text("Headphone cue: this channel in the headphones, pre-fader")
-        .clicked()
-    {
+    let hc = button(ui, cr, "CUE", s.headphone_cue, t.accent, &format!("Deck {n} Headphone Cue"), 9.0);
+    learnable(app, ui, &hc, &[(deck_target(d, DeckControl::HeadphoneCue), "")]);
+    if hc.on_hover_text("Headphone cue: this channel in the headphones, pre-fader").clicked() {
         run(app, "deck.headphone_cue", json!({"deck": d.id(), "on": !s.headphone_cue}));
     }
     // Crossfader assign.

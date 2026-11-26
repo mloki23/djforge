@@ -437,7 +437,7 @@ fn quiet(id: &str) -> bool {
     )
 }
 
-fn perform(app: &mut SoundApp, layout: &str, a: Action) {
+pub(crate) fn perform(app: &mut SoundApp, layout: &str, a: Action) {
     match a {
         Action::Run(id, p) => {
             if let Err(e) = app.run(id, p)
@@ -479,9 +479,10 @@ pub fn controls(app: &SoundApp) -> Vec<(PortId, MidiControl)> {
     app.controllers.devices.iter().flat_map(|d| d.logic.controls().into_iter().map(move |c| (d.input, c))).collect()
 }
 
-/// Lets go of everything the layouts hold, and turns their lights off and closes their outputs:
-/// the app is quitting.
+/// Lets go of everything the layouts and MIDI Learn's deck controls hold, and turns the layouts'
+/// lights off and closes their outputs: the app is quitting.
 pub fn shutdown(app: &mut SoundApp) {
+    crate::midi_learn::release_holds(app);
     let now = app.midi_learn.now;
     for d in std::mem::take(&mut app.controllers.devices) {
         stop(app, d, now);

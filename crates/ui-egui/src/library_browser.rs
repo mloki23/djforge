@@ -514,6 +514,12 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                     act = Some(Act::Analyse(path.clone()));
                     ui.close();
                 }
+                // MIDI Learn of the browser's own controls (as a controller's browse knob).
+                ui.separator();
+                use crate::deck_controls::LibraryControl;
+                for c in [LibraryControl::Browse, LibraryControl::Previous, LibraryControl::Next, LibraryControl::Load] {
+                    crate::midi_learn::menu_items_for(app, ui, crate::midi_learn::Target::Library { control: c }, c.label());
+                }
             });
         }
     });

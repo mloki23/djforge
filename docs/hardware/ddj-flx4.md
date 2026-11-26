@@ -29,7 +29,9 @@ the Rust table has exactly the same messages, so keep them in step.
   its controller, so the fader's movement while SHIFT is held is not followed. When SHIFT is let
   go, the fader's next message applies as it is: a small jump is possible.
 - **MIDI Learn** takes precedence over the layout. A mapping learned on either half of a 14-bit
-  control covers both halves: the other half no longer reaches the layout.
+  control covers both halves: the other half no longer reaches the layout. Learned on a deck or
+  mixer knob or fader (right-click it in the Decks tab), it reads both halves as one 14-bit value,
+  and the learned control acts as the layout's own would (the deck control code is shared).
 - "Deck 1" is djforge's Deck A, "Deck 2" Deck B.
 - In the djforge column, `(unmapped)` means djforge does nothing with the message yet. The layout
   still claims it, so it never plays the live instrument; MIDI Learn can map it.

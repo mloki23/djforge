@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-11-26 · **Last updated:** 2026-11-26 · **Change:** minor (stage 9b: MIDI output ports; a built-in Pioneer DDJ-FLX4 layout with LED feedback) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-11-26 · **Last updated:** 2026-11-26 · **Change:** minor (stage 9b: MIDI output ports; a built-in Pioneer DDJ-FLX4 layout with LED feedback; MIDI Learn on the decks) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
 SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal), `crates/midi-io`
@@ -36,7 +36,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 | MIDI output to external gear | ✅ | 🟡 output ports (a non-blocking sender thread) drive a controller's lights; no notes or clock to external gear yet |
 | MIDI Thru, input filter | ✅ | 🟡 the input filter leaves its kinds out of takes (live play unfiltered); no Thru |
 | MIDI Beat Clock out, MTC generate/chase | ✅ | ❌ |
-| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ✅ MIDI learn: notes and controllers to slots, scenes, faders, pans, stems, parameters and commands (Setup › MIDI › MIDI Mappings) |
+| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ✅ MIDI learn: notes and controllers to slots, scenes, faders, pans, stems, parameters, commands and the live decks' controls (transport, pitch with soft takeover, jog, hot cues, loops, mixer, headphones, library; 7- or 14-bit) (Setup › MIDI › MIDI Mappings) |
 | Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | ✅ Play mode plays the live target; step entry otherwise |
 
 ## Control surfaces
@@ -73,6 +73,7 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-26 | minor | Stage 9b: MIDI Learn on the live decks' controls, so any controller can drive the decks |
 | 2026-11-26 | minor | Stage 9b: MIDI output ports and a built-in DDJ-FLX4 layout with LED feedback |
 | 2026-11-11 | minor | Stage 7b review fixes: a device on another USB port keeps its settings; the input filter applies to takes |
 | 2026-11-11 | major | MIDI input (stage 7b): live play, keyboard Play mode, recording, MIDI learn, and MIDI Devices with reconnect; MIDI out, Thru and clock out still missing |

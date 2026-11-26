@@ -9,6 +9,7 @@ pub mod bounce;
 pub mod control;
 pub mod controller_layouts;
 pub mod credits;
+pub mod deck_controls;
 pub mod deck_wave;
 pub mod decks;
 pub mod decks_view;
